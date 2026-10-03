@@ -440,6 +440,7 @@ impl Shell {
     }
 
     fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        self.skill_manager = None;
         if let Some(workspace) = &self.workspace {
             workspace.update(cx, |workspace, cx| workspace.activate_tab(tab_id, None, cx));
         }

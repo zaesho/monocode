@@ -192,10 +192,7 @@ pub fn boot_with_skill_home(
         options.import_webkit = false;
         options.reap_orphans = false;
     }
-    let skill_home = skill_home
-        .or_else(|| monocode_platform::dirs_home().map(PathBuf::from))
-        .context("Could not resolve the skill home directory")?;
-    if !skill_home.is_absolute() {
+    if skill_home.as_ref().is_some_and(|home| !home.is_absolute()) {
         return Err(anyhow!("The skill home directory must be absolute"));
     }
     std::fs::create_dir_all(&options.data_dir.path)
@@ -203,14 +200,13 @@ pub fn boot_with_skill_home(
     let data_dir = std::fs::canonicalize(&options.data_dir.path)
         .context("Could not resolve the app data directory")?;
     options.data_dir.path = data_dir.clone();
-    let (skills, initial_generation) =
-        match crate::skills_runtime::initialize_manager(&data_dir, &skill_home) {
-            Ok((manager, generation)) => (Ok(manager), generation),
-            Err(error) => {
-                log::warn!("Shared skill library is unavailable: {error}");
-                (Err(error), 0)
-            }
-        };
+    let (skills, skill_home, initial_generation) = crate::skills_runtime::initialize_optional_home(
+        &data_dir,
+        skill_home.or_else(|| monocode_platform::dirs_home().map(PathBuf::from)),
+    );
+    if let Err(error) = &skills {
+        log::warn!("Shared skill library is unavailable: {error}");
+    }
     let skill_generation = Arc::new(AtomicU64::new(initial_generation));
     let kv = open_settings(&data_dir, options.import_webkit)?;
     let settings = monocode_settings::load_app_settings(&kv, Platform::current());

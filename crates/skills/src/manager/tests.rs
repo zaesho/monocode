@@ -58,7 +58,11 @@ impl Drop for Fixture {
                 permissions.set_mode(if metadata.is_dir() { 0o755 } else { 0o644 });
             }
             #[cfg(not(unix))]
-            permissions.set_readonly(false);
+            #[allow(clippy::permissions_set_readonly_false)]
+            {
+                // This branch clears the Windows read-only flag. Unix uses explicit modes.
+                permissions.set_readonly(false);
+            }
             fs::set_permissions(path, permissions).unwrap();
             if metadata.is_dir() {
                 for child in fs::read_dir(path).unwrap() {

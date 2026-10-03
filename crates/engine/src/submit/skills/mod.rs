@@ -552,7 +552,7 @@ impl SkillCatalog {
                 .into_iter()
                 .filter(|skill| !matches!(skill, Skill::Native(_)))
                 .collect();
-            let skills = merge_native_catalog(files, commands.clone());
+            let skills = merge_native_catalog(files, commands.clone(), false);
             let (entry_id, generation) = {
                 let mut state = catalog.inner.state.lock();
                 let generation = state.entries.get(&key).map_or(0, |entry| entry.generation) + 1;
@@ -594,7 +594,7 @@ impl SkillCatalog {
                         .into_iter()
                         .filter(|file| !disabled.contains(&file.path))
                         .collect();
-                    let skills = merge_native_catalog(merge_catalog(&files), commands);
+                    let skills = merge_native_catalog(merge_catalog(&files), commands, false);
                     {
                         let mut state = catalog.inner.state.lock();
                         let Some(entry) = state
@@ -679,9 +679,23 @@ impl SkillCatalog {
             {
                 return in_flight.load.clone();
             }
+            let cached_native =
+                (native && entry.retry_at == 0 && now - entry.loaded_at < NATIVE_SKILL_TTL_MS)
+                    .then(|| {
+                        entry.skills.as_ref().map(|skills| {
+                            skills
+                                .iter()
+                                .filter_map(|skill| match skill {
+                                    Skill::Native(command) => Some(command.clone()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                    })
+                    .flatten();
             entry.generation += 1;
             entry.retry_at = 0;
-            return self.start_catalog_load(state, key, load_id, normalized);
+            return self.start_catalog_load(state, key, load_id, normalized, cached_native);
         }
 
         if let Some(in_flight) = &entry.in_flight
@@ -702,7 +716,7 @@ impl SkillCatalog {
         if native && now < entry.retry_at {
             return ready(entry.skills.clone().unwrap_or_default());
         }
-        self.start_catalog_load(state, key, load_id, normalized)
+        self.start_catalog_load(state, key, load_id, normalized, None)
     }
 
     fn start_catalog_load(
@@ -711,6 +725,7 @@ impl SkillCatalog {
         key: String,
         load_id: u64,
         context: SkillCatalogContext,
+        cached_native: Option<Vec<NativeCommand>>,
     ) -> SkillsLoad {
         let entry = state.entries.get_mut(&key).expect("entry exists");
         let entry_id = entry.id;
@@ -729,8 +744,9 @@ impl SkillCatalog {
 
         let catalog = self.clone();
         let native = self.has_native_commands(context.harness);
+        let reused_native = cached_native.is_some();
         let work = async move {
-            let loaded = catalog.load_catalog(context).await;
+            let loaded = catalog.load_catalog(context, cached_native).await;
             let now = catalog.inner.sources.now_ms();
             let skills = {
                 let mut state = catalog.inner.state.lock();
@@ -746,7 +762,9 @@ impl SkillCatalog {
                         .unwrap_or_default(),
                     (Some(entry), Ok((skills, native_failed))) => {
                         entry.skills = Some(skills.clone());
-                        entry.loaded_at = now;
+                        if !reused_native {
+                            entry.loaded_at = now;
+                        }
                         entry.retry_at = if native_failed {
                             now + NATIVE_SKILL_RETRY_MS
                         } else {
@@ -786,6 +804,7 @@ impl SkillCatalog {
     async fn load_catalog(
         &self,
         context: SkillCatalogContext,
+        cached_native: Option<Vec<NativeCommand>>,
     ) -> Result<(Vec<Skill>, bool), String> {
         let disabled_paths = self.load_disabled_skill_paths();
         let files = self
@@ -794,6 +813,9 @@ impl SkillCatalog {
             .list_skills_in_context(context.clone(), disabled_paths);
         let provider = self.provider(context.harness);
         let native = async {
+            if let Some(commands) = cached_native {
+                return Ok(commands);
+            }
             match &provider {
                 Some(provider) => provider
                     .discover(command_context(&context))
@@ -821,8 +843,10 @@ impl SkillCatalog {
                 .collect()
         });
         filter_disabled_native_skills(&mut commands, &disabled.into_iter().collect::<Vec<_>>());
+        let qualify_files =
+            native_failed && provider.is_some_and(|provider| provider.raw_slash_commands());
         Ok((
-            merge_native_catalog(merge_catalog(&enabled), commands),
+            merge_native_catalog(merge_catalog(&enabled), commands, qualify_files),
             native_failed,
         ))
     }
@@ -849,7 +873,7 @@ impl SkillCatalog {
             .unwrap_or_default();
         let might_be_file = candidates.iter().any(|file| {
             !disabled.contains(&file.path) && possible_file_invocation(invocation, &file.name)
-        }) || invocation == BUILTIN_CREATE_SKILL.invocation;
+        }) || possible_file_invocation(invocation, BUILTIN_CREATE_SKILL.name);
         if !might_be_file {
             return true;
         }
@@ -1016,7 +1040,18 @@ pub fn merge_catalog(discovered: &[DiscoveredSkill]) -> Vec<Skill> {
     out
 }
 
-fn merge_native_catalog(mut files: Vec<Skill>, commands: Vec<NativeCommand>) -> Vec<Skill> {
+fn merge_native_catalog(
+    mut files: Vec<Skill>,
+    commands: Vec<NativeCommand>,
+    qualify_files: bool,
+) -> Vec<Skill> {
+    if qualify_files {
+        for skill in &mut files {
+            if let Skill::Builtin(builtin) = skill {
+                builtin.invocation = "skill:create-skill";
+            }
+        }
+    }
     files.retain(|skill| match skill {
         Skill::File(file) => !commands.iter().any(|command| {
             command
@@ -1024,9 +1059,14 @@ fn merge_native_catalog(mut files: Vec<Skill>, commands: Vec<NativeCommand>) -> 
                 .as_deref()
                 .is_some_and(|origin| same_skill_path(origin, &file.path))
         }),
-        Skill::Builtin(builtin) => !commands
-            .iter()
-            .any(|command| command.invocation == builtin.invocation),
+        Skill::Builtin(builtin) => !commands.iter().any(|command| {
+            command.invocation == builtin.invocation
+                || command.name == builtin.invocation
+                || command
+                    .aliases
+                    .as_ref()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == builtin.invocation))
+        }),
         _ => true,
     });
     let mut invocations: HashSet<String> = commands
@@ -1042,7 +1082,11 @@ fn merge_native_catalog(mut files: Vec<Skill>, commands: Vec<NativeCommand>) -> 
             // The command keeps its provider spelling. The picker supplies an
             // explicit file invocation when names or aliases overlap.
             let original = file.name.clone();
-            let mut qualified = original.clone();
+            let mut qualified = if qualify_files {
+                format!("skill:{original}")
+            } else {
+                original.clone()
+            };
             while invocations.contains(&qualified) {
                 qualified = if qualified == original {
                     format!("skill:{original}")

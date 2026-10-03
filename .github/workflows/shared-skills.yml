@@ -10,6 +10,7 @@ on:
       - crates/process/src/skills.rs
       - crates/harness/src/providers/pi/skills.rs
       - crates/engine/src/submit/**
+      - crates/view-composer/src/composer/model/skills_context.rs
       - apps/monocode-app/**
       - .github/workflows/shared-skills.yml
   workflow_dispatch:
@@ -51,6 +52,7 @@ jobs:
       - run: cargo test -p monocode-engine --no-default-features --features submit submit::skills --locked -j 2
       - run: cargo test -p monocode-engine --no-default-features --features submit submit::prompt --locked -j 2
       - run: cargo test -p monocode-engine --no-default-features --features submit submit::pipeline --locked -j 2
+      - run: cargo test -p monocode-view-composer skills_context --locked -j 2
       - run: cargo check -p monocode-app --all-targets --features screenshot --locked -j 2
       - run: cargo test -p monocode-app --lib skills_runtime::tests --features screenshot --locked -j 2
       - run: cargo test -p monocode-app --bin monocode-app cli::tests --features screenshot --locked -j 2

@@ -23,7 +23,7 @@ An unmanaged destination or an externally edited copy appears as a conflict. Mon
 
 Provider statuses describe files on this host. They do not prove that a provider has loaded a skill or that its scripts and tools are available. Antigravity has no default export until its personal runtime location is verified. Remote hosts keep their own skill directories. This version manages local exports.
 
-Pi and OMP composer catalogs include their native commands and discovered file skills. A file skill with a command name collision has a qualified invocation such as `/skill:review`. Native command arguments retain their original text. File skill prompts include the instruction file and resource directory so providers can locate bundled scripts and references.
+Pi and OMP composer catalogs include their native commands and discovered file skills. A file skill with a command name collision has a qualified invocation such as `/skill:review`. The picker also qualifies file skills when native discovery fails. Native command arguments retain their original text. File skill prompts include the instruction file and resource directory so providers can locate bundled scripts and references.
 
 ## Preview
 
@@ -46,6 +46,6 @@ MONOCODE_PREVIEW_BINARY=/path/to/monocode-app \
 
 ## Validation
 
-The shared skills workflow runs library tests and clippy on Linux, macOS, and Windows. Its macOS job tests process preparation, Pi command metadata, engine skill expansion, and prompt handling. It checks the native app and builds a downloadable preview binary.
+The shared skills workflow runs library tests, clippy, and process tests on Linux, macOS, and Windows. Its macOS job tests Pi command metadata, engine skill expansion, prompt handling, and submission behavior. It checks the native app and builds a downloadable preview binary.
 
 The service tests cover complete bundles, executable modes, import deduplication, independent same-name bundles, ownership conflicts, interrupted updates, account retirement, and concurrent imports. See [the library README](../crates/skills/README.md) for bundle limits and storage behavior.

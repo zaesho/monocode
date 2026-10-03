@@ -264,7 +264,7 @@ impl SkillManager {
         self.reconcile_locked(&mut registry)
     }
 
-    /// Forget a removed account after the caller deletes its directory.
+    /// Forget an account before the caller deletes its profile directory.
     /// This changes library metadata only. It never changes provider files.
     pub fn retire_targets_under(&self, root: &Path) -> Result<ReconcileReport> {
         let root = absolute(root)?;

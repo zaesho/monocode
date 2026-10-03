@@ -980,10 +980,10 @@ impl SkillManagerPage {
         let mut content = div()
             .flex()
             .flex_col()
+            .flex_none()
             .gap(u(20.))
             .max_w(u(900.))
-            .w_full()
-            .mx_auto();
+            .w_full();
         let source = self.selected_source();
         match &self.selection {
             Some(Selection::Managed(id)) => {
@@ -1159,6 +1159,10 @@ impl SkillManagerPage {
         }
         div()
             .id("skill-detail-scroll")
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_start()
             .flex_1()
             .min_w_0()
             .min_h_0()

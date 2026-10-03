@@ -623,6 +623,7 @@ fn deduplicates_native_skill_paths_without_conflating_same_name_files() {
         origin: Some("/another/review/SKILL.md".into()),
         ..pi_skill("review")
     }]);
+    fixture.sources.advance(NATIVE_SKILL_TTL_MS + 1);
     let catalog = block_on(fixture.catalog.load_skills(&context, true));
     assert_eq!(
         catalog

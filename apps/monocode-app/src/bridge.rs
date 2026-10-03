@@ -129,8 +129,44 @@ impl HarnessHooks for AppHarnessHooks {
         })
     }
 
+    fn refresh_catalogs_for_directories(
+        &self,
+        harnesses: Vec<HarnessId>,
+        directories: Vec<(HarnessId, String)>,
+        cx: &mut App,
+    ) -> Task<()> {
+        let registry = self.registry.clone();
+        let catalog = self.catalog.clone();
+        cx.background_spawn(async move {
+            let global_harnesses = harnesses
+                .into_iter()
+                .filter(|id| *id != HarnessId::Opencode)
+                .collect::<Vec<_>>();
+            let global = registry.refresh_harness_catalogs(global_harnesses, false, |id| {
+                catalog.has_live_catalog(id)
+            });
+            let projects = directories
+                .into_iter()
+                .filter(|(id, _)| *id == HarnessId::Opencode)
+                .map(|(id, directory)| {
+                    let registry = registry.clone();
+                    let catalog = catalog.clone();
+                    async move {
+                        registry
+                            .refresh_harness_catalogs_for_directory(vec![id], &directory, |id| {
+                                catalog.has_live_catalog(id)
+                            })
+                            .await;
+                    }
+                });
+            futures::join!(global, futures::future::join_all(projects));
+        })
+    }
+
     fn resolve_model(&self, session: &Session, _cx: &App) -> Option<(String, ModelSettings)> {
-        let catalog = self.catalog.read();
+        let catalog = self
+            .catalog
+            .snapshot_for_directory(session.worktree_cwd.as_deref().unwrap_or(&session.cwd));
         let resolved = catalog.resolve_model(session.harness, Some(&session.model));
         let settings = catalog.merge_model_settings(&resolved, Some(&session.model_settings));
         Some((resolved.id, settings))

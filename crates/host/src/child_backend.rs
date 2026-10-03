@@ -198,7 +198,10 @@ impl ChildBackend for HeadlessChildBackend {
                 | "models"
                 | "status --json"
                 | "agent list"
-        ) {
+                | "debug paths"
+        ) || (request.args.join(" ") == "debug paths"
+            && (provider != HarnessId::Opencode || request.args.len() != 2))
+        {
             return unsupported();
         }
         self.inner.exec(request)

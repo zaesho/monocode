@@ -34,6 +34,7 @@ fn npm_entry(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some("node_modules/@openai/codex/bin/codex.js"),
         "claude" => Some("node_modules/@anthropic-ai/claude-code/cli.js"),
+        "opencode" => Some("node_modules/opencode-ai/bin/opencode"),
         _ => None,
     }
 }

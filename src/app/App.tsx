@@ -261,6 +261,7 @@ import {
   type UserQuestionReply,
 } from "../integrations/harness";
 import { supportsHarnessLogin } from "../integrations/harness/core/authSupport";
+import { refreshProjectOpenCodeCatalog } from "../integrations/harness/providers/opencode/opencodeCatalog";
 import {
   appendPreparingHandoff,
   buildDeterministicHandoff,
@@ -291,6 +292,7 @@ import {
 } from "../features/sessions/model/btw";
 
 import { isEditTool } from "../integrations/harness/core/preview";
+import { MessageParts } from "../integrations/harness/core/streamText";
 import {
   createEditedResendAttempt,
   createEditedResendCoordinator,
@@ -1369,11 +1371,27 @@ export default function App({
     const harnesses = [
       ...new Set(sessionsRef.current.map((session) => session.harness)),
     ];
-    void refreshHarnessCatalogs(harnesses).then(() => {
+    const openCodeDirectories = [
+      ...new Set(
+        sessionsRef.current
+          .filter((session) => session.harness === "opencode")
+          .map((session) => session.worktreeCwd ?? session.cwd),
+      ),
+    ];
+    void Promise.all([
+      refreshHarnessCatalogs(
+        harnesses.filter((harness) => harness !== "opencode"),
+      ),
+      ...openCodeDirectories.map(refreshProjectOpenCodeCatalog),
+    ]).then(() => {
       setSessions((prev) =>
         prev.map((session) => {
           if (!isLiveHarness(session.harness)) return session;
-          const resolved = resolveModel(session.harness, session.model);
+          const resolved = resolveModel(
+            session.harness,
+            session.model,
+            session.worktreeCwd ?? session.cwd,
+          );
           const modelSettings = mergeModelSettings(
             resolved,
             session.modelSettings,
@@ -1537,17 +1555,18 @@ export default function App({
   }
   const busySessionIds = busySessionIdsRef.current;
 
-  /** Probe the active session's harness for its live model catalog whenever
-   * the active harness changes. Catalogs load lazily (probing spawns a CLI
-   * process) and the boot refresh runs before restored sessions land, so a
-   * fresh session would otherwise show only the built-in fallback model
-   * until the picker happened to be opened. Idempotent: refreshHarnessCatalogs
-   * dedupes via hasLiveCatalog and its inflight map. */
+  /** Refresh the active session's inventory before its model picker opens.
+   * OpenCode configuration belongs to the session's working directory. */
   const activeHarness = active?.harness;
+  const activeCatalogCwd = active?.worktreeCwd ?? active?.cwd;
   useEffect(() => {
     if (!activeHarness || !isLiveHarness(activeHarness)) return;
-    void refreshHarnessCatalogs([activeHarness]);
-  }, [activeHarness]);
+    if (activeHarness === "opencode" && activeCatalogCwd) {
+      void refreshProjectOpenCodeCatalog(activeCatalogCwd);
+    } else {
+      void refreshHarnessCatalogs([activeHarness]);
+    }
+  }, [activeHarness, activeCatalogCwd]);
 
   const usageProviders = useMemo(() => {
     if (
@@ -5694,7 +5713,11 @@ export default function App({
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       if (!current) return;
       if (isPreparingHandoff(current)) return;
-      const resolved = resolveModel(harness, model);
+      const resolved = resolveModel(
+        harness,
+        model,
+        current.worktreeCwd ?? current.cwd,
+      );
       saveRecentModelChoice(resolved.harness, resolved.id);
       if (current.modelSettings) {
         saveLastModelSettings(current.modelSettings, "fill");
@@ -6497,6 +6520,7 @@ export default function App({
         error: "Turn did not complete",
       };
       let controlText = "";
+      const messageParts = new MessageParts();
       let proposalText = "";
       let nativeProposalText = "";
       let completedProposal: OrchestrationProposal | undefined;
@@ -6623,6 +6647,12 @@ export default function App({
               proposalText = (proposalText + event.text).slice(-200_000);
               return null;
             }
+            if (event.type === "message.part" && !event.reasoning) {
+              proposalText = messageParts
+                .update(event.partId, event.text)
+                .slice(-200_000);
+              return null;
+            }
             if (event.type === "message.completed") {
               proposalText += "\n";
               return null;
@@ -6650,6 +6680,14 @@ export default function App({
           orchestrator.observe(sessionId, event);
           if (options?.onSettled && event.type === "message.delta")
             controlText = (controlText + event.text).slice(-20_000);
+          if (
+            options?.onSettled &&
+            event.type === "message.part" &&
+            !event.reasoning
+          )
+            controlText = messageParts
+              .update(event.partId, event.text)
+              .slice(-20_000);
           if (options?.onSettled && event.type === "message.completed")
             controlText += "\n";
           if (event.type === "session.error")
@@ -6829,6 +6867,7 @@ export default function App({
               nativeProposalText || proposalText,
               async (repairPrompt) => {
                 proposalText = "";
+                messageParts.clear();
                 nativeProposalText = "";
                 await sendTurn(repairPrompt, []);
                 if (providerFailureSeen)
@@ -7718,7 +7757,7 @@ export default function App({
         worktreeCwd: source.worktreeCwd,
         branch: source.branch,
         modelSettings: mergeModelSettings(
-          resolveModel(harness, model),
+          resolveModel(harness, model, source.worktreeCwd ?? source.cwd),
           modelSettings,
         ),
         title: formatSessionTitle(harness, SECOND_OPINION_TITLE),
@@ -8073,7 +8112,11 @@ export default function App({
         modelSettings ??
         existing?.modelSettings ??
         preferredModelSettings(
-          resolveModel(requestHarness!, selectedModel || source.model),
+          resolveModel(
+            requestHarness!,
+            selectedModel || source.model,
+            source.worktreeCwd ?? source.cwd,
+          ),
           source.modelSettings,
         );
       if (existing?.status === "running") return false;
@@ -8335,7 +8378,7 @@ export default function App({
         worktreeCwd: source.worktreeCwd,
         branch: source.branch,
         modelSettings: mergeModelSettings(
-          resolveModel(harness, model),
+          resolveModel(harness, model, source.worktreeCwd ?? source.cwd),
           modelSettings,
         ),
         title: formatSessionTitle(

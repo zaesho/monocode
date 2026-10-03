@@ -58,6 +58,7 @@ type Props = {
   values: Record<string, string>;
   /** Project whose disabled providers are hidden from the picker. */
   project?: string;
+  catalogCwd?: string;
   /** Hide option rows from the menu when they render as pills beside the picker. */
   hideSettings?: boolean;
   /** Limit provider tabs for surfaces that only support one harness. */
@@ -216,6 +217,7 @@ export function ModelPicker({
   model,
   values,
   project,
+  catalogCwd,
   hideSettings = false,
   allowedHarnesses,
   hotkeys = false,
@@ -223,7 +225,7 @@ export function ModelPicker({
   onSettingsChange,
   onClose,
 }: Props) {
-  const source = useModelSource();
+  const source = useModelSource(catalogCwd ?? project);
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
     getModelSnapshot,
@@ -947,6 +949,7 @@ export function ModelPicker({
 }
 
 export function ModelControlPills({
+  project,
   harness,
   model,
   values,
@@ -954,7 +957,7 @@ export function ModelControlPills({
   onClose,
 }: Pick<
   Props,
-  "harness" | "model" | "values" | "onSettingsChange" | "onClose"
+  "project" | "harness" | "model" | "values" | "onSettingsChange" | "onClose"
 >) {
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
@@ -962,7 +965,7 @@ export function ModelControlPills({
     getModelSnapshot,
   );
   void catalogVersion;
-  const current = useModelSource().resolve(harness, model);
+  const current = useModelSource(project).resolve(harness, model);
   const pills = pillSettings(current);
   const effort = pills.find(
     (setting) => setting.kind === "select" && isEffortSetting(setting),

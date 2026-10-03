@@ -2,6 +2,7 @@
 //! the model catalog from `opencode models --verbose` and `opencode agent
 //! list`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Result, bail};
@@ -17,8 +18,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::protocol::{
-    MINIMUM_OPENCODE_VERSION, compare_semver, infer_default_agent, infer_default_variant,
-    is_known_hidden_agent, locale_compare, open_code_variant_label, parse_open_code_version,
+    infer_default_agent, infer_default_variant, is_known_hidden_agent, locale_compare,
+    open_code_variant_label, open_code_version_error, parse_open_code_version,
     sort_open_code_variants, title_case_slug,
 };
 use crate::core::catalog::SharedCatalog;
@@ -93,17 +94,11 @@ pub async fn discover_open_code_models(
         )
     };
     let version_out = exec(&["--version"]).await?;
-    let Some(version) = parse_open_code_version(&version_out) else {
-        bail!(
-            "Unable to determine OpenCode version. MonoCode requires v{MINIMUM_OPENCODE_VERSION} or newer."
-        );
-    };
-    if compare_semver(&version, MINIMUM_OPENCODE_VERSION) < 0 {
-        bail!("OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer.");
+    let version = parse_open_code_version(&version_out);
+    if let Some(error) = open_code_version_error(version.as_deref()) {
+        bail!(error);
     }
 
-    // TODO(port): OpenCode 2 has no `models --verbose` or `agent list`; it
-    // prints its help, which parses as no models, so the bundled list stays.
     let models_out = exec(&["models", "--verbose"]).await?;
     let parsed = parse_models_cli_output(&models_out);
     let agents = match exec(&["agent", "list"]).await {
@@ -338,7 +333,7 @@ pub struct CatalogRefresher {
     children: Children,
     catalog: SharedCatalog,
     spawner: SharedSpawner,
-    inflight: Arc<Mutex<Option<Inflight>>>,
+    inflight: Arc<Mutex<HashMap<Option<String>, Inflight>>>,
 }
 
 impl CatalogRefresher {
@@ -347,7 +342,7 @@ impl CatalogRefresher {
             children,
             catalog,
             spawner,
-            inflight: Arc::new(Mutex::new(None)),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -355,13 +350,18 @@ impl CatalogRefresher {
     /// refresh runs on the spawner, so it finishes even if the caller stops
     /// waiting.
     pub fn refresh(&self) -> BoxFuture<'static, ()> {
+        self.refresh_for_directory(None)
+    }
+
+    pub fn refresh_for_directory(&self, cwd: Option<&str>) -> BoxFuture<'static, ()> {
+        let key = cwd.map(str::to_string);
         let mut inflight = self.inflight.lock();
-        if let Some(running) = inflight.as_ref() {
+        if let Some(running) = inflight.get(&key) {
             return running.clone().boxed();
         }
         let (done, finished) = oneshot::channel::<()>();
         let shared: Inflight = finished.map(|_| ()).boxed().shared();
-        *inflight = Some(shared.clone());
+        inflight.insert(key.clone(), shared.clone());
         drop(inflight);
 
         let children = self.children.clone();
@@ -369,15 +369,17 @@ impl CatalogRefresher {
         let slot = self.inflight.clone();
         self.spawner.spawn(
             async move {
-                match discover_open_code_models(&children, None).await {
+                match discover_open_code_models(&children, key.as_deref()).await {
                     Ok(models) => {
-                        if !models.is_empty() {
+                        if let Some(cwd) = key.as_deref() {
+                            catalog.set_project_harness_models(HarnessId::Opencode, cwd, models);
+                        } else if !models.is_empty() {
                             catalog.set_harness_models(HarnessId::Opencode, models);
                         }
                     }
                     Err(error) => log::debug!("[monocode] opencode catalog {error:#}"),
                 }
-                *slot.lock() = None;
+                slot.lock().remove(&key);
                 let _ = done.send(());
             }
             .boxed(),
@@ -396,6 +398,78 @@ mod tests {
     }
 
     // describe("OpenCode CLI inventory parsers")
+
+    #[test]
+    fn discovers_and_refreshes_project_inventory_without_cross_project_models() {
+        use crate::providers::opencode::test_support::FakeHost;
+        smol::block_on(async {
+            let host = FakeHost::new();
+            host.set_exec_handler(|request| {
+                if request.args == ["--version"] {
+                    return "1.14.19".into();
+                }
+                let id = request
+                    .cwd
+                    .as_deref()
+                    .unwrap_or("home")
+                    .trim_start_matches('/');
+                if request.args == ["agent", "list"] {
+                    return format!("agent_{id} (primary)\n{{}}");
+                }
+                format!("fixture/{id}\n{{\"id\":\"{id}\",\"name\":\"{id}\"}}")
+            });
+            let catalog = SharedCatalog::new();
+            let refresher = CatalogRefresher::new(host.children(), catalog.clone(), host.spawner());
+            futures::join!(
+                refresher.refresh_for_directory(Some("/a")),
+                refresher.refresh_for_directory(Some("/b"))
+            );
+            assert_eq!(
+                catalog
+                    .snapshot_for_directory("/a")
+                    .models_for(HarnessId::Opencode)[0]
+                    .native_id
+                    .as_deref(),
+                Some("fixture/a")
+            );
+            assert_eq!(
+                catalog
+                    .snapshot_for_directory("/b")
+                    .models_for(HarnessId::Opencode)[0]
+                    .native_id
+                    .as_deref(),
+                Some("fixture/b")
+            );
+            assert!(!catalog.has_live_catalog(HarnessId::Opencode));
+            let calls = host.exec_calls();
+            assert!(
+                calls
+                    .iter()
+                    .any(|request| request.cwd.as_deref() == Some("/a")
+                        && request.args == ["models", "--verbose"])
+            );
+            assert!(
+                calls
+                    .iter()
+                    .any(|request| request.cwd.as_deref() == Some("/b")
+                        && request.args == ["models", "--verbose"])
+            );
+            let settings = catalog
+                .project_models_for(HarnessId::Opencode, "/a")
+                .unwrap()[0]
+                .settings
+                .clone()
+                .unwrap();
+            assert_eq!(
+                settings
+                    .iter()
+                    .find(|setting| setting.id == "agent")
+                    .unwrap()
+                    .value,
+                "agent_a"
+            );
+        });
+    }
 
     #[test]
     fn parses_models_verbose_output() {

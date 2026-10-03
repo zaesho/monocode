@@ -110,6 +110,11 @@ pub fn binary_inspection_error(
                 "OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer."
             ));
         }
+        if !version.starts_with("1.") {
+            return Some(format!(
+                "OpenCode v{version} is not supported. Use v{MINIMUM_OPENCODE_VERSION} or a newer v1 release."
+            ));
+        }
     }
     None
 }
@@ -683,6 +688,11 @@ mod tests {
 
     #[test]
     fn validates_codex_and_opencode_versions() {
+        assert!(
+            binary_inspection_error(HarnessId::Opencode, &inspection("2.0.20"))
+                .unwrap()
+                .contains("not supported")
+        );
         assert_eq!(
             binary_inspection_error(HarnessId::Codex, &inspection("codex-cli 0.156.1")),
             None

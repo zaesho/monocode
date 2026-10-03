@@ -12,6 +12,7 @@
 //! `crypto.randomUUID()` and `Date.now()` come from a [`ReducerEnv`], so tests
 //! can pin block ids and time.
 
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -138,6 +139,40 @@ pub fn apply_harness_event_mut(
     match event {
         HarnessEvent::MessageDelta { text } => {
             patch_streaming(env, session, BlockRole::Assistant, &[text.as_str()], true)
+        }
+        HarnessEvent::MessagePart {
+            part_id,
+            text,
+            reasoning,
+            streaming,
+        } => {
+            let role = if *reasoning {
+                BlockRole::Reasoning
+            } else {
+                BlockRole::Assistant
+            };
+            if let Some(block) = session.blocks.iter_mut().find(|block| {
+                block.role == role
+                    && block.extra.get("providerPartId").and_then(Value::as_str)
+                        == Some(part_id.as_str())
+            }) {
+                if block.text == *text && block.streaming == Some(*streaming) {
+                    return false;
+                }
+                block.text = text.clone();
+                block.streaming = Some(*streaming);
+            } else {
+                if text.is_empty() {
+                    return false;
+                }
+                let mut block = Block::new(env.new_id(), role, text);
+                block
+                    .extra
+                    .insert("providerPartId".into(), Value::String(part_id.clone()));
+                block.streaming = Some(*streaming);
+                append_block(session, block);
+            }
+            true
         }
         HarnessEvent::MessageCompleted => {
             finish_role(session, BlockRole::Assistant);

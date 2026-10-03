@@ -7,7 +7,7 @@
 //! `turns` promise chain is an async mutex: prompts run one at a time, and a
 //! failed one does not block the next.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -22,15 +22,15 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::catalog::discover_open_code_models;
 use super::client::{OpenCodeClient, PromptInput, parse_event};
 use super::deps::stream_text_delta;
 use super::protocol::{
-    MINIMUM_OPENCODE_VERSION, OpenCodePart, OpenCodePermissionRule, OpenCodePromptPart,
-    ParsedOpenCodeModelSlug, PartStore, PartTime, PermissionAction, Record,
-    append_open_code_assistant_text_delta, compare_semver, event_session_id, field,
-    is_known_hidden_agent, is_truthy, merge_open_code_assistant_text, parse_open_code_model_slug,
-    parse_open_code_version, parse_server_url_from_output, record_field, string_field,
-    text_delta_event,
+    OpenCodePart, OpenCodePermissionRule, OpenCodePromptPart, ParsedOpenCodeModelSlug, PartStore,
+    PartTime, PermissionAction, Record, append_open_code_assistant_text_delta, event_session_id,
+    field, is_known_hidden_agent, is_truthy, merge_open_code_assistant_text,
+    open_code_version_error, parse_open_code_model_slug, parse_open_code_version,
+    parse_server_url_from_output, record_field, string_field,
 };
 use crate::core::abort_text_prompt::with_text_prompt_abort;
 use crate::core::catalog::SharedCatalog;
@@ -55,6 +55,7 @@ struct TextState {
     message_role_by_id: HashMap<String, Role>,
     part_by_id: PartStore,
     emitted_text_by_part_id: HashMap<String, String>,
+    emitted_ended_part_ids: HashSet<String>,
     pending_text_delta_by_part_id: HashMap<String, String>,
     on_event: Option<EventSink>,
     outbox: Vec<HarnessEvent>,
@@ -139,8 +140,11 @@ impl OpenCodeText {
                 input.model_settings.as_ref(),
             )
             .await?;
-        if let Some(signal) = &input.signal {
-            signal.throw_if_aborted()?;
+        if let Some(signal) = &input.signal
+            && let Err(error) = signal.throw_if_aborted()
+        {
+            self.drop_live().await;
+            return Err(error);
         }
         session.state.lock().on_event = input.on_event.clone();
 
@@ -177,7 +181,9 @@ impl OpenCodeText {
         // `abortTextPromptRace`: on abort, stop the server's turn, then reject.
         let result = with_text_prompt_abort(
             input.signal.as_ref(),
-            move || async move { client.abort_session(&session_id).await },
+            move || async move {
+                let _ = client.abort_session(&session_id).await;
+            },
             session.client.prompt(&prompt, timeout),
         )
         .await?;
@@ -193,6 +199,32 @@ impl OpenCodeText {
             };
             bail!(message);
         }
+        if let Some(info) = &result.info {
+            let event = serde_json::json!({
+                "type": "message.updated",
+                "properties": { "info": info },
+            });
+            handle_text_event(session, event.as_object().unwrap());
+        }
+        for value in result.parts.as_deref().unwrap_or_default() {
+            if parse_text_part(Some(value)).is_none() {
+                continue;
+            }
+            let mut part = value.as_object().unwrap().clone();
+            let mut time = part
+                .get("time")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            // The HTTP response can arrive before the completed SSE snapshot.
+            time.entry("end").or_insert_with(|| Value::from(0));
+            part.insert("time".into(), Value::Object(time));
+            let event = serde_json::json!({
+                "type": "message.part.updated",
+                "properties": { "part": part },
+            });
+            handle_text_event(session, event.as_object().unwrap());
+        }
         let text = get_open_code_text_response(result.parts.as_deref());
         if text.is_empty() {
             bail!("OpenCode returned empty output.");
@@ -206,7 +238,19 @@ impl OpenCodeText {
         requested_model: Option<&str>,
         model_settings: Option<&ModelSettings>,
     ) -> Result<Arc<LiveText>> {
-        let model = self.pick_text_model(requested_model);
+        if requested_model.is_none()
+            && self
+                .inner
+                .catalog
+                .project_models_for(HarnessId::Opencode, cwd)
+                .is_none()
+        {
+            let models = discover_open_code_models(&self.inner.children, Some(cwd)).await?;
+            self.inner
+                .catalog
+                .set_project_harness_models(HarnessId::Opencode, cwd, models);
+        }
+        let model = self.pick_text_model(requested_model, cwd);
         let settings_key = model_settings_key(model_settings);
         let current = self.inner.live.lock().clone();
         if let Some(live) = &current
@@ -241,36 +285,32 @@ impl OpenCodeText {
             .await
             .unwrap_or_default();
         let version = parse_open_code_version(&version_out);
-        if version
-            .as_deref()
-            .is_none_or(|version| compare_semver(version, MINIMUM_OPENCODE_VERSION) < 0)
-        {
-            bail!(
-                "OpenCode v{} is too old for text generation.",
-                version.as_deref().unwrap_or("unknown")
-            );
+        if let Some(error) = open_code_version_error(version.as_deref()) {
+            bail!(error);
         }
 
         self.inner.server_url.lock().clear();
         self.watch_server();
 
-        let port = children.free_harness_port().await?;
-        children
-            .spawn_child(
-                TEXT_CHILD_ID,
-                &binary.path,
-                vec![
-                    "serve".into(),
-                    "--hostname=127.0.0.1".into(),
-                    format!("--port={port}"),
-                ],
-                cwd,
-                None,
-                Some(HarnessId::Opencode),
-            )
-            .await?;
-
-        match self.connect(cwd, model, model_settings).await {
+        let startup = async {
+            let port = children.free_harness_port().await?;
+            children
+                .spawn_child(
+                    TEXT_CHILD_ID,
+                    &binary.path,
+                    vec![
+                        "serve".into(),
+                        "--hostname=127.0.0.1".into(),
+                        format!("--port={port}"),
+                    ],
+                    cwd,
+                    None,
+                    Some(HarnessId::Opencode),
+                )
+                .await?;
+            self.connect(cwd, model, model_settings).await
+        };
+        match startup.await {
             Ok(session) => Ok(session),
             Err(error) => {
                 self.drop_live().await;
@@ -364,7 +404,7 @@ impl OpenCodeText {
     async fn drop_live(&self) {
         let current = self.inner.live.lock().take();
         if let Some(current) = current {
-            current.client.abort_session(&current.session_id).await;
+            let _ = current.client.abort_session(&current.session_id).await;
             current.client.close_events(TEXT_CHILD_ID).await;
         }
         let children = &self.inner.children;
@@ -373,7 +413,7 @@ impl OpenCodeText {
     }
 
     /// `pickTextModel`.
-    fn pick_text_model(&self, requested: Option<&str>) -> ParsedOpenCodeModelSlug {
+    fn pick_text_model(&self, requested: Option<&str>, cwd: &str) -> ParsedOpenCodeModelSlug {
         let selected = requested.map(js::trim).unwrap_or_default();
         if !selected.is_empty() {
             let model_slug = selected.strip_prefix("opencode:").unwrap_or(selected);
@@ -387,7 +427,7 @@ impl OpenCodeText {
                 };
             }
         }
-        let catalog = self.inner.catalog.read();
+        let catalog = self.inner.catalog.snapshot_for_directory(cwd);
         for model in catalog.models_for(HarnessId::Opencode) {
             let slug = model.native_id.as_deref().unwrap_or(&model.id);
             if let Some(parsed) = parse_open_code_model_slug(Some(slug)) {
@@ -558,12 +598,7 @@ fn apply_text_event(session: &LiveText, state: &mut TextState, event: &Record) {
     if text_part_role(state, &next_part) != Some(Role::Assistant) {
         return;
     }
-    state
-        .emitted_text_by_part_id
-        .insert(next_part.id.clone(), next.next_text);
-    if let Some(mapped) = text_delta_event(&next_part, &next.delta_to_emit) {
-        state.outbox.push(mapped);
-    }
+    emit_text_part(state, &next_part);
 }
 
 /// `emitTextPart`.
@@ -574,14 +609,28 @@ fn emit_text_part(state: &mut TextState, part: &OpenCodePart) {
     let Some(text) = part.text.as_deref() else {
         return;
     };
-    let previous = state.emitted_text_by_part_id.get(&part.id).cloned();
-    let next = merge_open_code_assistant_text(previous.as_deref(), text);
+    let previous = state.emitted_text_by_part_id.get(&part.id);
+    let ended = part.time.and_then(|time| time.end).is_some();
+    if previous.map(String::as_str) == Some(text)
+        && state.emitted_ended_part_ids.contains(&part.id) == ended
+    {
+        return;
+    }
+    if previous.is_none() && text.is_empty() && !ended {
+        return;
+    }
     state
         .emitted_text_by_part_id
-        .insert(part.id.clone(), next.latest_text);
-    if let Some(mapped) = text_delta_event(part, &next.delta_to_emit) {
-        state.outbox.push(mapped);
+        .insert(part.id.clone(), text.into());
+    if ended {
+        state.emitted_ended_part_ids.insert(part.id.clone());
     }
+    state.outbox.push(HarnessEvent::MessagePart {
+        part_id: part.id.clone(),
+        text: text.into(),
+        reasoning: part.part_type == "reasoning",
+        streaming: !ended,
+    });
 }
 
 /// `textPartRole`.
@@ -621,6 +670,9 @@ fn merge_text_part(previous: Option<&OpenCodePart>, next: OpenCodePart) -> OpenC
         return next;
     };
     let ended = |part: &OpenCodePart| part.time.and_then(|time| time.end).is_some();
+    if ended(&next) {
+        return next;
+    }
     if ended(previous) && !ended(&next) {
         return previous.clone();
     }
@@ -640,6 +692,7 @@ fn merge_text_part(previous: Option<&OpenCodePart>, next: OpenCodePart) -> OpenC
 mod tests {
     use super::*;
     use crate::core::registry::event_sink;
+    use crate::core::task::AbortSignal;
     use crate::providers::opencode::test_support::{FakeHost, path_of, wait_for};
     use serde_json::json;
 
@@ -747,7 +800,16 @@ mod tests {
     }
 
     fn delta(text: &str) -> HarnessEvent {
-        HarnessEvent::MessageDelta { text: text.into() }
+        snapshot(text, true)
+    }
+
+    fn snapshot(text: &str, streaming: bool) -> HarnessEvent {
+        HarnessEvent::MessagePart {
+            part_id: "part_assistant_message".into(),
+            text: text.into(),
+            reasoning: false,
+            streaming,
+        }
     }
 
     async fn prompt_started(harness: &Harness) {
@@ -761,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn forwards_only_incremental_opencode_assistant_text() {
+    fn forwards_opencode_assistant_part_snapshots() {
         smol::block_on(async {
             let mut harness = Harness::new();
             let reply = harness.host.defer("POST", "/session/text_session/message");
@@ -775,7 +837,7 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("lo")]);
+            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("Hello")]);
         });
     }
 
@@ -794,7 +856,7 @@ mod tests {
             harness.finish(reply, "Hello!").await;
 
             assert_eq!(result.await.unwrap(), "Hello!");
-            assert_eq!(harness.deltas(), vec![delta("Hello"), delta("!")]);
+            assert_eq!(harness.deltas(), vec![delta("Hello"), delta("Hello!")]);
         });
     }
 
@@ -812,7 +874,7 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hello")]);
+            assert_eq!(harness.deltas(), vec![snapshot("Hello", false)]);
         });
     }
 
@@ -831,7 +893,61 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("lo")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![delta("Hel"), delta("Hello"), snapshot("Hello", false)]
+            );
+        });
+    }
+
+    #[test]
+    fn replaces_streamed_text_with_a_shorter_completed_part() {
+        smol::block_on(async {
+            let mut harness = Harness::new();
+            let reply = harness.host.defer("POST", "/session/text_session/message");
+            let result = harness.run();
+            prompt_started(&harness).await;
+            harness.message("assistant_message", "assistant");
+            harness.part("assistant_message", "Longer provisional answer", false);
+            harness.part("assistant_message", "Final", true);
+            harness.finish(reply, "Final").await;
+            assert_eq!(result.await.unwrap(), "Final");
+            assert_eq!(
+                harness.deltas(),
+                vec![
+                    snapshot("Longer provisional answer", true),
+                    snapshot("Final", false)
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn reconciles_the_completed_http_response_before_closing_the_stream() {
+        smol::block_on(async {
+            let mut harness = Harness::new();
+            let reply = harness.host.defer("POST", "/session/text_session/message");
+            let result = harness.run();
+            prompt_started(&harness).await;
+            harness.message("assistant_message", "assistant");
+            harness.part("assistant_message", "Longer provisional answer", false);
+            wait_for("events handled", || {
+                harness.text.processed_events() >= harness.injected
+            })
+            .await;
+            let body = json!({
+                "info": { "id": "assistant_message", "role": "assistant", "sessionID": "text_session" },
+                "parts": [{ "id": "part_assistant_message", "messageID": "assistant_message", "type": "text", "text": "Final" }],
+            });
+            reply.send((200, body.to_string())).unwrap();
+            assert_eq!(result.await.unwrap(), "Final");
+            assert_eq!(
+                harness.deltas(),
+                vec![
+                    snapshot("Longer provisional answer", true),
+                    snapshot("Final", false)
+                ]
+            );
         });
     }
 
@@ -897,6 +1013,54 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_during_session_creation_cleans_up_the_server() {
+        smol::block_on(async {
+            let harness = Harness::new();
+            let reply = harness.host.defer("POST", "/session");
+            let signal = AbortSignal::new();
+            let text = harness.text.clone();
+            let request_signal = signal.clone();
+            let result = smol::spawn(async move {
+                text.run(TextPromptInput {
+                    cwd: "/repo".into(),
+                    model: Some("openai/fixture".into()),
+                    prompt: "question".into(),
+                    signal: Some(request_signal),
+                    ..Default::default()
+                })
+                .await
+            });
+            wait_for("session creation", || {
+                !harness.host.calls_to("/session").is_empty()
+            })
+            .await;
+            signal.abort();
+            reply
+                .send((200, r#"{"id":"text_session"}"#.into()))
+                .unwrap();
+            assert!(result.await.is_err());
+            assert!(harness.host.kills().contains(&TEXT_CHILD_ID.to_string()));
+            assert!(
+                harness
+                    .host
+                    .calls_to("/session/text_session/message")
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn refuses_opencode_two_before_spawning_a_server() {
+        smol::block_on(async {
+            let harness = Harness::new();
+            harness.host.set_exec_output("opencode 2.0.20");
+            let error = harness.run().await.unwrap_err();
+            assert!(error.to_string().contains("requires OpenCode 1.x"));
+            assert!(harness.host.spawns().is_empty());
+        });
+    }
+
+    #[test]
     fn refuses_an_opencode_older_than_the_minimum() {
         smol::block_on(async {
             let harness = Harness::new();
@@ -904,7 +1068,7 @@ mod tests {
             let error = harness.run().await.unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "OpenCode v1.14.18 is too old for text generation."
+                "OpenCode v1.14.18 is too old. Upgrade to v1.14.19 or newer in the 1.x series."
             );
             assert!(harness.host.spawns().is_empty());
         });
@@ -919,14 +1083,17 @@ mod tests {
             model_id: model.into(),
         };
         assert_eq!(
-            text.pick_text_model(Some("opencode:openai/gpt-5.4")),
+            text.pick_text_model(Some("opencode:openai/gpt-5.4"), "/repo"),
             slug("openai", "gpt-5.4")
         );
         assert_eq!(
-            text.pick_text_model(Some(" kimi ")),
+            text.pick_text_model(Some(" kimi "), "/repo"),
             slug("opencode", "kimi")
         );
-        assert_eq!(text.pick_text_model(None), slug("opencode", "glm-5"));
+        assert_eq!(
+            text.pick_text_model(None, "/repo"),
+            slug("opencode", "glm-5")
+        );
         assert_eq!(
             get_open_code_text_response(Some(&[
                 json!({ "type": "text", "text": " a" }),

@@ -108,6 +108,8 @@ pub struct PromptInput {
 
 #[derive(Serialize)]
 struct PromptBody<'a> {
+    #[serde(rename = "messageID", skip_serializing_if = "Option::is_none")]
+    message_id: Option<&'a str>,
     model: &'a ParsedOpenCodeModelSlug,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<&'a str>,
@@ -122,6 +124,7 @@ impl<'a> PromptBody<'a> {
         let present =
             |value: &'a Option<String>| value.as_deref().filter(|value| !value.is_empty());
         Self {
+            message_id: None,
             model: &input.model,
             agent: present(&input.agent),
             variant: present(&input.variant),
@@ -229,6 +232,32 @@ impl OpenCodeClient {
             .map(|messages| messages.iter().map(OpenCodeMessage::from_value).collect()))
     }
 
+    pub async fn session_is_busy(&self, session_id: &str) -> Result<bool> {
+        let value = self
+            .request("GET", "/session/status", RequestOptions::default())
+            .await?;
+        Ok(value
+            .as_ref()
+            .and_then(|value| value.get(session_id))
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|status| status != "idle"))
+    }
+
+    pub async fn get_agents(&self) -> Result<Value> {
+        Ok(self
+            .request("GET", "/agent", RequestOptions::default())
+            .await?
+            .unwrap_or(Value::Null))
+    }
+
+    pub async fn get_config(&self) -> Result<Value> {
+        Ok(self
+            .request("GET", "/config", RequestOptions::default())
+            .await?
+            .unwrap_or(Value::Null))
+    }
+
     pub async fn create_session(
         &self,
         title: Option<&str>,
@@ -285,18 +314,18 @@ impl OpenCodeClient {
         session_from(value)
     }
 
-    /// `abortSession`. Failures are ignored.
-    pub async fn abort_session(&self, session_id: &str) {
-        let _ = self
-            .request(
-                "POST",
-                &format!("/session/{}/abort", enc(session_id)),
-                RequestOptions {
-                    body: json_body(&Empty {}),
-                    ..Default::default()
-                },
-            )
-            .await;
+    /// Confirm that the server received the cancellation request.
+    pub async fn abort_session(&self, session_id: &str) -> Result<()> {
+        self.request(
+            "POST",
+            &format!("/session/{}/abort", enc(session_id)),
+            RequestOptions {
+                body: json_body(&Empty {}),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn revert_session(&self, session_id: &str, message_id: &str) -> Result<()> {
@@ -335,11 +364,21 @@ impl OpenCodeClient {
     /// `promptAsync`: start a turn. The reply has no body; the event stream
     /// reports the turn.
     pub async fn prompt_async(&self, input: &PromptInput) -> Result<()> {
+        self.prompt_async_for_message(input, None).await
+    }
+
+    pub async fn prompt_async_for_message(
+        &self,
+        input: &PromptInput,
+        message_id: Option<&str>,
+    ) -> Result<()> {
+        let mut body = PromptBody::new(input);
+        body.message_id = message_id;
         self.request(
             "POST",
             &format!("/session/{}/prompt_async", enc(&input.session_id)),
             RequestOptions {
-                body: json_body(&PromptBody::new(input)),
+                body: json_body(&body),
                 ..Default::default()
             },
         )

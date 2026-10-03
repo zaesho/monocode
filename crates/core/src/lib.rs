@@ -17,6 +17,7 @@ pub mod harness;
 pub mod harness_event;
 pub mod inbox;
 pub mod js;
+pub mod message_parts;
 pub mod models;
 pub mod notes;
 pub mod orchestration;

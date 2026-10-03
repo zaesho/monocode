@@ -23,7 +23,7 @@ use monocode_harness::core::native_commands::{
     CommandContext, NativeCommand, NativeCommandProvider, Unsubscribe,
 };
 use monocode_harness::core::task::SharedSpawner;
-use monocode_process::skills::DiscoveredSkill;
+use monocode_process::skills::{DiscoveredSkill, SkillDiscoveryContext};
 use parking_lot::Mutex;
 use serde::Serialize;
 
@@ -143,6 +143,10 @@ pub struct SkillCatalogContext {
     pub harness: HarnessId,
     pub cwd: String,
     pub session_id: Option<String>,
+    pub account_id: Option<String>,
+    pub home: Option<String>,
+    pub provider_homes: HashMap<String, String>,
+    pub library_generation: u64,
 }
 
 impl SkillCatalogContext {
@@ -151,11 +155,40 @@ impl SkillCatalogContext {
             harness,
             cwd: cwd.into(),
             session_id: None,
+            account_id: None,
+            home: None,
+            provider_homes: HashMap::new(),
+            library_generation: 0,
         }
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_account(mut self, account_id: impl Into<String>) -> Self {
+        self.account_id = Some(account_id.into());
+        self
+    }
+
+    pub fn with_home(mut self, home: impl Into<String>) -> Self {
+        self.home = Some(home.into());
+        self
+    }
+
+    /// The provider's config directory, such as `CODEX_HOME`.
+    pub fn with_provider_home(
+        mut self,
+        source: impl Into<String>,
+        root: impl Into<String>,
+    ) -> Self {
+        self.provider_homes.insert(source.into(), root.into());
+        self
+    }
+
+    pub fn with_library_generation(mut self, generation: u64) -> Self {
+        self.library_generation = generation;
         self
     }
 }
@@ -172,6 +205,15 @@ pub trait SkillSources: Send + Sync {
         cwd: String,
         disabled: Vec<String>,
     ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>>;
+
+    /// Account-aware discovery. Existing implementations keep their list behavior.
+    fn list_skills_in_context(
+        &self,
+        context: SkillCatalogContext,
+        disabled: Vec<String>,
+    ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+        self.list_skills(context.cwd, disabled)
+    }
 
     fn read_text_file(&self, path: String) -> BoxFuture<'static, Result<String, String>>;
 
@@ -215,6 +257,34 @@ impl SkillSources for ProcessSkillSources {
         disabled: Vec<String>,
     ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
         smol::unblock(move || monocode_process::skills::list_skills(cwd, Some(disabled))).boxed()
+    }
+
+    fn list_skills_in_context(
+        &self,
+        context: SkillCatalogContext,
+        disabled: Vec<String>,
+    ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+        smol::unblock(move || {
+            let discovery = SkillDiscoveryContext {
+                home: context.home.map(std::path::PathBuf::from).or_else(|| {
+                    std::env::var("HOME")
+                        .or_else(|_| std::env::var("USERPROFILE"))
+                        .ok()
+                        .map(std::path::PathBuf::from)
+                }),
+                provider_homes: context
+                    .provider_homes
+                    .into_iter()
+                    .map(|(source, root)| (source, std::path::PathBuf::from(root)))
+                    .collect(),
+            };
+            monocode_process::skills::list_skills_with_context(
+                context.cwd,
+                Some(disabled),
+                discovery,
+            )
+        })
+        .boxed()
     }
 
     fn read_text_file(&self, path: String) -> BoxFuture<'static, Result<String, String>> {
@@ -410,6 +480,20 @@ impl SkillCatalog {
             key.push('\0');
             key.push_str(session_id);
         }
+        key.push('\0');
+        key.push_str(context.account_id.as_deref().unwrap_or_default());
+        key.push('\0');
+        key.push_str(context.home.as_deref().unwrap_or_default());
+        let mut homes: Vec<_> = context.provider_homes.iter().collect();
+        homes.sort_by_key(|(source, _)| *source);
+        for (source, root) in homes {
+            key.push('\0');
+            key.push_str(source);
+            key.push('\0');
+            key.push_str(root);
+        }
+        key.push('\0');
+        key.push_str(&context.library_generation.to_string());
         key
     }
 
@@ -426,6 +510,26 @@ impl SkillCatalog {
             && leading_native_command(text)
     }
 
+    /// Checks the loaded account catalog before treating a leading slash as raw.
+    pub fn is_native_command_prompt_cached(
+        &self,
+        text: &str,
+        context: &SkillCatalogContext,
+    ) -> bool {
+        if !self.is_native_command_prompt(text, context.harness) {
+            return false;
+        }
+        let invocation = leading_command_name(text).unwrap_or_default();
+        !self
+            .peek_skills(context)
+            .unwrap_or_default()
+            .iter()
+            .any(|skill| {
+                matches!(skill, Skill::File(_) | Skill::Builtin(_))
+                    && skill.invocation() == invocation
+            })
+    }
+
     /// `subscribeSkills`: a live update supersedes any cold probe already in
     /// flight.
     pub fn subscribe_skills(
@@ -438,16 +542,24 @@ impl SkillCatalog {
         };
         let catalog = self.clone();
         let key_context = context.clone();
-        let listener = Arc::new(move |commands: Vec<NativeCommand>| {
+        let on_skills = Arc::new(on_skills);
+        let listener = Arc::new(move |mut commands: Vec<NativeCommand>| {
             let key = catalog.skill_catalog_key(&key_context);
-            let skills: Vec<Skill> = commands.into_iter().map(Skill::Native).collect();
-            {
+            filter_disabled_native_skills(&mut commands, &catalog.load_disabled_skill_paths());
+            let files = catalog
+                .peek_skills(&key_context)
+                .unwrap_or_else(|| merge_catalog(&[]))
+                .into_iter()
+                .filter(|skill| !matches!(skill, Skill::Native(_)))
+                .collect();
+            let skills = merge_native_catalog(files, commands.clone());
+            let (entry_id, generation) = {
                 let mut state = catalog.inner.state.lock();
                 let generation = state.entries.get(&key).map_or(0, |entry| entry.generation) + 1;
                 let id = state.next();
                 let loaded_at = catalog.inner.sources.now_ms();
                 state.entries.insert(
-                    key,
+                    key.clone(),
                     CatalogEntry {
                         id,
                         cwd: normalize_project_path(&key_context.cwd),
@@ -458,8 +570,46 @@ impl SkillCatalog {
                         in_flight: None,
                     },
                 );
-            }
+                (id, generation)
+            };
             on_skills(skills);
+            let catalog = catalog.clone();
+            let context = key_context.clone();
+            let on_skills = on_skills.clone();
+            let spawner = catalog.inner.spawner.clone();
+            spawner.spawn(
+                async move {
+                    let disabled = catalog.load_disabled_skill_paths();
+                    let Ok(files) = catalog
+                        .inner
+                        .sources
+                        .list_skills_in_context(context, disabled)
+                        .await
+                    else {
+                        return;
+                    };
+                    let disabled: HashSet<String> =
+                        catalog.load_disabled_skill_paths().into_iter().collect();
+                    let files: Vec<_> = files
+                        .into_iter()
+                        .filter(|file| !disabled.contains(&file.path))
+                        .collect();
+                    let skills = merge_native_catalog(merge_catalog(&files), commands);
+                    {
+                        let mut state = catalog.inner.state.lock();
+                        let Some(entry) = state
+                            .entries
+                            .get_mut(&key)
+                            .filter(|entry| entry.id == entry_id && entry.generation == generation)
+                        else {
+                            return;
+                        };
+                        entry.skills = Some(skills.clone());
+                    }
+                    on_skills(skills);
+                }
+                .boxed(),
+            );
         });
         provider
             .subscribe(command_context(context), listener)
@@ -498,11 +648,9 @@ impl SkillCatalog {
 
     /// `loadSkills`.
     pub fn load_skills(&self, context: &SkillCatalogContext, refresh: bool) -> SkillsLoad {
-        let normalized = SkillCatalogContext {
-            harness: context.harness,
-            cwd: normalize_project_path(&context.cwd),
-            session_id: context.session_id.clone().filter(|id| !id.is_empty()),
-        };
+        let mut normalized = context.clone();
+        normalized.cwd = normalize_project_path(&context.cwd);
+        normalized.session_id = context.session_id.clone().filter(|id| !id.is_empty());
         let key = self.skill_catalog_key(&normalized);
         let native = self.has_native_commands(normalized.harness);
         let now = self.inner.sources.now_ms();
@@ -546,6 +694,7 @@ impl SkillCatalog {
         }
         if native
             && let Some(skills) = &entry.skills
+            && entry.retry_at == 0
             && now - entry.loaded_at < NATIVE_SKILL_TTL_MS
         {
             return ready(skills.clone());
@@ -595,10 +744,14 @@ impl SkillCatalog {
                         .get(&key)
                         .and_then(|entry| entry.skills.clone())
                         .unwrap_or_default(),
-                    (Some(entry), Ok(skills)) => {
+                    (Some(entry), Ok((skills, native_failed))) => {
                         entry.skills = Some(skills.clone());
                         entry.loaded_at = now;
-                        entry.retry_at = 0;
+                        entry.retry_at = if native_failed {
+                            now + NATIVE_SKILL_RETRY_MS
+                        } else {
+                            0
+                        };
                         skills
                     }
                     (Some(entry), Err(_)) if native => {
@@ -630,32 +783,87 @@ impl SkillCatalog {
         load
     }
 
-    async fn load_catalog(&self, context: SkillCatalogContext) -> Result<Vec<Skill>, String> {
-        if let Some(provider) = self.provider(context.harness) {
-            let commands = provider
-                .discover(command_context(&context))
-                .await
-                .map_err(|error| error.to_string())?;
-            return Ok(commands.into_iter().map(Skill::Native).collect());
-        }
+    async fn load_catalog(
+        &self,
+        context: SkillCatalogContext,
+    ) -> Result<(Vec<Skill>, bool), String> {
         let disabled_paths = self.load_disabled_skill_paths();
-        let discovered = self
+        let files = self
             .inner
             .sources
-            .list_skills(context.cwd.clone(), disabled_paths)
-            .await?;
+            .list_skills_in_context(context.clone(), disabled_paths);
+        let provider = self.provider(context.harness);
+        let native = async {
+            match &provider {
+                Some(provider) => provider
+                    .discover(command_context(&context))
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Ok(Vec::new()),
+            }
+        };
+        let (discovered, commands) = futures::future::join(files, native).await;
+        let discovered = discovered?;
         let disabled: HashSet<String> = self.load_disabled_skill_paths().into_iter().collect();
         let enabled: Vec<DiscoveredSkill> = discovered
             .into_iter()
             .filter(|skill| !disabled.contains(&skill.path))
             .collect();
-        Ok(merge_catalog(&enabled))
+        let native_failed = commands.is_err();
+        let mut commands = commands.unwrap_or_else(|_| {
+            self.peek_skills(&context)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|skill| match skill {
+                    Skill::Native(command) => Some(command),
+                    _ => None,
+                })
+                .collect()
+        });
+        filter_disabled_native_skills(&mut commands, &disabled.into_iter().collect::<Vec<_>>());
+        Ok((
+            merge_native_catalog(merge_catalog(&enabled), commands),
+            native_failed,
+        ))
+    }
+
+    /// Raw provider commands keep their arguments. A known file invocation expands locally.
+    pub async fn is_native_command_prompt_in_context(
+        &self,
+        text: &str,
+        context: &SkillCatalogContext,
+    ) -> bool {
+        if !self.is_native_command_prompt(text, context.harness) {
+            return false;
+        }
+        if self.peek_skills(context).is_some() {
+            return self.is_native_command_prompt_cached(text, context);
+        }
+        let invocation = leading_command_name(text).unwrap_or_default();
+        let disabled = self.load_disabled_skill_paths();
+        let candidates = self
+            .inner
+            .sources
+            .list_skills_in_context(context.clone(), disabled.clone())
+            .await
+            .unwrap_or_default();
+        let might_be_file = candidates.iter().any(|file| {
+            !disabled.contains(&file.path) && possible_file_invocation(invocation, &file.name)
+        }) || invocation == BUILTIN_CREATE_SKILL.invocation;
+        if !might_be_file {
+            return true;
+        }
+        self.load_skills(context, false).await;
+        self.is_native_command_prompt_cached(text, context)
     }
 
     /// `applySkillsToTurn`: prefix the bodies of the file and built-in
     /// skills the text invokes.
     pub async fn apply_skills_to_turn(&self, text: &str, context: &SkillCatalogContext) -> String {
-        if self.has_native_commands(context.harness) {
+        if self
+            .is_native_command_prompt_in_context(text, context)
+            .await
+        {
             return text.to_string();
         }
         let names = skill_names_in_text(text);
@@ -665,7 +873,7 @@ impl SkillCatalog {
         let catalog = self.load_skills(context, false).await;
         let mut picked: Vec<Skill> = Vec::new();
         for name in &names {
-            if let Some(skill) = catalog.iter().find(|item| item.name() == name)
+            if let Some(skill) = catalog.iter().find(|item| item.invocation() == name)
                 && matches!(skill, Skill::File(_) | Skill::Builtin(_))
             {
                 picked.push(skill.clone());
@@ -748,18 +956,40 @@ fn command_context(context: &SkillCatalogContext) -> CommandContext {
 
 /// `/^\s*\/[^\s/\\]+(?=\s|$)/`.
 fn leading_native_command(text: &str) -> bool {
+    leading_command_name(text).is_some()
+}
+
+fn leading_command_name(text: &str) -> Option<&str> {
     let trimmed = text.trim_start_matches(js::is_space);
     let Some(rest) = trimmed.strip_prefix('/') else {
-        return false;
+        return None;
     };
     let end = rest
         .char_indices()
         .find(|(_, c)| js::is_space(*c) || *c == '/' || *c == '\\')
         .map_or(rest.len(), |(index, _)| index);
     if end == 0 {
-        return false;
+        return None;
     }
-    rest[end..].chars().next().is_none_or(js::is_space)
+    rest[end..]
+        .chars()
+        .next()
+        .is_none_or(js::is_space)
+        .then_some(&rest[..end])
+}
+
+fn possible_file_invocation(invocation: &str, name: &str) -> bool {
+    if invocation == name {
+        return true;
+    }
+    invocation
+        .strip_suffix(name)
+        .and_then(|prefix| prefix.strip_suffix(':'))
+        .is_some_and(|prefix| {
+            prefix
+                .split(':')
+                .all(|part| matches!(part, "skill" | "file"))
+        })
 }
 
 /// `mergeCatalog`: `.agents` skills win, then the bundled create-skill,
@@ -784,6 +1014,68 @@ pub fn merge_catalog(discovered: &[DiscoveredSkill]) -> Vec<Skill> {
         }
     }
     out
+}
+
+fn merge_native_catalog(mut files: Vec<Skill>, commands: Vec<NativeCommand>) -> Vec<Skill> {
+    files.retain(|skill| match skill {
+        Skill::File(file) => !commands.iter().any(|command| {
+            command
+                .origin
+                .as_deref()
+                .is_some_and(|origin| same_skill_path(origin, &file.path))
+        }),
+        Skill::Builtin(builtin) => !commands
+            .iter()
+            .any(|command| command.invocation == builtin.invocation),
+        _ => true,
+    });
+    let mut invocations: HashSet<String> = commands
+        .iter()
+        .flat_map(|command| {
+            [command.invocation.clone(), command.name.clone()]
+                .into_iter()
+                .chain(command.aliases.clone().unwrap_or_default())
+        })
+        .collect();
+    for skill in &mut files {
+        if let Skill::File(file) = skill {
+            // The command keeps its provider spelling. The picker supplies an
+            // explicit file invocation when names or aliases overlap.
+            let original = file.name.clone();
+            let mut qualified = original.clone();
+            while invocations.contains(&qualified) {
+                qualified = if qualified == original {
+                    format!("skill:{original}")
+                } else {
+                    format!("file:{qualified}")
+                };
+            }
+            file.invocation = qualified.clone();
+            invocations.insert(qualified);
+        }
+    }
+    let mut out: Vec<Skill> = commands.into_iter().map(Skill::Native).collect();
+    out.extend(files);
+    out
+}
+
+fn same_skill_path(left: &str, right: &str) -> bool {
+    if !std::path::Path::new(left).is_absolute() {
+        return false;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn filter_disabled_native_skills(commands: &mut Vec<NativeCommand>, disabled: &[String]) {
+    commands.retain(|command| {
+        !command
+            .origin
+            .as_deref()
+            .is_some_and(|origin| disabled.iter().any(|path| same_skill_path(origin, path)))
+    });
 }
 
 fn as_skill(skill: &DiscoveredSkill) -> Skill {
@@ -841,10 +1133,12 @@ fn skill_tokens(text: &str) -> Vec<SkillToken<'_>> {
         let lead_ok = slash == 0 || text[..slash].chars().next_back().is_some_and(js::is_space);
         let rest = &text[slash + 1..];
         let mut len = skill_segment(rest);
-        if len > 0 && rest[len..].starts_with(':') {
+        while len > 0 && rest[len..].starts_with(':') {
             let tail = skill_segment(&rest[len + 1..]);
             if tail > 0 {
                 len += 1 + tail;
+            } else {
+                break;
             }
         }
         let end = slash + 1 + len;
@@ -944,7 +1238,20 @@ pub fn inject_skill_prompt(
         else {
             continue;
         };
-        blocks.push(format!("## /{}\n\n{body}", skill.name()));
+        let location = match skill {
+            Skill::File(file) => {
+                let directory = file
+                    .path
+                    .rsplit_once('/')
+                    .map_or("", |(directory, _)| directory);
+                format!(
+                    "\n\nSkill file: {}\nResource directory: {directory}\nResolve relative skill resources against this directory. Keep the user's working directory unchanged.",
+                    file.path
+                )
+            }
+            _ => String::new(),
+        };
+        blocks.push(format!("## /{}{location}\n\n{body}", skill.invocation()));
     }
     if blocks.is_empty() {
         return text.to_string();

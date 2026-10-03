@@ -34,6 +34,7 @@ gpui-component.workspace = true
 monocode-ui.workspace = true
 monocode-core.workspace = true
 monocode-settings.workspace = true
+monocode-skills.workspace = true
 monocode-store.workspace = true
 monocode-git.workspace = true
 monocode-process.workspace = true

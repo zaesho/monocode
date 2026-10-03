@@ -42,6 +42,18 @@ impl HarnessEvents for NoHarnessEvents {
 
 const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
 
+/// The selected provider's directories after account and child environment setup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillLaunchContext {
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
+    pub cwd: PathBuf,
+    pub provider_homes: HashMap<String, PathBuf>,
+}
+
+pub type SkillPreparer = Arc<dyn Fn(SkillLaunchContext) -> Result<(), String> + Send + Sync>;
+pub type SkillAccountRetirer = Arc<dyn Fn(PathBuf) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessAccount {
@@ -109,6 +121,8 @@ pub struct HarnessShared {
     inner: Mutex<HarnessInner>,
     sse: Mutex<HashMap<String, Arc<LiveSse>>>,
     runtime_binary_paths: Mutex<Option<HashMap<String, String>>>,
+    skill_preparer: Mutex<Option<SkillPreparer>>,
+    skill_account_retirer: Mutex<Option<SkillAccountRetirer>>,
     /// Bumped by `kill_all` so a spawn that started before quit cannot reinsert.
     kill_all_gen: AtomicU64,
     events: Arc<dyn HarnessEvents>,
@@ -138,6 +152,8 @@ impl HarnessHost {
             }),
             sse: Mutex::new(HashMap::new()),
             runtime_binary_paths: Mutex::new(None),
+            skill_preparer: Mutex::new(None),
+            skill_account_retirer: Mutex::new(None),
             kill_all_gen: AtomicU64::new(0),
             events,
         }))
@@ -145,6 +161,54 @@ impl HarnessHost {
 }
 
 impl HarnessShared {
+    /// Install local skill preparation without changing provider credentials.
+    pub fn set_skill_preparer(&self, preparer: Option<SkillPreparer>) {
+        *self
+            .skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = preparer;
+    }
+
+    pub fn set_skill_account_retirer(&self, retirer: Option<SkillAccountRetirer>) {
+        *self
+            .skill_account_retirer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = retirer;
+    }
+
+    fn retire_skill_account(&self, path: PathBuf) -> Result<(), String> {
+        let retirer = self
+            .skill_account_retirer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(retirer) = retirer {
+            retirer(path)
+                .map_err(|error| format!("Could not retire shared skill exports: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn has_skill_preparer(&self) -> bool {
+        self.skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    fn prepare_skills(&self, context: SkillLaunchContext) -> Result<(), String> {
+        let preparer = self
+            .skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(preparer) = preparer {
+            preparer(context)
+                .map_err(|error| format!("Could not prepare shared skills: {error}"))?;
+        }
+        Ok(())
+    }
+
     pub fn runtime_binary_path(&self, provider: &str) -> Option<String> {
         self.runtime_binary_paths
             .lock()
@@ -849,6 +913,19 @@ pub fn harness_spawn(
     prepare_child(&mut cmd, &command);
     apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
 
+    if host.has_skill_preparer()
+        && !args
+            .iter()
+            .any(|arg| arg == "--no-skills" || arg == "--bare")
+    {
+        host.prepare_skills(skill_launch_context(
+            &cmd,
+            &workdir,
+            account.as_ref(),
+            binary_provider.as_deref(),
+        )?)?;
+    }
+
     crate::control::configure_child(control, &session_id, &mut cmd);
 
     let mut child =
@@ -971,6 +1048,9 @@ pub fn provider_account_remove(
     account_id: String,
 ) -> Result<(), String> {
     let dir = provider_account_path(data_dir, &provider, &account_id)?;
+    // Validate and retire persisted exports before deleting profile credentials.
+    // A later filesystem failure leaves this target retired until another launch.
+    host.retire_skill_account(dir.clone())?;
     host.kill_account(&provider, &account_id);
 
     #[cfg(target_os = "macos")]
@@ -998,7 +1078,8 @@ pub fn provider_account_remove(
             "Could not remove the {provider} account directory {}: {error}",
             dir.display()
         )
-    })
+    })?;
+    Ok(())
 }
 
 fn apply_provider_account(
@@ -1032,6 +1113,90 @@ fn apply_provider_account(
         _ => unreachable!("provider_account_dir validates the provider"),
     }
     Ok(())
+}
+
+/// Resolve relative paths and existing symlink prefixes without creating directories.
+pub fn resolve_provider_home(path: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            component => {
+                resolved.push(component.as_os_str());
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = std::fs::canonicalize(&resolved).map_err(|error| {
+                            format!(
+                                "Could not resolve provider directory {}: {error}",
+                                resolved.display()
+                            )
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not inspect provider directory {}: {error}",
+                            resolved.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn child_env_path(cmd: &Command, key: &str, cwd: &Path) -> Result<Option<PathBuf>, String> {
+    let explicit = cmd.get_envs().find(|(name, _)| {
+        if cfg!(windows) {
+            name.to_string_lossy().eq_ignore_ascii_case(key)
+        } else {
+            *name == std::ffi::OsStr::new(key)
+        }
+    });
+    let value = match explicit {
+        Some((_, value)) => value.map(|value| value.to_os_string()),
+        None => std::env::var_os(key),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    resolve_provider_home(Path::new(&value), cwd).map(Some)
+}
+
+fn skill_launch_context(
+    cmd: &Command,
+    cwd: &Path,
+    account: Option<&HarnessAccount>,
+    provider: Option<&str>,
+) -> Result<SkillLaunchContext, String> {
+    let provider = provider.or_else(|| account.map(|account| account.provider.as_str()));
+    let mut provider_homes = HashMap::new();
+    for (source, key) in [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")] {
+        if provider == Some(source)
+            && let Some(path) = child_env_path(cmd, key, cwd)?
+        {
+            provider_homes.insert(source.to_string(), path);
+        }
+    }
+    Ok(SkillLaunchContext {
+        provider: provider.map(str::to_string),
+        account_id: account.map(|account| account.id.clone()),
+        cwd: cwd.to_path_buf(),
+        provider_homes,
+    })
 }
 
 /// A child that stops draining stdin can block `write_all` for minutes, so the
@@ -2906,6 +3071,213 @@ fn command_basename(command: &str) -> &str {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    struct SkillHookFixture(PathBuf);
+
+    impl SkillHookFixture {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("monocode-skill-hook-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            Self(std::fs::canonicalize(directory).unwrap())
+        }
+
+        fn account(&self) -> HarnessAccount {
+            HarnessAccount {
+                provider: "codex".into(),
+                id: "work".into(),
+            }
+        }
+
+        fn account_path(&self) -> PathBuf {
+            provider_account_path(&self.0, "codex", "work").unwrap()
+        }
+
+        fn binary(&self) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let binary = self.0.join("codex");
+            std::fs::write(
+                &binary,
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'codex 1.2.3'
+  exit 0
+fi
+if [ -f "$CODEX_HOME/skills/example/SKILL.md" ]; then
+  cat "$CODEX_HOME/skills/example/SKILL.md" > "$CODEX_HOME/child-skill.txt"
+fi
+printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            binary
+        }
+
+        fn spawn(&self, host: &HarnessHost, flags: Vec<String>) -> Result<u32, String> {
+            let binary = self.binary().to_string_lossy().into_owned();
+            harness_spawn(
+                host,
+                &self.0,
+                None,
+                "skill-hook-test".into(),
+                binary.clone(),
+                flags,
+                self.0.to_string_lossy().into_owned(),
+                Some(self.account()),
+                Some("codex".into()),
+                Some(binary),
+            )
+        }
+    }
+
+    impl Drop for SkillHookFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn skill_preparation_uses_account_environment_before_the_child_launches() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        host.set_skill_preparer(Some(Arc::new(move |context| {
+            let root = &context.provider_homes["codex"];
+            std::fs::create_dir_all(root.join("skills/example")).unwrap();
+            std::fs::write(root.join("skills/example/SKILL.md"), "Prepared skill").unwrap();
+            sink.lock().unwrap().push(context);
+            Ok(())
+        })));
+        fixture.spawn(&host, Vec::new()).unwrap();
+        let child_root = fixture.account_path().join("child-root.txt");
+        for _ in 0..100 {
+            if child_root.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let context = &seen.lock().unwrap()[0];
+        assert_eq!(context.account_id.as_deref(), Some("work"));
+        assert_eq!(context.provider.as_deref(), Some("codex"));
+        assert_eq!(context.provider_homes["codex"], fixture.account_path());
+        assert_eq!(
+            std::fs::read_to_string(child_root).unwrap(),
+            fixture.account_path().to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.account_path().join("child-skill.txt")).unwrap(),
+            "Prepared skill"
+        );
+    }
+
+    #[test]
+    fn failed_skill_preparation_prevents_provider_launch_and_disable_flags_skip_it() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        host.set_skill_preparer(Some(Arc::new(|_| Err("Cannot read skill registry".into()))));
+        let error = fixture.spawn(&host, Vec::new()).unwrap_err();
+        assert!(error.contains("Cannot read skill registry"));
+        assert!(!fixture.account_path().join("child-root.txt").exists());
+        for flag in ["--no-skills", "--bare"] {
+            fixture.spawn(&host, vec![flag.into()]).unwrap();
+            for _ in 0..100 {
+                if fixture.account_path().join("child-root.txt").exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(fixture.account_path().join("child-root.txt").exists());
+            std::fs::remove_file(fixture.account_path().join("child-root.txt")).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_skill_account_retirement_preserves_account_artifacts() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let account = fixture.account_path();
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join("auth.json"), b"test credential artifact").unwrap();
+        host.set_skill_account_retirer(Some(Arc::new(|_| Err("Registry unavailable".into()))));
+        assert!(
+            provider_account_remove(&host, &fixture.0, "codex".into(), "work".into())
+                .unwrap_err()
+                .contains("Registry unavailable")
+        );
+        assert_eq!(
+            std::fs::read(account.join("auth.json")).unwrap(),
+            b"test credential artifact"
+        );
+        host.set_skill_account_retirer(None);
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        assert!(!account.exists());
+    }
+
+    #[test]
+    fn skill_account_retirement_runs_for_missing_paths_and_preserves_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let retired = Arc::new(Mutex::new(Vec::new()));
+        let sink = retired.clone();
+        host.set_skill_account_retirer(Some(Arc::new(move |path| {
+            sink.lock().unwrap().push(path);
+            Ok(())
+        })));
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        let account = fixture.account_path();
+        let external = fixture.0.join("external");
+        std::fs::create_dir_all(account.parent().unwrap()).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("auth.json"), b"preserve external profile").unwrap();
+        symlink(&external, &account).unwrap();
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        assert!(std::fs::symlink_metadata(&account).is_err());
+        assert_eq!(
+            std::fs::read(external.join("auth.json")).unwrap(),
+            b"preserve external profile"
+        );
+        assert_eq!(
+            retired.lock().unwrap().as_slice(),
+            &[account.clone(), account]
+        );
+    }
+
+    #[test]
+    fn provider_environment_paths_resolve_relative_symlinks_and_respect_unix_key_case() {
+        use std::os::unix::fs::symlink;
+        let fixture = SkillHookFixture::new();
+        let real = fixture.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, fixture.0.join("alias")).unwrap();
+        let mut command = Command::new("codex");
+        command.env("CODEX_HOME", "alias/new profile");
+        command.env_remove("CLAUDE_CONFIG_DIR");
+        let context = skill_launch_context(&command, &fixture.0, None, Some("codex")).unwrap();
+        assert_eq!(context.provider_homes["codex"], real.join("new profile"));
+        assert!(!real.join("new profile").exists());
+        let key = format!("MC_SKILL_TEST_{}", uuid::Uuid::new_v4().simple());
+        let mut command = Command::new("codex");
+        command.env(key.to_lowercase(), "alias/wrong profile");
+        assert!(
+            child_env_path(&command, &key, &fixture.0)
+                .unwrap()
+                .is_none()
+        );
+        command.env(&key, "alias/right profile");
+        assert_eq!(
+            child_env_path(&command, &key, &fixture.0).unwrap(),
+            Some(real.join("right profile"))
+        );
+        command.env_remove(&key);
+        assert!(
+            child_env_path(&command, &key, &fixture.0)
+                .unwrap()
+                .is_none()
+        );
+    }
 
     fn spawn_group(script: &str) -> std::process::Child {
         Command::new("sh")

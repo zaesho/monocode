@@ -37,6 +37,7 @@ monocode-store = { path = "crates/store" }
 monocode-git = { path = "crates/git" }
 monocode-integrations = { path = "crates/integrations" }
 monocode-process = { path = "crates/process" }
+monocode-skills = { path = "crates/skills" }
 monocode-terminal = { path = "crates/terminal" }
 monocode-remote = { path = "crates/remote" }
 monocode-platform = { path = "crates/platform" }

@@ -522,6 +522,181 @@ fn prefixes_invoked_skill_bodies_and_keeps_the_user_text() {
     assert!(out.contains("## /review-pr"));
     assert!(out.contains("Be strict."));
     assert!(out.ends_with("/review-pr look at auth"));
+    assert!(out.contains("Skill file: /tmp/.agents/skills/review-pr/SKILL.md"));
+    assert!(out.contains("Resource directory: /tmp/.agents/skills/review-pr"));
+    assert!(out.contains("Keep the user's working directory unchanged."));
+}
+
+#[test]
+fn file_skills_expand_with_resource_paths_in_both_native_provider_catalogs() {
+    let fixture = visibility_fixture();
+    fixture.sources.files.lock().insert(
+        REVIEW_PATH.into(),
+        "Run scripts/review.py and read references/policy.md".into(),
+    );
+    for harness in [HarnessId::Pi, HarnessId::Omp] {
+        let context = ctx(harness, "/repo");
+        let prompt = block_on(
+            fixture
+                .catalog
+                .apply_skills_to_turn("/review inspect this", &context),
+        );
+        assert!(prompt.contains("Run scripts/review.py"));
+        assert!(prompt.contains(REVIEW_PATH));
+        assert!(prompt.contains("Resource directory: /repo/.agents/skills/review"));
+        assert_eq!(context.cwd, "/repo");
+    }
+}
+
+#[test]
+fn command_collisions_keep_native_arguments_and_give_files_exact_invocations() {
+    let fixture = visibility_fixture();
+    *fixture.sources.omp().default.lock() = Ok(vec![
+        command("review", HarnessId::Omp),
+        command("skill:review", HarnessId::Omp),
+    ]);
+    fixture
+        .sources
+        .files
+        .lock()
+        .insert(REVIEW_PATH.into(), "Shared review instructions".into());
+    let context = ctx(HarnessId::Omp, "/repo");
+    let catalog = block_on(fixture.catalog.load_skills(&context, false));
+    let file = catalog
+        .iter()
+        .find(|skill| matches!(skill, Skill::File(_)) && skill.name() == "review")
+        .unwrap();
+    assert_eq!(file.invocation(), "file:skill:review");
+    assert!(
+        !fixture
+            .catalog
+            .is_native_command_prompt_cached("/file:skill:review inspect this", &context)
+    );
+    assert!(
+        fixture
+            .catalog
+            .is_native_command_prompt_cached("/skill:review @README.md", &context)
+    );
+    for invocation in ["/review  @README.md\tfoo", "/skill:review @README.md"] {
+        assert_eq!(
+            block_on(fixture.catalog.apply_skills_to_turn(invocation, &context)),
+            invocation
+        );
+    }
+    let expanded = block_on(
+        fixture
+            .catalog
+            .apply_skills_to_turn("/file:skill:review inspect this", &context),
+    );
+    assert!(expanded.contains("Shared review instructions"));
+    assert!(expanded.contains("## /file:skill:review"));
+    assert!(slash_token_at("/file:skill:rev", 15, false).is_some());
+}
+
+#[test]
+#[cfg(unix)]
+fn deduplicates_native_skill_paths_without_conflating_same_name_files() {
+    let fixture = visibility_fixture();
+    let context = ctx(HarnessId::Pi, "/repo");
+    *fixture.sources.pi().default.lock() = Ok(vec![NativeCommand {
+        origin: Some(REVIEW_PATH.into()),
+        ..pi_skill("review")
+    }]);
+    let catalog = block_on(fixture.catalog.load_skills(&context, false));
+    assert_eq!(
+        catalog
+            .iter()
+            .filter(|skill| skill.name() == "review")
+            .count(),
+        1
+    );
+    assert!(matches!(&catalog[0], Skill::Native(_)));
+    assert_eq!(
+        block_on(
+            fixture
+                .catalog
+                .apply_skills_to_turn("/skill:review", &context)
+        ),
+        "/skill:review"
+    );
+    *fixture.sources.pi().default.lock() = Ok(vec![NativeCommand {
+        origin: Some("/another/review/SKILL.md".into()),
+        ..pi_skill("review")
+    }]);
+    let catalog = block_on(fixture.catalog.load_skills(&context, true));
+    assert_eq!(
+        catalog
+            .iter()
+            .filter(|skill| skill.name() == "review")
+            .count(),
+        2
+    );
+    assert!(
+        catalog
+            .iter()
+            .any(|skill| matches!(skill, Skill::File(_))
+                && skill.invocation() == "file:skill:review")
+    );
+}
+
+#[test]
+fn account_catalogs_read_effective_roots_and_generation_refreshes_files() {
+    struct TestDirectory(std::path::PathBuf);
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = TestDirectory(
+        std::env::temp_dir().join(format!("monocode-account-skills-{}", uuid::Uuid::new_v4())),
+    );
+    let project = root.0.join("project");
+    let home = root.0.join("home");
+    let a = root.0.join("account-a");
+    let b = root.0.join("account-b");
+    for (config, body) in [(&a, "Account A"), (&b, "Account B")] {
+        std::fs::create_dir_all(config.join("skills/review")).unwrap();
+        std::fs::write(config.join("skills/review/SKILL.md"), body).unwrap();
+    }
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let catalog = SkillCatalog::new(
+        Arc::new(ProcessSkillSources {
+            registry: monocode_harness::core::HarnessRegistry::new(
+                Arc::new(SmolSpawner),
+                Default::default(),
+            ),
+        }),
+        Arc::new(TestStore::default()),
+        Arc::new(SmolSpawner),
+    );
+    let context_a = ctx(HarnessId::Codex, project.to_str().unwrap())
+        .with_home(home.to_str().unwrap())
+        .with_account("a")
+        .with_provider_home("codex", a.to_str().unwrap());
+    let context_b = ctx(HarnessId::Codex, project.to_str().unwrap())
+        .with_home(home.to_str().unwrap())
+        .with_account("b")
+        .with_provider_home("codex", b.to_str().unwrap());
+    assert_ne!(
+        catalog.skill_catalog_key(&context_a),
+        catalog.skill_catalog_key(&context_b)
+    );
+    let turn_a = block_on(catalog.apply_skills_to_turn("/review", &context_a));
+    let turn_b = block_on(catalog.apply_skills_to_turn("/review", &context_b));
+    assert!(turn_a.contains("Account A") && !turn_a.contains("Account B"));
+    assert!(turn_b.contains("Account B") && !turn_b.contains("Account A"));
+    std::fs::create_dir_all(a.join("skills/new-skill")).unwrap();
+    std::fs::write(a.join("skills/new-skill/SKILL.md"), "New instructions").unwrap();
+    assert_eq!(
+        block_on(catalog.apply_skills_to_turn("/new-skill", &context_a)),
+        "/new-skill"
+    );
+    let next_generation = context_a.with_library_generation(1);
+    assert!(
+        block_on(catalog.apply_skills_to_turn("/new-skill", &next_generation))
+            .contains("New instructions")
+    );
 }
 
 #[test]
@@ -677,16 +852,26 @@ fn creates_a_blank_skill_in_the_project_or_home() {
 // skillCatalog.test.ts: provider-aware skill catalog
 
 #[test]
-fn uses_pi_discovery_without_adding_monocodes_built_in_row() {
+fn merges_pi_discovery_with_filesystem_skills() {
     let fixture = fixture();
+    fixture.sources.set_listing(|_, _| {
+        Ok(vec![discovered(
+            "shared",
+            "Shared",
+            "/repo/.agents/skills/shared/SKILL.md",
+            "project",
+            "agents",
+        )])
+    });
     let catalog = block_on(
         fixture
             .catalog
             .load_skills(&ctx(HarnessId::Pi, "/repo/"), false),
     );
     assert_eq!(fixture.sources.pi().calls.lock()[0].cwd, "/repo");
-    assert_eq!(catalog, vec![Skill::Native(pi_skill("architect"))]);
-    assert!(!catalog.contains(&create()));
+    assert_eq!(names(&catalog), ["architect", "shared", "create-skill"]);
+    assert!(matches!(&catalog[0], Skill::Native(_)));
+    assert!(matches!(&catalog[1], Skill::File(_)));
 }
 
 #[test]
@@ -695,7 +880,7 @@ fn uses_omp_native_discovery_and_leaves_commands_and_arguments_out_of_skill_inje
     let context = ctx(HarnessId::Omp, "/repo").with_session("thread");
     let skills = block_on(fixture.catalog.load_skills(&context, false));
     assert!(
-        matches!(&skills[..], [Skill::Native(command)] if command.name == "workflow" && command.source == HarnessId::Omp)
+        matches!(&skills[0], Skill::Native(command) if command.name == "workflow" && command.source == HarnessId::Omp)
     );
     assert_eq!(
         fixture.sources.omp().calls.lock()[0],
@@ -704,7 +889,7 @@ fn uses_omp_native_discovery_and_leaves_commands_and_arguments_out_of_skill_inje
             session_id: Some("thread".into())
         }
     );
-    assert!(fixture.sources.list_calls.lock().is_empty());
+    assert_eq!(fixture.sources.list_calls.lock().len(), 1);
     assert_eq!(
         block_on(
             fixture
@@ -713,6 +898,39 @@ fn uses_omp_native_discovery_and_leaves_commands_and_arguments_out_of_skill_inje
         ),
         "/workflow foo /create-skill"
     );
+}
+
+#[test]
+fn a_cold_raw_command_does_not_wait_for_the_native_probe() {
+    let fixture = visibility_fixture();
+    let context = ctx(HarnessId::Omp, "/repo");
+    let (probe, reply) = deferred();
+    fixture.sources.omp().push(reply);
+    fixture.catalog.warm_native_skills(&context);
+    wait_for(|| fixture.sources.omp().call_count() == 1);
+    let prompt = "  /workflow\t@README.md  foo\n";
+    let result = block_on(async {
+        futures::future::select(
+            fixture
+                .catalog
+                .is_native_command_prompt_in_context(prompt, &context)
+                .boxed(),
+            smol::Timer::after(std::time::Duration::from_millis(250)).boxed(),
+        )
+        .await
+    });
+    match result {
+        futures::future::Either::Left((native, _)) => assert!(native),
+        futures::future::Either::Right(_) => panic!("raw command waited for native discovery"),
+    }
+    assert_eq!(
+        block_on(fixture.catalog.apply_skills_to_turn(prompt, &context)),
+        prompt
+    );
+    probe
+        .send(Ok(vec![command("workflow", HarnessId::Omp)]))
+        .unwrap();
+    block_on(fixture.catalog.load_skills(&context, false));
 }
 
 #[test]
@@ -746,7 +964,7 @@ fn a_live_command_update_supersedes_an_older_probe_and_refreshes_subscribers() {
     probe
         .send(Ok(vec![command("old-workflow", HarnessId::Omp)]))
         .unwrap();
-    assert_eq!(names(&block_on(pending)), ["new-workflow"]);
+    assert_eq!(names(&block_on(pending)), ["new-workflow", "create-skill"]);
     assert!(
         seen.lock()[0]
             .iter()
@@ -757,7 +975,7 @@ fn a_live_command_update_supersedes_an_older_probe_and_refreshes_subscribers() {
 }
 
 #[test]
-fn keeps_the_last_omp_inventory_on_discovery_failure_without_falling_back_to_injected_files() {
+fn keeps_last_native_commands_and_files_after_provider_discovery_failure() {
     let fixture = fixture();
     let context = ctx(HarnessId::Omp, "/repo");
     block_on(fixture.catalog.load_skills(&context, false));
@@ -765,14 +983,14 @@ fn keeps_the_last_omp_inventory_on_discovery_failure_without_falling_back_to_inj
     *fixture.sources.omp().default.lock() = Err("Unsupported command".into());
     assert_eq!(
         names(&block_on(fixture.catalog.load_skills(&context, false))),
-        ["workflow"]
+        ["workflow", "create-skill"]
     );
     fixture.catalog.invalidate_skills(None);
     assert_eq!(
         block_on(fixture.catalog.load_skills(&context, false)),
-        vec![]
+        vec![create()]
     );
-    assert!(fixture.sources.list_calls.lock().is_empty());
+    assert_eq!(fixture.sources.list_calls.lock().len(), 3);
 }
 
 #[test]
@@ -845,13 +1063,13 @@ fn refreshes_stale_pi_data_and_retains_it_after_a_failed_refresh() {
         "architect"
     );
     refresh.send(Ok(vec![pi_skill("new-skill")])).unwrap();
-    assert_eq!(names(&block_on(loading)), ["new-skill"]);
+    assert_eq!(names(&block_on(loading)), ["new-skill", "create-skill"]);
 
     fixture.sources.advance(30_001);
     fixture.sources.pi().push(Reply::Now(Err("offline".into())));
     assert_eq!(
         names(&block_on(fixture.catalog.load_skills(&context, false))),
-        ["new-skill"]
+        ["new-skill", "create-skill"]
     );
     block_on(fixture.catalog.load_skills(&context, false));
     assert_eq!(fixture.sources.pi().call_count(), 3);
@@ -877,10 +1095,10 @@ fn does_not_let_an_invalidated_request_replace_a_newer_generation() {
     block_on(current_load);
     old.send(Ok(vec![pi_skill("old")])).unwrap();
 
-    assert_eq!(names(&block_on(old_load)), ["current"]);
+    assert_eq!(names(&block_on(old_load)), ["current", "create-skill"]);
     assert_eq!(
         names(&fixture.catalog.peek_skills(&context).unwrap()),
-        ["current"]
+        ["current", "create-skill"]
     );
 }
 
@@ -900,10 +1118,10 @@ fn rejects_completions_captured_before_a_global_reset() {
     block_on(fixture.catalog.load_skills(&context, false));
     old.send(Ok(vec![pi_skill("old")])).unwrap();
 
-    assert_eq!(names(&block_on(old_load)), ["current"]);
+    assert_eq!(names(&block_on(old_load)), ["current", "create-skill"]);
     assert_eq!(
         names(&fixture.catalog.peek_skills(&context).unwrap()),
-        ["current"]
+        ["current", "create-skill"]
     );
 }
 
@@ -974,7 +1192,41 @@ fn leaves_provider_owned_native_catalogs_intact() {
             .catalog
             .load_skills(&ctx(HarnessId::Pi, "/repo"), false),
     );
-    assert!(matches!(&skills[..], [Skill::Native(command)] if command.name == "architect"));
+    assert!(matches!(&skills[0], Skill::Native(command) if command.name == "architect"));
+    assert!(!skills.iter().any(|skill| skill.name() == "review"));
+}
+
+#[test]
+#[cfg(unix)]
+fn disabling_a_file_also_hides_its_native_backed_skill() {
+    let fixture = visibility_fixture();
+    *fixture.sources.pi().default.lock() = Ok(vec![NativeCommand {
+        origin: Some(REVIEW_PATH.into()),
+        ..pi_skill("review")
+    }]);
+    fixture
+        .catalog
+        .save_disabled_skill_paths(&[REVIEW_PATH.into()])
+        .unwrap();
+    let skills = block_on(
+        fixture
+            .catalog
+            .load_skills(&ctx(HarnessId::Pi, "/repo"), false),
+    );
+    assert!(skills.iter().all(|skill| skill.name() != "review"));
+    fixture.catalog.save_disabled_skill_paths(&[]).unwrap();
+    let skills = block_on(
+        fixture
+            .catalog
+            .load_skills(&ctx(HarnessId::Pi, "/repo"), false),
+    );
+    assert_eq!(
+        skills
+            .iter()
+            .filter(|skill| skill.name() == "review")
+            .count(),
+        1
+    );
 }
 
 #[test]

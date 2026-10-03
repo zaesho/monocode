@@ -1,0 +1,68 @@
+name: Shared skills
+
+on:
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - crates/skills/**
+      - crates/process/src/harness.rs
+      - crates/process/src/skills.rs
+      - crates/harness/src/providers/pi/skills.rs
+      - crates/engine/src/submit/**
+      - apps/monocode-app/**
+      - .github/workflows/shared-skills.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-skills-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  library:
+    name: Library on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p monocode-skills -- --check
+      - run: cargo test -p monocode-skills --locked
+      - run: cargo clippy -p monocode-skills --all-targets --locked -- -D warnings
+
+  native:
+    name: Native integration and preview
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p monocode-process --locked -j 2
+      - run: cargo test -p monocode-harness providers::pi::skills::tests --locked -j 2
+      - run: cargo test -p monocode-engine --no-default-features --features submit submit::skills --locked -j 2
+      - run: cargo test -p monocode-engine --no-default-features --features submit submit::prompt --locked -j 2
+      - run: cargo test -p monocode-engine --no-default-features --features submit cold_file_skill_classifies_before_consuming_note_cards --locked -j 2
+      - run: cargo test -p monocode-engine --no-default-features --features submit accepts_only_the_classification_for_the_current_account_and_library_revision --locked -j 2
+      - run: cargo check -p monocode-app --all-targets --features screenshot --locked -j 2
+      - run: cargo test -p monocode-app --lib skills_runtime::tests --features screenshot --locked -j 2
+      - run: cargo test -p monocode-app --bin monocode-app cli::tests --features screenshot --locked -j 2
+      - run: cargo test -p monocode-app --bin monocode-app skill_manager::tests --features screenshot --locked -j 2
+      - run: cargo build -p monocode-app --bin monocode-app --features screenshot --locked -j 2
+      - name: Record preview platform
+        run: uname -m > target/debug/preview-architecture.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monocode-skill-manager-macos-preview
+          path: |
+            target/debug/monocode-app
+            target/debug/preview-architecture.txt
+          if-no-files-found: error

@@ -138,6 +138,37 @@ mod tests {
     use super::*;
     use monocode_core::HarnessId;
 
+    fn remove_fixture(root: &Path) {
+        fn writable(path: &Path) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            if metadata.file_type().is_symlink() {
+                return;
+            }
+            let mut permissions = metadata.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.is_dir() {
+                    permissions.set_mode(permissions.mode() | 0o700);
+                    std::fs::set_permissions(path, permissions).unwrap();
+                }
+            }
+            #[cfg(not(unix))]
+            #[allow(clippy::permissions_set_readonly_false)]
+            {
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions).unwrap();
+            }
+            if metadata.is_dir() {
+                for child in std::fs::read_dir(path).unwrap() {
+                    writable(&child.unwrap().path());
+                }
+            }
+        }
+        writable(root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn unavailable_registry_returns_an_error_without_replacing_its_bytes() {
         let root = std::env::temp_dir().join(format!("mc-skill-startup-{}", uuid::Uuid::new_v4()));
@@ -151,7 +182,7 @@ mod tests {
             std::fs::read_to_string(registry).unwrap(),
             "Invalid registry"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        remove_fixture(&root);
     }
 
     #[test]
@@ -179,7 +210,7 @@ mod tests {
             std::fs::read_to_string(blocked).unwrap(),
             "Preserve this file"
         );
-        std::fs::remove_dir_all(root).unwrap();
+        remove_fixture(&root);
     }
 
     #[test]
@@ -242,7 +273,7 @@ mod tests {
         manager.reconcile(&[]).unwrap();
         assert!(!profile.exists());
         drop(later);
-        std::fs::remove_dir_all(root).unwrap();
+        remove_fixture(&root);
     }
 
     #[test]

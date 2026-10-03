@@ -2,7 +2,7 @@
 
 Open Settings in the native app, or press `cmd-,`, to open the Skill Manager.
 
-Import a folder containing `SKILL.md`. MonoCode copies the complete folder into its library and records the original location. Identical bundles share one entry. Bundles with different contents remain separate, even if their names match.
+Import a folder containing `SKILL.md`. MonoCode copies the complete folder into its library and records the original location. Importing the same name and content again reuses its entry. A different bundle with the same name causes a conflict. Rename the skill before importing that bundle.
 
 Open the source folder to edit instructions, scripts, or references. Apply edits validates the folder and saves a new revision. MonoCode updates copies that it still owns. Start a new provider session to load a changed skill.
 
@@ -48,4 +48,4 @@ MONOCODE_PREVIEW_BINARY=/path/to/monocode-app \
 
 The shared skills workflow runs library tests, clippy, and process tests on Linux, macOS, and Windows. Its macOS job tests Pi command metadata, engine skill expansion, prompt handling, and submission behavior. It checks the native app and builds a downloadable preview binary.
 
-The service tests cover complete bundles, executable modes, import deduplication, independent same-name bundles, ownership conflicts, interrupted updates, account retirement, and concurrent imports. See [the library README](../crates/skills/README.md) for bundle limits and storage behavior.
+The service tests cover complete bundles, executable modes, import deduplication, same-name import conflicts, ownership conflicts, interrupted updates, account retirement, and concurrent imports. See [the library README](../crates/skills/README.md) for bundle limits and storage behavior.

@@ -253,7 +253,7 @@ impl SkillManagerPage {
             narrow: Rc::new(Cell::new(false)),
             _subscriptions: vec![subscription],
         };
-        window.focus(&page.focus);
+        window.focus(&page.focus, cx);
         page.operate(Operation::Refresh, cx);
         page
     }

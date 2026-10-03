@@ -1157,6 +1157,102 @@ fn picker_refresh_finds_new_files_without_reprobing_native_commands_or_extending
 }
 
 #[test]
+fn repeated_picker_opens_refresh_files_during_native_backoff_without_postponing_retry() {
+    let fixture = fixture();
+    let context = ctx(HarnessId::Omp, "/repo");
+    fixture.sources.set_listing(|_, _| {
+        Ok(vec![discovered(
+            "review",
+            "Shared review",
+            "/shared/review/SKILL.md",
+            "user",
+            "agents",
+        )])
+    });
+    let (failed_probe, reply) = deferred();
+    fixture.sources.omp().push(reply);
+    let initial = fixture.catalog.load_skills(&context, false);
+    wait_for(|| fixture.sources.omp().call_count() == 1);
+    let reopened = fixture.catalog.load_skills(&context, true);
+    assert_eq!(fixture.sources.omp().call_count(), 1);
+    failed_probe.send(Err("Probe unavailable".into())).unwrap();
+    assert_eq!(block_on(initial), block_on(reopened));
+
+    let (retry_probe, reply) = deferred();
+    fixture.sources.omp().push(reply);
+    for name in ["first-new-skill", "second-new-skill"] {
+        fixture.sources.advance(2_000);
+        fixture.sources.set_listing(move |_, _| {
+            Ok(vec![
+                discovered(
+                    "review",
+                    "Shared review",
+                    "/shared/review/SKILL.md",
+                    "user",
+                    "agents",
+                ),
+                discovered(
+                    name,
+                    "New shared skill",
+                    "/shared/new/SKILL.md",
+                    "user",
+                    "agents",
+                ),
+            ])
+        });
+        let result = block_on(async {
+            futures::future::select(
+                fixture.catalog.load_skills(&context, true),
+                smol::Timer::after(std::time::Duration::from_millis(250)).boxed(),
+            )
+            .await
+        });
+        let refreshed = match result {
+            futures::future::Either::Left((skills, _)) => skills,
+            futures::future::Either::Right(_) => {
+                panic!("picker reopened the pending native probe during backoff")
+            }
+        };
+        assert!(names(&refreshed).contains(&name));
+        assert!(
+            refreshed
+                .iter()
+                .any(|skill| skill.invocation() == "skill:review")
+        );
+        assert!(
+            refreshed
+                .iter()
+                .any(|skill| skill.invocation() == "skill:create-skill")
+        );
+        assert_eq!(fixture.sources.omp().call_count(), 1);
+        let raw = "/review  @README.md\targument";
+        assert_eq!(
+            block_on(fixture.catalog.apply_skills_to_turn(raw, &context)),
+            raw
+        );
+    }
+    assert_eq!(fixture.sources.list_calls.lock().len(), 3);
+
+    fixture.sources.advance(1_001);
+    let retry = fixture.catalog.load_skills(&context, true);
+    wait_for(|| fixture.sources.omp().call_count() == 2);
+    retry_probe
+        .send(Ok(vec![command("review", HarnessId::Omp)]))
+        .unwrap();
+    let recovered = block_on(retry);
+    assert!(
+        recovered
+            .iter()
+            .any(|skill| skill.invocation() == "create-skill")
+    );
+    assert!(
+        recovered
+            .iter()
+            .any(|skill| skill.invocation() == "second-new-skill")
+    );
+}
+
+#[test]
 fn refreshes_stale_pi_data_and_retains_it_after_a_failed_refresh() {
     let fixture = fixture();
     let context = ctx(HarnessId::Pi, "/repo");

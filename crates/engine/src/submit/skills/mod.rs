@@ -348,6 +348,11 @@ struct InFlight {
     load: SkillsLoad,
 }
 
+struct CachedNativeCommands {
+    commands: Vec<NativeCommand>,
+    retry_at: i64,
+}
+
 struct CatalogEntry {
     /// Stands in for object identity: a replaced entry gets a new id.
     id: u64,
@@ -679,22 +684,27 @@ impl SkillCatalog {
             {
                 return in_flight.load.clone();
             }
-            let cached_native =
-                (native && entry.retry_at == 0 && now - entry.loaded_at < NATIVE_SKILL_TTL_MS)
-                    .then(|| {
-                        entry.skills.as_ref().map(|skills| {
-                            skills
-                                .iter()
-                                .filter_map(|skill| match skill {
-                                    Skill::Native(command) => Some(command.clone()),
-                                    _ => None,
-                                })
-                                .collect()
+            let cached_native = (native
+                && (now < entry.retry_at
+                    || (entry.retry_at == 0
+                        && entry.skills.is_some()
+                        && now - entry.loaded_at < NATIVE_SKILL_TTL_MS)))
+                .then(|| CachedNativeCommands {
+                    commands: entry
+                        .skills
+                        .iter()
+                        .flatten()
+                        .filter_map(|skill| match skill {
+                            Skill::Native(command) => Some(command.clone()),
+                            _ => None,
                         })
-                    })
-                    .flatten();
+                        .collect(),
+                    retry_at: entry.retry_at,
+                });
             entry.generation += 1;
-            entry.retry_at = 0;
+            if cached_native.is_none() {
+                entry.retry_at = 0;
+            }
             return self.start_catalog_load(state, key, load_id, normalized, cached_native);
         }
 
@@ -725,7 +735,7 @@ impl SkillCatalog {
         key: String,
         load_id: u64,
         context: SkillCatalogContext,
-        cached_native: Option<Vec<NativeCommand>>,
+        cached_native: Option<CachedNativeCommands>,
     ) -> SkillsLoad {
         let entry = state.entries.get_mut(&key).expect("entry exists");
         let entry_id = entry.id;
@@ -744,7 +754,7 @@ impl SkillCatalog {
 
         let catalog = self.clone();
         let native = self.has_native_commands(context.harness);
-        let reused_native = cached_native.is_some();
+        let cached_retry_at = cached_native.as_ref().map(|cached| cached.retry_at);
         let work = async move {
             let loaded = catalog.load_catalog(context, cached_native).await;
             let now = catalog.inner.sources.now_ms();
@@ -762,18 +772,20 @@ impl SkillCatalog {
                         .unwrap_or_default(),
                     (Some(entry), Ok((skills, native_failed))) => {
                         entry.skills = Some(skills.clone());
-                        if !reused_native {
+                        if cached_retry_at.is_none() {
                             entry.loaded_at = now;
                         }
-                        entry.retry_at = if native_failed {
-                            now + NATIVE_SKILL_RETRY_MS
-                        } else {
-                            0
-                        };
+                        entry.retry_at = cached_retry_at.unwrap_or_else(|| {
+                            if native_failed {
+                                now + NATIVE_SKILL_RETRY_MS
+                            } else {
+                                0
+                            }
+                        });
                         skills
                     }
                     (Some(entry), Err(_)) if native => {
-                        entry.retry_at = now + NATIVE_SKILL_RETRY_MS;
+                        entry.retry_at = cached_retry_at.unwrap_or(now + NATIVE_SKILL_RETRY_MS);
                         entry.skills.clone().unwrap_or_default()
                     }
                     (Some(entry), Err(_)) => {
@@ -804,7 +816,7 @@ impl SkillCatalog {
     async fn load_catalog(
         &self,
         context: SkillCatalogContext,
-        cached_native: Option<Vec<NativeCommand>>,
+        cached_native: Option<CachedNativeCommands>,
     ) -> Result<(Vec<Skill>, bool), String> {
         let disabled_paths = self.load_disabled_skill_paths();
         let files = self
@@ -812,9 +824,12 @@ impl SkillCatalog {
             .sources
             .list_skills_in_context(context.clone(), disabled_paths);
         let provider = self.provider(context.harness);
+        let cached_failure = cached_native
+            .as_ref()
+            .is_some_and(|cached| cached.retry_at != 0);
         let native = async {
-            if let Some(commands) = cached_native {
-                return Ok(commands);
+            if let Some(cached) = cached_native {
+                return Ok(cached.commands);
             }
             match &provider {
                 Some(provider) => provider
@@ -831,7 +846,7 @@ impl SkillCatalog {
             .into_iter()
             .filter(|skill| !disabled.contains(&skill.path))
             .collect();
-        let native_failed = commands.is_err();
+        let native_failed = cached_failure || commands.is_err();
         let mut commands = commands.unwrap_or_else(|_| {
             self.peek_skills(&context)
                 .unwrap_or_default()

@@ -6,6 +6,7 @@ monocode_preview_repo="$(cd "$(dirname "$0")/.." && pwd)"
 monocode_preview_root="$(mktemp -d "${TMPDIR:-/tmp}/monocode-skill-manager-preview.XXXXXX")"
 monocode_preview_library_target="${MONOCODE_PREVIEW_LIBRARY_TARGET:-${TMPDIR:-/tmp}/monocode-skill-manager-library-target}"
 monocode_preview_binary="${MONOCODE_PREVIEW_BINARY:-$monocode_preview_repo/target/debug/monocode-app}"
+monocode_preview_manage="${MONOCODE_PREVIEW_MANAGE:-$monocode_preview_library_target/debug/examples/manage}"
 
 python3 - "$monocode_preview_root" <<'PY'
 from pathlib import Path
@@ -51,10 +52,12 @@ existing.mkdir(parents=True)
 PY
 
 cd "$monocode_preview_repo"
-cargo build -p monocode-skills --example manage --locked --target-dir "$monocode_preview_library_target"
+if [[ -z "${MONOCODE_PREVIEW_MANAGE:-}" ]]; then
+    cargo build -p monocode-skills --example manage --locked --target-dir "$monocode_preview_library_target"
+fi
 for monocode_preview_source in "$monocode_preview_root"/sources/*; do
     monocode_preview_name="$(basename "$monocode_preview_source")"
-    "$monocode_preview_library_target/debug/examples/manage" \
+    "$monocode_preview_manage" \
         "$monocode_preview_root/data" "$monocode_preview_root/home" \
         import "$monocode_preview_source" > "$monocode_preview_root/$monocode_preview_name-import-result.json"
 done

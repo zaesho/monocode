@@ -274,16 +274,28 @@ impl AutomationsData for AppAutomationsData {
         cwd: &str,
         cx: &App,
     ) -> Rc<dyn SkillCompletions> {
-        let catalog = Submit::global(cx).read(cx).skills().clone();
-        let context = engine_skills::SkillCatalogContext::new(harness, cwd);
-        let load = catalog.load_skills(&context, false);
-        AppServices::global(cx)
-            .registry
-            .spawner()
-            .spawn(Box::pin(async move {
-                let _ = load.await;
-            }));
-        Rc::new(AppSkillCompletions { catalog, context })
+        let submit = Submit::global(cx).read(cx);
+        let catalog = submit.skills().clone();
+        let resolve = submit.config().skill_context.clone();
+        let store = monocode_engine::submit::prefs::KvStore(AppServices::global(cx).kv.clone());
+        let cwd = cwd.to_string();
+        let context = Rc::new(move || {
+            let account = monocode_harness::core::provider_accounts::selected_provider_account_id(
+                &store,
+                harness,
+                Some(&cwd),
+            );
+            resolve(
+                engine_skills::SkillCatalogContext::new(harness, cwd.clone()).with_account(account),
+            )
+        });
+        let completions = AppSkillCompletions { catalog, context };
+        drop(
+            completions
+                .catalog
+                .load_skills(&(completions.context)(), false),
+        );
+        Rc::new(completions)
     }
 }
 fn template(source: &engine_templates::AutomationTemplate) -> AutomationTemplate {
@@ -331,11 +343,17 @@ fn template(source: &engine_templates::AutomationTemplate) -> AutomationTemplate
 }
 struct AppSkillCompletions {
     catalog: engine_skills::SkillCatalog,
-    context: engine_skills::SkillCatalogContext,
+    context: Rc<dyn Fn() -> engine_skills::SkillCatalogContext>,
 }
 impl AppSkillCompletions {
     fn skills(&self) -> Vec<engine_skills::Skill> {
-        self.catalog.peek_skills(&self.context).unwrap_or_default()
+        let context = (self.context)();
+        if let Some(skills) = self.catalog.peek_skills(&context) {
+            return skills;
+        }
+        // The catalog starts its load before returning the shared future.
+        drop(self.catalog.load_skills(&context, false));
+        Vec::new()
     }
 }
 impl SkillCompletions for AppSkillCompletions {
@@ -343,7 +361,7 @@ impl SkillCompletions for AppSkillCompletions {
         engine_skills::slash_token_at(
             text,
             cursor,
-            self.catalog.has_native_commands(self.context.harness),
+            self.catalog.has_native_commands((self.context)().harness),
         )
         .map(|token| SlashToken {
             start: token.start,
@@ -412,5 +430,142 @@ impl SkillCompletions for AppSkillCompletions {
                 skill: part.skill,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod skill_completion_tests {
+    use super::*;
+    use futures::FutureExt as _;
+    use futures::future::BoxFuture;
+    use monocode_harness::core::local_store::MemoryStore;
+    use monocode_harness::core::native_commands::NativeCommandProvider;
+    use monocode_process::skills::DiscoveredSkill;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct Sources {
+        contexts: Mutex<Vec<engine_skills::SkillCatalogContext>>,
+    }
+
+    impl engine_skills::SkillSources for Sources {
+        fn command_provider(
+            &self,
+            _: monocode_core::HarnessId,
+        ) -> Option<Arc<dyn NativeCommandProvider>> {
+            None
+        }
+
+        fn list_skills(
+            &self,
+            _: String,
+            _: Vec<String>,
+        ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+            futures::future::ready(Err("This test requires resolved skill context.".into())).boxed()
+        }
+
+        fn list_skills_in_context(
+            &self,
+            context: engine_skills::SkillCatalogContext,
+            _: Vec<String>,
+        ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+            let name = format!("revision-{}", context.library_generation);
+            self.contexts.lock().push(context);
+            futures::future::ready(Ok(vec![DiscoveredSkill {
+                path: format!("/fixture/{name}/SKILL.md"),
+                name,
+                description: "Updated library skill.".into(),
+                scope: "user".into(),
+                source: "agents".into(),
+            }]))
+            .boxed()
+        }
+
+        fn read_text_file(&self, _: String) -> BoxFuture<'static, Result<String, String>> {
+            futures::future::ready(Err("Not used by completion listing.".into())).boxed()
+        }
+        fn home_dir(&self) -> BoxFuture<'static, Result<String, String>> {
+            futures::future::ready(Ok("/isolated/home".into())).boxed()
+        }
+        fn create_path(
+            &self,
+            _: String,
+            _: String,
+            _: bool,
+        ) -> BoxFuture<'static, Result<String, String>> {
+            futures::future::ready(Err("Not used by completion listing.".into())).boxed()
+        }
+        fn write_text_file(&self, _: String, _: String) -> BoxFuture<'static, Result<(), String>> {
+            futures::future::ready(Err("Not used by completion listing.".into())).boxed()
+        }
+    }
+
+    #[test]
+    fn an_open_completion_source_reloads_after_library_changes_and_invalidation() {
+        let pending = Arc::new(Mutex::new(Vec::<BoxFuture<'static, ()>>::new()));
+        let queued = pending.clone();
+        let sources = Arc::new(Sources::default());
+        let catalog = engine_skills::SkillCatalog::new(
+            sources.clone(),
+            Arc::new(MemoryStore::default()),
+            Arc::new(move |future| queued.lock().push(future)),
+        );
+        let generation = Arc::new(AtomicU64::new(0));
+        let current = generation.clone();
+        let completions = AppSkillCompletions {
+            catalog: catalog.clone(),
+            context: Rc::new(move || {
+                engine_skills::SkillCatalogContext::new(monocode_core::HarnessId::Codex, "/project")
+                    .with_home("/isolated/home")
+                    .with_library_generation(current.load(Ordering::Acquire))
+            }),
+        };
+        let finish_loads = || {
+            let loads = std::mem::take(&mut *pending.lock());
+            for load in loads {
+                futures::executor::block_on(load);
+            }
+        };
+
+        assert!(completions.skills().is_empty());
+        finish_loads();
+        assert!(
+            completions
+                .rank("revision-0")
+                .iter()
+                .any(|skill| skill.invocation.as_ref() == "revision-0")
+        );
+
+        generation.store(1, Ordering::Release);
+        catalog.invalidate_skills(None);
+        assert!(completions.skills().is_empty());
+        finish_loads();
+        assert!(
+            completions
+                .rank("revision-1")
+                .iter()
+                .any(|skill| skill.invocation.as_ref() == "revision-1")
+        );
+        assert!(completions.rank("revision-0").is_empty());
+
+        catalog.invalidate_skills(None);
+        assert!(completions.skills().is_empty());
+        finish_loads();
+        assert!(
+            completions
+                .rank("revision-1")
+                .iter()
+                .any(|skill| skill.invocation.as_ref() == "revision-1")
+        );
+        let contexts = sources.contexts.lock();
+        assert_eq!(contexts.len(), 3);
+        assert_eq!(contexts[1].library_generation, 1);
+        assert!(
+            contexts
+                .iter()
+                .all(|context| context.home.as_deref() == Some("/isolated/home"))
+        );
     }
 }

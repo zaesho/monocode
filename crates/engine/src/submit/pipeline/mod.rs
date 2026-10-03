@@ -44,7 +44,10 @@ use super::hooks::SubmitPeers;
 use super::link_preview::LinkPreviews;
 use super::mcp_settings_cache::McpSettingsCache;
 use super::prefs::KvStore;
-use super::skills::{ProcessSkillSources, SkillCatalog, SkillSources};
+use super::skills::{ProcessSkillSources, SkillCatalog, SkillCatalogContext, SkillSources};
+
+pub type SkillContextResolver =
+    Arc<dyn Fn(SkillCatalogContext) -> SkillCatalogContext + Send + Sync>;
 
 /// What `Submit` needs from the app.
 #[derive(Clone)]
@@ -58,6 +61,8 @@ pub struct SubmitConfig {
     pub is_harness_available: Arc<dyn Fn(HarnessId) -> bool + Send + Sync>,
     pub attachment_io: Arc<dyn AttachmentIo>,
     pub skill_sources: Arc<dyn SkillSources>,
+    /// Resolve account directories and the shared library revision before catalog use.
+    pub skill_context: SkillContextResolver,
     /// `app_cli_path`: the executable the `/operator` prompt tells the agent
     /// to run.
     pub app_cli_path: Arc<dyn Fn() -> Result<String, String> + Send + Sync>,
@@ -78,6 +83,7 @@ impl SubmitConfig {
             skill_sources: Arc::new(ProcessSkillSources {
                 registry: registry.clone(),
             }),
+            skill_context: Arc::new(|context| context),
             registry,
             catalog,
             kv,

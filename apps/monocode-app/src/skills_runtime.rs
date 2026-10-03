@@ -8,6 +8,33 @@ use monocode_engine::submit::skills::SkillCatalogContext;
 use monocode_process::harness::{HarnessHost, SkillLaunchContext, lock_skill_account_lifecycle};
 use monocode_skills::{ExportState, ExportTarget, ReconcileReport, SkillManager};
 
+pub fn initialize_optional_home(
+    data_dir: &Path,
+    home: Option<PathBuf>,
+) -> (Result<Arc<SkillManager>, String>, PathBuf, u64) {
+    let home = match home {
+        Some(home) if home.is_absolute() => home,
+        Some(_) => {
+            return (
+                Err("The skill home directory must be absolute".into()),
+                PathBuf::new(),
+                0,
+            );
+        }
+        None => {
+            return (
+                Err("Could not resolve the skill home directory".into()),
+                PathBuf::new(),
+                0,
+            );
+        }
+    };
+    match initialize_manager(data_dir, &home) {
+        Ok((manager, generation)) => (Ok(manager), home, generation),
+        Err(error) => (Err(error), home, 0),
+    }
+}
+
 pub fn initialize_manager(
     data_dir: &Path,
     home: &Path,
@@ -39,9 +66,10 @@ pub fn resolve_context(
     generation: u64,
     isolated: bool,
 ) -> SkillCatalogContext {
-    let mut context = context
-        .with_home(skill_home.to_string_lossy().into_owned())
-        .with_library_generation(generation);
+    let mut context = context.with_library_generation(generation);
+    if !skill_home.as_os_str().is_empty() {
+        context = context.with_home(skill_home.to_string_lossy().into_owned());
+    }
     let provider = context.harness.as_str();
     if provider != "claude" && provider != "codex" {
         return context;
@@ -167,6 +195,37 @@ mod tests {
         }
         writable(root);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_or_relative_default_home_disables_the_library_without_creating_directories() {
+        let data = std::env::temp_dir().join(format!("mc-skill-no-home-{}", uuid::Uuid::new_v4()));
+        for home in [None, Some(PathBuf::from("relative-home"))] {
+            let (manager, home, generation) = initialize_optional_home(&data, home);
+            assert!(manager.is_err());
+            assert!(home.as_os_str().is_empty());
+            assert_eq!(generation, 0);
+            let context = resolve_context(
+                SkillCatalogContext::new(HarnessId::Claude, data.to_string_lossy())
+                    .with_account("work"),
+                &data,
+                &home,
+                generation,
+                true,
+            );
+            assert!(context.home.is_none());
+            assert_eq!(context.library_generation, 0);
+            assert_eq!(
+                context.provider_homes["claude"],
+                monocode_process::harness::resolve_provider_home(
+                    &data.join("provider-accounts/claude/work"),
+                    &data,
+                )
+                .unwrap()
+                .to_string_lossy()
+            );
+            assert!(!data.exists());
+        }
     }
 
     #[test]

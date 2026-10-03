@@ -31,7 +31,7 @@ use crate::providers::grok::protocol::{
     permission_request_from_acp, pick_auto_option_with_kinds,
 };
 use crate::providers::grok::shared::{
-    Wiring, initialize_params, respond_method_not_found, selected_outcome, spawn_method_not_found,
+    Wiring, initialize_params, respond_method_not_found, spawn_method_not_found,
 };
 
 use super::catalog::DroidCatalog;
@@ -460,10 +460,15 @@ impl Inner {
                     move |code| {
                         let live = wiring.live();
                         if let Some(live) = &live {
-                            live.state.lock().mute_updates = true;
+                            {
+                                let mut state = live.state.lock();
+                                state.mute_updates = true;
+                                acp.close(Some("Factory Droid exited"));
+                            }
                             live.resolve_approvals();
+                        } else {
+                            acp.close(Some("Factory Droid exited"));
                         }
-                        acp.close(Some("Factory Droid exited"));
                         threads.lock().live_by_thread.remove(&session_id);
                         wiring.clear();
                         children.unwatch_child(&session_id);
@@ -893,10 +898,7 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         return Ok(());
     }
     if live.cancelled() {
-        return live
-            .acp
-            .respond(id, json!({ "outcome": { "outcome": "cancelled" } }))
-            .await;
+        return respond_permission(live, id, None).await;
     }
     let mut request = permission_request_from_acp(params);
     if request.kind.is_none() {
@@ -916,6 +918,9 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
             preview: request.preview.clone(),
             paths: None,
         });
+    }
+    if live.cancelled() || live.acp.is_closed() {
+        return respond_permission(live, id, None).await;
     }
 
     let (planning, runtime_mode) = {
@@ -939,17 +944,9 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         } else {
             ApprovalDecision::Deny
         };
-        return live
-            .acp
-            .respond(
-                id,
-                permission_outcome(permission_option_id_with_kinds(
-                    decision,
-                    &request.option_ids,
-                    &request.option_kinds,
-                )),
-            )
-            .await;
+        let option =
+            permission_option_id_with_kinds(decision, &request.option_ids, &request.option_kinds);
+        return respond_permission(live, id, option).await;
     }
 
     if let Some(automatic) = pick_auto_option_with_kinds(
@@ -958,11 +955,22 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         &request.option_ids,
         &request.option_kinds,
     ) {
-        return live.acp.respond(id, selected_outcome(&automatic)).await;
+        return respond_permission(live, id, Some(automatic)).await;
     }
 
-    let (tx, rx) = oneshot::channel();
-    live.approvals.lock().insert(id, tx);
+    let receiver = {
+        let state = live.state.lock();
+        if state.cancelled || live.acp.is_closed() {
+            None
+        } else {
+            let (tx, rx) = oneshot::channel();
+            live.approvals.lock().insert(id, tx);
+            Some(rx)
+        }
+    };
+    let Some(rx) = receiver else {
+        return respond_permission(live, id, None).await;
+    };
     live.emit(HarnessEvent::ApprovalRequested {
         request_id: id,
         title: request.title.clone(),
@@ -976,12 +984,17 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         request_id: id,
         decision: decided(decision.unwrap_or(ApprovalDecision::Deny)),
     });
+    let option = decision.and_then(|decision| {
+        permission_option_id_with_kinds(decision, &request.option_ids, &request.option_kinds)
+    });
+    respond_permission(live, id, option).await
+}
+
+async fn respond_permission(live: &Live, id: i64, option: Option<String>) -> Result<()> {
     if live.acp.is_closed() {
         return Ok(());
     }
-    let option = decision.filter(|_| !live.cancelled()).and_then(|decision| {
-        permission_option_id_with_kinds(decision, &request.option_ids, &request.option_kinds)
-    });
+    let option = option.filter(|_| !live.cancelled());
     live.acp.respond(id, permission_outcome(option)).await
 }
 

@@ -601,6 +601,10 @@ async function handlePermission(
       preview: request.preview,
     });
   }
+  if (live.cancelled || live.closed) {
+    await respondPermission(live, id, null);
+    return;
+  }
 
   if (live.planning) {
     // Spec mode ends by asking to leave it. Surface the spec as MonoCode's
@@ -664,6 +668,7 @@ async function respondPermission(
   optionId: string | null,
 ): Promise<void> {
   if (live.closed) return;
+  if (live.cancelled) optionId = null;
   await live.acp.respond(id, {
     outcome: optionId
       ? { outcome: "selected", optionId }

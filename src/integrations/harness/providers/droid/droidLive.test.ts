@@ -392,6 +392,39 @@ async function ready(
 }
 
 describe("Droid issue 1 regressions", () => {
+  it.each(["supervised", "full-access"] as const)(
+    "cancels permission decisions if a tool update stops %s mode",
+    async (runtimeMode) => {
+      const sessionId = `cancel-tool-update-${runtimeMode}`;
+      const events: HarnessEvent[] = [];
+      let stopping: Promise<void> | undefined;
+      const turn = sendDroidTurn({
+        ...input(sessionId, (event) => {
+          events.push(event);
+          if (event.type === "tool.updated")
+            stopping = cancelDroidTurn(sessionId);
+          // Exit on an unexpected late approval so a failed assertion does not
+          // leave a live prompt.
+          if (event.type === "approval.requested") onExit!(1);
+        }),
+        runtimeMode,
+      });
+      await start();
+      const mode = await next("session/set_mode");
+      reply(mode.id, {});
+      await next("session/prompt");
+      permission(906, "execute");
+      await stopping;
+      await turn;
+      expect(events.some((event) => event.type === "approval.requested")).toBe(
+        false,
+      );
+      expect(
+        parse().find((message) => message.id === 906)?.result?.outcome,
+      ).toEqual({ outcome: "cancelled" });
+    },
+  );
+
   beforeEach(() => {
     sent.length = 0;
     spawned.length = 0;

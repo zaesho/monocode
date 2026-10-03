@@ -380,6 +380,72 @@ fn permission(peer: &Peer, session: &str, id: Value, kind: Option<&str>) {
 }
 
 #[test]
+fn cancellation_during_tool_update_prevents_new_permission_decisions() {
+    smol::block_on(async {
+        for mode in [RuntimeMode::Supervised, RuntimeMode::FullAccess] {
+            let peer = Peer::new();
+            let adapter = DroidAdapter::new(&peer.ctx);
+            let events = Events::default();
+            let sink = events.sink();
+            let callback = adapter.clone();
+            let sender = adapter.clone();
+            let running = smol::spawn(async move {
+                sender
+                    .send_turn(
+                        turn("cancel-tool-update", "droid:gpt-6-luna", mode, "test", None),
+                        Arc::new(move |event| {
+                            sink(event.clone());
+                            if matches!(event, HarnessEvent::ToolUpdated { .. }) {
+                                let live = callback.inner.threads.lock().live_by_thread
+                                    ["cancel-tool-update"]
+                                    .clone();
+                                live.state.lock().cancelled = true;
+                                live.resolve_approvals();
+                            }
+                            if let HarnessEvent::ApprovalRequested { request_id, .. } = event {
+                                callback.respond_approval(
+                                    "cancel-tool-update",
+                                    request_id,
+                                    ApprovalDecision::Deny,
+                                );
+                            }
+                        }),
+                        None,
+                    )
+                    .await
+            });
+            start_session(&peer, "cancel-tool-update").await;
+            peer.answer("cancel-tool-update", "session/set_mode", json!({}))
+                .await;
+            let prompt = peer.next("session/prompt", |_| true).await;
+            permission(&peer, "cancel-tool-update", json!(906), Some("execute"));
+            peer.wait_for("permission response", |peer| {
+                peer.sent()
+                    .iter()
+                    .any(|message| message["id"] == 906 && message.get("result").is_some())
+            })
+            .await;
+            let response = peer
+                .sent()
+                .into_iter()
+                .find(|message| message["id"] == 906)
+                .unwrap();
+            peer.reply("cancel-tool-update", &prompt["id"], json!({}));
+            running.await.unwrap();
+            adapter
+                .stop_session("cancel-tool-update".into())
+                .await
+                .unwrap();
+            assert!(!events.any(|event| matches!(event, HarnessEvent::ApprovalRequested { .. })));
+            assert_eq!(
+                response["result"]["outcome"],
+                json!({ "outcome": "cancelled" })
+            );
+        }
+    });
+}
+
+#[test]
 fn forgetting_during_resolution_prevents_spawn_and_binding() {
     smol::block_on(async {
         let (tx, rx) = async_channel::bounded(1);

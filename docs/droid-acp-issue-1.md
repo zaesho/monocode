@@ -16,7 +16,7 @@ This change addresses [issue 1](https://github.com/zaesho/monocode/issues/1) in 
 | F08 | The adapter registers the approval waiter before emitting the approval event. | Synchronous-denial tests in both adapters. |
 | F09 | A model switch waits for its configuration before applying the requested effort. Unsupported, rejected, and ineffective settings fail before prompting. | Delayed configuration tests in both adapters and a rejected-effort test. |
 | F10 | Configuration and mode notifications update cached effective selections. Control replies preserve notifications received while the request was pending. | TypeScript model-fallback regression and mode-notification races in both adapters. |
-| F11 | Cancellation resolves permissions with the ACP `cancelled` outcome. Late requests cannot create approval UI or automatic approvals. | Pending and late permission tests, plus installed Droid cancellation. |
+| F11 | Cancellation resolves permissions with the ACP `cancelled` outcome. Late requests cannot create approval UI or automatic approvals. | Pending and late permission tests, cancellation during tool-update callbacks in both adapters, and installed Droid cancellation. |
 | F12 | Unloaded or partial Droid catalogs preserve saved model IDs and settings. Only a completed catalog normalizes unsupported settings. | TypeScript and Rust model-resolver tests. |
 | F13 | Partial catalogs stay eligible for refresh. Native discovery publishes accumulated effort metadata before each further request. | Native timeout followed by a successful retry. |
 | F14 | Exit and failed-start cleanup release approval senders. Closed clients suppress permission writes. | Three repeated crash cycles verify that weak references to native live sessions expire. |
@@ -29,9 +29,9 @@ ACP defines the cancellation boundary and permission outcome in its [prompt-turn
 
 ## Validation
 
-- The regression tests reproduced nine TypeScript failures before implementation. A further mode-notification regression failed in both adapters before its fix.
-- All 4,098 web tests pass, with 13 skipped. This includes the Droid, Cursor, Grok, and Hermes providers, shared ACP helpers, model recovery, usage routing, and the footer.
-- All 1,267 tests pass across the Rust core, provider, and integration crates. The 35 ignored provider tests require installed CLIs.
+- The regression tests reproduced nine TypeScript failures before implementation. Further mode-notification and tool-update cancellation regressions failed in both adapters before their fixes.
+- All 4,100 web tests pass, with 13 skipped. This includes the Droid, Cursor, Grok, and Hermes providers, shared ACP helpers, model recovery, usage routing, and the footer.
+- All 1,268 tests pass across the Rust core, provider, and integration crates. The 35 ignored provider tests require installed CLIs.
 - All 1,577 native engine tests pass with the default features, with four ignored tests. The narrower attention suite also passes all 156 tests.
 - All 119 Node host tests pass, with two skipped tests. This includes Droid over the host process transport.
 - Frontend and host TypeScript checks, the Vite production build, the host bundle build, and the Tauri Cargo check pass.

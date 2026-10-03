@@ -60,6 +60,13 @@ pub enum HarnessEvent {
     },
     #[serde(rename = "message.delta")]
     MessageDelta { text: String },
+    #[serde(rename = "message.part", rename_all = "camelCase")]
+    MessagePart {
+        part_id: String,
+        text: String,
+        reasoning: bool,
+        streaming: bool,
+    },
     #[serde(rename = "message.completed")]
     MessageCompleted,
     /// `image.generated` has two shapes: inline base64 data, or a file on disk.

@@ -46,6 +46,9 @@ pub async fn request_outgoing_handoff_with_timeout(
     timeout: Duration,
 ) -> String {
     let brief = Arc::new(Mutex::new(String::new()));
+    let parts = Arc::new(Mutex::new(
+        monocode_core::message_parts::MessageParts::default(),
+    ));
     let sink = {
         let brief = brief.clone();
         let registry = registry.clone();
@@ -55,6 +58,14 @@ pub async fn request_outgoing_handoff_with_timeout(
             HarnessEvent::MessageDelta { text } => {
                 let mut brief = brief.lock();
                 *brief = join_stream_text(&brief, &text);
+            }
+            HarnessEvent::MessagePart {
+                part_id,
+                text,
+                reasoning: false,
+                ..
+            } => {
+                *brief.lock() = parts.lock().update(&part_id, &text);
             }
             HarnessEvent::ApprovalRequested { request_id, .. } => {
                 registry.respond_harness_approval(

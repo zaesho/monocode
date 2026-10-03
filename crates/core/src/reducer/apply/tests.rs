@@ -11,6 +11,25 @@ use crate::project_providers::ProjectProviders;
 use crate::reducer::preview::tests::preview_from_tool;
 use crate::session::new_session;
 
+#[test]
+fn provider_parts_replace_exact_rows_after_tools_and_later_parts() {
+    let mut t = T::new();
+    let mut session = t.session(HarnessId::Opencode, "/tmp");
+    session = t.apply_all(&session, &[
+        json!({"type":"message.part","partId":"first","text":"Hello worle","reasoning":false,"streaming":true}),
+        json!({"type":"tool.started","callId":"read","title":"Read file"}),
+        json!({"type":"message.part","partId":"second","text":"Next message","reasoning":false,"streaming":true}),
+    ]);
+    let first_id = session.blocks[0].id.clone();
+    session = t.apply(&session, json!({"type":"message.part","partId":"first","text":"Hello world","reasoning":false,"streaming":false}));
+    assert_eq!(session.blocks[0].id, first_id);
+    assert_eq!(session.blocks[0].text, "Hello world");
+    assert_eq!(session.blocks[2].text, "Next message");
+    session = t.apply(&session, json!({"type":"message.part","partId":"first","text":"Hi","reasoning":false,"streaming":false}));
+    assert_eq!(session.blocks[0].text, "Hi");
+    assert_eq!(session.blocks.len(), 3);
+}
+
 /// Counter ids and a clock the test sets, like the `Date.now` spy.
 struct TestEnv {
     ids: u64,

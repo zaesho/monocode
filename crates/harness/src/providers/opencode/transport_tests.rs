@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use monocode_core::harness::{HarnessId, RuntimeMode};
 use monocode_core::harness_event::{HarnessEvent, HarnessSessionInput, SendTurnInput};
@@ -38,12 +38,14 @@ impl FixtureServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let subscribers: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+        let messages: Arc<Mutex<Vec<Value>>> = Arc::default();
         let directory = directory.to_string_lossy().into_owned();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let subscribers = subscribers.clone();
                 let directory = directory.clone();
-                thread::spawn(move || serve(stream, &subscribers, &directory));
+                let messages = messages.clone();
+                thread::spawn(move || serve(stream, &subscribers, &messages, &directory));
             }
         });
         Self { port }
@@ -64,7 +66,12 @@ fn respond(mut stream: TcpStream, status: &str, body: &str) {
     let _ = stream.flush();
 }
 
-fn serve(stream: TcpStream, subscribers: &Mutex<Vec<TcpStream>>, directory: &str) {
+fn serve(
+    stream: TcpStream,
+    subscribers: &Mutex<Vec<TcpStream>>,
+    messages: &Mutex<Vec<Value>>,
+    directory: &str,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -99,13 +106,31 @@ fn serve(stream: TcpStream, subscribers: &Mutex<Vec<TcpStream>>, directory: &str
     }
     let session = json!({ "id": "fixture_open", "directory": directory }).to_string();
     match path {
+        "/agent" => respond(
+            stream,
+            "200 OK",
+            r#"[{"name":"build","permission":[{"permission":"*","pattern":"*","action":"ask"}]}]"#,
+        ),
+        "/config" => respond(stream, "200 OK", r#"{"experimental":{"primary_tools":[]}}"#),
         "/session" | "/session/fixture_open" => respond(stream, "200 OK", &session),
-        "/session/fixture_open/message" => respond(stream, "200 OK", "[]"),
+        "/session/fixture_open/message" => respond(
+            stream,
+            "200 OK",
+            &serde_json::to_string(&*messages.lock()).unwrap(),
+        ),
         "/session/fixture_open/prompt_async" => {
+            let prompt: Value = serde_json::from_slice(&body).unwrap();
+            let user = json!({"id":prompt["messageID"],"sessionID":"fixture_open","role":"user"});
+            let assistant = json!({"id":"msg","sessionID":"fixture_open","role":"assistant","parentID":prompt["messageID"],"agent":"build","finish":"stop","time":{"completed":1}});
+            *messages.lock() = vec![
+                json!({"info":user,"parts":prompt["parts"]}),
+                json!({"info":assistant,"parts":[]}),
+            ];
             respond(stream, "204 No Content", "");
             thread::sleep(Duration::from_millis(30));
             let events = [
-                json!({ "type": "message.updated", "properties": { "info": { "sessionID": "fixture_open", "id": "msg", "role": "assistant" } } }),
+                json!({ "type": "message.updated", "properties": { "info":user } }),
+                json!({ "type": "message.updated", "properties": { "info":assistant } }),
                 json!({ "type": "message.part.updated", "properties": { "part": {
                     "sessionID": "fixture_open", "id": "part", "messageID": "msg", "type": "text", "text": "Headless OpenCode completed",
                 } } }),
@@ -134,7 +159,7 @@ fn write_fixture_binary(dir: &Path, port: u16) -> PathBuf {
     std::fs::write(
         &binary,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.20.0; exit 0; fi\n\
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.20.0; exit 0; fi\nif [ \"$1\" = agent ]; then printf \"build (primary)\\n[]\\n\"; exit 0; fi\nif [ \"$1\" = debug ]; then printf 'data       /data/opencode\\n'; exit 0; fi\n\
              echo 'opencode server listening on http://127.0.0.1:{port}'\nexec sleep 600\n"
         ),
     )
@@ -221,7 +246,11 @@ fn runs_an_opencode_session_through_the_host_http_and_sse_bridge() {
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessagePart {
+                text,
+                reasoning: false,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -276,7 +305,11 @@ fn live_turn_with_a_real_opencode() {
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessagePart {
+                text,
+                reasoning: false,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect();

@@ -210,6 +210,10 @@ pub trait HarnessAdapter: Send + Sync {
         ok(())
     }
 
+    fn refresh_catalog_for_directory(&self, _cwd: &str) -> BoxFuture<'_, Result<()>> {
+        self.refresh_catalog()
+    }
+
     /// LLM tab title for the first turn.
     fn generate_title(
         &self,
@@ -865,6 +869,30 @@ impl HarnessRegistry {
             .map(|adapter| async move {
                 if let Err(error) = adapter.refresh_catalog().await {
                     log::debug!("[monocode] {} catalog {error:#}", adapter.id());
+                }
+            });
+        futures::future::join_all(refreshes).await;
+    }
+
+    pub async fn refresh_harness_catalogs_for_directory(
+        &self,
+        ids: impl IntoIterator<Item = HarnessId>,
+        cwd: &str,
+        has_live_catalog: impl Fn(HarnessId) -> bool,
+    ) {
+        let wanted: HashSet<HarnessId> = ids.into_iter().collect();
+        let refreshes = self
+            .list_harnesses()
+            .into_iter()
+            .filter(|adapter| {
+                wanted.contains(&adapter.id()) && adapter.capabilities().refresh_catalog
+            })
+            .filter(|adapter| {
+                adapter.id() == HarnessId::Opencode || !has_live_catalog(adapter.id())
+            })
+            .map(|adapter| async move {
+                if let Err(error) = adapter.refresh_catalog_for_directory(cwd).await {
+                    log::debug!("[monocode] {} project catalog {error:#}", adapter.id());
                 }
             });
         futures::future::join_all(refreshes).await;

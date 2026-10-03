@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::Shared;
 use gpui::{App, AsyncApp, Context, EventEmitter, Task, WeakEntity};
+use monocode_core::session::session_work_cwd;
 use monocode_core::{HarnessEvent, HarnessId, Session};
 
 use super::engine::Engine;
@@ -971,12 +972,19 @@ impl Sessions {
         // Only the harnesses already in this window. Probing every installed
         // CLI at boot left unused agents running in the background.
         let mut harnesses: Vec<HarnessId> = Vec::new();
+        let mut directories = Vec::new();
         for session in &self.list {
             if !harnesses.contains(&session.harness) {
                 harnesses.push(session.harness);
             }
+            let key = (session.harness, session_work_cwd(session).to_string());
+            if !directories.contains(&key) {
+                directories.push(key);
+            }
         }
-        let refresh = hooks.harness.refresh_catalogs(harnesses, cx);
+        let refresh = hooks
+            .harness
+            .refresh_catalogs_for_directories(harnesses, directories, cx);
         cx.spawn(async move |this, cx| {
             refresh.await;
             this.update(cx, |this, cx| {

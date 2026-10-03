@@ -46,6 +46,7 @@ pub struct SpawnRequest {
     pub account: Option<ChildAccount>,
     pub binary_provider: Option<HarnessId>,
     pub binary_path: Option<String>,
+    pub env: Option<HashMap<String, String>>,
 }
 
 /// The arguments of `harness_exec`.
@@ -576,6 +577,29 @@ impl Children {
         account: Option<ChildAccount>,
         binary_provider: Option<HarnessId>,
     ) -> Result<()> {
+        self.spawn_child_with_env(
+            session_id,
+            command,
+            args,
+            cwd,
+            account,
+            binary_provider,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_child_with_env(
+        &self,
+        session_id: &str,
+        command: &str,
+        args: Vec<String>,
+        cwd: &str,
+        account: Option<ChildAccount>,
+        binary_provider: Option<HarnessId>,
+        env: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         self.inner.router.clear_pid(session_id);
         let binary_path = binary_provider
             .and_then(|provider| self.binary_path_for(provider, &BinaryPathChoice::Runtime));
@@ -590,6 +614,7 @@ impl Children {
                 account,
                 binary_provider,
                 binary_path,
+                env,
             })
             .await
             .map_err(err)?;
@@ -971,6 +996,7 @@ impl ChildBackend for HostChildBackend {
                 account,
                 request.binary_provider.map(|id| id.as_str().to_string()),
                 request.binary_path,
+                request.env,
             )
         })
     }

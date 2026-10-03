@@ -33,7 +33,9 @@ use monocode_view_composer::pickers::ModelSource;
 use monocode_app::boot::AppServices;
 
 /// The model picker's source: the live catalog and the installer probe.
+#[derive(Clone)]
 pub struct CatalogModelSource {
+    cwd: String,
     catalog: SharedCatalog,
     availability: HarnessAvailabilityStore,
     registry: HarnessRegistry,
@@ -41,15 +43,23 @@ pub struct CatalogModelSource {
 
 impl ModelSource for CatalogModelSource {
     fn models_for(&self, harness: HarnessId) -> Vec<AgentModel> {
-        self.catalog.read().models_for(harness).to_vec()
+        self.catalog
+            .snapshot_for_directory(&self.cwd)
+            .models_for(harness)
+            .to_vec()
     }
 
     fn resolve(&self, harness: HarnessId, id: Option<&str>) -> AgentModel {
-        self.catalog.read().resolve_model(harness, id)
+        self.catalog
+            .snapshot_for_directory(&self.cwd)
+            .resolve_model(harness, id)
     }
 
     fn find(&self, id: &str) -> Option<AgentModel> {
-        self.catalog.read().find_model(id).cloned()
+        self.catalog
+            .snapshot_for_directory(&self.cwd)
+            .find_model(id)
+            .cloned()
     }
 
     fn available(&self, harness: HarnessId) -> bool {
@@ -65,9 +75,12 @@ impl ModelSource for CatalogModelSource {
         let registry = self.registry.clone();
         let catalog = self.catalog.clone();
         let harnesses = harnesses.to_vec();
+        let cwd = self.cwd.clone();
         registry.clone().spawner().spawn(Box::pin(async move {
             registry
-                .refresh_harness_catalogs(harnesses, false, |id| catalog.has_live_catalog(id))
+                .refresh_harness_catalogs_for_directory(harnesses, &cwd, |id| {
+                    catalog.has_live_catalog(id)
+                })
                 .await;
         }));
     }
@@ -135,7 +148,7 @@ pub struct SessionComposerHost {
     kv: Kv,
     skills: Option<SkillCatalog>,
     attachment_io: Option<std::sync::Arc<dyn AttachmentIo>>,
-    model_source: Option<Rc<dyn ModelSource>>,
+    model_source: Option<CatalogModelSource>,
     /// The composer this host serves, for refreshing suggestions when a
     /// skill catalog or the file index finishes loading.
     composer: RefCell<Option<WeakEntity<Composer>>>,
@@ -151,12 +164,11 @@ impl SessionComposerHost {
         let attachment_io = submit
             .as_ref()
             .map(|submit| submit.read(cx).config().attachment_io.clone());
-        let model_source = services.map(|services| {
-            Rc::new(CatalogModelSource {
-                catalog: services.catalog.clone(),
-                availability: services.availability.clone(),
-                registry: services.registry.clone(),
-            }) as Rc<dyn ModelSource>
+        let model_source = services.map(|services| CatalogModelSource {
+            cwd: String::new(),
+            catalog: services.catalog.clone(),
+            availability: services.availability.clone(),
+            registry: services.registry.clone(),
         });
         Self {
             session_id,
@@ -429,8 +441,16 @@ impl ComposerHost for SessionComposerHost {
             .is_some_and(|files| files.index.read(cx).peek_project_files(cwd).is_none())
     }
 
-    fn model_source(&self, _: &mut App) -> Option<Rc<dyn ModelSource>> {
-        self.model_source.clone()
+    fn model_source(&self, cx: &mut App) -> Option<Rc<dyn ModelSource>> {
+        let mut source = self.model_source.clone()?;
+        let sessions = Engine::sessions(cx);
+        let session = sessions.read(cx).get(&self.session_id)?;
+        source.cwd = session
+            .worktree_cwd
+            .as_deref()
+            .unwrap_or(&session.cwd)
+            .into();
+        Some(Rc::new(source))
     }
 
     fn model_prefs(&self, _: &mut App) -> ModelPrefs {

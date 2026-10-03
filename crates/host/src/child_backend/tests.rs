@@ -68,6 +68,38 @@ fn resolves_every_provider_and_runs_only_allowed_catalog_commands() {
         serde_json::from_str::<Vec<String>>(output.trim()).unwrap(),
         ["models", "--json"]
     );
+    let opencode = binaries[&HarnessId::Opencode]
+        .to_string_lossy()
+        .into_owned();
+    let output = smol::block_on(backend.exec(ExecRequest {
+        command: opencode.clone(),
+        args: vec!["debug".into(), "paths".into()],
+        cwd: Some(directory.path().to_string_lossy().into_owned()),
+        binary_provider: Some(HarnessId::Opencode),
+        binary_path: backend.runtime_binary_path(HarnessId::Opencode),
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(output.trim()).unwrap(),
+        ["debug", "paths"]
+    );
+    for (provider, command, args) in [
+        (
+            HarnessId::Fx,
+            fx.clone(),
+            vec!["debug".into(), "paths".into()],
+        ),
+        (HarnessId::Opencode, opencode, vec!["debug paths".into()]),
+    ] {
+        let refused = smol::block_on(backend.exec(ExecRequest {
+            command,
+            args,
+            binary_provider: Some(provider),
+            binary_path: backend.runtime_binary_path(provider),
+            ..Default::default()
+        }));
+        assert_eq!(refused.unwrap_err(), "Unsupported headless catalog command");
+    }
     let unsafe_exec = smol::block_on(backend.exec(ExecRequest {
         command: fx,
         args: vec!["-e".into(), "console.log('unsafe')".into()],

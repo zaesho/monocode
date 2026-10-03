@@ -165,6 +165,7 @@ pub(crate) struct TurnRun {
 
 /// The turn's mutable state (the `let` bindings in the TypeScript closure).
 struct TurnState {
+    message_parts: monocode_core::message_parts::MessageParts,
     control_text: String,
     control_error: Option<String>,
     proposal: Option<OrchestrationProposal>,
@@ -195,6 +196,7 @@ pub(crate) async fn run_turn(this: WeakEntity<Submit>, run: TurnRun, cx: &mut As
     let cx: &AsyncApp = cx;
     let mut state = TurnState {
         control_text: String::new(),
+        message_parts: Default::default(),
         control_error: Some("Turn did not complete".into()),
         proposal: run.proposal_draft.clone(),
         proposal_text: String::new(),
@@ -590,6 +592,7 @@ impl TurnRun {
                 first
             } else {
                 state.proposal_text.clear();
+                state.message_parts.clear();
                 state.native_proposal_text.clear();
                 let repair = self.peers.orchestration.repair_prompt(&first);
                 self.send_turn(repair, Vec::new(), state, cx).await?;
@@ -712,6 +715,15 @@ impl TurnRun {
                     state.control_text.push_str(text);
                     keep_tail(&mut state.control_text, 20_000);
                 }
+                HarnessEvent::MessagePart {
+                    part_id,
+                    text,
+                    reasoning: false,
+                    ..
+                } => {
+                    state.control_text = state.message_parts.update(part_id, text);
+                    keep_tail(&mut state.control_text, 20_000);
+                }
                 HarnessEvent::MessageCompleted => state.control_text.push('\n'),
                 _ => {}
             }
@@ -754,6 +766,16 @@ impl TurnRun {
             match &event {
                 HarnessEvent::MessageDelta { text } => {
                     state.proposal_text.push_str(text);
+                    keep_tail(&mut state.proposal_text, 200_000);
+                    return None;
+                }
+                HarnessEvent::MessagePart {
+                    part_id,
+                    text,
+                    reasoning: false,
+                    ..
+                } => {
+                    state.proposal_text = state.message_parts.update(part_id, text);
                     keep_tail(&mut state.proposal_text, 200_000);
                     return None;
                 }

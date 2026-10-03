@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -93,6 +93,16 @@ struct LiveChild {
 
 struct LiveSse {
     stop: Arc<AtomicBool>,
+    socket: Mutex<Option<TcpStream>>,
+}
+
+impl LiveSse {
+    fn cancel(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(socket) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 struct HarnessInner {
@@ -281,7 +291,7 @@ impl HarnessShared {
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id)
         {
-            live.stop.store(true, Ordering::SeqCst);
+            live.cancel();
         }
     }
 
@@ -291,7 +301,7 @@ impl HarnessShared {
             map.drain().map(|(_, live)| live).collect()
         };
         for live in streams {
-            live.stop.store(true, Ordering::SeqCst);
+            live.cancel();
         }
     }
 }
@@ -822,6 +832,7 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
     binary_provider: Option<String>,
     binary_path: Option<String>,
+    env: Option<HashMap<String, String>>,
 ) -> Result<u32, String> {
     let workdir = expand_home(&cwd);
     if !workdir.is_dir() {
@@ -840,15 +851,20 @@ pub fn harness_spawn(
         terminate(prev.pid);
     }
 
-    let mut cmd = Command::new(&command);
-    cmd.args(&args)
-        .current_dir(&workdir)
+    let mut cmd = harness_command(&command, &args)?;
+    cmd.current_dir(&workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
     apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
-
+    if binary_provider.as_deref() == Some("opencode")
+        && args.first().map(String::as_str) == Some("serve")
+    {
+        configure_opencode_server(&mut cmd, env.as_ref())?;
+    } else if env.as_ref().is_some_and(|env| !env.is_empty()) {
+        return Err("Environment overrides are limited to OpenCode servers".into());
+    }
     crate::control::configure_child(control, &session_id, &mut cmd);
 
     let mut child =
@@ -919,6 +935,136 @@ pub fn harness_spawn(
     });
 
     Ok(pid)
+}
+
+fn merge_config(target: &mut serde_json::Value, patch: serde_json::Value) {
+    if let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) {
+        for (key, value) in patch {
+            if let Some(previous) = target.get_mut(key) {
+                merge_config(previous, value.clone());
+            } else {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *target = patch;
+    }
+}
+
+fn configure_opencode_server(
+    cmd: &mut Command,
+    env: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    cmd.env_remove("OPENCODE_SERVER_PASSWORD")
+        .env_remove("OPENCODE_SERVER_USERNAME");
+    let Some(env) = env else {
+        return Ok(());
+    };
+    if env.keys().any(|key| key != "OPENCODE_CONFIG_CONTENT") {
+        return Err("Unsupported OpenCode environment override".into());
+    }
+    if let Some(override_config) = env.get("OPENCODE_CONFIG_CONTENT") {
+        let inherited = command_env(cmd, "OPENCODE_CONFIG_CONTENT").unwrap_or_else(|| "{}".into());
+        let cwd = cmd
+            .get_current_dir()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let config = merge_opencode_config_with_env(&inherited, override_config, &cwd, |name| {
+            command_env(cmd, name)
+        })?;
+        cmd.env("OPENCODE_CONFIG_CONTENT", config);
+    }
+    Ok(())
+}
+
+fn command_env(cmd: &Command, name: &str) -> Option<String> {
+    match cmd.get_envs().find(|(key, _)| *key == name) {
+        Some((_, value)) => value.and_then(|value| value.to_str().map(str::to_owned)),
+        None => std::env::var(name).ok(),
+    }
+}
+
+#[cfg(test)]
+fn merge_opencode_config(base: &str, policy: &str, cwd: &Path) -> Result<String, String> {
+    merge_opencode_config_with_env(base, policy, cwd, |name| std::env::var(name).ok())
+}
+
+fn merge_opencode_config_with_env(
+    base: &str,
+    policy: &str,
+    cwd: &Path,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let expanded = substitute_opencode_config(base, cwd, env)?;
+    let mut config: serde_json::Value = serde_json::from_str(&expanded)
+        .or_else(|_| serde_json::from_str(&crate::mcp::strip_jsonc(&expanded)))
+        .map_err(|_| "Invalid inherited OpenCode config".to_string())?;
+    let patch: serde_json::Value =
+        serde_json::from_str(policy).map_err(|_| "Invalid OpenCode policy config".to_string())?;
+    if !config.is_object() || !patch.is_object() {
+        return Err("Invalid OpenCode config object".into());
+    }
+    merge_config(&mut config, patch);
+    Ok(config
+        .to_string()
+        .replace("{env:", "\\u007benv:")
+        .replace("{file:", "\\u007bfile:"))
+}
+
+fn substitute_opencode_config(
+    raw: &str,
+    cwd: &Path,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let mut expanded = String::with_capacity(raw.len());
+    let mut cursor = 0;
+    while let Some(offset) = raw[cursor..].find("{env:") {
+        let start = cursor + offset;
+        let Some(end) = raw[start + 5..].find('}').map(|end| start + 5 + end) else {
+            break;
+        };
+        expanded.push_str(&raw[cursor..start]);
+        if end == start + 5 {
+            expanded.push_str(&raw[start..=end]);
+        } else {
+            expanded.push_str(&env(&raw[start + 5..end]).unwrap_or_default());
+        }
+        cursor = end + 1;
+    }
+    expanded.push_str(&raw[cursor..]);
+    let mut result = String::with_capacity(expanded.len());
+    cursor = 0;
+    while let Some(offset) = expanded[cursor..].find("{file:") {
+        let start = cursor + offset;
+        let Some(end) = expanded[start + 6..].find('}').map(|end| start + 6 + end) else {
+            break;
+        };
+        result.push_str(&expanded[cursor..start]);
+        let line = expanded[..start].rfind('\n').map_or(0, |line| line + 1);
+        if end == start + 6 || expanded[line..start].trim_start().starts_with("//") {
+            result.push_str(&expanded[start..=end]);
+        } else {
+            let name = &expanded[start + 6..end];
+            let file = if name.starts_with("~/") {
+                expand_home(name)
+            } else {
+                PathBuf::from(name)
+            };
+            let file = if file.is_absolute() {
+                file
+            } else {
+                cwd.join(file)
+            };
+            let content = std::fs::read_to_string(&file)
+                .map_err(|_| format!("Invalid OpenCode file reference: {}", file.display()))?;
+            let quoted =
+                serde_json::to_string(content.trim()).map_err(|error| error.to_string())?;
+            result.push_str(&quoted[1..quoted.len() - 1]);
+        }
+        cursor = end + 1;
+    }
+    result.push_str(&expanded[cursor..]);
+    Ok(result)
 }
 
 pub fn provider_account_dir(
@@ -1075,7 +1221,10 @@ pub fn harness_http(
 ) -> Result<HarnessHttpResponse, String> {
     assert_loopback(&url)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
     let mut request = agent.request(&method, &url);
     if let Some(headers) = &headers {
         for (key, value) in headers {
@@ -1104,50 +1253,274 @@ pub fn harness_sse_open(
 ) -> Result<(), String> {
     assert_loopback(&url)?;
     host.stop_sse(&session_id);
-    let stop = Arc::new(AtomicBool::new(false));
-    host.insert_sse(
-        session_id.clone(),
-        Arc::new(LiveSse {
-            stop: Arc::clone(&stop),
-        }),
-    );
-
-    let events = host.events.clone();
+    let live = Arc::new(LiveSse {
+        stop: Arc::new(AtomicBool::new(false)),
+        socket: Mutex::new(None),
+    });
+    host.insert_sse(session_id.clone(), live.clone());
+    let shared = Arc::downgrade(&host.0);
+    let stream_id = session_id.clone();
+    let stream_live = live.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let events = events.as_ref();
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(60 * 60 * 6))
-            .timeout_write(Duration::from_secs(30))
-            .build();
-        let mut request = agent.get(&url).set("Accept", "text/event-stream");
-        if let Some(headers) = &headers {
-            for (key, value) in headers {
-                request = request.set(key, value);
-            }
-        }
-        let result = request.call();
-        if stop.load(Ordering::SeqCst) {
-            emit_sse_end(events, &session_id, None);
-            return;
-        }
-        match result {
-            Ok(response) => {
-                let reader = BufReader::new(response.into_reader());
-                read_sse(reader, events, &session_id, &stop);
-                emit_sse_end(events, &session_id, None);
+        let body = open_sse_body(&url, headers.as_ref(), &stream_live);
+        match body {
+            Ok(body) => {
+                if ready_tx.send(Ok(())).is_err() {
+                    stream_live.cancel();
+                    return;
+                }
+                let events = CurrentSseEvents {
+                    shared,
+                    session_id: stream_id,
+                    live: stream_live,
+                };
+                read_sse(
+                    BufReader::new(body),
+                    &events,
+                    &events.session_id,
+                    &events.live.stop,
+                );
+                events.sse_end(&events.session_id, None);
             }
             Err(error) => {
-                emit_sse_end(
-                    events,
-                    &session_id,
-                    Some(format!("OpenCode event stream failed: {error}")),
-                );
+                let _ = ready_tx.send(Err(error));
             }
         }
     });
+    match ready_rx.recv_timeout(Duration::from_secs(12)) {
+        Ok(Ok(())) if !live.stop.load(Ordering::SeqCst) => Ok(()),
+        result => {
+            live.cancel();
+            let mut streams = host.sse.lock().unwrap_or_else(|e| e.into_inner());
+            if streams
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &live))
+            {
+                streams.remove(&session_id);
+            }
+            match result {
+                Ok(Err(error)) => Err(error),
+                _ => Err("OpenCode event stream handshake was cancelled or timed out".into()),
+            }
+        }
+    }
+}
 
-    Ok(())
+struct CurrentSseEvents {
+    shared: std::sync::Weak<HarnessShared>,
+    session_id: String,
+    live: Arc<LiveSse>,
+}
+
+impl HarnessEvents for CurrentSseEvents {
+    fn stdout(&self, _: &str, _: String) {}
+    fn stderr(&self, _: &str, _: String) {}
+    fn exit(&self, _: &str, _: Option<i32>, _: u32) {}
+    fn sse(&self, session_id: &str, data: String) {
+        if let Some(shared) = self.shared.upgrade() {
+            let streams = shared.sse.lock().unwrap_or_else(|e| e.into_inner());
+            if streams
+                .get(session_id)
+                .is_some_and(|live| Arc::ptr_eq(live, &self.live))
+                && !self.live.stop.load(Ordering::SeqCst)
+            {
+                shared.events.sse(session_id, data);
+            }
+        }
+    }
+    fn sse_end(&self, session_id: &str, error: Option<String>) {
+        if let Some(shared) = self.shared.upgrade() {
+            let mut streams = shared.sse.lock().unwrap_or_else(|e| e.into_inner());
+            if streams
+                .get(session_id)
+                .is_some_and(|live| Arc::ptr_eq(live, &self.live))
+            {
+                streams.remove(session_id);
+                shared.events.sse_end(session_id, error);
+            }
+        }
+    }
+}
+
+fn http_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
+    let mut line = String::new();
+    reader.take(64 * 1024).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid HTTP line",
+        ));
+    }
+    Ok(line)
+}
+
+struct SseBody {
+    reader: BufReader<TcpStream>,
+    chunked: bool,
+    remaining: usize,
+    chunk_end: bool,
+    finished: bool,
+}
+
+impl Read for SseBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.finished {
+            return Ok(0);
+        }
+        if !self.chunked {
+            return self.reader.read(buf);
+        }
+        if self.remaining == 0 {
+            if self.chunk_end {
+                let mut separator = [0; 2];
+                self.reader.read_exact(&mut separator)?;
+                if separator != *b"\r\n" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid HTTP chunk separator",
+                    ));
+                }
+            }
+            let size = http_line(&mut self.reader)?;
+            self.remaining = usize::from_str_radix(size.trim().split(';').next().unwrap_or(""), 16)
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid HTTP chunk size")
+                })?;
+            if self.remaining == 0 {
+                self.finished = true;
+                return Ok(0);
+            }
+        }
+        let length = buf.len().min(self.remaining);
+        let read = self.reader.read(&mut buf[..length])?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.remaining -= read;
+        self.chunk_end = self.remaining == 0;
+        Ok(read)
+    }
+}
+
+fn open_sse_body(
+    url: &str,
+    headers: Option<&HashMap<String, String>>,
+    live: &LiveSse,
+) -> Result<SseBody, String> {
+    let open = || -> Result<SseBody, String> {
+        let parsed = url::Url::parse(url).map_err(|error| error.to_string())?;
+        let host = parsed.host_str().ok_or("Missing OpenCode host")?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or("Missing OpenCode port")?;
+        let address = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| error.to_string())?
+            .find(|address| address.ip().is_loopback())
+            .ok_or("OpenCode host did not resolve to loopback")?;
+        let socket = TcpStream::connect_timeout(&address, Duration::from_secs(10))
+            .map_err(|error| error.to_string())?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        {
+            let mut handle = live.socket.lock().unwrap_or_else(|e| e.into_inner());
+            if live.stop.load(Ordering::SeqCst) {
+                return Err("OpenCode event stream was cancelled".into());
+            }
+            *handle = Some(socket.try_clone().map_err(|error| error.to_string())?);
+        }
+        let mut reader = BufReader::new(socket);
+        let path = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().into(),
+        };
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
+        );
+        if let Some(headers) = headers {
+            for (key, value) in headers {
+                if key.is_empty()
+                    || !key
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+                    || value.contains(['\r', '\n'])
+                {
+                    return Err("Invalid OpenCode event stream header".into());
+                }
+                if [
+                    "host",
+                    "connection",
+                    "accept-encoding",
+                    "content-length",
+                    "transfer-encoding",
+                ]
+                .iter()
+                .any(|name| key.eq_ignore_ascii_case(name))
+                {
+                    return Err("Unsupported OpenCode event stream header".into());
+                }
+                request.push_str(&format!("{key}: {value}\r\n"));
+            }
+        }
+        request.push_str("\r\n");
+        reader
+            .get_mut()
+            .write_all(request.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let status = http_line(&mut reader).map_err(|error| error.to_string())?;
+        if status.split_whitespace().nth(1) != Some("200") {
+            return Err(format!("OpenCode event stream returned {}", status.trim()));
+        }
+        let mut sse = false;
+        let mut chunked = false;
+        let mut total = 0;
+        loop {
+            let line = http_line(&mut reader).map_err(|error| error.to_string())?;
+            total += line.len();
+            if total > 64 * 1024 {
+                return Err("OpenCode event stream headers are too large".into());
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                if key.eq_ignore_ascii_case("content-type") {
+                    sse = value.trim().starts_with("text/event-stream");
+                }
+                if key.eq_ignore_ascii_case("transfer-encoding") {
+                    if !value.trim().eq_ignore_ascii_case("chunked") {
+                        return Err("Unsupported OpenCode transfer encoding".into());
+                    }
+                    chunked = true;
+                }
+                if key.eq_ignore_ascii_case("content-encoding")
+                    && !value.trim().eq_ignore_ascii_case("identity")
+                {
+                    return Err("Unsupported OpenCode stream encoding".into());
+                }
+            }
+        }
+        if !sse {
+            return Err("OpenCode server did not return an event stream".into());
+        }
+        reader
+            .get_mut()
+            .set_read_timeout(None)
+            .map_err(|error| error.to_string())?;
+        Ok(SseBody {
+            reader,
+            chunked,
+            remaining: 0,
+            chunk_end: false,
+            finished: false,
+        })
+    };
+    open().map_err(|error| format!("OpenCode event stream failed: {error}"))
 }
 
 pub fn harness_sse_close(host: &HarnessHost, session_id: String) -> Result<(), String> {
@@ -1196,21 +1569,22 @@ fn read_sse<R: BufRead>(
     }
 }
 
-fn emit_sse_end(events: &dyn HarnessEvents, session_id: &str, error: Option<String>) {
-    events.sse_end(session_id, error);
-}
-
 fn assert_loopback(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://127.0.0.1:")
-        || lower.starts_with("http://127.0.0.1/")
-        || lower.starts_with("http://localhost:")
-        || lower.starts_with("http://localhost/")
+    let parsed =
+        url::Url::parse(url).map_err(|_| "OpenCode HTTP is limited to localhost".to_string())?;
+    if parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
     {
         return Ok(());
     }
     Err("OpenCode HTTP is limited to localhost".into())
 }
+
+#[cfg(test)]
+#[path = "harness_transport_tests.rs"]
+mod transport_tests;
 
 const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["--version"],
@@ -1220,6 +1594,7 @@ const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["models"],
     &["status", "--json"],
     &["agent", "list"],
+    &["debug", "paths"],
 ];
 
 fn exec_args_allowed(args: &[String]) -> bool {
@@ -1254,7 +1629,10 @@ pub fn harness_exec(
     binary_provider: Option<String>,
     binary_path: Option<String>,
 ) -> Result<String, String> {
-    if !exec_args_allowed(&args) {
+    if !exec_args_allowed(&args)
+        || (args.iter().map(String::as_str).eq(["debug", "paths"])
+            && binary_provider.as_deref() != Some("opencode"))
+    {
         return Err("harness_exec: unsupported arguments".into());
     }
     if !is_resolved_harness_binary(&command, binary_provider.as_deref(), binary_path.as_deref()) {
@@ -1275,15 +1653,46 @@ fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<Str
 
 const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
+fn harness_command(command: &str, args: &[String]) -> Result<Command, String> {
+    let entry = opencode_npm_entry(command, cfg!(windows))?;
+    let mut process = Command::new(if entry.is_some() { "node" } else { command });
+    if let Some(entry) = entry {
+        process.arg(entry);
+    }
+    process.args(args);
+    Ok(process)
+}
+
+fn opencode_npm_entry(command: &str, windows: bool) -> Result<Option<PathBuf>, String> {
+    let path = Path::new(command);
+    if windows
+        && path
+            .file_stem()
+            .is_some_and(|name| name.eq_ignore_ascii_case("opencode"))
+        && path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+    {
+        let entry = path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join("node_modules/opencode-ai/bin/opencode");
+        if !entry.is_file() {
+            return Err("Missing npm OpenCode entry point".into());
+        }
+        return Ok(Some(entry));
+    }
+    Ok(None)
+}
+
 pub fn exec_output(
     command: &str,
     args: &[String],
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = Command::new(command);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    let mut cmd = harness_command(command, args)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
@@ -3738,6 +4147,20 @@ mod exec_allowlist_tests {
         assert!(exec_args_allowed(&args(&["models"])));
         assert!(exec_args_allowed(&args(&["status", "--json"])));
         assert!(exec_args_allowed(&args(&["agent", "list"])));
+        assert!(exec_args_allowed(&args(&["debug", "paths"])));
+    }
+
+    #[test]
+    fn limits_debug_paths_to_opencode() {
+        let error = harness_exec(
+            "unused".into(),
+            args(&["debug", "paths"]),
+            None,
+            Some("codex".into()),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "harness_exec: unsupported arguments");
     }
 
     #[test]

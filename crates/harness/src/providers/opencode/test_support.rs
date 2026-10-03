@@ -22,6 +22,7 @@ use crate::core::child::{
 };
 use crate::core::task::{SharedSpawner, SmolSpawner};
 
+type ExecHandler = Arc<dyn Fn(&ExecRequest) -> String + Send + Sync>;
 type Handler = Arc<dyn Fn(&HttpRequest) -> (u16, String) + Send + Sync>;
 
 /// A reply a test sends later: status and body.
@@ -40,8 +41,12 @@ struct State {
     deferred: Vec<(String, String, LaterReply)>,
     spawns: Vec<SpawnRequest>,
     kills: Vec<String>,
+    deferred_kills: VecDeque<oneshot::Receiver<()>>,
     sse_opens: Vec<(String, String)>,
     exec_output: String,
+    exec_handler: Option<ExecHandler>,
+    exec_calls: Vec<ExecRequest>,
+    messages: HashMap<String, Vec<Value>>,
 }
 
 struct Inner {
@@ -92,8 +97,12 @@ impl FakeHost {
                 deferred: Vec::new(),
                 spawns: Vec::new(),
                 kills: Vec::new(),
+                deferred_kills: VecDeque::new(),
                 sse_opens: Vec::new(),
                 exec_output: "opencode 1.14.19".into(),
+                exec_handler: None,
+                exec_calls: Vec::new(),
+                messages: HashMap::new(),
             }),
             next_pid: AtomicU32::new(4000),
             server_line: "opencode server listening on http://127.0.0.1:4096".into(),
@@ -151,8 +160,25 @@ impl FakeHost {
         tx
     }
 
+    pub fn defer_kill(&self) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        self.inner.state.lock().deferred_kills.push_back(rx);
+        tx
+    }
+
     pub fn set_exec_output(&self, output: &str) {
         self.inner.state.lock().exec_output = output.into();
+    }
+
+    pub fn set_exec_handler(
+        &self,
+        handler: impl Fn(&ExecRequest) -> String + Send + Sync + 'static,
+    ) {
+        self.inner.state.lock().exec_handler = Some(Arc::new(handler));
+    }
+
+    pub fn exec_calls(&self) -> Vec<ExecRequest> {
+        self.inner.state.lock().exec_calls.clone()
     }
 
     pub fn http_calls(&self) -> Vec<HttpRequest> {
@@ -181,6 +207,46 @@ impl FakeHost {
 
     /// One SSE frame on `stream_id`.
     pub fn sse(&self, stream_id: &str, event: Value) {
+        let properties = &event["properties"];
+        let session_id = properties["sessionID"]
+            .as_str()
+            .or_else(|| properties["info"]["sessionID"].as_str())
+            .or_else(|| properties["part"]["sessionID"].as_str());
+        if let Some(session_id) = session_id {
+            let mut state = self.inner.state.lock();
+            let messages = state.messages.entry(session_id.to_string()).or_default();
+            match event["type"].as_str() {
+                Some("message.updated") => {
+                    let info = &properties["info"];
+                    if let Some(existing) = messages
+                        .iter_mut()
+                        .find(|message| message["info"]["id"] == info["id"])
+                    {
+                        existing["info"] = info.clone();
+                    } else {
+                        messages.push(serde_json::json!({"info": info, "parts": []}));
+                    }
+                }
+                Some("message.part.updated") => {
+                    let part = &properties["part"];
+                    if let Some(message) = messages
+                        .iter_mut()
+                        .find(|message| message["info"]["id"] == part["messageID"])
+                    {
+                        let parts = message["parts"].as_array_mut().unwrap();
+                        if let Some(existing) = parts
+                            .iter_mut()
+                            .find(|existing| existing["id"] == part["id"])
+                        {
+                            *existing = part.clone();
+                        } else {
+                            parts.push(part.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         self.inner.router.on_sse(stream_id, event.to_string());
     }
 
@@ -233,8 +299,18 @@ impl ChildBackend for FakeBackend {
     }
 
     fn kill(&self, session_id: String) -> ChildFuture<()> {
-        self.inner.state.lock().kills.push(session_id);
-        ready(Ok(()))
+        let deferred = {
+            let mut state = self.inner.state.lock();
+            state.kills.push(session_id);
+            state.deferred_kills.pop_front()
+        };
+        async move {
+            if let Some(deferred) = deferred {
+                let _ = deferred.await;
+            }
+            Ok(())
+        }
+        .boxed()
     }
 
     fn kill_all(&self) -> ChildFuture<()> {
@@ -263,8 +339,15 @@ impl ChildBackend for FakeBackend {
         }))
     }
 
-    fn exec(&self, _request: ExecRequest) -> ChildFuture<String> {
-        ready(Ok(self.inner.state.lock().exec_output.clone()))
+    fn exec(&self, request: ExecRequest) -> ChildFuture<String> {
+        let (handler, output) = {
+            let mut state = self.inner.state.lock();
+            state.exec_calls.push(request.clone());
+            (state.exec_handler.clone(), state.exec_output.clone())
+        };
+        ready(Ok(handler.map(|handler| handler(&request)).unwrap_or_else(|| {
+            if request.args == ["agent", "list"] { "build (primary)\n[]\nplan (primary)\n[]\ngeneral (subagent)\n[]\nexplore (subagent)\n[]\n".into() } else if request.args == ["debug", "paths"] { "data       /data/opencode\n".into() } else { output }
+        })))
     }
 
     fn free_port(&self) -> ChildFuture<u16> {
@@ -287,8 +370,9 @@ impl ChildBackend for FakeBackend {
             };
             (once, deferred, state.handler.clone())
         };
+        let inner = self.inner.clone();
         async move {
-            let (status, body) = match (deferred, once) {
+            let (mut status, mut body) = match (deferred, once) {
                 (Some(reply), _) => reply.await.map_err(|_| "dropped".to_string())?,
                 (None, Some(Once::Reply(status, body))) => (status, body),
                 (None, Some(Once::Pending(reply))) => {
@@ -296,6 +380,44 @@ impl ChildBackend for FakeBackend {
                 }
                 (None, None) => handler(&request),
             };
+            let path = path_of(&request.url);
+            if status < 400 && body.is_empty() && request.method == "GET" && matches!(path.as_str(),"/agent"|"/config") {
+                let config = inner.state.lock().spawns.last().and_then(|spawn|spawn.env.as_ref()).and_then(|env|env.get("OPENCODE_CONFIG_CONTENT")).and_then(|config|serde_json::from_str::<Value>(config).ok()).unwrap_or_else(||serde_json::json!({}));
+                let value = if path == "/config" { config } else {
+                    let agents: Vec<_> = config["agent"].as_object().into_iter().flat_map(|agents|agents.iter()).map(|(name,agent)| {
+                        let mut rules = Vec::new();
+                        for (permission,policy) in agent["permission"].as_object().into_iter().flat_map(|permission|permission.iter()) {
+                            if let Some(action) = policy.as_str() { rules.push(serde_json::json!({"permission":permission,"pattern":"*","action":action})); }
+                            else if let Some(patterns) = policy.as_object() { for (pattern,action) in patterns { rules.push(serde_json::json!({"permission":permission,"pattern":pattern,"action":action})); } }
+                        }
+                        serde_json::json!({"name":name,"permission":rules})
+                    }).collect();
+                    Value::Array(agents)
+                };
+                status = 200;
+                body = value.to_string();
+            }
+            if status < 400 && path.ends_with("/prompt_async")
+                && let Some(message_id) = request.body.as_deref().and_then(|body| serde_json::from_str::<Value>(body).ok()).and_then(|body| body["messageID"].as_str().map(str::to_string)) {
+                    let session_id = path.split('/').nth(2).unwrap();
+                    let info = serde_json::json!({"id": message_id, "sessionID": session_id, "role":"user", "time":{"created":1}});
+                    let stream = {
+                        let mut state = inner.state.lock();
+                        state.messages.entry(session_id.to_string()).or_default().push(serde_json::json!({"info":info,"parts":[{"type":"text","text":"fixture prompt"}]}));
+                        state.sse_opens.last().map(|(stream, _)| stream.clone())
+                    };
+                    if let Some(stream) = stream { inner.router.on_sse(&stream, serde_json::json!({"type":"message.updated", "properties":{"info":info}}).to_string()); }
+            }
+            if status < 400 && request.method == "GET" && path.ends_with("/message") {
+                let session_id = path.split('/').nth(2).unwrap();
+                if let Some(dynamic) = inner.state.lock().messages.get(session_id) {
+                    let mut combined = serde_json::from_str::<Vec<Value>>(&body).unwrap_or_default();
+                    for message in dynamic {
+                        if let Some(existing) = combined.iter_mut().find(|existing| existing["info"]["id"] == message["info"]["id"]) { *existing = message.clone(); } else { combined.push(message.clone()); }
+                    }
+                    body = serde_json::to_string(&combined).unwrap();
+                }
+            }
             Ok(HttpResponse { status, body })
         }
         .boxed()

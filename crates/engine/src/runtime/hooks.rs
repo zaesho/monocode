@@ -120,6 +120,15 @@ pub trait HarnessHooks {
         Task::ready(())
     }
 
+    fn refresh_catalogs_for_directories(
+        &self,
+        harnesses: Vec<HarnessId>,
+        _directories: Vec<(HarnessId, String)>,
+        cx: &mut App,
+    ) -> Task<()> {
+        self.refresh_catalogs(harnesses, cx)
+    }
+
     /// `resolveModel` plus `mergeModelSettings` against the live catalog.
     /// `None` keeps the session's model as it is.
     fn resolve_model(&self, _session: &Session, _cx: &App) -> Option<(String, ModelSettings)> {

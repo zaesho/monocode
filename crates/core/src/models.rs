@@ -241,6 +241,11 @@ impl ModelCatalog {
         if models.is_empty() {
             return;
         }
+        self.replace_harness_models(harness, models);
+    }
+
+    /// Replace a scoped list, including an empty list of enabled models.
+    pub fn replace_harness_models(&mut self, harness: HarnessId, models: Vec<AgentModel>) {
         let default_id = pick_default_id(harness, &models);
         self.overlays.insert(harness, models);
         self.overlay_defaults.insert(harness, default_id);

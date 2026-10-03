@@ -2,6 +2,7 @@
 //! (`setHarnessModels`, `hasLiveCatalog`, `resetHarnessModelOverlays`),
 //! shared between the engine and the provider adapters that refresh it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -10,12 +11,14 @@ use monocode_core::harness::HarnessId;
 use monocode_core::models::{AgentModel, ModelCatalog};
 
 type Listener = Arc<dyn Fn(HarnessId) + Send + Sync>;
+type ProjectModels = HashMap<(HarnessId, String), Vec<AgentModel>>;
 
 /// A [`ModelCatalog`] behind a lock, with change listeners. Clones share one
 /// catalog.
 #[derive(Clone, Default)]
 pub struct SharedCatalog {
     catalog: Arc<RwLock<ModelCatalog>>,
+    project_models: Arc<RwLock<ProjectModels>>,
     listeners: Arc<Mutex<Vec<(u64, Listener)>>>,
     next_listener: Arc<Mutex<u64>>,
 }
@@ -49,6 +52,43 @@ impl SharedCatalog {
         }
     }
 
+    pub fn set_project_harness_models(
+        &self,
+        harness: HarnessId,
+        cwd: &str,
+        models: Vec<AgentModel>,
+    ) {
+        self.project_models
+            .write()
+            .insert((harness, cwd.into()), models);
+        let listeners: Vec<Listener> = self
+            .listeners
+            .lock()
+            .iter()
+            .map(|(_, listener)| listener.clone())
+            .collect();
+        for listener in listeners {
+            listener(harness);
+        }
+    }
+
+    pub fn project_models_for(&self, harness: HarnessId, cwd: &str) -> Option<Vec<AgentModel>> {
+        self.project_models
+            .read()
+            .get(&(harness, cwd.into()))
+            .cloned()
+    }
+
+    pub fn snapshot_for_directory(&self, cwd: &str) -> ModelCatalog {
+        let mut catalog = self.snapshot();
+        for ((harness, directory), models) in self.project_models.read().iter() {
+            if directory == cwd {
+                catalog.replace_harness_models(*harness, models.clone());
+            }
+        }
+        catalog
+    }
+
     /// `hasLiveCatalog`.
     pub fn has_live_catalog(&self, harness: HarnessId) -> bool {
         self.catalog.read().has_live_catalog(harness)
@@ -57,6 +97,7 @@ impl SharedCatalog {
     /// `resetHarnessModelOverlays`. Test seam.
     pub fn reset_overlays(&self) {
         self.catalog.write().reset_overlays();
+        self.project_models.write().clear();
     }
 
     /// Call `listener` after each `set_harness_models`. Returns an id for
@@ -80,6 +121,44 @@ impl SharedCatalog {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn project_catalogs_do_not_replace_home_or_other_projects() {
+        let catalog = SharedCatalog::new();
+        let model = |id: &str| AgentModel::new(id, HarnessId::Opencode, id);
+        catalog.set_harness_models(HarnessId::Opencode, vec![model("home")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/a", vec![model("a")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/b", vec![model("b")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/empty", vec![]);
+        assert_eq!(catalog.read().models_for(HarnessId::Opencode)[0].id, "home");
+        assert_eq!(
+            catalog
+                .snapshot_for_directory("/a")
+                .models_for(HarnessId::Opencode)[0]
+                .id,
+            "a"
+        );
+        assert_eq!(
+            catalog
+                .snapshot_for_directory("/b")
+                .models_for(HarnessId::Opencode)[0]
+                .id,
+            "b"
+        );
+        assert!(
+            catalog
+                .snapshot_for_directory("/empty")
+                .models_for(HarnessId::Opencode)
+                .is_empty()
+        );
+        assert_eq!(
+            catalog
+                .snapshot_for_directory("/unknown")
+                .models_for(HarnessId::Opencode)[0]
+                .id,
+            "home"
+        );
+    }
 
     #[test]
     fn notifies_after_a_live_list_lands() {

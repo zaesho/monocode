@@ -287,6 +287,7 @@ export async function spawnChild(
   cwd: string,
   account?: { provider: "claude" | "codex"; id: string },
   binaryProvider?: ConfigurableBinaryProvider,
+  env?: Record<string, string>,
 ): Promise<void> {
   livePid.delete(sessionId);
   pendingExit.delete(sessionId);
@@ -301,6 +302,7 @@ export async function spawnChild(
     account,
     binaryProvider,
     binaryPath,
+    env,
   });
   if (typeof pid !== "number" || pid <= 0) return;
   livePid.set(sessionId, pid);

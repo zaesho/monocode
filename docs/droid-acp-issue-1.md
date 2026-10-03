@@ -10,7 +10,7 @@ This change addresses [issue 1](https://github.com/zaesho/monocode/issues/1) in 
 | F02 | Cancellation retires the connection and process. A follow-up waits for retirement, then resumes on a new connection. | Both adapters hold child termination pending and verify that no follow-up spawns early. TypeScript also injects old output after the new turn starts. |
 | F03 | Edit mode only automatically approves `read`, `search`, and `edit`. Missing kinds, `delete`, `move`, and `switch_mode` require review. Sparse requests recover previously reported tool kinds. | Shared policy tests and sparse execute-permission tests in both adapters. |
 | F04 | An unexpected exit closes pending requests without setting the user-cancellation flag. The turn rejects and reports an error. | Crash tests verify rejection and an error event. |
-| F05 | Permission tasks catch reply failures. Stop drains pending permission replies before closing the client and removing the child. | TypeScript stop-with-pending-permission test and Node host transport tests. |
+| F05 | Permission tasks catch reply failures. Shared request dispatch preserves wire order. Stop drains pending permission replies before closing the client and removing the child. | TypeScript stop-with-pending-permission test, synchronous request-order tests, and Node host transport tests. |
 | F06 | Permission selection uses offered semantic kinds and preserves the original option identifier. A missing choice produces cancellation. | Exact manual, automatic, and planning response assertions. Installed Droid also offered `proceed_once` and `cancel`. |
 | F07 | A failed resume preserves the existing binding and rejects the turn. It does not start a new conversation. | Transient storage-error tests in both adapters. |
 | F08 | The adapter registers the approval waiter before emitting the approval event. | Synchronous-denial tests in both adapters. |
@@ -30,7 +30,7 @@ ACP defines the cancellation boundary and permission outcome in its [prompt-turn
 ## Validation
 
 - The regression tests reproduced nine TypeScript failures before implementation. A further mode-notification regression failed in both adapters before its fix.
-- All 185 focused web tests pass. They cover Droid, shared ACP helpers, Grok, Hermes, model recovery, usage routing, and the footer.
+- All 4,098 web tests pass, with 13 skipped. This includes the Droid, Cursor, Grok, and Hermes providers, shared ACP helpers, model recovery, usage routing, and the footer.
 - All 1,267 tests pass across the Rust core, provider, and integration crates. The 35 ignored provider tests require installed CLIs.
 - All 1,577 native engine tests pass with the default features, with four ignored tests. The narrower attention suite also passes all 156 tests.
 - All 119 Node host tests pass, with two skipped tests. This includes Droid over the host process transport.

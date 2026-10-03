@@ -33,9 +33,13 @@ export class AcpClient {
         let numeric = typeof id === "number" ? id : this.nextRequestId--;
         while (this.requestIds.has(numeric)) numeric = this.nextRequestId--;
         this.requestIds.set(numeric, id);
-        void Promise.resolve()
-          .then(() => this.handlers.onRequest?.(numeric, method, params))
-          .catch(() => undefined);
+        try {
+          void Promise.resolve(
+            this.handlers.onRequest?.(numeric, method, params),
+          ).catch(() => undefined);
+        } catch {
+          return;
+        }
       },
     };
     this.rpc = new JsonRpcClient(sessionId, rpcHandlers, {

@@ -257,18 +257,26 @@ async function ensureLive(
         .catch(() => undefined);
       return;
     }
-    const task = handleRequest(live, id, method, params).catch(
-      (error: unknown) => {
+    let complete!: () => void;
+    const task = new Promise<void>((resolve) => {
+      complete = resolve;
+    });
+    live.permissionTasks.add(task);
+    void (async () => {
+      try {
+        await handleRequest(live, id, method, params);
+      } catch (error) {
         if (!live.closed && !live.cancelled) {
           live.onEvent({
             type: "session.error",
             message: droidErrorMessage(error),
           });
         }
-      },
-    );
-    live.permissionTasks.add(task);
-    void task.finally(() => live.permissionTasks.delete(task));
+      } finally {
+        live.permissionTasks.delete(task);
+        complete();
+      }
+    })().catch(() => undefined);
   };
 
   const emit = (event: HarnessEvent) => {

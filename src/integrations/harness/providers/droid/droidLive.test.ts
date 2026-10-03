@@ -6,6 +6,7 @@ let onExit: ((code: number) => void) | undefined;
 let resolveGate: Promise<void> | undefined;
 let killed = false;
 let killGate: Promise<void> | undefined;
+let permissionWriteGate: Promise<void> | undefined;
 const spawned: { path: string; args: string[] }[] = [];
 
 vi.mock("../../core/child", () => ({
@@ -31,6 +32,8 @@ vi.mock("../../core/child", () => ({
     onExit = exit;
   },
   writeChild: async (_id: string, line: string) => {
+    if (permissionWriteGate && JSON.parse(line).result?.outcome)
+      await permissionWriteGate;
     if (killed) throw new Error("Harness process not running");
     sent.push(line);
   },
@@ -145,6 +148,7 @@ describe("Factory Droid live ACP sequence", () => {
     resolveGate = undefined;
     killed = false;
     killGate = undefined;
+    permissionWriteGate = undefined;
   });
 
   it("spawns droid ACP, switches model then effort, sets autonomy, and prompts", async () => {
@@ -392,6 +396,29 @@ async function ready(
 }
 
 describe("Droid issue 1 regressions", () => {
+  it("drains a permission reply when its tool update stops the session", async () => {
+    const sessionId = "stop-tool-update-drain";
+    let stopping: Promise<void> | undefined;
+    const { turn } = await ready(sessionId, (event) => {
+      if (event.type === "tool.updated") stopping = stopDroidSession(sessionId);
+    });
+    let release!: () => void;
+    permissionWriteGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    permission(907, "execute");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const stoppedBeforeReply = killed;
+    release();
+    await stopping;
+    await turn;
+    expect(stoppedBeforeReply).toBe(false);
+    expect(
+      parse().find((message) => message.id === 907)?.result?.outcome,
+    ).toEqual({ outcome: "cancelled" });
+    expect(killed).toBe(true);
+  });
+
   it.each(["supervised", "full-access"] as const)(
     "cancels permission decisions if a tool update stops %s mode",
     async (runtimeMode) => {
@@ -433,6 +460,7 @@ describe("Droid issue 1 regressions", () => {
     resolveGate = undefined;
     killed = false;
     killGate = undefined;
+    permissionWriteGate = undefined;
   });
 
   it("invalidates startup when a session is forgotten", async () => {

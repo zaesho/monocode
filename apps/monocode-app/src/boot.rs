@@ -84,7 +84,7 @@ pub struct AppServices {
     pub factory: Rc<AppSessionFactory>,
     /// Settings as they were at boot.
     pub settings: AppSettings,
-    pub skills: Arc<monocode_skills::SkillManager>,
+    pub skills: std::result::Result<Arc<monocode_skills::SkillManager>, String>,
     pub skill_home: PathBuf,
     pub skill_generation: Arc<AtomicU64>,
     /// `startHarnessBridge`: the child router keeps its routes while held.
@@ -195,13 +195,23 @@ pub fn boot_with_skill_home(
     let skill_home = skill_home
         .or_else(|| monocode_platform::dirs_home().map(PathBuf::from))
         .context("Could not resolve the skill home directory")?;
+    if !skill_home.is_absolute() {
+        return Err(anyhow!("The skill home directory must be absolute"));
+    }
     std::fs::create_dir_all(&options.data_dir.path)
         .context("Could not create the app data directory")?;
     let data_dir = std::fs::canonicalize(&options.data_dir.path)
         .context("Could not resolve the app data directory")?;
     options.data_dir.path = data_dir.clone();
-    let skills = Arc::new(monocode_skills::SkillManager::open(&data_dir, &skill_home)?);
-    let skill_generation = Arc::new(AtomicU64::new(skills.generation()?));
+    let (skills, initial_generation) =
+        match crate::skills_runtime::initialize_manager(&data_dir, &skill_home) {
+            Ok((manager, generation)) => (Ok(manager), generation),
+            Err(error) => {
+                log::warn!("Shared skill library is unavailable: {error}");
+                (Err(error), 0)
+            }
+        };
+    let skill_generation = Arc::new(AtomicU64::new(initial_generation));
     let kv = open_settings(&data_dir, options.import_webkit)?;
     let settings = monocode_settings::load_app_settings(&kv, Platform::current());
     if options.reap_orphans {
@@ -222,12 +232,20 @@ pub fn boot_with_skill_home(
         spawner.clone(),
     );
     let bridge = children.start_harness_bridge();
-    crate::skills_runtime::install_preparer(
-        &host,
-        skills.clone(),
-        skill_generation.clone(),
-        isolated.then(|| data_dir.clone()),
-    );
+    match &skills {
+        Ok(manager) => crate::skills_runtime::install_preparer(
+            &host,
+            manager.clone(),
+            skill_generation.clone(),
+            isolated.then(|| data_dir.clone()),
+        ),
+        Err(error) => {
+            let preparation_error = error.clone();
+            host.set_skill_preparer(Some(Arc::new(move |_| Err(preparation_error.clone()))));
+            let error = error.clone();
+            host.set_skill_account_retirer(Some(Arc::new(move |_| Err(error.clone()))));
+        }
+    }
     let catalog = SharedCatalog::new();
     let registry = HarnessRegistry::new(spawner.clone(), RegistryOptions::default());
     let ctx = HarnessContext::new(registry.clone(), children.clone(), catalog.clone());

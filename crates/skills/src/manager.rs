@@ -2,7 +2,7 @@ use crate::bundle::Bundle;
 use crate::persistence::{self, Journal, OwnedExport, Registry, StoredSkill, SCHEMA_VERSION};
 use crate::{
     io, Error, ExportState, ExportStatus, ExportTarget, ImportResult, ReconcileReport, Result,
-    SkillEntry, SkillExportStatus,
+    SkillEntry, SkillExportStatus, SkillSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -93,14 +93,24 @@ impl SkillManager {
     }
 
     pub fn entries(&self) -> Result<Vec<SkillEntry>> {
+        Ok(self.snapshot()?.entries)
+    }
+
+    /// Read generation, entries, and remembered export targets under one lock.
+    pub fn snapshot(&self) -> Result<SkillSnapshot> {
         let _lock = self.lock()?;
         let mut registry = self.load()?;
         self.recover(&mut registry)?;
-        Ok(registry
+        let entries = registry
             .entries
             .iter()
             .map(|entry| self.public_entry(&registry, entry))
-            .collect())
+            .collect();
+        Ok(SkillSnapshot {
+            generation: registry.generation,
+            entries,
+            targets: registry.targets,
+        })
     }
 
     pub fn source_path(&self, id: &str) -> Result<PathBuf> {
@@ -150,7 +160,7 @@ impl SkillManager {
             });
         }
         let id = uuid::Uuid::new_v4().to_string();
-        self.snapshot(&bundle)?;
+        self.store_snapshot(&bundle)?;
         let working_stage = self.root.join("sources").join(format!(".import-{id}"));
         bundle.write_new(&working_stage)?;
         let working = self.source_directory(&id);
@@ -191,7 +201,7 @@ impl SkillManager {
             return Err(Error::InvalidBundle("An applied edit cannot rename a skill. Import the renamed bundle as a separate skill.".into()));
         }
         if bundle.digest != registry.entries[index].digest {
-            self.snapshot(&bundle)?;
+            self.store_snapshot(&bundle)?;
             let entry = &mut registry.entries[index];
             entry.digest = bundle.digest;
             entry.description = bundle.description;
@@ -386,7 +396,7 @@ impl SkillManager {
             .ok_or_else(|| Error::UnknownSkill(id.into()))
     }
 
-    fn snapshot(&self, bundle: &Bundle) -> Result<()> {
+    fn store_snapshot(&self, bundle: &Bundle) -> Result<()> {
         let destination = self.object_directory(&bundle.digest);
         if exists(&destination)? {
             if Bundle::read(&destination, false)?.digest != bundle.digest {
@@ -438,6 +448,7 @@ impl SkillManager {
             revision: entry.revision,
             shared: entry.shared,
             source_path: self.source_directory(&entry.id),
+            applied_path: self.object_directory(&entry.digest),
             origins: entry.origins.clone(),
             statuses,
             warnings,

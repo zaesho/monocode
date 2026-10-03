@@ -77,10 +77,20 @@ pub struct SkillEntry {
     pub shared: bool,
     /// The editable managed directory. Applied snapshots are separate.
     pub source_path: PathBuf,
+    /// The immutable directory for this entry's captured applied revision.
+    pub applied_path: PathBuf,
     /// Original directories imported into this entry.
     pub origins: Vec<PathBuf>,
     pub statuses: Vec<ExportStatus>,
     pub warnings: Vec<String>,
+}
+
+/// A coherent library view read under one registry lock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillSnapshot {
+    pub generation: u64,
+    pub entries: Vec<SkillEntry>,
+    pub targets: Vec<ExportTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

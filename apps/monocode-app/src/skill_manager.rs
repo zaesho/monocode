@@ -23,7 +23,7 @@ use monocode_harness::core::provider_accounts::selected_provider_account_id;
 use monocode_process::skills::{
     DiscoveredSkill, SkillDiscoveryContext, discover_skill_inventory_from,
 };
-use monocode_skills::{ExportState, ExportStatus, SkillEntry, SkillManager};
+use monocode_skills::{ExportState, ExportStatus, ReconcileReport, SkillEntry, SkillManager};
 use monocode_ui::widgets::{button, icon_button, spinner, tooltip};
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 use monocode_view_composer::pickers::SkillDocumentPreview;
@@ -52,9 +52,45 @@ enum Selection {
 
 #[derive(Default)]
 struct Snapshot {
+    generation: u64,
     entries: Vec<SkillEntry>,
     candidates: Vec<DiscoveredSkill>,
     diagnostics: Vec<String>,
+}
+
+struct DiscoveryRequest {
+    home: PathBuf,
+    cwd: PathBuf,
+    data_dir: Option<PathBuf>,
+    kv: Option<monocode_settings::Kv>,
+    isolated: bool,
+}
+
+impl DiscoveryRequest {
+    fn resolve(&self) -> SkillDiscoveryContext {
+        let mut context = SkillDiscoveryContext {
+            home: Some(self.home.clone()),
+            ..Default::default()
+        };
+        if let (Some(data_dir), Some(kv)) = (&self.data_dir, &self.kv) {
+            let store = KvStore(kv.clone());
+            let cwd = self.cwd.to_string_lossy();
+            for provider in [HarnessId::Claude, HarnessId::Codex] {
+                let account = selected_provider_account_id(&store, provider, Some(&cwd));
+                let resolved = monocode_app::skills_runtime::resolve_context(
+                    SkillCatalogContext::new(provider, cwd.as_ref()).with_account(account),
+                    data_dir,
+                    &self.home,
+                    0,
+                    self.isolated,
+                );
+                for (provider, path) in resolved.provider_homes {
+                    context.provider_homes.insert(provider, PathBuf::from(path));
+                }
+            }
+        }
+        context
+    }
 }
 
 enum Operation {
@@ -82,7 +118,6 @@ struct OperationResult {
     snapshot: Snapshot,
     selected_id: Option<String>,
     notice: Option<String>,
-    generation: Option<u64>,
 }
 
 pub struct SkillManagerPage {
@@ -115,7 +150,8 @@ fn load_snapshot(
     cwd: &Path,
     context: &SkillDiscoveryContext,
 ) -> Result<Snapshot, String> {
-    let mut entries = manager.entries().map_err(|error| error.to_string())?;
+    let managed = manager.snapshot().map_err(|error| error.to_string())?;
+    let mut entries = managed.entries;
     entries.sort_by(|left, right| {
         left.name
             .to_lowercase()
@@ -124,6 +160,7 @@ fn load_snapshot(
     });
     let inventory = discover_skill_inventory_from(cwd, context);
     Ok(Snapshot {
+        generation: managed.generation,
         entries,
         candidates: inventory.candidates,
         diagnostics: inventory
@@ -132,6 +169,28 @@ fn load_snapshot(
             .map(|diagnostic| format!("{}: {}", diagnostic.path, diagnostic.message))
             .collect(),
     })
+}
+
+fn merge_pending_details(snapshot: &mut Snapshot, report: &ReconcileReport) {
+    if report.generation != snapshot.generation {
+        return;
+    }
+    for status in &report.statuses {
+        if status.export.state != ExportState::Pending {
+            continue;
+        }
+        if let Some(entry) = snapshot
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == status.skill_id)
+            && let Some(current) = entry.statuses.iter_mut().find(|current| {
+                current.target_key == status.export.target_key && current.path == status.export.path
+            })
+            && current.state == ExportState::Pending
+        {
+            current.detail = status.export.detail.clone();
+        }
+    }
 }
 
 fn run_operation(
@@ -182,31 +241,25 @@ fn run_operation(
     };
     let mut snapshot = load_snapshot(manager, cwd, context)?;
     if let Some(report) = &report {
-        for status in &report.statuses {
-            if let Some(entry) = snapshot
-                .entries
-                .iter_mut()
-                .find(|entry| entry.id == status.skill_id)
-            {
-                if let Some(previous) = entry.statuses.iter_mut().find(|previous| {
-                    previous.target_key == status.export.target_key
-                        && previous.path == status.export.path
-                }) {
-                    *previous = status.export.clone();
-                } else {
-                    entry.statuses.push(status.export.clone());
-                }
-            }
-        }
+        merge_pending_details(&mut snapshot, report);
     }
     Ok(OperationResult {
         snapshot,
         selected_id,
         notice,
-        generation: report
-            .map(|report| report.generation)
-            .or_else(|| manager.generation().ok()),
     })
+}
+
+fn selected_document_path(snapshot: &Snapshot, selection: &Option<Selection>) -> Option<PathBuf> {
+    match selection {
+        Some(Selection::Managed(id)) => snapshot
+            .entries
+            .iter()
+            .find(|entry| &entry.id == id)
+            .map(|entry| entry.applied_path.join("SKILL.md")),
+        Some(Selection::Existing(path)) => Some(PathBuf::from(path)),
+        None => None,
+    }
 }
 
 impl SkillManagerPage {
@@ -273,11 +326,21 @@ impl SkillManagerPage {
         self.error = None;
         self.notice = None;
         let cwd = self.cwd.clone();
-        let context = self.discovery_context(cx);
+        let request = self.discovery_request(cx);
         let generation_sink =
             AppServices::try_global(cx).map(|services| services.skill_generation.clone());
         cx.spawn(async move |this, cx| {
             let (result, fallback, generation) = smol::unblock(move || {
+                let _lifecycle = match request
+                    .data_dir
+                    .as_deref()
+                    .map(monocode_process::harness::lock_skill_account_lifecycle)
+                    .transpose()
+                {
+                    Ok(guard) => guard,
+                    Err(error) => return (Err(error), None, None),
+                };
+                let context = request.resolve();
                 let result = run_operation(&manager, &cwd, &context, operation);
                 let fallback = if result.is_err() {
                     load_snapshot(&manager, &cwd, &context).ok()
@@ -285,8 +348,8 @@ impl SkillManagerPage {
                     None
                 };
                 let generation = match &result {
-                    Ok(result) => result.generation,
-                    Err(_) => manager.generation().ok(),
+                    Ok(result) => Some(result.snapshot.generation),
+                    Err(_) => fallback.as_ref().map(|snapshot| snapshot.generation),
                 };
                 (result, fallback, generation)
             })
@@ -331,33 +394,17 @@ impl SkillManagerPage {
         cx.notify();
     }
 
-    fn discovery_context(&self, cx: &App) -> SkillDiscoveryContext {
-        let mut context = SkillDiscoveryContext {
-            home: Some(self.home.clone()),
-            ..Default::default()
-        };
-        let Some(services) = AppServices::try_global(cx) else {
-            return context;
-        };
-        let store = KvStore(services.kv.clone());
-        let cwd = self.cwd.to_string_lossy();
-        let isolated = cx
-            .try_global::<StartupOptions>()
-            .is_some_and(|options| options.isolated);
-        for provider in [HarnessId::Claude, HarnessId::Codex] {
-            let account = selected_provider_account_id(&store, provider, Some(&cwd));
-            let resolved = monocode_app::skills_runtime::resolve_context(
-                SkillCatalogContext::new(provider, cwd.as_ref()).with_account(account),
-                &services.data_dir.path,
-                &self.home,
-                services.skill_generation.load(Ordering::Acquire),
-                isolated,
-            );
-            for (provider, path) in resolved.provider_homes {
-                context.provider_homes.insert(provider, PathBuf::from(path));
-            }
+    fn discovery_request(&self, cx: &App) -> DiscoveryRequest {
+        let services = AppServices::try_global(cx);
+        DiscoveryRequest {
+            home: self.home.clone(),
+            cwd: self.cwd.clone(),
+            data_dir: services.map(|services| services.data_dir.path.clone()),
+            kv: services.map(|services| services.kv.clone()),
+            isolated: cx
+                .try_global::<StartupOptions>()
+                .is_some_and(|options| options.isolated),
         }
-        context
     }
 
     fn ensure_selection(&mut self) {
@@ -413,16 +460,7 @@ impl SkillManagerPage {
     }
 
     fn selected_source(&self) -> Option<PathBuf> {
-        match &self.selection {
-            Some(Selection::Managed(id)) => self
-                .snapshot
-                .entries
-                .iter()
-                .find(|entry| &entry.id == id)
-                .map(|entry| entry.source_path.join("SKILL.md")),
-            Some(Selection::Existing(path)) => Some(PathBuf::from(path)),
-            None => None,
-        }
+        selected_document_path(&self.snapshot, &self.selection)
     }
 
     fn load_document(&mut self, cx: &mut Context<Self>) {
@@ -984,7 +1022,15 @@ impl SkillManagerPage {
             .gap(u(20.))
             .max_w(u(900.))
             .w_full();
-        let source = self.selected_source();
+        let source = match &self.selection {
+            Some(Selection::Managed(id)) => self
+                .snapshot
+                .entries
+                .iter()
+                .find(|entry| &entry.id == id)
+                .map(|entry| entry.source_path.join("SKILL.md")),
+            _ => self.selected_source(),
+        };
         match &self.selection {
             Some(Selection::Managed(id)) => {
                 if let Some(entry) = self.snapshot.entries.iter().find(|entry| &entry.id == id) {
@@ -1136,7 +1182,11 @@ impl SkillManagerPage {
                         .border_color(theme.colors.stroke)
                         .text_px(theme.text.body)
                         .medium()
-                        .child("Skill instructions"),
+                        .child(if matches!(self.selection, Some(Selection::Managed(_))) {
+                            "Applied skill instructions"
+                        } else {
+                            "Skill instructions"
+                        }),
                 )
                 .child(document.clone());
         }
@@ -1305,7 +1355,7 @@ pub fn page(
         PathBuf::from(cwd)
     };
     let (manager, home) = if let Some(services) = AppServices::try_global(cx) {
-        (Ok(services.skills.clone()), services.skill_home.clone())
+        (services.skills.clone(), services.skill_home.clone())
     } else if let Some(options) = cx.try_global::<StartupOptions>() {
         match &options.skills_home {
             Some(home) => (
@@ -1344,10 +1394,144 @@ mod tests {
 
     struct Fixture(PathBuf);
 
+    impl Fixture {
+        fn new() -> Self {
+            let fixture = Self(
+                std::env::temp_dir().join(format!("monocode-manager-ui-{}", uuid::Uuid::new_v4())),
+            );
+            for name in ["home", "project"] {
+                std::fs::create_dir_all(fixture.0.join(name)).unwrap();
+            }
+            fixture
+        }
+
+        fn manager(&self) -> SkillManager {
+            SkillManager::open(self.0.join("data"), self.0.join("home")).unwrap()
+        }
+
+        fn context(&self) -> SkillDiscoveryContext {
+            SkillDiscoveryContext {
+                home: Some(self.0.join("home")),
+                ..Default::default()
+            }
+        }
+
+        fn source(&self, name: &str, body: &str) -> PathBuf {
+            let source = self.0.join(name);
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(
+                source.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: UI regression fixture.\n---\n\n{body}\n"),
+            )
+            .unwrap();
+            source
+        }
+
+        fn snapshot(&self, manager: &SkillManager) -> Snapshot {
+            load_snapshot(manager, &self.0.join("project"), &self.context()).unwrap()
+        }
+    }
+
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn external_export_edits_remain_conflicts_after_an_earlier_success_report() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let imported = manager
+            .import(fixture.source("external-edit", "Applied instructions."))
+            .unwrap();
+        let claude = imported
+            .report
+            .statuses
+            .iter()
+            .find(|status| status.export.target_key == "claude")
+            .unwrap();
+        assert_eq!(claude.export.state, ExportState::Exported);
+        std::fs::write(claude.export.path.join("SKILL.md"), "An external edit.").unwrap();
+
+        let mut snapshot = fixture.snapshot(&manager);
+        assert_eq!(snapshot.generation, imported.report.generation);
+        merge_pending_details(&mut snapshot, &imported.report);
+        let current = snapshot.entries[0]
+            .statuses
+            .iter()
+            .find(|status| status.target_key == "claude")
+            .unwrap();
+        assert_eq!(current.state, ExportState::Conflict);
+    }
+
+    #[test]
+    fn stale_pending_details_do_not_replace_a_newer_snapshot() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        std::fs::write(fixture.0.join("home/.claude"), "Blocked export root.").unwrap();
+        let mut imported = manager
+            .import(fixture.source("earlier", "Earlier instructions."))
+            .unwrap();
+        imported
+            .report
+            .statuses
+            .iter_mut()
+            .find(|status| status.export.target_key == "claude")
+            .unwrap()
+            .export
+            .detail = "Stale failure from an earlier operation.".into();
+        manager
+            .import(fixture.source("later", "Later instructions."))
+            .unwrap();
+
+        let mut snapshot = fixture.snapshot(&manager);
+        assert!(snapshot.generation > imported.report.generation);
+        merge_pending_details(&mut snapshot, &imported.report);
+        let current = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.id == imported.entry.id)
+            .unwrap()
+            .statuses
+            .iter()
+            .find(|status| status.target_key == "claude")
+            .unwrap();
+        assert_eq!(current.state, ExportState::Pending);
+        assert_ne!(current.detail, "Stale failure from an earlier operation.");
+    }
+
+    #[test]
+    fn preview_reads_the_applied_revision_captured_by_the_snapshot() {
+        let fixture = Fixture::new();
+        let manager = fixture.manager();
+        let imported = manager
+            .import(fixture.source("preview-revision", "Original applied instructions."))
+            .unwrap();
+        let captured = fixture.snapshot(&manager);
+        let selected = Some(Selection::Managed(imported.entry.id.clone()));
+        let captured_path = selected_document_path(&captured, &selected).unwrap();
+        std::fs::write(imported.entry.source_path.join("SKILL.md"), "---\nname: preview-revision\ndescription: Changed instructions.\n---\n\nNew editable instructions.\n").unwrap();
+        assert!(
+            std::fs::read_to_string(&captured_path)
+                .unwrap()
+                .contains("Original applied instructions.")
+        );
+
+        manager.apply(&imported.entry.id).unwrap();
+        let latest = fixture.snapshot(&manager);
+        let latest_path = selected_document_path(&latest, &selected).unwrap();
+        assert_ne!(captured_path, latest_path);
+        assert!(
+            std::fs::read_to_string(&captured_path)
+                .unwrap()
+                .contains("Original applied instructions.")
+        );
+        assert!(
+            std::fs::read_to_string(latest_path)
+                .unwrap()
+                .contains("New editable instructions.")
+        );
     }
 
     #[test]

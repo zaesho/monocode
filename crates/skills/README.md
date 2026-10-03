@@ -10,6 +10,8 @@ All manager calls that change files hold an OS file lock and reload the registry
 
 Supply absolute data and home directories to `SkillManager::open`. Storage lives in the data directory's `skills` folder. Tests use temporary data and home directories. Account exports use explicit resolved `ExportTarget` values and persist in the registry so later Apply and Stop sharing operations cover them.
 
+`snapshot` reads the generation, skill entries, and remembered export targets under one registry lock. The public JSON types use snake_case field names. Export state values are `exported`, `pending`, `conflict`, `disabled`, and `unsupported`. Paths serialize as strings.
+
 The importer accepts at most 4096 files and directories, 64 MiB of content, 32 directory levels, and a 1 MiB `SKILL.md`. It parses complete YAML frontmatter and preserves the source bytes and unknown fields. It reads at most 256 frontmatter fields. Names and descriptions have character limits, optional license and compatibility strings have a 4096 character limit, and unknown values remain unexpanded. Internal symbolic links become copies. External links, cycles, special files, and paths that cannot be represented on supported platforms fail validation.
 
 Run the focused checks with `cargo test -p monocode-skills` and `cargo clippy -p monocode-skills --all-targets -- -D warnings`.

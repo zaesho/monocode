@@ -75,7 +75,9 @@ impl Drop for Fixture {
 }
 
 fn instructions(body: &str) -> String {
-    format!("---\nname: example-skill\ndescription: |\n  A skill with a multiline description.\n  It preserves supporting resources.\nprovider-extension:\n  arbitrary: [one, two]\n---\n{body}\n")
+    format!(
+        "---\nname: example-skill\ndescription: |\n  A skill with a multiline description.\n  It preserves supporting resources.\nprovider-extension:\n  arbitrary: [one, two]\n---\n{body}\n"
+    )
 }
 
 fn change_source(manager: &SkillManager, id: &str, text: &str) {
@@ -84,6 +86,58 @@ fn change_source(manager: &SkillManager, id: &str, text: &str) {
         instructions(text),
     )
     .unwrap();
+}
+
+#[test]
+fn snapshot_reports_the_remembered_plan_and_catalog_with_one_generation() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    let empty = manager.snapshot().unwrap();
+    assert_eq!(empty.generation, 0);
+    assert!(empty.entries.is_empty());
+    assert!(empty.targets.iter().any(|target| target.key == "shared"
+        && target.providers.iter().any(|provider| provider == "droid")));
+
+    let imported = manager.import(&fixture.source).unwrap();
+    let account = ExportTarget::new(
+        "claude-account",
+        fixture.root().join("account/skills"),
+        vec!["claude".into()],
+    );
+    let report = manager.reconcile(std::slice::from_ref(&account)).unwrap();
+    let snapshot = manager.snapshot().unwrap();
+    assert_eq!(snapshot.generation, report.generation);
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].id, imported.entry.id);
+    assert!(snapshot.targets.contains(&account));
+    assert!(snapshot.entries[0]
+        .statuses
+        .iter()
+        .any(|status| status.target_key == account.key && status.state == ExportState::Exported));
+
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(json["entries"][0]["source_path"].is_string());
+    assert!(json["entries"][0]["applied_path"].is_string());
+    assert_eq!(
+        snapshot.entries[0].applied_path,
+        manager.applied_path(&imported.entry.id).unwrap()
+    );
+    assert!(json["entries"][0].get("sourcePath").is_none());
+    assert_eq!(json["entries"][0]["statuses"][0]["state"], "exported");
+    assert_eq!(json["targets"][0]["key"], "shared");
+    assert_eq!(manager.snapshot().unwrap().generation, snapshot.generation);
+
+    let applied = snapshot.entries[0].applied_path.join("SKILL.md");
+    let original_bytes = fs::read(&applied).unwrap();
+    change_source(&manager, &imported.entry.id, "New applied instructions.");
+    manager.apply(&imported.entry.id).unwrap();
+    let newer = manager.snapshot().unwrap();
+    assert!(newer.generation > snapshot.generation);
+    assert_ne!(
+        newer.entries[0].applied_path,
+        snapshot.entries[0].applied_path
+    );
+    assert_eq!(fs::read(applied).unwrap(), original_bytes);
 }
 
 #[test]
@@ -329,7 +383,9 @@ fn large_unknown_yaml_aliases_are_preserved_without_materializing_their_values()
     let aliases = std::iter::repeat_n("*payload", 10_000)
         .collect::<Vec<_>>()
         .join(", ");
-    let text = format!("---\nname: example-skill\ndescription: Bounded metadata parsing\nprovider-text: &payload {payload}\nprovider-copies: [{aliases}]\nmetadata:\n  repeated: [{aliases}]\n---\nInstructions\n");
+    let text = format!(
+        "---\nname: example-skill\ndescription: Bounded metadata parsing\nprovider-text: &payload {payload}\nprovider-copies: [{aliases}]\nmetadata:\n  repeated: [{aliases}]\n---\nInstructions\n"
+    );
     assert!(text.len() < 1024 * 1024);
     fs::write(fixture.source.join("SKILL.md"), &text).unwrap();
     let imported = fixture.manager().import(&fixture.source).unwrap();
@@ -372,7 +428,10 @@ fn unknown_yaml_values_still_require_valid_syntax_and_frontmatter_fields_are_uni
         "---\nname: example-skill\ndescription: Description\nprovider-data: *unknown-anchor\n---\nInstructions\n",
     ] {
         fs::write(fixture.source.join("SKILL.md"), text).unwrap();
-        assert!(matches!(manager.import(&fixture.source), Err(Error::InvalidBundle(_))));
+        assert!(matches!(
+            manager.import(&fixture.source),
+            Err(Error::InvalidBundle(_))
+        ));
     }
     assert!(manager.entries().unwrap().is_empty());
 }
@@ -666,7 +725,7 @@ fn recovery_finishes_interrupted_replace_after_previous_directory_was_moved() {
     let imported = manager.import(&fixture.source).unwrap();
     change_source(&manager, &imported.entry.id, "Recover this revision.");
     let bundle = Bundle::read(&manager.source_path(&imported.entry.id).unwrap(), true).unwrap();
-    manager.snapshot(&bundle).unwrap();
+    manager.store_snapshot(&bundle).unwrap();
     let mut registry = manager.load().unwrap();
     registry.entries[0].digest = bundle.digest.clone();
     registry.entries[0].revision += 1;
@@ -758,7 +817,7 @@ fn recovery_restores_edited_backup_as_visible_conflict_and_preserves_new_stage()
     let imported = manager.import(&fixture.source).unwrap();
     change_source(&manager, &imported.entry.id, "New staged revision.");
     let bundle = Bundle::read(&manager.source_path(&imported.entry.id).unwrap(), true).unwrap();
-    manager.snapshot(&bundle).unwrap();
+    manager.store_snapshot(&bundle).unwrap();
     let mut registry = manager.load().unwrap();
     registry.entries[0].digest = bundle.digest.clone();
     registry.entries[0].revision += 1;

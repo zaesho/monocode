@@ -3,6 +3,7 @@
 //! src-tauri/src/harness.rs.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -54,7 +55,33 @@ pub struct SkillLaunchContext {
 pub type SkillPreparer = Arc<dyn Fn(SkillLaunchContext) -> Result<(), String> + Send + Sync>;
 pub type SkillAccountRetirer = Arc<dyn Fn(PathBuf) -> Result<(), String> + Send + Sync>;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+/// Hold across account discovery, skill updates, and account setup or removal.
+pub struct SkillAccountLifecycle {
+    _file: File,
+}
+
+pub fn lock_skill_account_lifecycle(data_dir: &Path) -> Result<SkillAccountLifecycle, String> {
+    std::fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
+    let data_dir = std::fs::canonicalize(data_dir).map_err(|error| error.to_string())?;
+    let path = data_dir.join("shared-skills-accounts.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("Shared skills account lock must be a regular file".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("Cannot open shared skills account lock: {error}"))?;
+    file.lock()
+        .map_err(|error| format!("Cannot lock shared skills account lifecycle: {error}"))?;
+    Ok(SkillAccountLifecycle { _file: file })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessAccount {
     provider: String,
@@ -110,6 +137,7 @@ struct LiveSse {
 struct HarnessInner {
     children: HashMap<String, Arc<LiveChild>>,
     epochs: HashMap<String, u64>,
+    account_generations: HashMap<HarnessAccount, u64>,
 }
 
 /// Supervises harness children. Clones share one set of children; the last
@@ -149,6 +177,7 @@ impl HarnessHost {
             inner: Mutex::new(HarnessInner {
                 children: HashMap::new(),
                 epochs: HashMap::new(),
+                account_generations: HashMap::new(),
             }),
             sse: Mutex::new(HashMap::new()),
             runtime_binary_paths: Mutex::new(None),
@@ -234,14 +263,49 @@ impl HarnessShared {
         self.lock_inner().children.get(session_id).cloned()
     }
 
-    /// Stamp this spawn and drop any child already registered under the id.
-    fn begin_spawn(&self, session_id: &str) -> (u64, u64, Option<Arc<LiveChild>>) {
+    /// Stamp before account preparation waits so Stop can cancel queued work.
+    fn stamp_spawn(
+        &self,
+        session_id: &str,
+        account: Option<&HarnessAccount>,
+    ) -> (u64, u64, Option<(HarnessAccount, u64)>) {
         let mut inner = self.lock_inner();
         let kill_all = self.kill_all_gen.load(Ordering::SeqCst);
         let epoch = inner.epochs.entry(session_id.to_string()).or_insert(0);
         *epoch += 1;
         let epoch = *epoch;
-        let prev = inner.children.remove(session_id);
+        let account = account.map(|account| {
+            let generation = inner.account_generations.get(account).copied().unwrap_or(0);
+            (account.clone(), generation)
+        });
+        (epoch, kill_all, account)
+    }
+
+    fn start_stamped_spawn(
+        &self,
+        session_id: &str,
+        epoch: u64,
+        kill_all: u64,
+        account: Option<&(HarnessAccount, u64)>,
+    ) -> Result<Option<Arc<LiveChild>>, String> {
+        let mut inner = self.lock_inner();
+        if self.kill_all_gen.load(Ordering::SeqCst) != kill_all
+            || inner.epochs.get(session_id) != Some(&epoch)
+            || account.is_some_and(|(account, generation)| {
+                inner.account_generations.get(account).copied().unwrap_or(0) != *generation
+            })
+        {
+            return Err(SPAWN_CANCELLED.into());
+        }
+        Ok(inner.children.remove(session_id))
+    }
+
+    #[cfg(all(test, unix))]
+    fn begin_spawn(&self, session_id: &str) -> (u64, u64, Option<Arc<LiveChild>>) {
+        let (epoch, kill_all, _) = self.stamp_spawn(session_id, None);
+        let prev = self
+            .start_stamped_spawn(session_id, epoch, kill_all, None)
+            .unwrap();
         (epoch, kill_all, prev)
     }
 
@@ -290,6 +354,11 @@ impl HarnessShared {
     fn kill_account(&self, provider: &str, account_id: &str) {
         let children: Vec<(String, Arc<LiveChild>)> = {
             let mut inner = self.lock_inner();
+            let account = HarnessAccount {
+                provider: provider.into(),
+                id: account_id.into(),
+            };
+            *inner.account_generations.entry(account).or_insert(0) += 1;
             let session_ids: Vec<String> = inner
                 .children
                 .iter()
@@ -899,7 +968,26 @@ pub fn harness_spawn(
     }
 
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
-    let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
+    let (epoch, kill_all, account_stamp) = host.stamp_spawn(&session_id, account.as_ref());
+    let lifecycle = match lock_skill_account_lifecycle(data_dir) {
+        Ok(guard) => Some(guard),
+        Err(error)
+            if account
+                .as_ref()
+                .is_some_and(|account| account.id != DEFAULT_PROVIDER_ACCOUNT_ID) =>
+        {
+            return Err(format!(
+                "Cannot prepare provider account lifecycle: {error}"
+            ));
+        }
+        Err(error) => {
+            eprintln!(
+                "Shared skill exports were not updated: {error}. Open Settings > Skills to repair sharing."
+            );
+            None
+        }
+    };
+    let prev = host.start_stamped_spawn(&session_id, epoch, kill_all, account_stamp.as_ref())?;
     if let Some(prev) = prev {
         terminate(prev.pid);
     }
@@ -914,16 +1002,19 @@ pub fn harness_spawn(
     apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
 
     if host.has_skill_preparer()
+        && lifecycle.is_some()
         && !args
             .iter()
             .any(|arg| arg == "--no-skills" || arg == "--bare")
     {
-        host.prepare_skills(skill_launch_context(
-            &cmd,
-            &workdir,
-            account.as_ref(),
-            binary_provider.as_deref(),
-        )?)?;
+        let preparation =
+            skill_launch_context(&cmd, &workdir, account.as_ref(), binary_provider.as_deref())
+                .and_then(|context| host.prepare_skills(context));
+        if let Err(error) = preparation {
+            eprintln!(
+                "Shared skill exports were not updated: {error}. Open Settings > Skills to repair sharing."
+            );
+        }
     }
 
     crate::control::configure_child(control, &session_id, &mut cmd);
@@ -962,6 +1053,7 @@ pub fn harness_spawn(
         });
         return Err(SPAWN_CANCELLED.to_string());
     }
+    drop(lifecycle);
 
     let stdout_events = host.events.clone();
     let stdout_id = session_id.clone();
@@ -1048,6 +1140,7 @@ pub fn provider_account_remove(
     account_id: String,
 ) -> Result<(), String> {
     let dir = provider_account_path(data_dir, &provider, &account_id)?;
+    let _lifecycle = lock_skill_account_lifecycle(data_dir)?;
     // Validate and retire persisted exports before deleting profile credentials.
     // A later filesystem failure leaves this target retired until another launch.
     host.retire_skill_account(dir.clone())?;
@@ -3169,6 +3262,16 @@ printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
         let sink = seen.clone();
         host.set_skill_preparer(Some(Arc::new(move |context| {
             let root = &context.provider_homes["codex"];
+            let data = root.parent().unwrap().parent().unwrap().parent().unwrap();
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(data.join("shared-skills-accounts.lock"))
+                .unwrap();
+            assert!(
+                lock.try_lock().is_err(),
+                "The process supervisor must hold the lifecycle guard during export preparation"
+            );
             std::fs::create_dir_all(root.join("skills/example")).unwrap();
             std::fs::write(root.join("skills/example/SKILL.md"), "Prepared skill").unwrap();
             sink.lock().unwrap().push(context);
@@ -3197,15 +3300,21 @@ printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
     }
 
     #[test]
-    fn failed_skill_preparation_prevents_provider_launch_and_disable_flags_skip_it() {
+    fn failed_skill_preparation_warns_and_disable_flags_skip_it() {
         let fixture = SkillHookFixture::new();
         let host = HarnessHost::default();
-        host.set_skill_preparer(Some(Arc::new(|_| Err("Cannot read skill registry".into()))));
-        let error = fixture.spawn(&host, Vec::new()).unwrap_err();
-        assert!(error.contains("Cannot read skill registry"));
-        assert!(!fixture.account_path().join("child-root.txt").exists());
-        for flag in ["--no-skills", "--bare"] {
-            fixture.spawn(&host, vec![flag.into()]).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = calls.clone();
+        host.set_skill_preparer(Some(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err("Cannot read skill registry".into())
+        })));
+        for flags in [
+            Vec::new(),
+            vec!["--no-skills".into()],
+            vec!["--bare".into()],
+        ] {
+            fixture.spawn(&host, flags).unwrap();
             for _ in 0..100 {
                 if fixture.account_path().join("child-root.txt").exists() {
                     break;
@@ -3215,6 +3324,29 @@ printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
             assert!(fixture.account_path().join("child-root.txt").exists());
             std::fs::remove_file(fixture.account_path().join("child-root.txt")).unwrap();
         }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_named_account_lifecycle_lock_preserves_the_previous_child() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let current = host.begin_spawn("skill-hook-test");
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(
+            host.install_spawn("skill-hook-test".into(), current.0, current.1, live)
+                .is_none()
+        );
+        std::fs::create_dir(fixture.0.join("shared-skills-accounts.lock")).unwrap();
+        assert!(
+            fixture
+                .spawn(&host, Vec::new())
+                .unwrap_err()
+                .contains("account lock must be a regular file")
+        );
+        assert_eq!(host.get("skill-hook-test").map(|live| live.pid), Some(pid));
+        reap(child);
     }
 
     #[test]
@@ -3405,6 +3537,52 @@ printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
         assert!(host.spawn_stamp_current("s1", epoch, kill_all));
         host.kill_session("s1");
         assert!(!host.spawn_stamp_current("s1", epoch, kill_all));
+    }
+
+    #[test]
+    fn stopped_spawn_waiting_for_account_preparation_preserves_a_newer_child() {
+        let host = HarnessHost::default();
+        let waiting = host.stamp_spawn("s1", None);
+        host.kill_session("s1");
+        let current = host.begin_spawn("s1");
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(
+            host.install_spawn("s1".into(), current.0, current.1, live)
+                .is_none()
+        );
+        assert_eq!(
+            host.start_stamped_spawn("s1", waiting.0, waiting.1, None)
+                .err()
+                .as_deref(),
+            Some(SPAWN_CANCELLED)
+        );
+        assert_eq!(host.get("s1").map(|live| live.pid), Some(pid));
+        reap(child);
+    }
+
+    #[test]
+    fn account_removal_cancels_a_queued_spawn_without_a_live_child() {
+        let host = HarnessHost::default();
+        let account = HarnessAccount {
+            provider: "codex".into(),
+            id: "work".into(),
+        };
+        let waiting = host.stamp_spawn("s1", Some(&account));
+        assert!(host.get("s1").is_none());
+        host.kill_account("codex", "work");
+        assert_eq!(
+            host.start_stamped_spawn("s1", waiting.0, waiting.1, waiting.2.as_ref())
+                .err()
+                .as_deref(),
+            Some(SPAWN_CANCELLED)
+        );
+        assert!(host.get("s1").is_none());
+        let fresh = host.stamp_spawn("s2", Some(&account));
+        assert!(
+            host.start_stamped_spawn("s2", fresh.0, fresh.1, fresh.2.as_ref())
+                .is_ok()
+        );
     }
 
     #[test]

@@ -5,8 +5,31 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use monocode_engine::submit::skills::SkillCatalogContext;
-use monocode_process::harness::{HarnessHost, SkillLaunchContext};
-use monocode_skills::{ExportTarget, SkillManager};
+use monocode_process::harness::{HarnessHost, SkillLaunchContext, lock_skill_account_lifecycle};
+use monocode_skills::{ExportState, ExportTarget, ReconcileReport, SkillManager};
+
+pub fn initialize_manager(
+    data_dir: &Path,
+    home: &Path,
+) -> Result<(Arc<SkillManager>, u64), String> {
+    let _lifecycle = lock_skill_account_lifecycle(data_dir)?;
+    let manager = Arc::new(SkillManager::open(data_dir, home).map_err(|error| error.to_string())?);
+    let report = manager.reconcile(&[]).map_err(|error| error.to_string())?;
+    if let Some(warning) = pending_warning(&report) {
+        log::warn!("Shared skill exports need repair: {warning}");
+    }
+    Ok((manager, report.generation))
+}
+
+fn pending_warning(report: &ReconcileReport) -> Option<String> {
+    let warnings = report
+        .statuses
+        .iter()
+        .filter(|status| status.export.state == ExportState::Pending)
+        .map(|status| format!("{}: {}", status.export.path.display(), status.export.detail))
+        .collect::<Vec<_>>();
+    (!warnings.is_empty()).then(|| warnings.join("; "))
+}
 
 /// Resolve the same account directories the process supervisor uses.
 pub fn resolve_context(
@@ -103,7 +126,10 @@ pub fn install_preparer(
             .reconcile(&account_targets(&context))
             .map_err(|error| error.to_string())?;
         generation.fetch_max(report.generation, Ordering::AcqRel);
-        Ok(())
+        match pending_warning(&report) {
+            Some(warning) => Err(warning),
+            None => Ok(()),
+        }
     })));
 }
 
@@ -111,6 +137,113 @@ pub fn install_preparer(
 mod tests {
     use super::*;
     use monocode_core::HarnessId;
+
+    #[test]
+    fn unavailable_registry_returns_an_error_without_replacing_its_bytes() {
+        let root = std::env::temp_dir().join(format!("mc-skill-startup-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let home = root.join("home");
+        std::fs::create_dir_all(data.join("skills")).unwrap();
+        let registry = data.join("skills/registry.json");
+        std::fs::write(&registry, "Invalid registry").unwrap();
+        assert!(initialize_manager(&data, &home).is_err());
+        assert_eq!(
+            std::fs::read_to_string(registry).unwrap(),
+            "Invalid registry"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preparation_preserves_pending_export_failure_details_as_warnings() {
+        let root = std::env::temp_dir().join(format!("mc-skill-warning-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let home = root.join("home");
+        let (manager, _) = initialize_manager(&data, &home).unwrap();
+        let source = root.join("review");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: review\ndescription: Review files\n---\nReview instructions\n",
+        )
+        .unwrap();
+        manager.import(&source).unwrap();
+        let blocked = home.join(".claude/skills");
+        std::fs::remove_dir_all(&blocked).unwrap();
+        std::fs::write(&blocked, "Preserve this file").unwrap();
+        let report = manager.reconcile(&[]).unwrap();
+        let warning = pending_warning(&report).unwrap();
+        assert!(warning.contains("Cannot prepare export directory:"));
+        assert!(warning.contains(&blocked.to_string_lossy().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(blocked).unwrap(),
+            "Preserve this file"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_guard_orders_captured_target_reconciliation_before_account_removal() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root =
+            std::env::temp_dir().join(format!("mc-skill-lifecycle-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let home = root.join("home");
+        let (manager, _) = initialize_manager(&data, &home).unwrap();
+        let source = root.join("review");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: review\ndescription: Review files\n---\nReview instructions\n",
+        )
+        .unwrap();
+        manager.import(source).unwrap();
+        let profile = data.join("provider-accounts/codex/work");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("auth.json"), "test account artifact").unwrap();
+        let host = HarnessHost::default();
+        install_preparer(&host, manager.clone(), Arc::new(AtomicU64::new(0)), None);
+
+        let lifecycle = lock_skill_account_lifecycle(&data).unwrap();
+        let captured = account_targets(&SkillLaunchContext {
+            provider: Some("codex".into()),
+            provider_homes: [("codex".into(), profile.clone())].into(),
+            ..Default::default()
+        });
+        let removal_data = data.clone();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let removal = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            monocode_process::harness::provider_account_remove(
+                &host,
+                &removal_data,
+                "codex".into(),
+                "work".into(),
+            )
+            .unwrap();
+            done_tx.send(()).unwrap();
+        });
+        attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        manager.reconcile(&captured).unwrap();
+        assert!(profile.join("skills/review/SKILL.md").exists());
+        drop(lifecycle);
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        removal.join().unwrap();
+        assert!(!profile.exists());
+
+        let later = lock_skill_account_lifecycle(&data).unwrap();
+        manager.reconcile(&[]).unwrap();
+        assert!(!profile.exists());
+        drop(later);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn catalog_uses_selected_account_and_isolated_home_without_creating_profiles() {

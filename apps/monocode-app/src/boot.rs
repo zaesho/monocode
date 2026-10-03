@@ -3,9 +3,10 @@
 //! main.tsx wired them. The window and the headless live test both call
 //! [`boot`] and then [`restore_workspace`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::future::BoxFuture;
@@ -83,6 +84,9 @@ pub struct AppServices {
     pub factory: Rc<AppSessionFactory>,
     /// Settings as they were at boot.
     pub settings: AppSettings,
+    pub skills: std::result::Result<Arc<monocode_skills::SkillManager>, String>,
+    pub skill_home: PathBuf,
+    pub skill_generation: Arc<AtomicU64>,
     /// `startHarnessBridge`: the child router keeps its routes while held.
     _bridge: Rc<BridgeLease>,
 }
@@ -174,7 +178,36 @@ fn register_providers(ctx: &HarnessContext, kv: &Kv, data_dir: &Path) {
 
 /// Start the engine on `options.data_dir`. Call once, before any window.
 pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
-    let data_dir = options.data_dir.path.clone();
+    boot_with_skill_home(options, None, cx)
+}
+
+/// Override only skill discovery and exports for an isolated preview.
+pub fn boot_with_skill_home(
+    mut options: BootOptions,
+    skill_home: Option<PathBuf>,
+    cx: &mut App,
+) -> Result<()> {
+    let isolated = skill_home.is_some();
+    if isolated {
+        options.import_webkit = false;
+        options.reap_orphans = false;
+    }
+    if skill_home.as_ref().is_some_and(|home| !home.is_absolute()) {
+        return Err(anyhow!("The skill home directory must be absolute"));
+    }
+    std::fs::create_dir_all(&options.data_dir.path)
+        .context("Could not create the app data directory")?;
+    let data_dir = std::fs::canonicalize(&options.data_dir.path)
+        .context("Could not resolve the app data directory")?;
+    options.data_dir.path = data_dir.clone();
+    let (skills, skill_home, initial_generation) = crate::skills_runtime::initialize_optional_home(
+        &data_dir,
+        skill_home.or_else(|| monocode_platform::dirs_home().map(PathBuf::from)),
+    );
+    if let Err(error) = &skills {
+        log::warn!("Shared skill library is unavailable: {error}");
+    }
+    let skill_generation = Arc::new(AtomicU64::new(initial_generation));
     let kv = open_settings(&data_dir, options.import_webkit)?;
     let settings = monocode_settings::load_app_settings(&kv, Platform::current());
     if options.reap_orphans {
@@ -195,6 +228,20 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
         spawner.clone(),
     );
     let bridge = children.start_harness_bridge();
+    match &skills {
+        Ok(manager) => crate::skills_runtime::install_preparer(
+            &host,
+            manager.clone(),
+            skill_generation.clone(),
+            isolated.then(|| data_dir.clone()),
+        ),
+        Err(error) => {
+            let preparation_error = error.clone();
+            host.set_skill_preparer(Some(Arc::new(move |_| Err(preparation_error.clone()))));
+            let error = error.clone();
+            host.set_skill_account_retirer(Some(Arc::new(move |_| Err(error.clone()))));
+        }
+    }
     let catalog = SharedCatalog::new();
     let registry = HarnessRegistry::new(spawner.clone(), RegistryOptions::default());
     let ctx = HarnessContext::new(registry.clone(), children.clone(), catalog.clone());
@@ -265,6 +312,18 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
 
     // Submit.
     let mut submit = SubmitConfig::new(registry.clone(), catalog.clone(), kv.clone(), spawner);
+    let skill_data = data_dir.clone();
+    let catalog_home = skill_home.clone();
+    let catalog_generation = skill_generation.clone();
+    submit.skill_context = Arc::new(move |context| {
+        crate::skills_runtime::resolve_context(
+            context,
+            &skill_data,
+            &catalog_home,
+            catalog_generation.load(Ordering::Acquire),
+            isolated,
+        )
+    });
     let available = availability.clone();
     submit.is_harness_available = Arc::new(move |id| available.is_harness_available(id));
     Submit::init(submit, cx);
@@ -301,6 +360,9 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
         availability,
         factory,
         settings,
+        skills,
+        skill_home,
+        skill_generation,
         _bridge: Rc::new(bridge),
     });
     Ok(())

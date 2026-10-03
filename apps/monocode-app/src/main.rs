@@ -16,6 +16,7 @@ mod glass;
 mod screenshot;
 mod session_pane;
 mod shell;
+mod skill_manager;
 mod view_data;
 mod views;
 
@@ -67,7 +68,7 @@ fn main() {
         eprintln!("--screenshot needs a build with `--features screenshot`");
         std::process::exit(2);
     }
-    let data_dir = if entry.engine {
+    let data_dir = if entry.engine || entry.name == "skills-manager" {
         match data_dir::resolve(args.data_dir.as_deref()) {
             Ok(dir) => {
                 eprintln!("data dir: {}", dir.path.display());
@@ -86,8 +87,20 @@ fn main() {
         .with_assets(monocode_ui::Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            if let Some(dir) = data_dir.clone()
-                && let Err(err) = boot::boot(BootOptions::app(dir), cx)
+            if let Some(dir) = &data_dir {
+                cx.set_global(skill_manager::StartupOptions {
+                    isolated: args.skills_home.is_some(),
+                    data_dir: dir.path.clone(),
+                    skills_home: args
+                        .skills_home
+                        .clone()
+                        .or_else(|| monocode_platform::dirs_home().map(std::path::PathBuf::from)),
+                });
+            }
+            if entry.engine
+                && let Some(dir) = data_dir.clone()
+                && let Err(err) =
+                    boot::boot_with_skill_home(BootOptions::app(dir), args.skills_home.clone(), cx)
             {
                 eprintln!("could not start: {err:#}");
                 std::process::exit(1);
@@ -112,6 +125,15 @@ fn main() {
             cx.set_global(shell::StartupSession(args.open_session.clone()));
             cx.bind_keys([
                 KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-,"
+                    } else {
+                        "ctrl-,"
+                    },
+                    shell::OpenSettings,
+                    None,
+                ),
                 // `onNew` (⌘T): a new chat in a new tab.
                 KeyBinding::new(
                     if cfg!(target_os = "macos") {

@@ -41,7 +41,7 @@ use crate::file_pane::FilePane;
 use crate::session_pane::SessionPane;
 use crate::view_data::ShellData;
 
-gpui::actions!(shell, [NewSession]);
+gpui::actions!(shell, [NewSession, OpenSettings]);
 
 /// The session sidebar's tabs, `SidebarTabId` in appearance.ts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +136,7 @@ pub struct Shell {
     project_stats: HashMap<String, (i64, i64)>,
     session_panes: HashMap<String, Entity<SessionPane>>,
     file_panes: HashMap<String, Entity<FilePane>>,
+    skill_manager: Option<Entity<crate::skill_manager::SkillManagerPage>>,
     /// The sidebar card under the context menu.
     menu_session: Option<String>,
     open_session: Option<String>,
@@ -173,6 +174,7 @@ impl Shell {
             project_stats: HashMap::new(),
             session_panes: HashMap::new(),
             file_panes: HashMap::new(),
+            skill_manager: None,
             menu_session: None,
             open_session: options.open_session.or_else(|| {
                 cx.try_global::<StartupSession>()
@@ -376,6 +378,7 @@ impl Shell {
 
     /// `onSelectHistorySession`: open a sidebar card's session.
     fn open_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        self.skill_manager = None;
         if let Some(workspace) = &self.workspace {
             workspace
                 .update(cx, |workspace, cx| workspace.open_session(session_id, cx))
@@ -386,6 +389,7 @@ impl Shell {
     /// `onNew`: a new chat with the default model in a new tab, in the
     /// current project.
     fn new_session(&mut self, cx: &mut Context<Self>) {
+        self.skill_manager = None;
         if let Some(workspace) = &self.workspace {
             workspace.update(cx, |workspace, cx| {
                 workspace.new_session_tab(cx);
@@ -395,6 +399,7 @@ impl Shell {
 
     /// The project rail: show the project's open tab, or start a chat in it.
     fn select_project(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.skill_manager = None;
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
@@ -435,6 +440,7 @@ impl Shell {
     }
 
     fn activate_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        self.skill_manager = None;
         if let Some(workspace) = &self.workspace {
             workspace.update(cx, |workspace, cx| workspace.activate_tab(tab_id, None, cx));
         }
@@ -450,6 +456,34 @@ impl Shell {
 
     fn compact_rail_visible(&self) -> bool {
         self.compact_rail && !self.project_rail_open
+    }
+
+    fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.skill_manager.is_some() {
+            self.skill_manager = None;
+            let focused = self
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.read(cx).active_tab())
+                .map(|tab| tab.focused_id.clone());
+            if let Some(pane) = focused.and_then(|id| self.session_panes.get(&id).cloned()) {
+                pane.update(cx, |pane, cx| pane.focus_composer(window, cx));
+            }
+        } else {
+            let cwd = self
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.read(cx).sidebar_cwd(cx))
+                .unwrap_or_default();
+            self.skill_manager = Some(crate::skill_manager::page(
+                &cwd,
+                true,
+                self.project_rail_open || self.compact_rail_visible(),
+                window,
+                cx,
+            ));
+        }
+        cx.notify();
     }
 
     fn toggle_project_rail(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -656,8 +690,7 @@ impl Render for Shell {
         } else {
             None
         };
-        let sidebar = self
-            .session_sidebar_open
+        let sidebar = (self.session_sidebar_open && self.skill_manager.is_none())
             .then(|| self.render_sidebar(&data, window, cx).into_any_element());
         let mut main = div()
             .flex()
@@ -666,11 +699,14 @@ impl Render for Shell {
             .min_w_0()
             .min_h_0()
             .bg(c.body_glass);
-        if !compact_title_bar {
+        if !compact_title_bar && self.skill_manager.is_none() {
             main = main.child(self.render_title_bar(&data, cx));
         }
         let pane = self.render_main_pane(window, cx);
-        let main = main.child(pane).child(self.render_footer(&data, cx));
+        let mut main = main.child(pane);
+        if self.skill_manager.is_none() {
+            main = main.child(self.render_footer(&data, cx));
+        }
         let row = div()
             .flex()
             .flex_1()
@@ -691,6 +727,9 @@ impl Render for Shell {
             .font_family(theme.fonts.sans.clone())
             .line_height(gpui::relative(theme.leading.normal))
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.new_session(cx)))
+            .on_action(
+                cx.listener(|this, _: &OpenSettings, window, cx| this.toggle_settings(window, cx)),
+            )
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
         if compact_title_bar {

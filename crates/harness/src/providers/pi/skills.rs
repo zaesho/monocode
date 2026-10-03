@@ -165,10 +165,11 @@ pub fn omp_commands_from_rpc_data(data: Option<&Value>) -> Result<Vec<NativeComm
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
-            origin: row
-                .get("source")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            origin: command_skill_path(row).or_else(|| {
+                row.get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
             aliases: (!aliases.is_empty()).then_some(aliases),
             input_hint: hint.and_then(Value::as_str).map(str::to_string),
             subcommands: (!subcommands.is_empty()).then_some(subcommands),
@@ -211,13 +212,23 @@ pub fn pi_skills_from_rpc_data(data: Option<&Value>) -> Result<Vec<NativeCommand
                 .to_string(),
             invocation: invocation.clone(),
             source: HarnessId::Pi,
-            origin: None,
+            origin: command_skill_path(command),
             aliases: None,
             input_hint: None,
             subcommands: None,
         });
     }
     Ok(skills)
+}
+
+fn command_skill_path(command: &serde_json::Map<String, Value>) -> Option<String> {
+    if command.get("source").and_then(Value::as_str) != Some("skill") {
+        return None;
+    }
+    let path = command.get("sourceInfo")?.get("path")?.as_str()?;
+    std::path::Path::new(path)
+        .is_absolute()
+        .then(|| path.to_string())
 }
 
 #[cfg(test)]
@@ -304,7 +315,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_skill_paths_without_treating_other_command_sources_as_skills() {
+        let path = std::env::temp_dir()
+            .join("design/SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        let data = json!({ "commands": [
+            { "name": "skill:design", "source": "skill", "sourceInfo": { "path": path } },
+            { "name": "review", "source": "custom", "sourceInfo": { "path": path } }
+        ] });
+        let commands = omp_commands_from_rpc_data(Some(&data)).unwrap();
+        assert_eq!(commands[0].origin, Some(path));
+        assert_eq!(commands[1].origin.as_deref(), Some("custom"));
+    }
+
+    #[test]
     fn keeps_the_first_valid_row_for_each_pi_skill_invocation() {
+        let skill_path = std::env::temp_dir()
+            .join("architect/SKILL.md")
+            .to_string_lossy()
+            .into_owned();
         let data = json!({
             "commands": [
                 { "name": "help", "description": "Help", "source": "builtin" },
@@ -312,7 +342,7 @@ mod tests {
                     "name": "skill:architect",
                     "description": "Design before implementation.",
                     "source": "skill",
-                    "sourceInfo": { "path": "/tmp/architect/SKILL.md" },
+                    "sourceInfo": { "path": skill_path },
                 },
                 { "name": "skill:architect", "description": "Duplicate", "source": "skill" },
                 { "name": "skill:", "source": "skill" },
@@ -326,7 +356,7 @@ mod tests {
                 description: "Design before implementation.".into(),
                 invocation: "skill:architect".into(),
                 source: HarnessId::Pi,
-                origin: None,
+                origin: Some(skill_path),
                 aliases: None,
                 input_hint: None,
                 subcommands: None,

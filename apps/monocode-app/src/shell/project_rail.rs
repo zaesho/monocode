@@ -21,7 +21,7 @@ pub(super) fn rail_action(
     active: bool,
     trailing: Option<AnyElement>,
     theme: &Theme,
-) -> impl IntoElement {
+) -> gpui::Stateful<gpui::Div> {
     let c = theme.colors;
     let (ink, fill) = if active {
         (c.content, Some(c.selection))
@@ -244,14 +244,17 @@ impl Shell {
             .flex_none()
             .gap(gpui::px(1.))
             .p(u(8.))
-            .child(rail_action(
-                "rail-settings",
-                "Settings",
-                IconName::Settings,
-                false,
-                Some(shortcut("⌘,", &theme)),
-                &theme,
-            ));
+            .child(
+                rail_action(
+                    "rail-settings",
+                    "Settings",
+                    IconName::Settings,
+                    self.skill_manager.is_some(),
+                    Some(shortcut("⌘,", &theme)),
+                    &theme,
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
+            );
 
         div()
             .id("project-rail")
@@ -541,13 +544,18 @@ impl Shell {
                     .items_center()
                     .gap(u(4.))
                     .py(u(6.))
-                    .child(action(
-                        "compact-settings",
-                        "Settings (⌘,)",
-                        IconName::Settings,
-                        false,
-                        false,
-                    )),
+                    .child(
+                        action(
+                            "compact-settings",
+                            "Settings (⌘,)",
+                            IconName::Settings,
+                            self.skill_manager.is_some(),
+                            false,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_settings(window, cx)),
+                        ),
+                    ),
             )
     }
 }

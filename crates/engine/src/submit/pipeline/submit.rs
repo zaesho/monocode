@@ -40,7 +40,9 @@ use crate::runtime::engine::Engine;
 use crate::submit::acceptance::{
     ControlOutcome, SubmissionAcceptance, SubmitError, submit_after_project_sync,
 };
-use crate::submit::edit_last_turn::{EditedResendAttempt, create_edited_resend_attempt};
+use crate::submit::edit_last_turn::{
+    EditedResendAttempt, create_edited_resend_attempt, last_user_turn_block,
+};
 use crate::submit::handoff::{
     append_preparing_handoff, handoff_turn_card, is_preparing_handoff, pending_handoff,
 };
@@ -939,6 +941,19 @@ impl Submit {
         edited: Option<Rc<EditedResendAttempt>>,
         cx: &mut Context<Self>,
     ) -> SubmissionAcceptance {
+        let (turn_generation, edited_target) = {
+            let sessions = Engine::sessions(cx);
+            let sessions = sessions.read(cx);
+            (
+                sessions.turn_gen(session_id),
+                edited.as_ref().and_then(|_| {
+                    sessions
+                        .get(session_id)
+                        .and_then(|session| last_user_turn_block(&session.blocks))
+                        .map(|block| block.id.clone())
+                }),
+            )
+        };
         let (sender, acceptance) = SubmissionAcceptance::deferred();
         let id = session_id.to_string();
         let text = text.to_string();
@@ -948,6 +963,20 @@ impl Submit {
             let raw = skills.is_native_command_prompt_in_context(&submitted_text, &context).await;
             let options_for_error = options.clone();
             let retried = this.update(cx, |this, cx| {
+                let still_current = {
+                    let sessions = Engine::sessions(cx);
+                    let sessions = sessions.read(cx);
+                    sessions.turn_gen(&id) == turn_generation
+                        && sessions.get(&id).is_some_and(|session| {
+                            edited_target.as_ref().is_none_or(|target| {
+                                last_user_turn_block(&session.blocks)
+                                    .is_some_and(|block| &block.id == target)
+                            })
+                        })
+                };
+                if !still_current {
+                    return SubmissionAcceptance::Ready(false);
+                }
                 this.submit_with_skill_classification(&id, &text, attachments, options, Some((context, raw)), cx)
             }).unwrap_or(SubmissionAcceptance::Ready(false));
             let result = retried.resolve().await;

@@ -439,8 +439,13 @@ impl SkillSources for ColdFileSkills {
     }
 }
 
-#[gpui::test]
-async fn cold_file_skill_classifies_before_consuming_note_cards(cx: &mut TestAppContext) {
+fn setup_cold_file_scan(
+    cx: &mut TestAppContext,
+) -> (
+    Fixture,
+    Arc<FakeAdapter>,
+    futures::channel::oneshot::Sender<()>,
+) {
     let (release_scan, scan) = futures::channel::oneshot::channel();
     let fixture = setup_with_skill_sources(
         cx,
@@ -454,6 +459,12 @@ async fn cold_file_skill_classifies_before_consuming_note_cards(cx: &mut TestApp
             submit.config.registry.register_harness(omp.clone());
         })
     });
+    (fixture, omp, release_scan)
+}
+
+#[gpui::test]
+async fn cold_file_skill_classifies_before_consuming_note_cards(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
     let mut started = chat("s", HarnessId::Omp);
     started.note_card = Some(monocode_core::notes::NoteComposerCard {
         id: "note".into(),
@@ -491,6 +502,148 @@ async fn cold_file_skill_classifies_before_consuming_note_cards(cx: &mut TestApp
     assert!(sent.contains("Shared review instructions"));
     assert!(sent.contains("Resource directory: /shared/review"));
     assert!(sent.contains("Note instructions"));
+}
+
+#[gpui::test]
+async fn cold_file_skill_stays_cancelled_after_stop(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.note_card = Some(monocode_core::notes::NoteComposerCard {
+        id: "note".into(),
+        slug: "policy".into(),
+        title: "Review policy".into(),
+        source_cwd: None,
+        body: "Note instructions".into(),
+    });
+    insert(started, cx);
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review inspect this",
+                Vec::new(),
+                SubmitOptions::default(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(session("s", cx).blocks.is_empty());
+    cx.update(|cx| {
+        fixture
+            .submit
+            .update(cx, |submit, cx| submit.stop("s", false, cx))
+    });
+    cx.run_until_parked();
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    let stopped = session("s", cx);
+    assert!(stopped.blocks.is_empty());
+    assert_eq!(stopped.note_card.as_ref().unwrap().id, "note");
+    assert!(omp.calls.lock().sends.is_empty());
+    assert!(omp.calls.lock().rewinds.is_empty());
+}
+
+#[gpui::test]
+async fn cold_edited_skill_does_not_replace_a_newer_completed_turn(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.blocks = vec![
+        Block::new("old-user", BlockRole::User, "Original request"),
+        Block::new("old-answer", BlockRole::Assistant, "Original answer"),
+    ];
+    insert(started, cx);
+    let rejected: Rc<RefCell<Vec<EditedResendRejection>>> = Rc::default();
+    let sink = rejected.clone();
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review edited request",
+                Vec::new(),
+                SubmitOptions {
+                    resend_edited: true,
+                    on_resend_rejected: Some(Rc::new(move |rejection, _| {
+                        sink.borrow_mut().push(rejection)
+                    })),
+                    ..SubmitOptions::default()
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(submit(
+        &fixture,
+        "s",
+        "Newer request",
+        SubmitOptions::default(),
+        cx
+    ));
+    let completed = session("s", cx);
+    assert!(!completed.is_busy());
+    let completed_history = texts(&completed);
+    assert!(completed_history.contains(&(BlockRole::User, "Newer request".into())));
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    assert_eq!(texts(&session("s", cx)), completed_history);
+    assert_eq!(omp.calls.lock().sends.len(), 1);
+    assert!(omp.calls.lock().rewinds.is_empty());
+    assert_eq!(rejected.borrow().len(), 1);
+    assert!(!rejected.borrow()[0].provider_rewound);
+}
+
+#[gpui::test]
+async fn cold_edited_skill_keeps_replaced_history_when_turn_generation_is_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.blocks = vec![
+        Block::new("old-user", BlockRole::User, "Original request"),
+        Block::new("old-answer", BlockRole::Assistant, "Original answer"),
+    ];
+    insert(started, cx);
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review edited request",
+                Vec::new(),
+                SubmitOptions {
+                    resend_edited: true,
+                    ..SubmitOptions::default()
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            let generation = sessions.turn_gen("s");
+            sessions.update("s", cx, |session| {
+                session.blocks = vec![
+                    Block::new("replacement-user", BlockRole::User, "Replacement request"),
+                    Block::new(
+                        "replacement-answer",
+                        BlockRole::Assistant,
+                        "Replacement answer",
+                    ),
+                ]
+            });
+            assert_eq!(sessions.turn_gen("s"), generation);
+        })
+    });
+    let replacement_history = texts(&session("s", cx));
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    assert_eq!(texts(&session("s", cx)), replacement_history);
+    assert!(omp.calls.lock().sends.is_empty());
+    assert!(omp.calls.lock().rewinds.is_empty());
 }
 
 #[gpui::test]

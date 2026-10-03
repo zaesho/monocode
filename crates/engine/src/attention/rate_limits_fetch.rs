@@ -561,16 +561,22 @@ impl RateLimitFetcher for NativeRateLimitFetcher {
                     });
                 opencode_from(result, now_ms())
             }),
-            RateLimitProvider::Droid => self.blocking(|| {
-                let result = monocode_integrations::rate_limits::fetch_droid_usage().map(|fetch| {
-                    UsageFetch {
+            RateLimitProvider::Droid => {
+                let binary_path = self.children.as_ref().and_then(|children| {
+                    children.runtime_binary_path(monocode_core::harness::HarnessId::Droid)
+                });
+                self.blocking(move || {
+                    let result = monocode_integrations::rate_limits::fetch_droid_usage_for_binary(
+                        binary_path.as_deref(),
+                    )
+                    .map(|fetch| UsageFetch {
                         status: fetch.status,
                         body: fetch.body,
                         error: fetch.error,
-                    }
-                });
-                droid_from(result, now_ms())
-            }),
+                    });
+                    droid_from(result, now_ms())
+                })
+            }
             RateLimitProvider::Codex => {
                 let request = self.request_codex_account(
                     "account/rateLimits/read",

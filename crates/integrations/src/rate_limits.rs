@@ -397,6 +397,13 @@ struct DroidCredentials {
 /// Fetch Factory Droid 5-hour / weekly / monthly usage via the token the
 /// Droid CLI stores in `~/.factory`. The token never leaves the host process.
 pub fn fetch_droid_usage() -> Result<DroidUsageFetch, String> {
+    fetch_droid_usage_for_binary(None)
+}
+
+pub fn fetch_droid_usage_for_binary(binary_path: Option<&str>) -> Result<DroidUsageFetch, String> {
+    if binary_path.is_some_and(|path| !path.trim().is_empty()) {
+        return Ok(droid_result("unavailable", None, None, Some("Droid usage is unavailable for a configured executable because its account home cannot be determined".into())));
+    }
     fetch_droid_usage_sync()
 }
 
@@ -420,7 +427,18 @@ fn fetch_droid_usage_sync() -> Result<DroidUsageFetch, String> {
             "unavailable",
             None,
             None,
-            Some("Droid not signed in".into()),
+            Some(
+                if factory_dir().is_some_and(|dir| {
+                    ["auth.v2.file", "auth.v2.loginkeychain", "auth.v2.keyring"]
+                        .iter()
+                        .any(|file| dir.join(file).exists())
+                }) {
+                    "Droid credentials could not be read from the current Factory home"
+                } else {
+                    "Droid not signed in"
+                }
+                .into(),
+            ),
         ));
     };
     // Droid rotates its refresh token on use, so refreshing here could
@@ -481,26 +499,47 @@ fn droid_api_base_url(eu: bool) -> String {
 }
 
 fn factory_dir() -> Option<PathBuf> {
-    let home = dirs_home().or_else(|| {
-        std::env::var_os("USERPROFILE").map(|value| value.to_string_lossy().into_owned())
-    })?;
-    Some(PathBuf::from(home).join(".factory"))
+    factory_dir_from(
+        std::env::var_os("FACTORY_HOME_OVERRIDE"),
+        dirs_home(),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+fn factory_dir_from(
+    override_home: Option<std::ffi::OsString>,
+    home: Option<String>,
+    profile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    let base = override_home
+        .filter(|value| !value.is_empty())
+        .or_else(|| home.map(Into::into))
+        .or(profile)?;
+    Some(PathBuf::from(base).join(".factory"))
 }
 
 /// Reads the key that decrypts one Droid credentials file.
 type DroidKeyReader = Box<dyn Fn() -> Option<Vec<u8>>>;
 
-/// Droid writes its credentials to one of two encrypted files: the macOS
-/// Keychain variant (key held by the `security` CLI) or the plain file
-/// variant (key in `auth.v2.key`). The most recently written one wins.
+/// Droid encrypts credentials with a macOS Keychain key, a platform keyring
+/// key, or `auth.v2.key`. The most recently written credentials file wins.
 fn read_droid_credentials() -> Option<DroidCredentials> {
-    let dir = factory_dir()?;
+    read_droid_credentials_from(
+        &factory_dir()?,
+        Box::new(read_droid_keychain_key),
+        Box::new(read_droid_keyring_key),
+    )
+}
+
+fn read_droid_credentials_from(
+    dir: &Path,
+    _keychain: DroidKeyReader,
+    keyring: DroidKeyReader,
+) -> Option<DroidCredentials> {
     let mut sources: Vec<(PathBuf, DroidKeyReader)> = Vec::new();
     #[cfg(target_os = "macos")]
-    sources.push((
-        dir.join("auth.v2.loginkeychain"),
-        Box::new(read_droid_keychain_key),
-    ));
+    sources.push((dir.join("auth.v2.loginkeychain"), _keychain));
+    sources.push((dir.join("auth.v2.keyring"), keyring));
     let key_path = dir.join("auth.v2.key");
     sources.push((
         dir.join("auth.v2.file"),
@@ -514,11 +553,16 @@ fn read_droid_credentials() -> Option<DroidCredentials> {
         })
         .collect();
     existing.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    existing.into_iter().find_map(|(_, path, key)| {
-        let blob = std::fs::read_to_string(&path).ok()?;
-        let plain = decrypt_droid_blob(&blob, &key()?)?;
-        droid_credentials_from_json(&plain)
-    })
+    // A newer unreadable file must not fall back to another account.
+    let (_, path, key) = existing.into_iter().next()?;
+    let blob = std::fs::read_to_string(&path).ok()?;
+    let plain = decrypt_droid_blob(&blob, &key()?)?;
+    droid_credentials_from_json(&plain)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_droid_keychain_key() -> Option<Vec<u8>> {
+    None
 }
 
 #[cfg(target_os = "macos")]
@@ -846,7 +890,7 @@ fn security_run(args: &[String]) -> Option<String> {
     run_with_timeout(&mut cmd, KEYCHAIN_TIMEOUT)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run_with_timeout(cmd: &mut std::process::Command, timeout: Duration) -> Option<String> {
     use std::io::Read;
     use std::time::Instant;
@@ -875,6 +919,70 @@ fn run_with_timeout(cmd: &mut std::process::Command, timeout: Duration) -> Optio
             Ok(None) => std::thread::sleep(Duration::from_millis(40)),
             Err(_) => return None,
         }
+    }
+}
+
+fn read_droid_keyring_key() -> Option<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        decode_droid_key(&security_output(&[
+            "find-generic-password".into(),
+            "-s".into(),
+            "Factory CLI".into(),
+            "-a".into(),
+            "auth-encryption-key".into(),
+            "-w".into(),
+        ])?)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::{Command, Stdio};
+        let mut command = Command::new("secret-tool");
+        command
+            .args([
+                "lookup",
+                "service",
+                "Factory CLI",
+                "account",
+                "auth-encryption-key",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        decode_droid_key(&run_with_timeout(&mut command, Duration::from_secs(3))?)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+        };
+        let target: Vec<u16> = "Factory CLI/auth-encryption-key"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+        // Keytar writes a generic credential with an UTF-8 password blob.
+        unsafe {
+            if CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) == 0 {
+                return None;
+            }
+            let value = &*credential;
+            let key = if value.CredentialBlob.is_null() {
+                None
+            } else {
+                let bytes = std::slice::from_raw_parts(
+                    value.CredentialBlob,
+                    value.CredentialBlobSize as usize,
+                );
+                std::str::from_utf8(bytes).ok().and_then(decode_droid_key)
+            };
+            CredFree(credential.cast());
+            key
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
     }
 }
 
@@ -1018,6 +1126,61 @@ mod tests {
         };
         assert_eq!(read_opencode_go_api_key(), None);
         unsafe { std::env::remove_var("OPENCODE_AUTH_CONTENT") };
+    }
+
+    #[test]
+    fn factory_home_override_is_a_home_root_and_preserves_spaces() {
+        assert_eq!(
+            factory_dir_from(
+                Some("/isolated home ".into()),
+                Some("/desktop".into()),
+                None
+            ),
+            Some(PathBuf::from("/isolated home /.factory"))
+        );
+        assert_eq!(
+            factory_dir_from(Some("".into()), Some("/desktop".into()), None),
+            Some(PathBuf::from("/desktop/.factory"))
+        );
+        assert_eq!(
+            factory_dir_from(None, None, Some("C:/Users/agent".into())),
+            Some(PathBuf::from("C:/Users/agent/.factory"))
+        );
+    }
+
+    #[test]
+    fn wrapper_usage_reports_unknown_identity_before_reading_credentials() {
+        let result = fetch_droid_usage_for_binary(Some("/configured/droid-wrapper")).unwrap();
+        assert_eq!(result.status, "unavailable");
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("account home cannot be determined")
+        );
+    }
+
+    #[test]
+    fn reads_keyring_credentials_with_the_keyring_key() {
+        let dir =
+            std::env::temp_dir().join(format!("monocode-droid-keyring-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = [7u8; 32];
+        let blob = encrypt_droid_blob(
+            r#"{"access_token":"fixture-keyring-token"}"#,
+            &key,
+            &[3u8; 16],
+        );
+        std::fs::write(dir.join("auth.v2.keyring"), blob).unwrap();
+        let creds = read_droid_credentials_from(
+            &dir,
+            Box::new(|| panic!("wrong key source")),
+            Box::new(move || Some(key.to_vec())),
+        )
+        .unwrap();
+        assert_eq!(creds.access_token, "fixture-keyring-token");
+        assert!(read_droid_credentials_from(&dir, Box::new(|| None), Box::new(|| None)).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn encrypt_droid_blob(plain: &str, key: &[u8], iv: &[u8; 16]) -> String {

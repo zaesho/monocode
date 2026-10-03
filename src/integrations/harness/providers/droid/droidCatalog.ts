@@ -1,5 +1,8 @@
 import { homeDir } from "../../../../platform/tauri/fs";
-import { setHarnessModels, type AgentModel } from "../../../../features/sessions/model/models";
+import {
+  setHarnessModels,
+  type AgentModel,
+} from "../../../../features/sessions/model/models";
 import { AcpClient } from "../../core/acp";
 import {
   killChild,
@@ -26,8 +29,8 @@ let inflight: Promise<void> | null = null;
 
 export function refreshDroidCatalog(): Promise<void> {
   if (inflight) return inflight;
-  inflight = probeDroidModels((models) => {
-    if (models.length > 0) setHarnessModels("droid", models);
+  inflight = probeDroidModels((models, complete) => {
+    if (models.length > 0) setHarnessModels("droid", models, complete);
   })
     .catch((error: unknown) => {
       console.debug("[monocode] droid catalog", error);
@@ -56,7 +59,7 @@ export async function discoverDroidModels(
  * model's own effort choices.
  */
 async function probeDroidModels(
-  publish: (models: AgentModel[]) => void,
+  publish: (models: AgentModel[], complete: boolean) => void,
   workingDirectory?: string,
 ): Promise<void> {
   const { path } = await resolveDroidBinary();
@@ -114,12 +117,15 @@ async function probeDroidModels(
           REQUEST_TIMEOUT_MS,
         );
         const models = modelsFromDroidSession(created);
-        publish(models);
+        publish(models, false);
         const sessionId = droidSessionId(created);
         if (!sessionId || models.length === 0) return;
 
         const efforts = new Map<string, DroidConfigOption>();
-        const initial = droidEffortConfig(droidConfigOptionsFrom(created) ?? []);
+        let complete = true;
+        const initial = droidEffortConfig(
+          droidConfigOptionsFrom(created) ?? [],
+        );
         for (const model of models) {
           const nativeId = model.nativeId ?? "";
           if (!nativeId) continue;
@@ -135,15 +141,17 @@ async function probeDroidModels(
               (await settledConfig(() => latestConfig));
             const effort = options ? droidEffortConfig(options) : undefined;
             if (effort) efforts.set(nativeId, effort);
+            if (!options) complete = false;
+            publish(modelsFromDroidSession(created, efforts), false);
           } catch {
-            // Keep the model without effort choices rather than drop it.
+            complete = false;
           }
         }
         if (efforts.size === 0 && initial) {
           const current = models[0]?.nativeId;
           if (current) efforts.set(current, initial);
         }
-        publish(modelsFromDroidSession(created, efforts));
+        publish(modelsFromDroidSession(created, efforts), complete);
       },
       () => {
         void stop();

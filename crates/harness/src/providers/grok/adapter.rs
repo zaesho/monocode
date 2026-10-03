@@ -39,8 +39,8 @@ use super::protocol::{
     AUTH_HELP, GrokSpawnInput, as_record, ask_question_response, ask_questions_from_acp,
     context_window_from_setup, current_model_id, events_from_acp_update, grok_auth_error,
     grok_auth_method_id, grok_effort, grok_prompt_blocks, grok_session_new_params, grok_spawn_args,
-    is_grok_auth_detail, permission_option_id, permission_request_from_acp, pick_auto_option,
-    plan_from_exit_plan, session_id_from_result,
+    is_grok_auth_detail, permission_option_id, permission_outcome, permission_request_from_acp,
+    pick_auto_option, plan_from_exit_plan, session_id_from_result,
 };
 use super::shared::{
     Wiring, ignore_unsupported_control, initialize_params, respond_method_not_found,
@@ -836,7 +836,7 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
             },
             &request.option_ids,
         );
-        return live.acp.respond(id, selected_outcome(&option_id)).await;
+        return live.acp.respond(id, permission_outcome(option_id)).await;
     }
 
     let runtime_mode = live.state.lock().runtime_mode;
@@ -863,7 +863,7 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
     live.acp
         .respond(
             id,
-            selected_outcome(&permission_option_id(decision, &request.option_ids)),
+            permission_outcome(permission_option_id(decision, &request.option_ids)),
         )
         .await
 }

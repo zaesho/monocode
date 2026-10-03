@@ -36,6 +36,8 @@ pub struct Fake {
     pub missing: Vec<HarnessId>,
     /// Next pid for `spawn`. A receiver lets a test hold the spawn open.
     pub pids: Mutex<Option<async_channel::Receiver<u32>>>,
+    pub resolve_gate: Mutex<Option<async_channel::Receiver<()>>>,
+    pub kill_gate: Mutex<Option<async_channel::Receiver<()>>>,
 }
 
 impl Fake {
@@ -66,7 +68,14 @@ impl ChildBackend for Fake {
     }
     fn kill(&self, session_id: String) -> ChildFuture<()> {
         self.record(Call::Kill(session_id));
-        done(())
+        let gate = self.kill_gate.lock().clone();
+        async move {
+            if let Some(gate) = gate {
+                gate.recv().await.map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        }
+        .boxed()
     }
     fn kill_all(&self) -> ChildFuture<()> {
         self.record(Call::KillAll);
@@ -80,14 +89,22 @@ impl ChildBackend for Fake {
         if self.missing.contains(&provider) {
             return async move { Err(format!("{provider} CLI not found")) }.boxed();
         }
-        done(ResolvedHarnessBinary {
+        let gate = self.resolve_gate.lock().clone();
+        let binary = ResolvedHarnessBinary {
             path: self
                 .resolved
                 .get(&provider)
                 .cloned()
                 .unwrap_or_else(|| "/resolved".into()),
             args: None,
-        })
+        };
+        async move {
+            if let Some(gate) = gate {
+                gate.recv().await.map_err(|error| error.to_string())?;
+            }
+            Ok(binary)
+        }
+        .boxed()
     }
     fn resolve_configured(
         &self,

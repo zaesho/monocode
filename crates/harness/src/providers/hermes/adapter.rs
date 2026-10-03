@@ -34,7 +34,8 @@ use crate::core::registry::{AcceptedHook, AdapterCapabilities, EventSink, Harnes
 use crate::core::task::{self, BoxFuture, SharedSpawner};
 use crate::providers::grok::adapter::decided;
 use crate::providers::grok::protocol::{
-    events_from_acp_update, permission_option_id, permission_request_from_acp, pick_auto_option,
+    events_from_acp_update, permission_option_id, permission_outcome, permission_request_from_acp,
+    pick_auto_option,
 };
 use crate::providers::grok::shared::{
     Wiring, initialize_params, respond_method_not_found, selected_outcome, spawn_method_not_found,
@@ -913,7 +914,7 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
             .acp
             .respond(
                 id,
-                selected_outcome(&permission_option_id(decision, &request.option_ids)),
+                permission_outcome(permission_option_id(decision, &request.option_ids)),
             )
             .await;
     }
@@ -942,7 +943,7 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
     live.acp
         .respond(
             id,
-            selected_outcome(&permission_option_id(decision, &request.option_ids)),
+            permission_outcome(permission_option_id(decision, &request.option_ids)),
         )
         .await
 }

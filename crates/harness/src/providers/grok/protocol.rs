@@ -2,6 +2,7 @@
 //! ACP mapping for Grok Build. Droid and Hermes reuse the event, permission,
 //! and option helpers here.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -67,6 +68,7 @@ pub struct GrokPermissionRequest {
     pub call_id: Option<String>,
     pub preview: Option<ToolPreview>,
     pub option_ids: Vec<String>,
+    pub option_kinds: HashMap<String, String>,
 }
 
 /// `askQuestionsFromAcp`.
@@ -252,7 +254,7 @@ pub fn pick_auto_option(
         return None;
     }
     if runtime_mode == RuntimeMode::AutoAcceptEdits
-        && (tool == "execute" || tool == "other" || tool == "fetch")
+        && !matches!(tool.as_str(), "read" | "search" | "edit")
     {
         return None;
     }
@@ -281,7 +283,7 @@ pub fn pick_auto_option(
 }
 
 /// `permissionOptionId`.
-pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -> String {
+pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -> Option<String> {
     if decision == ApprovalDecision::Allow {
         return pick_option(
             option_ids,
@@ -292,8 +294,7 @@ pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -
                 "allow_always",
                 "allow",
             ],
-        )
-        .unwrap_or_else(|| "allow-once".into());
+        );
     }
     pick_option(
         option_ids,
@@ -306,7 +307,6 @@ pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -
             "deny",
         ],
     )
-    .unwrap_or_else(|| "reject-once".into())
 }
 
 /// `permissionRequestFromAcp`.
@@ -391,6 +391,23 @@ pub fn permission_request_from_acp(params: &Value) -> GrokPermissionRequest {
         kind,
         call_id,
         option_ids,
+        option_kinds: rec
+            .and_then(|rec| rec.get("options"))
+            .and_then(Value::as_array)
+            .map(|options| {
+                options
+                    .iter()
+                    .filter_map(|option| {
+                        let id = option
+                            .get("optionId")
+                            .or_else(|| option.get("option_id"))?
+                            .as_str()?;
+                        let kind = option.get("kind")?.as_str()?;
+                        Some((id.to_string(), kind.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -1289,3 +1306,50 @@ pub(crate) fn json_text_string(value: &Value) -> String {
 #[cfg(test)]
 #[path = "protocol_tests.rs"]
 mod tests;
+
+pub fn permission_option_id_with_kinds(
+    decision: ApprovalDecision,
+    ids: &[String],
+    kinds: &HashMap<String, String>,
+) -> Option<String> {
+    let preferred = if decision == ApprovalDecision::Allow {
+        ["allow_once", "allow_always"]
+    } else {
+        ["reject_once", "reject_always"]
+    };
+    for kind in preferred {
+        if let Some(id) = ids
+            .iter()
+            .find(|id| kinds.get(*id).map(String::as_str) == Some(kind))
+        {
+            return Some(id.clone());
+        }
+    }
+    permission_option_id(
+        decision,
+        &ids.iter()
+            .filter(|id| !kinds.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+pub fn pick_auto_option_with_kinds(
+    mode: RuntimeMode,
+    kind: Option<&str>,
+    ids: &[String],
+    kinds: &HashMap<String, String>,
+) -> Option<String> {
+    if mode == RuntimeMode::Supervised
+        || (mode == RuntimeMode::AutoAcceptEdits
+            && !matches!(kind, Some("read" | "search" | "edit")))
+    {
+        return None;
+    }
+    permission_option_id_with_kinds(ApprovalDecision::Allow, ids, kinds)
+}
+pub fn permission_outcome(option: Option<String>) -> Value {
+    match option {
+        Some(option) => json!({ "outcome": { "outcome": "selected", "optionId": option } }),
+        None => json!({ "outcome": { "outcome": "cancelled" } }),
+    }
+}

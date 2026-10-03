@@ -1,5 +1,6 @@
 //! Tauri commands over `monocode_integrations::rate_limits`.
-use tauri::AppHandle;
+use crate::harness::HarnessHost;
+use tauri::{AppHandle, State};
 
 use monocode_integrations::rate_limits::{
     self, ClaudeUsageFetch, DroidUsageFetch, OpencodeGoUsageFetch,
@@ -18,10 +19,13 @@ pub async fn fetch_opencode_go_usage() -> Result<OpencodeGoUsageFetch, String> {
 /// Fetch Factory Droid 5-hour / weekly / monthly usage via the token the
 /// Droid CLI stores in `~/.factory`. The token never leaves the host process.
 #[tauri::command]
-pub async fn fetch_droid_usage() -> Result<DroidUsageFetch, String> {
-    tauri::async_runtime::spawn_blocking(rate_limits::fetch_droid_usage)
-        .await
-        .map_err(|e| e.to_string())?
+pub async fn fetch_droid_usage(host: State<'_, HarnessHost>) -> Result<DroidUsageFetch, String> {
+    let binary_path = host.runtime_binary_path("droid");
+    tauri::async_runtime::spawn_blocking(move || {
+        rate_limits::fetch_droid_usage_for_binary(binary_path.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Fetch Claude Code 5-hour / weekly usage via the local OAuth token.

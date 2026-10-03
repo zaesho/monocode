@@ -1126,6 +1126,9 @@ pub fn resolve_provider_home(path: &Path, cwd: &Path) -> Result<PathBuf, String>
     let mut resolved = PathBuf::new();
     for component in path.components() {
         match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 resolved.pop();
@@ -3064,6 +3067,27 @@ fn command_basename(command: &str) -> &str {
         .file_stem()
         .and_then(|name| name.to_str())
         .unwrap_or(command)
+}
+
+#[cfg(all(test, windows))]
+mod provider_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_verbatim_windows_provider_roots_without_creating_profiles() {
+        let directory =
+            std::env::temp_dir().join(format!("monocode-skill-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let root = std::fs::canonicalize(&directory).unwrap();
+        let profile = root.join("new profile").join("skills");
+        assert_eq!(resolve_provider_home(&profile, &root).unwrap(), profile);
+        assert_eq!(
+            resolve_provider_home(Path::new("new profile/skills"), &root).unwrap(),
+            profile
+        );
+        assert!(!profile.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
 
 #[cfg(unix)]

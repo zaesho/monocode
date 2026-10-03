@@ -1,7 +1,8 @@
 //! Port of src/integrations/harness/core/acp.ts: the ACP JSON-RPC client, a
-//! thin wrapper over [`JsonRpcClient`] that keeps the numeric request ids the
-//! Cursor adapter was written against.
+//! Numeric UI approval ids map back to the original JSON-RPC request ids.
 
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -42,29 +43,17 @@ impl AcpHandlers {
     }
 }
 
-/// `Number(id)` for an inbound request id.
-fn numeric_id(id: &JsonRpcId) -> i64 {
-    match id {
-        JsonRpcId::Number(id) => *id,
-        JsonRpcId::String(text) => {
-            let text = text.trim();
-            if text.is_empty() {
-                return 0;
-            }
-            // TODO(port): `Number("abc")` is NaN in TypeScript, which then
-            // serialized as `null` in a response. This reads it as 0.
-            text.parse::<i64>()
-                .ok()
-                .or_else(|| text.parse::<f64>().ok().map(|value| value as i64))
-                .unwrap_or(0)
-        }
-    }
+#[derive(Default)]
+struct RequestIds {
+    ids: HashMap<i64, JsonRpcId>,
+    next: i64,
 }
 
 /// `AcpClient`. Clones share one connection.
 #[derive(Clone)]
 pub struct AcpClient {
     rpc: JsonRpcClient,
+    request_ids: Arc<Mutex<RequestIds>>,
 }
 
 impl AcpClient {
@@ -85,13 +74,31 @@ impl AcpClient {
         handlers: AcpHandlers,
         options: JsonRpcClientOptions,
     ) -> Self {
+        let request_ids = Arc::new(Mutex::new(RequestIds::default()));
         let mut rpc_handlers = JsonRpcHandlers::default();
         if let Some(on_notification) = handlers.on_notification {
             rpc_handlers.on_notification = Some(on_notification);
         }
         if let Some(on_request) = handlers.on_request {
+            let ids = request_ids.clone();
             rpc_handlers.on_request = Some(Arc::new(move |id: JsonRpcId, method: &str, params| {
-                on_request(numeric_id(&id), method, params)
+                let numeric = {
+                    let mut ids = ids.lock();
+                    let mut numeric = match &id {
+                        JsonRpcId::Number(id) => *id,
+                        JsonRpcId::String(_) => {
+                            ids.next -= 1;
+                            ids.next
+                        }
+                    };
+                    while ids.ids.contains_key(&numeric) {
+                        ids.next -= 1;
+                        numeric = ids.next;
+                    }
+                    ids.ids.insert(numeric, id);
+                    numeric
+                };
+                on_request(numeric, method, params)
             }));
         }
         let rpc = JsonRpcClient::new(
@@ -104,7 +111,7 @@ impl AcpClient {
                 ..options
             },
         );
-        Self { rpc }
+        Self { rpc, request_ids }
     }
 
     /// The underlying client.
@@ -118,6 +125,7 @@ impl AcpClient {
 
     pub fn close(&self, error: Option<&str>) {
         self.rpc.close(error);
+        self.request_ids.lock().ids.clear();
     }
 
     pub fn reject_pending(&self, error: Option<&str>) {
@@ -150,12 +158,20 @@ impl AcpClient {
         self.rpc.notify(method, params).await
     }
 
+    fn raw_id(&self, id: i64) -> JsonRpcId {
+        self.request_ids
+            .lock()
+            .ids
+            .remove(&id)
+            .unwrap_or(JsonRpcId::Number(id))
+    }
+
     pub async fn respond(&self, id: i64, result: Value) -> Result<()> {
-        self.rpc.respond(JsonRpcId::Number(id), result).await
+        self.rpc.respond(self.raw_id(id), result).await
     }
 
     pub async fn respond_error(&self, id: i64, error: RpcErrorBody) -> Result<()> {
-        self.rpc.respond_error(JsonRpcId::Number(id), error).await
+        self.rpc.respond_error(self.raw_id(id), error).await
     }
 }
 
@@ -175,6 +191,44 @@ mod tests {
     }
 
     #[test]
+    fn preserves_raw_id_types_when_internal_approval_ids_collide() {
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let ids = seen.clone();
+        let client = AcpClient::new(
+            "ids",
+            recorder.clone(),
+            AcpHandlers::default().on_request(move |id, _, _| ids.lock().push(id)),
+        );
+        for id in [
+            serde_json::json!("permission-abc"),
+            serde_json::json!(-1),
+            serde_json::json!("12"),
+            serde_json::json!(12),
+        ] {
+            client.push_line(&serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "session/request_permission" }).to_string());
+        }
+        for id in seen.lock().clone() {
+            smol::block_on(client.respond(id, serde_json::json!({}))).unwrap();
+        }
+        let responses: Vec<Value> = recorder
+            .0
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["id"].clone())
+            .collect();
+        assert_eq!(
+            responses,
+            vec![
+                serde_json::json!("permission-abc"),
+                serde_json::json!(-1),
+                serde_json::json!("12"),
+                serde_json::json!(12)
+            ]
+        );
+    }
+
+    #[test]
     fn sends_jsonrpc_and_hands_numeric_request_ids() {
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         let ids = Arc::new(Mutex::new(Vec::new()));
@@ -190,11 +244,11 @@ mod tests {
         assert_eq!(
             *ids.lock(),
             vec![
-                (12, "session/request_permission".to_string()),
+                (-1, "session/request_permission".to_string()),
                 (4, "fs/read_text_file".to_string())
             ]
         );
-        smol::block_on(client.respond(12, serde_json::json!({ "outcome": "allow" }))).unwrap();
+        smol::block_on(client.respond(-1, serde_json::json!({ "outcome": "allow" }))).unwrap();
         smol::block_on(client.notify(
             "session/cancel",
             Some(serde_json::json!({ "sessionId": "x" })),
@@ -203,7 +257,7 @@ mod tests {
         assert_eq!(
             *recorder.0.lock(),
             vec![
-                r#"{"jsonrpc":"2.0","id":12,"result":{"outcome":"allow"}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":"12","result":{"outcome":"allow"}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"x"}}"#
                     .to_string(),
             ]

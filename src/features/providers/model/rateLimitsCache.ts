@@ -3,6 +3,7 @@ import {
   errorRateLimits,
   fetchingRateLimits,
   idleRateLimits,
+  unavailableRateLimits,
   type ProviderRateLimits,
   type RateLimitProvider,
 } from "./rateLimits";
@@ -20,8 +21,14 @@ const queuedRefreshes = new Map<string, Promise<ProviderRateLimits>>();
 const listeners = new Set<() => void>();
 let allSnapshots: Record<string, ProviderRateLimits> = {};
 
-function keyFor(provider: RateLimitProvider, accountId: string): string {
-  return `${provider}:${accountId}`;
+function keyFor(
+  provider: RateLimitProvider,
+  accountId: string,
+  environmentId = "local",
+): string {
+  return environmentId === "local"
+    ? `${provider}:${accountId}`
+    : JSON.stringify([environmentId, provider, accountId]);
 }
 
 function publish(key: string, value: ProviderRateLimits): void {
@@ -42,8 +49,11 @@ export function getAllRateLimits(): Record<string, ProviderRateLimits> {
 export function getCachedRateLimits(
   provider: RateLimitProvider,
   accountId = "default",
+  environmentId = "local",
 ): ProviderRateLimits {
-  return snapshots.get(keyFor(provider, accountId)) ?? idle[provider];
+  return (
+    snapshots.get(keyFor(provider, accountId, environmentId)) ?? idle[provider]
+  );
 }
 
 const idle: Record<RateLimitProvider, ProviderRateLimits> = {
@@ -57,11 +67,12 @@ const idle: Record<RateLimitProvider, ProviderRateLimits> = {
 export function useCachedRateLimits(
   provider: RateLimitProvider,
   accountId = "default",
+  environmentId = "local",
 ): ProviderRateLimits {
   return useSyncExternalStore(
     subscribeRateLimits,
-    () => getCachedRateLimits(provider, accountId),
-    () => getCachedRateLimits(provider, accountId),
+    () => getCachedRateLimits(provider, accountId, environmentId),
+    () => getCachedRateLimits(provider, accountId, environmentId),
   );
 }
 
@@ -69,8 +80,9 @@ export function setCachedRateLimits(
   provider: RateLimitProvider,
   accountId: string,
   value: ProviderRateLimits,
+  environmentId = "local",
 ): void {
-  publish(keyFor(provider, accountId), value);
+  publish(keyFor(provider, accountId, environmentId), value);
 }
 
 /** Fetch an account once per window lifetime, or again on explicit refresh. */
@@ -78,14 +90,17 @@ export function loadRateLimits(
   provider: RateLimitProvider,
   accountId = "default",
   force = false,
+  environmentId = "local",
 ): Promise<ProviderRateLimits> {
-  const key = keyFor(provider, accountId);
+  const key = keyFor(provider, accountId, environmentId);
   const running = pending.get(key);
   if (running) {
     if (!force) return running;
     const queued = queuedRefreshes.get(key);
     if (queued) return queued;
-    const next = running.then(() => loadRateLimits(provider, accountId, true));
+    const next = running.then(() =>
+      loadRateLimits(provider, accountId, true, environmentId),
+    );
     queuedRefreshes.set(key, next);
     void next.finally(() => {
       if (queuedRefreshes.get(key) === next) queuedRefreshes.delete(key);
@@ -98,14 +113,18 @@ export function loadRateLimits(
   publish(key, fetchingRateLimits(provider, cached));
   const run = (async () => {
     try {
-      const result = await fetchProviderRateLimits(provider, accountId);
+      const result = await fetchProviderRateLimits(
+        provider,
+        accountId,
+        environmentId,
+      );
       publish(key, result);
       return result;
     } catch (error) {
       const result = errorRateLimits(
         provider,
         error instanceof Error ? error.message : String(error),
-        getCachedRateLimits(provider, accountId),
+        getCachedRateLimits(provider, accountId, environmentId),
       );
       publish(key, result);
       return result;
@@ -120,7 +139,15 @@ export function loadRateLimits(
 function fetchProviderRateLimits(
   provider: RateLimitProvider,
   accountId: string,
+  environmentId: string,
 ): Promise<ProviderRateLimits> {
+  if (environmentId !== "local")
+    return Promise.resolve(
+      unavailableRateLimits(
+        provider,
+        "Usage is unavailable for remote sessions",
+      ),
+    );
   switch (provider) {
     case "claude":
       return fetchClaudeRateLimits(accountId);
@@ -139,9 +166,10 @@ function fetchProviderRateLimits(
 export function clearCachedRateLimits(
   provider?: RateLimitProvider,
   accountId?: string,
+  environmentId = "local",
 ): void {
   if (provider && accountId) {
-    const key = keyFor(provider, accountId);
+    const key = keyFor(provider, accountId, environmentId);
     snapshots.delete(key);
     const { [key]: _removed, ...rest } = allSnapshots;
     allSnapshots = rest;

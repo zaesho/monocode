@@ -558,6 +558,10 @@ impl Children {
         self.inner.router.unwatch_sse(session_id);
     }
 
+    pub fn runtime_binary_path(&self, provider: HarnessId) -> Option<String> {
+        self.inner.backend.runtime_binary_path(provider)
+    }
+
     fn binary_path_for(&self, provider: HarnessId, choice: &BinaryPathChoice) -> Option<String> {
         match choice {
             BinaryPathChoice::Runtime => self.inner.backend.runtime_binary_path(provider),

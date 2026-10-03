@@ -176,11 +176,11 @@ fn picks_allow_reject_option_ids_from_acp_permission_options() {
             ApprovalDecision::Allow,
             &ids(&["allow_once", "reject_once"])
         ),
-        "allow_once"
+        Some("allow_once".into())
     );
     assert_eq!(
         permission_option_id(ApprovalDecision::Deny, &ids(&["allow-once", "reject-once"])),
-        "reject-once"
+        Some("reject-once".into())
     );
 }
 

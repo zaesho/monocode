@@ -327,7 +327,8 @@ pub fn interjection_chrome(meta: &InterjectionMeta) -> InterjectionChrome {
     }
 }
 
-/// `claude-fable-5-1` as `Fable 5.1`. Other ids show as they are.
+/// `claude-fable-5-1` as `Fable 5.1`, with any date suffix dropped. Other ids
+/// show as they are.
 fn interjection_model_label(model: &str) -> Option<String> {
     let model = model.trim();
     if model.is_empty() {
@@ -338,7 +339,11 @@ fn interjection_model_label(model: &str) -> Option<String> {
     };
     let mut parts = rest.split('-');
     let family = parts.next().filter(|family| !family.is_empty());
-    let version: Vec<&str> = parts.collect();
+    let mut version: Vec<&str> = parts.collect();
+    // Dated snapshots like `claude-haiku-4-5-20251001` name the same model.
+    if version.len() > 1 && version.last().is_some_and(|part| part.len() == 8) {
+        version.pop();
+    }
     let numeric = !version.is_empty()
         && version.len() <= 2
         && version
@@ -599,7 +604,7 @@ mod tests {
         assert_eq!(failed.severity, Some(InterjectionSeverity::Blocker));
         assert_eq!(
             interjection_model_label("claude-opus-4-8-20260101").as_deref(),
-            Some("claude-opus-4-8-20260101")
+            Some("Opus 4.8")
         );
         assert_eq!(interjection_model_label("gpt-5").as_deref(), Some("gpt-5"));
     }

@@ -103,6 +103,7 @@ pub(crate) async fn drive<T>(
 }
 
 /// `preparePrompt` with the prompt hooks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare(
     text: &str,
     harness: HarnessId,

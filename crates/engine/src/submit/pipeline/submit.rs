@@ -1052,42 +1052,6 @@ impl Submit {
     }
 }
 
-#[cfg(test)]
-mod skill_classification_tests {
-    use super::*;
-
-    #[test]
-    fn accepts_only_the_classification_for_the_current_account_and_library_revision() {
-        let context = SkillCatalogContext::new(HarnessId::Omp, "/repo")
-            .with_session("session")
-            .with_account("work")
-            .with_home("/home")
-            .with_provider_home("omp", "/home/.omp")
-            .with_library_generation(3);
-        let file_classification = (context.clone(), false);
-        assert_eq!(
-            matching_skill_classification(&context, Some(&file_classification)),
-            Ok(Some(false))
-        );
-        assert_eq!(
-            matching_skill_classification(&context, Some(&(context.clone(), true))),
-            Ok(Some(true))
-        );
-        for changed in [
-            context.clone().with_library_generation(4),
-            context.clone().with_account("personal"),
-            context.clone().with_provider_home("omp", "/other/.omp"),
-            context.clone().with_session("other-session"),
-        ] {
-            assert_eq!(
-                matching_skill_classification(&changed, Some(&file_classification)),
-                Err(())
-            );
-        }
-        assert_eq!(matching_skill_classification(&context, None), Ok(None));
-    }
-}
-
 /// Everything the busy branch needs.
 struct FollowUp<'a> {
     session_id: &'a str,
@@ -1227,5 +1191,41 @@ impl CommitTurn {
             &self.visible,
             Some(&self.cards),
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_classification_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_classification_for_the_current_account_and_library_revision() {
+        let context = SkillCatalogContext::new(HarnessId::Omp, "/repo")
+            .with_session("session")
+            .with_account("work")
+            .with_home("/home")
+            .with_provider_home("omp", "/home/.omp")
+            .with_library_generation(3);
+        let file_classification = (context.clone(), false);
+        assert_eq!(
+            matching_skill_classification(&context, Some(&file_classification)),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            matching_skill_classification(&context, Some(&(context.clone(), true))),
+            Ok(Some(true))
+        );
+        for changed in [
+            context.clone().with_library_generation(4),
+            context.clone().with_account("personal"),
+            context.clone().with_provider_home("omp", "/other/.omp"),
+            context.clone().with_session("other-session"),
+        ] {
+            assert_eq!(
+                matching_skill_classification(&changed, Some(&file_classification)),
+                Err(())
+            );
+        }
+        assert_eq!(matching_skill_classification(&context, None), Ok(None));
     }
 }

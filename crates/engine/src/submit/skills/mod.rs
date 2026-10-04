@@ -1000,9 +1000,7 @@ fn leading_native_command(text: &str) -> bool {
 
 fn leading_command_name(text: &str) -> Option<&str> {
     let trimmed = text.trim_start_matches(js::is_space);
-    let Some(rest) = trimmed.strip_prefix('/') else {
-        return None;
-    };
+    let rest = trimmed.strip_prefix('/')?;
     let end = rest
         .char_indices()
         .find(|(_, c)| js::is_space(*c) || *c == '/' || *c == '\\')

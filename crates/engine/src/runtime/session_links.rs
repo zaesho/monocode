@@ -121,6 +121,8 @@ impl SessionLinks {
         let before = self.links.len();
         self.links.retain(|entry| entry != &key);
         self.sent.remove(&key);
+        // A refund still in flight belongs to this link, not a later relink.
+        *self.epochs.entry(key).or_insert(0) += 1;
         if self.links.len() != before {
             self.persist(a, b, false, cx);
             cx.notify();
@@ -278,6 +280,23 @@ mod tests {
             }
             links.refund("a", "b", stale.epoch);
             assert_eq!(links.sent("a", "b"), LINK_MESSAGE_BUDGET);
+            assert!(links.spend("a", "b").is_err());
+        });
+    }
+
+    #[gpui::test]
+    fn a_refund_from_an_earlier_link_leaves_a_relink_alone(cx: &mut TestAppContext) {
+        init(cx);
+        let links = cx.update(|cx| Engine::global(cx).links.clone());
+        links.update(cx, |links, cx| {
+            links.link("a", "b", cx).unwrap();
+            let stale = links.spend("a", "b").unwrap();
+            links.unlink("a", "b", cx);
+            links.link("a", "b", cx).unwrap();
+            for _ in 0..LINK_MESSAGE_BUDGET {
+                links.spend("a", "b").unwrap();
+            }
+            links.refund("a", "b", stale.epoch);
             assert!(links.spend("a", "b").is_err());
         });
     }

@@ -20,7 +20,7 @@ use monocode_ui::{IconName, Theme, file_type_icon, folder_type_icon, icon, u};
 
 use super::super::model::chat_context::{
     ChatContextItem, DiffLineChange, chat_context_key, context_excerpt, context_file_name,
-    line_range,
+    line_range, session_label,
 };
 use super::Composer;
 use crate::pickers::anchor::{Side, anchored_popover};
@@ -85,6 +85,10 @@ fn chip_label(item: &ChatContextItem) -> ChipLabel {
                 context_excerpt(comment)
             ),
         },
+        ChatContextItem::Session { id, title } => ChipLabel {
+            action: "Session context",
+            full: format!("{} ({id})", session_label(title)),
+        },
     }
 }
 
@@ -116,6 +120,10 @@ fn chip_icon(item: &ChatContextItem, theme: &Theme) -> AnyElement {
             .text_color(theme.content(0.45))
             .into_any_element(),
         ChatContextItem::Comment { .. } => icon(IconName::MessageSquare)
+            .size(u(14.))
+            .text_color(theme.content(0.45))
+            .into_any_element(),
+        ChatContextItem::Session { .. } => icon(IconName::Chatting)
             .size(u(14.))
             .text_color(theme.content(0.45))
             .into_any_element(),
@@ -170,6 +178,9 @@ fn chip_body(item: &ChatContextItem, theme: &Theme) -> Vec<AnyElement> {
                     .into_any_element(),
             );
             out
+        }
+        ChatContextItem::Session { title, .. } => {
+            vec![truncated(session_label(title), 224.).into_any_element()]
         }
     }
 }
@@ -292,6 +303,25 @@ fn chat_context_preview(item: &ChatContextItem, openable: bool, theme: &Theme) -
                 )
                 .into_any_element()
         }
+        ChatContextItem::Session { id, title } => div()
+            .child(header(session_label(title)))
+            .child(
+                div()
+                    .mt(u(6.))
+                    .text_px(12.)
+                    .line_height(u(20.))
+                    .text_color(theme.content(0.70))
+                    .child("A recap of this session's user and assistant messages goes with your message."),
+            )
+            .child(
+                div()
+                    .mt(u(6.))
+                    .font_family(theme.fonts.mono.clone())
+                    .text_px(11.)
+                    .text_color(theme.content(0.40))
+                    .child(id.clone()),
+            )
+            .into_any_element(),
     }
 }
 

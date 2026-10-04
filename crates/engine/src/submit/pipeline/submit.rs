@@ -37,9 +37,11 @@ use super::session_edits::{apply_user_turn_fields, with_plan_build_target};
 use super::turn::{TurnRun, Wrap, run_turn};
 use super::{Submit, SubmitOptions, settle};
 use crate::runtime::engine::Engine;
+use crate::runtime::session_links::is_link_message;
 use crate::submit::acceptance::{
     ControlOutcome, SubmissionAcceptance, SubmitError, submit_after_project_sync,
 };
+use crate::submit::app_access::TurnAppAccess;
 use crate::submit::edit_last_turn::{EditedResendAttempt, create_edited_resend_attempt};
 use crate::submit::handoff::{
     append_preparing_handoff, handoff_turn_card, is_preparing_handoff, pending_handoff,
@@ -141,6 +143,12 @@ impl Submit {
         }
         if self.edited_resends.is_active(session_id) {
             return SubmissionAcceptance::Ready(false);
+        }
+        // A message the user wrote resets the agent message budget of every
+        // link this session has. Agent calls carry a request id, and a link
+        // message keeps its header when it leaves the queue.
+        if options.app_request_id.is_none() && !is_link_message(text) {
+            Engine::links(cx).update(cx, |links, _| links.reset_budget(session_id));
         }
         if let Some(error) = peers
             .orchestration
@@ -536,6 +544,19 @@ impl Submit {
             });
         }
 
+        // Decided here, after every early return, so a note counts as sent
+        // only when a turn really starts.
+        let app_access = self.turn_app_access(&current, operator_access, cx);
+        let app_note = app_access.note();
+        let app_note = if self.app_notes.get(session_id) == app_note.as_ref() {
+            None
+        } else {
+            match &app_note {
+                Some(note) => self.app_notes.insert(session_id.to_string(), note.clone()),
+                None => self.app_notes.remove(session_id),
+            };
+            app_note
+        };
         let run = TurnRun {
             session_id: session_id.to_string(),
             generation,
@@ -548,6 +569,8 @@ impl Submit {
             raw_command,
             operator_matched: operator.matched,
             operator_access,
+            app_access,
+            app_note,
             provider_account_id,
             initial_work_cwd,
             create_draft_worktree,
@@ -580,6 +603,31 @@ impl Submit {
         cx.spawn(async move |this, cx| run_turn(this, run, cx).await)
             .detach();
         SubmissionAcceptance::Ready(true)
+    }
+
+    /// What this turn's agent may do with the app CLI.
+    fn turn_app_access(&self, current: &Session, operator: bool, cx: &App) -> TurnAppAccess {
+        let sessions = Engine::sessions(cx);
+        let sessions = sessions.read(cx);
+        let peers = Engine::links(cx)
+            .read(cx)
+            .peers(&current.id, cx)
+            .into_iter()
+            .map(|id| {
+                let title = sessions
+                    .get(&id)
+                    .map(|peer| peer.title.clone())
+                    .unwrap_or_default();
+                (id, title)
+            })
+            .collect();
+        TurnAppAccess::for_session(
+            current,
+            operator,
+            monocode_settings::settings_store::load_agent_sessions_enabled(&self.config.kv),
+            monocode_settings::settings_store::load_agent_sessions_review(&self.config.kv),
+            peers,
+        )
     }
 
     /// The busy branch of `submitSession`: queue the message, or hand it to

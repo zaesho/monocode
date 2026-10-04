@@ -26,7 +26,8 @@ use crate::history::session_folders::{
     SessionFolderTarget, load_session_folders, place_session_in_folder, save_session_folders,
 };
 use crate::projects::recents::looks_like_project;
-use crate::submit::operator_command::consume_operator_command;
+use crate::runtime::session_links::link_message_text;
+use crate::submit::operator_command::{consume_operator_command, operator_enabled_in_thread};
 
 /// `AppSessionListing`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -82,6 +83,22 @@ pub struct DraftResult {
     pub draft: bool,
 }
 
+/// `host.send_linked`'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedSendResult {
+    /// The peer was busy, so the message waits in its queue.
+    pub queued: bool,
+    pub already_submitted: bool,
+}
+
+/// A session linked to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedPeer {
+    pub id: String,
+    /// Agent messages the link still allows before a user message.
+    pub messages_left: u32,
+}
+
 /// `AgentAppHost`, plus the module state agentApp.ts read directly: the
 /// model catalog, harness availability, the preferred model, and the settings
 /// store that holds session folders.
@@ -129,9 +146,99 @@ pub trait AgentAppHost {
     fn preferred_model_id(&self, harness: HarnessId, cx: &App) -> String;
     /// The settings store behind `loadSessionFolders` and `saveSessionFolders`.
     fn kv(&self) -> Kv;
+    /// The "Let agents open sessions" setting.
+    fn agent_sessions_enabled(&self, cx: &App) -> bool;
+    /// The "Review agent-opened sessions before they run" setting.
+    fn agent_sessions_review(&self, cx: &App) -> bool;
+    /// The sessions linked to `id`.
+    fn linked_peers(&self, id: &str, cx: &App) -> Vec<LinkedPeer>;
+    /// A linked session in any project. Callers check the link first.
+    fn peer_session(&self, id: &str, cx: &mut App) -> Task<Result<Option<Session>, String>>;
+    /// Count one agent message from `from` to `to`, or fail past the link's
+    /// budget. Returns the messages left.
+    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<u32, String>;
+    /// Give back a counted message that was not delivered.
+    fn refund_link_message(&self, from: &str, to: &str, cx: &mut App);
+    /// Deliver `text` to a linked session. A busy session queues it and runs
+    /// it when its current turn ends.
+    fn send_linked(
+        &self,
+        id: &str,
+        text: &str,
+        request_id: &str,
+        cx: &mut App,
+    ) -> Task<Result<LinkedSendResult, String>>;
 }
 
-const FIELDS: [(&str, &[&str]); 13] = [
+/// What the calling thread may do with the app CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppAccess {
+    /// A `/operator` turn enabled every action in this thread.
+    pub operator: bool,
+    /// "Let agents open sessions": `sessions.list` and `sessions.start`.
+    pub open_sessions: bool,
+    /// "Review agent-opened sessions before they run": a `sessions.start`
+    /// without `/operator` always saves a draft.
+    pub review_opened: bool,
+    /// The session has linked peers: `links.*`.
+    pub links: bool,
+}
+
+/// Actions every thread gets when "Let agents open sessions" is on.
+pub const OPEN_SESSION_ACTIONS: [&str; 2] = ["sessions.list", "sessions.start"];
+/// Actions a session with linked peers gets.
+pub const LINK_ACTIONS: [&str; 3] = ["links.list", "links.read", "links.send"];
+/// `sessions.start` fields that need `/operator`: they change permissions or
+/// the checkout.
+const OPERATOR_START_FIELDS: [&str; 4] = [
+    "runtimeMode",
+    "workspaceMode",
+    "worktreeBase",
+    "worktreeCwd",
+];
+
+impl AppAccess {
+    /// The access of `source`'s thread, from its transcript, the settings,
+    /// and its links.
+    pub fn of(source: &Session, host: &dyn AgentAppHost, cx: &App) -> Self {
+        Self {
+            operator: operator_enabled_in_thread(&source.blocks),
+            open_sessions: host.agent_sessions_enabled(cx),
+            review_opened: host.agent_sessions_review(cx),
+            links: !host.linked_peers(&source.id, cx).is_empty(),
+        }
+    }
+
+    /// Whether any action is available.
+    pub fn any(&self) -> bool {
+        self.operator || self.open_sessions || self.links
+    }
+
+    pub fn allows(&self, action: &str) -> bool {
+        if LINK_ACTIONS.contains(&action) {
+            self.links
+        } else if OPEN_SESSION_ACTIONS.contains(&action) {
+            self.operator || self.open_sessions
+        } else {
+            self.operator
+        }
+    }
+
+    /// Why `action` is refused.
+    fn denied(&self, action: &str) -> String {
+        if LINK_ACTIONS.contains(&action) {
+            "This session has no linked sessions. The user can link one by dropping a session on the composer and choosing Link sessions.".into()
+        } else if OPEN_SESSION_ACTIONS.contains(&action) {
+            format!(
+                "{action} is off. The user can turn on Let agents open sessions in Settings, or use /operator in this thread."
+            )
+        } else {
+            format!("{action} needs /operator in this thread.")
+        }
+    }
+}
+
+const FIELDS: [(&str, &[&str]); 16] = [
     ("models.list", &[]),
     ("sessions.list", &[]),
     (
@@ -165,6 +272,9 @@ const FIELDS: [(&str, &[&str]); 13] = [
     ("notes.list", &["limit", "offset"]),
     ("notes.read", &["id"]),
     ("notes.write", &["id", "title", "body", "tags"]),
+    ("links.list", &[]),
+    ("links.read", &["sessionId", "before", "limit", "maxChars"]),
+    ("links.send", &["sessionId", "prompt"]),
 ];
 
 fn fields(action: &str, input: &Map<String, Value>) -> Result<(), String> {
@@ -446,6 +556,10 @@ pub async fn handle_agent_app(
     cx: &mut AsyncApp,
 ) -> Result<Value, String> {
     fields(action, input)?;
+    let access = cx.update(|cx| AppAccess::of(source, host, cx));
+    if !access.allows(action) {
+        return Err(access.denied(action));
+    }
     match action {
         "models.list" => Ok(cx.update(|cx| {
             let catalog = host.catalog(cx);
@@ -530,7 +644,18 @@ pub async fn handle_agent_app(
                     "request ID must use letters, digits, underscores or hyphens".into(),
                 );
             }
+            if !access.operator
+                && let Some(field) = OPERATOR_START_FIELDS
+                    .iter()
+                    .find(|field| input.contains_key(**field))
+            {
+                return Err(format!("sessions.start {field} needs /operator in this thread"));
+            }
             let mut launch = cx.update(|cx| start_launch(source, input, host, cx))?;
+            if !access.operator && access.review_opened {
+                // The user reads the prompt and sends it.
+                launch.draft = Some(true);
+            }
             if input.get("worktreeCwd").is_some() {
                 let listed = cx.update(|cx| host.worktrees(&launch.cwd, cx)).await?;
                 let wanted = launch.worktree_cwd.clone().unwrap_or_default();
@@ -735,6 +860,93 @@ pub async fn handle_agent_app(
             };
             Ok(json_value(cx.update(|cx| host.save_note(upsert, cx)).await?))
         }
+        "links.list" => {
+            let peers = cx.update(|cx| host.linked_peers(&source.id, cx));
+            let mut sessions = Vec::new();
+            for peer in peers {
+                let Some(session) = cx.update(|cx| host.peer_session(&peer.id, cx)).await? else {
+                    continue;
+                };
+                sessions.push(json!({
+                    "id": session.id,
+                    "title": session.title,
+                    "harness": session.harness,
+                    "model": session.model,
+                    "busy": session.is_busy(),
+                    "messagesLeft": peer.messages_left,
+                }));
+            }
+            Ok(json!({ "sessions": sessions }))
+        }
+        "links.read" => {
+            let id = required_string(input.get("sessionId"), "sessionId", 256)?;
+            let target = linked_session(source, &id, host, cx).await?;
+            let before = optional_string(input.get("before"), "before", 256)?;
+            let page = session_conversation_page(
+                &target,
+                SessionReadOptions {
+                    before: before.as_deref(),
+                    limit: input.get("limit"),
+                    max_chars: input.get("maxChars"),
+                },
+            )?;
+            Ok(json_value(page))
+        }
+        "links.send" => {
+            let id = required_string(input.get("sessionId"), "sessionId", 256)?;
+            let prompt = agent_prompt(input.get("prompt"))?;
+            if !REQUEST_ID.is_match(request_id) {
+                return Err("Invalid request ID".into());
+            }
+            linked_session(source, &id, host, cx).await?;
+            let left = cx.update(|cx| host.spend_link_message(&source.id, &id, cx))?;
+            let text = link_message_text(&source.id, &source.title, &prompt);
+            let key = format!("link-{}-{request_id}", source.id);
+            match cx
+                .update(|cx| host.send_linked(&id, &text, &key, cx))
+                .await
+            {
+                Ok(result) => {
+                    if result.already_submitted {
+                        cx.update(|cx| host.refund_link_message(&source.id, &id, cx));
+                    }
+                    Ok(json!({
+                        "sessionId": id,
+                        "submitted": !result.queued,
+                        "queued": result.queued,
+                        "alreadySubmitted": result.already_submitted,
+                        "messagesLeft": if result.already_submitted { left + 1 } else { left },
+                    }))
+                }
+                Err(error) => {
+                    cx.update(|cx| host.refund_link_message(&source.id, &id, cx));
+                    Err(error)
+                }
+            }
+        }
         _ => Err(format!("Unknown app action: {action}")),
     }
+}
+
+/// A session linked to `source`, in any project.
+async fn linked_session(
+    source: &Session,
+    id: &str,
+    host: &dyn AgentAppHost,
+    cx: &mut AsyncApp,
+) -> Result<Session, String> {
+    if id == source.id {
+        return Err("Use the current conversation to continue this session".into());
+    }
+    let linked = cx.update(|cx| {
+        host.linked_peers(&source.id, cx)
+            .iter()
+            .any(|peer| peer.id == id)
+    });
+    if !linked {
+        return Err("That session is not linked to this one; run links.list".into());
+    }
+    cx.update(|cx| host.peer_session(id, cx))
+        .await?
+        .ok_or_else(|| "The linked session was not found".into())
 }

@@ -60,6 +60,18 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn set_workspace_snapshot(&self, snapshot: Value) -> StoreFuture<()>;
     /// `workspace_get_snapshot`.
     fn workspace_snapshot(&self) -> StoreFuture<Option<Value>>;
+    /// Every link between two sessions, each pair once.
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>>;
+    /// Add (`linked`) or remove the link between two sessions.
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()>;
+    /// Save a portable transcript snapshot of `session_id` as `name` and
+    /// return its absolute path, for an agent's file tools to read.
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String>;
     /// `claude_shell_commands`: Bash commands by tool-use id, read from
     /// Claude's own transcript.
     fn claude_shell_commands(
@@ -102,6 +114,23 @@ pub trait CheckpointBackend: Send + Sync + 'static {
         cwd: String,
         relative: Option<String>,
     ) -> StoreFuture<CheckpointStatus>;
+}
+
+/// Write `<dir>/<session_id>/<name>.md`. Both parts must be plain ids so
+/// the file stays inside `dir`.
+pub fn write_context_snapshot(
+    dir: &std::path::Path,
+    session_id: &str,
+    name: &str,
+    text: &str,
+) -> Result<String, String> {
+    session_store::validate_id(session_id, "session")?;
+    session_store::validate_id(name, "snapshot")?;
+    let folder = dir.join(session_id);
+    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    let path = folder.join(format!("{name}.md"));
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Store change notices with nobody listening.
@@ -260,6 +289,26 @@ impl SessionBackend for StoreBackend {
 
     fn workspace_snapshot(&self) -> StoreFuture<Option<Value>> {
         self.run(session_store::workspace_get_snapshot)
+    }
+
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>> {
+        self.run(monocode_store::session_links::session_list_links)
+    }
+
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()> {
+        self.run(move |store| monocode_store::session_links::session_set_link(store, a, b, linked))
+    }
+
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String> {
+        let dir = self.data_dir.join("context-snapshots");
+        self.executor
+            .spawn(async move { write_context_snapshot(&dir, &session_id, &name, &text) })
+            .boxed()
     }
 
     fn claude_shell_commands(

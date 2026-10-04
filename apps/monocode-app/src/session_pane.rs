@@ -600,7 +600,7 @@ impl SessionPane {
         &mut self,
         _: &Entity<Composer>,
         event: &ComposerEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let id = self.session_id.clone();
@@ -677,6 +677,45 @@ impl SessionPane {
                 });
             }
             ComposerEvent::InsertRequestConsumed(_) => {}
+            ComposerEvent::SessionDragOver => {
+                crate::panes::workspace_area(window, cx)
+                    .update(cx, |area, cx| area.hide_external_drop(cx));
+            }
+            ComposerEvent::SessionDropped => {
+                let position = window.mouse_position();
+                crate::panes::workspace_area(window, cx)
+                    .update(cx, |area, cx| area.end_external_drag(position, cx));
+            }
+            ComposerEvent::ForwardDrop(source) => {
+                let (source, position) = (source.clone(), window.mouse_position());
+                crate::panes::workspace_area(window, cx)
+                    .update(cx, |area, cx| area.drop_external(source, position, cx));
+            }
+            ComposerEvent::AddSessionContext(source) => {
+                let loading = crate::session_links::session_title(source, cx);
+                let (source, composer) = (source.clone(), self.composer.downgrade());
+                cx.spawn(async move |_, cx| {
+                    let title = loading.await;
+                    composer
+                        .update(cx, |composer, cx| {
+                            composer.add_context_item(
+                                monocode_view_composer::composer::model::chat_context::ChatContextItem::Session {
+                                    id: source,
+                                    title,
+                                },
+                                cx,
+                            )
+                        })
+                        .ok();
+                })
+                .detach();
+            }
+            ComposerEvent::LinkSession(peer) => {
+                let linked = Engine::links(cx).update(cx, |links, cx| links.link(&id, peer, cx));
+                if let Err(error) = linked {
+                    monocode_app::bridge::dialogs::alert(&error, true, cx);
+                }
+            }
         }
     }
 

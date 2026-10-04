@@ -8,6 +8,7 @@
 pub mod appearance;
 pub mod assets;
 pub mod color;
+pub mod drag;
 pub mod file_icons;
 pub mod icons;
 pub mod styled;

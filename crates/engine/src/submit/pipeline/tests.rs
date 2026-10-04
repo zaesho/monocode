@@ -302,6 +302,9 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
     registry.register_harness(codex.clone());
     registry.register_harness(fx.clone());
     let kv = Kv::in_memory();
+    // Most tests compare the exact text a turn sends. The tests for agent
+    // session access turn the setting back on.
+    monocode_settings::settings_store::save_agent_sessions_enabled(&kv, false);
     let mut config = SubmitConfig::new(registry, SharedCatalog::new(), kv.clone(), spawner);
     config.skill_sources = Arc::new(NoSkills);
     config.app_cli_path =
@@ -607,6 +610,123 @@ async fn operator_turns_get_app_access_and_cli_instructions(cx: &mut TestAppCont
     );
     assert_eq!(sends[0].session.app_access, Some(true));
     assert_eq!(sends[0].session.controls_agents, Some(true));
+}
+
+#[gpui::test]
+async fn ordinary_turns_learn_the_open_session_actions_once(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    monocode_settings::settings_store::save_agent_sessions_enabled(&fixture.kv, true);
+    insert(chat("s", HarnessId::Codex), cx);
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    submit(&fixture, "s", "again", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.starts_with("hello\n\n<monocode_app>"));
+    assert!(sends[0].text.contains("sessions.start"));
+    assert!(sends[0].text.contains("runs its prompt at once"));
+    assert!(
+        sends[0]
+            .text
+            .contains("Run `/Applications/MonoCode.app/Contents/MacOS/monocode app --help`")
+    );
+    assert_eq!(sends[0].session.app_access, Some(true));
+    // The open session actions keep the provider's network policy.
+    assert_eq!(sends[0].session.controls_agents, Some(false));
+    assert_eq!(sends[1].text, "again");
+    assert_eq!(sends[1].session.app_access, Some(true));
+}
+
+#[gpui::test]
+async fn the_review_setting_changes_the_instructions(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    monocode_settings::settings_store::save_agent_sessions_enabled(&fixture.kv, true);
+    monocode_settings::settings_store::save_agent_sessions_review(&fixture.kv, true);
+    insert(chat("s", HarnessId::Codex), cx);
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.contains("waits as an unsent draft"));
+}
+
+#[gpui::test]
+async fn linked_turns_get_link_actions_and_the_loopback_socket(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    let mut peer = chat("t", HarnessId::Codex);
+    peer.title = "API work".into();
+    insert(chat("s", HarnessId::Codex), cx);
+    insert(peer, cx);
+    cx.update(|cx| {
+        Engine::links(cx).update(cx, |links, cx| links.link("s", "t", cx).unwrap());
+    });
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.contains("Linked sessions: \"API work\" (t)."));
+    assert!(!sends[0].text.contains("sessions.start"));
+    assert_eq!(sends[0].session.app_access, Some(true));
+    assert_eq!(sends[0].session.controls_agents, Some(true));
+}
+
+#[gpui::test]
+async fn a_user_message_resets_the_link_budget_and_an_agent_message_does_not(
+    cx: &mut TestAppContext,
+) {
+    let fixture = setup(cx);
+    insert(chat("s", HarnessId::Codex), cx);
+    insert(chat("t", HarnessId::Codex), cx);
+    let links = cx.update(|cx| Engine::links(cx));
+    links.update(cx, |links, cx| {
+        links.link("s", "t", cx).unwrap();
+        for _ in 0..5 {
+            links.spend("s", "t").unwrap();
+        }
+    });
+    let from_agent = crate::runtime::session_links::link_message_text("s", "S", "ping");
+    submit(&fixture, "t", &from_agent, SubmitOptions::default(), cx);
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 5);
+    submit(
+        &fixture,
+        "t",
+        "from the agent CLI",
+        SubmitOptions {
+            app_request_id: Some("app-s-1".into()),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 5);
+    submit(
+        &fixture,
+        "t",
+        "the user writes",
+        SubmitOptions::default(),
+        cx,
+    );
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 0);
+}
+
+#[gpui::test]
+async fn a_dropped_session_reaches_the_agent_as_portable_history(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    let mut source = chat("src", HarnessId::Codex);
+    source.title = "Auth fix".into();
+    source.blocks = vec![
+        Block::new("u1", BlockRole::User, "Why does login fail?"),
+        Block::new("a1", BlockRole::Assistant, "The cookie is missing."),
+    ];
+    insert(source, cx);
+    insert(chat("s", HarnessId::Codex), cx);
+    let message = crate::submit::chat_context::compose_chat_context(
+        "Continue from this",
+        &[crate::submit::chat_context::ChatContextItem::Session {
+            id: "src".into(),
+            title: "Auth fix".into(),
+        }],
+    );
+    submit(&fixture, "s", &message, SubmitOptions::default(), cx);
+    // The transcript keeps the short tag; the agent gets the history.
+    assert_eq!(session("s", cx).blocks[0].text, message);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.starts_with("Continue from this\n\n<attached_context>\n<session_context id=\"src\" title=\"Auth fix\">\nSource session: \"Auth fix\" (src)."));
+    assert!(sends[0].text.contains("The cookie is missing."));
+    assert!(sends[0].text.contains("/data/context-snapshots/src/a1.md"));
 }
 
 #[gpui::test]

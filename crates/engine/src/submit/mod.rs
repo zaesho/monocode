@@ -5,6 +5,7 @@
 //! src/features/settings/model (MCP).
 
 pub mod acceptance;
+pub mod app_access;
 pub mod attachments;
 #[cfg(feature = "attention")]
 pub mod attention_glue;
@@ -26,10 +27,12 @@ pub mod monocode_tool_call;
 pub mod operator_command;
 pub mod paths;
 pub mod pipeline;
+pub mod portable_context;
 pub mod prefs;
 pub mod prompt;
 pub mod quote_draft;
 pub mod second_opinion;
+pub mod session_context;
 pub mod session_folder_command;
 pub mod skills;
 pub mod text;

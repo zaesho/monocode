@@ -959,6 +959,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     crate::notes::ensure_notes_table(conn)?;
     crate::reminders::ensure_table(conn)?;
     crate::automations::ensure_tables(conn)?;
+    crate::session_links::ensure_table(conn)?;
     ensure_orchestration_history(conn)?;
     Ok(())
 }
@@ -1724,6 +1725,7 @@ fn delete_session(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
         "DELETE FROM orchestration_runs WHERE lead_id = ?1",
         [session_id],
     )?;
+    crate::session_links::forget_session(&tx, session_id)?;
     tx.execute(
         "DELETE FROM orchestration_sidebar WHERE lead_id = ?1",
         [session_id],

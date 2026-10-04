@@ -185,6 +185,7 @@ import {
 } from "../features/terminal/model/terminalClose";
 import {
   listRunningTerminals,
+  newTerminalCwd,
   terminalTabLabel,
   type TerminalMetaPatch,
 } from "../features/terminal/model/terminalTab";
@@ -1276,6 +1277,11 @@ export default function App({
     !historyFailed;
   const gitCwd =
     activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
+  const terminalCwd = newTerminalCwd({
+    activeFile,
+    session: active,
+    fallback: sidebarCwd,
+  });
   const gitCwdBranches = useProjectBranches(
     gitCwd,
     Boolean(gitCwd) && gitCwd !== "~",
@@ -2185,7 +2191,7 @@ export default function App({
 
   const onOpenTerminal = useCallback(
     (cwd: string, asWorkspaceTab = false, occupySessionId?: string) => {
-      const workdir = cwd || gitCwd;
+      const workdir = cwd || terminalCwd;
       if (openProjectTerminal(workdir)) return;
 
       if (asWorkspaceTab || !activeTab) {
@@ -2224,12 +2230,12 @@ export default function App({
       );
       setComposerFocused(false);
     },
-    [gitCwd, activeTab, appendTab, openProjectTerminal, sidebarCwd],
+    [terminalCwd, activeTab, appendTab, openProjectTerminal, sidebarCwd],
   );
 
   const onNewTerminal = useCallback(() => {
-    onOpenTerminal(gitCwd);
-  }, [gitCwd, onOpenTerminal]);
+    onOpenTerminal(terminalCwd);
+  }, [terminalCwd, onOpenTerminal]);
 
   const onShowProjectTerminal = useCallback(() => {
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
@@ -2244,8 +2250,8 @@ export default function App({
       focusProjectTerminal();
       return;
     }
-    onOpenTerminal(gitCwd);
-  }, [gitCwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
+    onOpenTerminal(terminalCwd);
+  }, [terminalCwd, focusProjectTerminal, onOpenTerminal, projectCwd]);
 
   const onNewTerminalInSession = useCallback(
     (sessionId: string) => {
@@ -2266,7 +2272,7 @@ export default function App({
     if (!looksLikeProject(projectCwd)) return;
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
     if (!dock) {
-      openProjectTerminal(gitCwd);
+      openProjectTerminal(terminalCwd);
       return;
     }
     const nextOpen = !dock.open;
@@ -2277,7 +2283,7 @@ export default function App({
     );
     if (nextOpen) focusProjectTerminal();
     else setProjectTerminalFocused(false);
-  }, [gitCwd, focusProjectTerminal, openProjectTerminal, projectCwd]);
+  }, [terminalCwd, focusProjectTerminal, openProjectTerminal, projectCwd]);
 
   const onHideProjectTerminal = useCallback(() => {
     setProjectTerminals((prev) =>
@@ -2445,8 +2451,8 @@ export default function App({
   );
 
   const onNewTerminalTab = useCallback(() => {
-    onOpenTerminal(gitCwd, true);
-  }, [gitCwd, onOpenTerminal]);
+    onOpenTerminal(terminalCwd, true);
+  }, [terminalCwd, onOpenTerminal]);
 
   const onCloseTab = useCallback(
     (id: string, opts?: { confirmedTerminalIds?: string[] }) => {

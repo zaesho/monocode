@@ -9,6 +9,7 @@ pub mod cli_sessions;
 pub mod cursor_store;
 pub mod notes;
 pub mod reminders;
+pub mod session_links;
 pub mod session_store;
 
 /// Change notices for data that several windows show. The Tauri app emits

@@ -23,6 +23,7 @@ mod remote_pane;
 mod screenshot;
 mod session_cards;
 mod session_empty;
+mod session_links;
 mod session_navigation;
 mod session_pane;
 mod session_threads;

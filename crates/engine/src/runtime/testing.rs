@@ -48,6 +48,8 @@ struct FakeState {
     failing: HashSet<String>,
     gates: HashMap<String, VecDeque<oneshot::Receiver<()>>>,
     shell_commands: HashMap<String, String>,
+    links: Vec<(String, String)>,
+    snapshots: HashMap<String, String>,
 }
 
 /// An in-memory `SessionBackend` and `CheckpointBackend`.
@@ -146,6 +148,16 @@ impl FakeBackend {
             .iter()
             .map(|entry| (entry.session_id.clone(), entry.cwd.clone()))
             .collect()
+    }
+
+    /// Context snapshots by the path `write_context_snapshot` returned.
+    pub fn context_snapshots(&self) -> HashMap<String, String> {
+        self.state.lock().snapshots.clone()
+    }
+
+    /// Stored session links, each pair in stored order.
+    pub fn session_links(&self) -> Vec<(String, String)> {
+        self.state.lock().links.clone()
     }
 
     /// Bash commands `claude_shell_commands` returns, by tool-use id.
@@ -405,6 +417,34 @@ impl SessionBackend for FakeBackend {
         self.call("workspace_get_snapshot", Value::Null, |state| {
             Ok(state.workspace_snapshot.clone())
         })
+    }
+
+    // Links skip the command log: the engine reads them once at startup, and
+    // tests that compare the exact command list should not see that read.
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>> {
+        futures::future::ready(Ok(self.state.lock().links.clone())).boxed()
+    }
+
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()> {
+        let pair = monocode_store::session_links::ordered(&a, &b);
+        let pair = (pair.0.to_string(), pair.1.to_string());
+        let mut state = self.state.lock();
+        state.links.retain(|entry| entry != &pair);
+        if linked {
+            state.links.push(pair);
+        }
+        futures::future::ready(Ok(())).boxed()
+    }
+
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String> {
+        let path = format!("/data/context-snapshots/{session_id}/{name}.md");
+        self.state.lock().snapshots.insert(path.clone(), text);
+        futures::future::ready(Ok(path)).boxed()
     }
 
     fn claude_shell_commands(

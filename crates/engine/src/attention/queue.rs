@@ -117,6 +117,7 @@ pub(crate) mod tests {
 
     pub(crate) fn queued(id: &str, text: &str) -> QueuedMessage {
         QueuedMessage {
+            app_request_id: None,
             id: id.into(),
             text: text.into(),
             attachments: Vec::new(),

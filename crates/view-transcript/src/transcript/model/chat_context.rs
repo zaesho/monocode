@@ -54,6 +54,11 @@ pub enum ChatContextItem {
         code: String,
         comment: String,
     },
+    /// Another session the user dropped on the composer.
+    Session {
+        id: String,
+        title: String,
+    },
 }
 
 impl ChatContextItem {
@@ -63,6 +68,7 @@ impl ChatContextItem {
             Self::Quote { .. } => "quote",
             Self::Code { .. } => "code",
             Self::Comment { .. } => "comment",
+            Self::Session { .. } => "session",
         }
     }
 }
@@ -76,14 +82,23 @@ pub struct ChatContextMessage {
 
 const OPEN: &str = "<attached_context>";
 const CLOSE: &str = "</attached_context>";
-const TAGS: [&str; 3] = ["quoted_text", "code_selection", "review_comment"];
+const TAGS: [&str; 4] = [
+    "quoted_text",
+    "code_selection",
+    "review_comment",
+    "session_context",
+];
 
 static RESERVED_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment)\b")
-        .expect("reserved tag")
+    Regex::new(
+        r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment|session_context)\b",
+    )
+    .expect("reserved tag")
 });
 static ESCAPED_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<\\(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment)\b")
+    Regex::new(
+        r"<\\(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment|session_context)\b",
+    )
         .expect("escaped tag")
 });
 
@@ -178,6 +193,11 @@ fn format_item(item: &ChatContextItem) -> String {
             ]
             .join("\n")
         }
+        ChatContextItem::Session { id, title } => format!(
+            "<session_context id=\"{}\" title=\"{}\" />",
+            escape_attribute(id),
+            escape_attribute(title)
+        ),
     }
 }
 
@@ -262,6 +282,14 @@ fn parse_item(raw: &RawItem<'_>) -> Option<ChatContextItem> {
     if raw.tag == "quoted_text" {
         let text = unquote_lines(&raw.body?.split('\n').collect::<Vec<_>>())?;
         return (!text.is_empty()).then_some(ChatContextItem::Quote { text });
+    }
+    if raw.tag == "session_context" {
+        if raw.body.is_some() {
+            return None;
+        }
+        let id = attr(&raw.attrs, "id").filter(|id| !id.is_empty())?;
+        let title = attr(&raw.attrs, "title").unwrap_or_default();
+        return Some(ChatContextItem::Session { id, title });
     }
     let path = attr(&raw.attrs, "path").filter(|path| !path.is_empty())?;
     if raw.tag == "code_selection" {
@@ -478,6 +506,21 @@ pub fn chip_label(item: &ChatContextItem) -> ChipLabel {
                 comment: Some(excerpt),
             }
         }
+        ChatContextItem::Session { id, title } => {
+            let excerpt = context_excerpt(title);
+            let name = if excerpt.is_empty() {
+                "Session".to_string()
+            } else {
+                excerpt
+            };
+            ChipLabel {
+                action: "Session context",
+                full: format!("{name} ({id})"),
+                name,
+                line_tag: None,
+                comment: None,
+            }
+        }
     }
 }
 
@@ -554,6 +597,20 @@ mod tests {
         let split = split_chat_context(&compose_chat_context("", &items));
         assert_eq!(split.items, items);
         assert_eq!(split.text, "");
+    }
+
+    #[test]
+    fn parses_a_dropped_session_into_a_chip() {
+        let item = ChatContextItem::Session {
+            id: "s-1".into(),
+            title: "Fix \"auth\"".into(),
+        };
+        let message = compose_chat_context("Compare", std::slice::from_ref(&item));
+        let split = split_chat_context(&message);
+        assert_eq!(split.items, vec![item.clone()]);
+        assert_eq!(split.items[0].kind(), "session");
+        assert_eq!(chip_label(&item).name, "Fix \"auth\"");
+        assert_eq!(file_target(&item), None);
     }
 
     #[test]

@@ -22,17 +22,19 @@ use monocode_store::notes::{Note, NoteUpsert};
 use serde_json::{Value, json};
 
 use super::agent_app::{
-    AgentAppHost, AppLaunch, AppSessionListing, AppSessionPlacement, DraftResult, SendResult,
-    handle_agent_app,
+    AgentAppHost, AppLaunch, AppSessionListing, AppSessionPlacement, DraftResult, LinkedPeer,
+    LinkedSendResult, SendResult, handle_agent_app,
 };
 use super::orchestrator::{Orchestrator, handle};
 use super::peers::OrchestrationPeers;
 use crate::history::HistoryPackage;
 use crate::projects::backend::{Worktree, Worktrees};
-use crate::runtime::Engine;
+use crate::runtime::session_links::LinkSpend;
 use crate::runtime::sessions::get_stored_session;
 use crate::runtime::util::project_path::same_project_path;
+use crate::runtime::{Engine, LINK_MESSAGE_BUDGET};
 use crate::submit::{Submit, SubmitConfig, SubmitOptions};
+use monocode_core::settings::FollowUpBehavior;
 
 /// Delivers control requests from the server's threads to the engine.
 pub struct ControlExecutor {
@@ -575,4 +577,143 @@ impl AgentAppHost for EngineAppHost {
     fn kv(&self) -> Kv {
         self.kv.clone()
     }
+
+    fn agent_sessions_enabled(&self, _cx: &App) -> bool {
+        monocode_settings::settings_store::load_agent_sessions_enabled(&self.kv)
+    }
+
+    fn agent_sessions_review(&self, _cx: &App) -> bool {
+        monocode_settings::settings_store::load_agent_sessions_review(&self.kv)
+    }
+
+    fn linked_peers(&self, id: &str, cx: &App) -> Vec<LinkedPeer> {
+        let links = Engine::links(cx);
+        let links = links.read(cx);
+        links
+            .peers(id, cx)
+            .into_iter()
+            .map(|peer| LinkedPeer {
+                messages_left: LINK_MESSAGE_BUDGET.saturating_sub(links.sent(id, &peer)),
+                id: peer,
+            })
+            .collect()
+    }
+
+    fn peer_session(&self, id: &str, cx: &mut App) -> Task<Result<Option<Session>, String>> {
+        let target = open_or_stored(id, cx);
+        cx.spawn(async move |_| {
+            Ok(target
+                .await
+                .filter(|target| target.orchestration_lead_id.is_none()))
+        })
+    }
+
+    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<LinkSpend, String> {
+        Engine::links(cx).update(cx, |links, _| links.spend(from, to))
+    }
+
+    fn refund_link_message(&self, from: &str, to: &str, epoch: u64, cx: &mut App) {
+        Engine::links(cx).update(cx, |links, _| links.refund(from, to, epoch));
+    }
+
+    fn send_linked(
+        &self,
+        id: &str,
+        text: &str,
+        request_id: &str,
+        cx: &mut App,
+    ) -> Task<Result<LinkedSendResult, String>> {
+        let opening = Engine::sessions(cx).update(cx, |sessions, cx| sessions.ensure_open(id, cx));
+        let orchestrator = self.orchestrator.clone();
+        let (id, text, request_id) = (id.to_string(), text.to_string(), request_id.to_string());
+        cx.spawn(async move |cx| {
+            let target = opening.await;
+            let checked =
+                cx.update(|cx| linked_target(target, &orchestrator, &text, &request_id, cx))?;
+            let target = match checked {
+                Ok(target) => target,
+                Err(previous) => return Ok(previous),
+            };
+            let queued = target.is_busy();
+            let acceptance = cx.update(|cx| {
+                Submit::try_global(cx).map(|submit| {
+                    submit.update(cx, |submit, cx| {
+                        submit.submit(
+                            &id,
+                            &text,
+                            Vec::new(),
+                            SubmitOptions {
+                                app_request_id: Some(request_id.clone()),
+                                follow_up_behavior: Some(FollowUpBehavior::Queue),
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                })
+            });
+            let accepted = match acceptance {
+                Some(acceptance) => acceptance.resolve().await.map_err(|error| error.message)?,
+                None => false,
+            };
+            if !accepted {
+                return Err("The linked session could not accept the message".into());
+            }
+            Ok(LinkedSendResult {
+                queued,
+                already_submitted: false,
+            })
+        })
+    }
+}
+
+/// The checks `send_linked` makes. A busy peer is fine: the message queues.
+/// `Ok(Err(..))` is the earlier answer for a repeated request id.
+fn linked_target(
+    target: Option<Session>,
+    orchestrator: &WeakEntity<Orchestrator>,
+    text: &str,
+    request_id: &str,
+    cx: &App,
+) -> Result<Result<Session, LinkedSendResult>, String> {
+    let Some(target) = target.filter(|target| {
+        target.orchestration_lead_id.is_none()
+            && target.inbox_ask.is_none()
+            && !leads_run(orchestrator, &target.id, cx)
+    }) else {
+        return Err("The linked session is unavailable".into());
+    };
+    if let Some(previous) = target
+        .blocks
+        .iter()
+        .find(|block| block.app_request_id.as_deref() == Some(request_id))
+    {
+        if previous.text != text {
+            return Err("Request ID was already used with another prompt".into());
+        }
+        return Ok(Err(LinkedSendResult {
+            queued: false,
+            already_submitted: true,
+        }));
+    }
+    if let Some(previous) = target
+        .queued_messages
+        .iter()
+        .flatten()
+        .find(|queued| queued.app_request_id.as_deref() == Some(request_id))
+    {
+        if previous.text != text {
+            return Err("Request ID was already used with another prompt".into());
+        }
+        return Ok(Err(LinkedSendResult {
+            queued: true,
+            already_submitted: true,
+        }));
+    }
+    if session_draft_block(&target.blocks).is_some() {
+        return Err(
+            "The linked session has an unsent draft; ask the user to send or remove it".into(),
+        );
+    }
+    Ok(Ok(target))
 }

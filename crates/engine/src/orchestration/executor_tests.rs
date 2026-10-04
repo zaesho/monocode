@@ -104,10 +104,12 @@ fn refuses_app_calls_from_workers_inbox_asks_and_unknown_sessions(cx: &mut TestA
 #[gpui::test]
 fn answers_a_repeated_app_request_once_and_rejects_changed_input(cx: &mut TestAppContext) {
     init(cx, None);
-    open(
-        cx,
-        Session::blank("lead", HarnessId::Codex, "codex:test", "/tmp/project"),
-    );
+    let mut lead = Session::blank("lead", HarnessId::Codex, "codex:test", "/tmp/project");
+    lead.blocks = vec![monocode_core::Block {
+        monocode: Some(true),
+        ..monocode_core::Block::new("op", monocode_core::BlockRole::User, "list folders")
+    }];
+    open(cx, lead);
     let first = run(
         cx,
         request("app", "lead", "same", "folders.list", json!({})),

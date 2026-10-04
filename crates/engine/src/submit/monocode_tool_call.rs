@@ -29,6 +29,9 @@ fn action_label(action: &str) -> Option<&'static str> {
         "notes.list" => "List notes",
         "notes.read" => "Read a note",
         "notes.write" => "Write a note",
+        "links.list" => "List linked sessions",
+        "links.read" => "Read a linked session",
+        "links.send" => "Message a linked session",
         _ => return None,
     })
 }
@@ -298,6 +301,14 @@ mod tests {
             ..Block::new("generic", BlockRole::Tool, "Run command:")
         };
         assert_eq!(label(&generic).as_deref(), Some("Start a session"));
+        for (action, expected) in [
+            ("links.list", "List linked sessions"),
+            ("links.read", "Read a linked session"),
+            ("links.send", "Message a linked session"),
+        ] {
+            let command = format!("monocode app {action} --json '{{}}'");
+            assert_eq!(label(&shell(&command)).as_deref(), Some(expected));
+        }
         let codex = Block {
             tool: Some(tool("execute", None, Some("monocode app notes.list"))),
             ..Block::new("codex-action", BlockRole::Tool, "List")

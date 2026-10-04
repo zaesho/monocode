@@ -13,6 +13,7 @@ mod keys;
 mod message_queue;
 mod render;
 pub(crate) mod runner;
+mod session_drop;
 mod submit;
 #[cfg(test)]
 mod tests;
@@ -222,6 +223,19 @@ pub enum ComposerEvent {
     ResumeQueue,
     /// `onEditingLastTurnChange`.
     EditingLastTurnChange(bool),
+    /// Another session's card is over the composer, which takes the drop.
+    /// The owner hides the pane tree's split hint.
+    SessionDragOver,
+    /// A session card dropped on the composer; the pane tree's drag ended.
+    SessionDropped,
+    /// A drag the composer does not use dropped on it. The owner passes it
+    /// to the pane tree.
+    ForwardDrop(monocode_ui::drag::PaneDragSource),
+    /// "Add to context" for a dropped session. The owner adds the chip with
+    /// `add_context_item` once it knows the title.
+    AddSessionContext(String),
+    /// "Link sessions" for a dropped session.
+    LinkSession(String),
 }
 
 /// The mode toggles in the + menu.
@@ -260,6 +274,10 @@ pub struct Composer {
     pub(crate) borrowed_attachment_ids: HashSet<String>,
     pub(crate) paste_error: Option<String>,
     pub(crate) file_drag: bool,
+    /// A session card is over the composer.
+    pub(crate) session_drag: bool,
+    /// A dropped session waiting for "Add to context" or "Link sessions".
+    pub(crate) session_drop: Option<String>,
     pub(crate) plus_open: bool,
     pub(crate) modes: ModeSelection,
     pub(crate) slash: Option<SlashToken>,
@@ -368,6 +386,8 @@ impl Composer {
             borrowed_attachment_ids: HashSet::new(),
             paste_error: None,
             file_drag: false,
+            session_drag: false,
+            session_drop: None,
             plus_open: false,
             modes: ModeSelection::default(),
             slash: None,

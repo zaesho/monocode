@@ -28,6 +28,9 @@ const ACTION_LABELS: &[(&str, &str)] = &[
     ("notes.list", "List notes"),
     ("notes.read", "Read a note"),
     ("notes.write", "Write a note"),
+    ("links.list", "List linked sessions"),
+    ("links.read", "Read a linked session"),
+    ("links.send", "Message a linked session"),
 ];
 
 fn is_js_space(c: char) -> bool {
@@ -303,6 +306,19 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn names_the_linked_session_actions() {
+        for (action, label) in [
+            ("links.list", "List linked sessions"),
+            ("links.read", "Read a linked session"),
+            ("links.send", "Message a linked session"),
+        ] {
+            let call = monocode_tool_call(&shell(&format!("monocode app {action} --json '{{}}'")))
+                .unwrap();
+            assert_eq!(call.label, label);
+        }
     }
 
     #[test]

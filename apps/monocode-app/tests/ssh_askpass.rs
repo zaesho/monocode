@@ -65,6 +65,9 @@ fn desktop_answers_an_authenticated_ssh_prompt_without_starting_gpui() {
             Err(error) => panic!("accept SSH prompt: {error}"),
         }
     };
+    // macOS gives an accepted socket the listener's non-blocking mode, so
+    // the read below could fail before the desktop writes its request.
+    stream.set_nonblocking(false).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();

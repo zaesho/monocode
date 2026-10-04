@@ -37,7 +37,9 @@ use monocode_layout::tab_visit_history::{
     prune_tab_visit_history, record_tab_visit, tab_visit_back, tab_visit_forward,
 };
 use monocode_layout::terminal_close::{close_terminals_prompt, running_terminals};
-use monocode_layout::terminal_tab::{RunningTerminal, TerminalMetaPatch, list_running_terminals};
+use monocode_layout::terminal_tab::{
+    RunningTerminal, TerminalMetaPatch, list_running_terminals, new_terminal_cwd,
+};
 use monocode_layout::workspace_tab_groups::{
     PlaceSessionOnPane, WorkspaceTabClosePlan, WorkspaceTabCloseScope, apply_detach_pane_to_tab,
     apply_place_session_on_pane, apply_place_tab_on_pane, filter_tabs_for_project,
@@ -509,6 +511,17 @@ impl Workspace {
                 .unwrap_or_else(|| session_work_cwd(&session).to_string()),
             None => self.sidebar_cwd(cx),
         }
+    }
+
+    /// `terminalCwd`: where the general New Terminal commands open. Unlike
+    /// `git_cwd`, the active session's worktree wins over the focused pane.
+    pub fn terminal_cwd(&self, cx: &App) -> String {
+        let session = self.active_session(cx);
+        new_terminal_cwd(
+            self.active_tab().and_then(focused_file_tab),
+            session.as_ref(),
+            &self.sidebar_cwd(cx),
+        )
     }
 
     /// `projectOfTab`: the project folder name the title bar shows.
@@ -2327,7 +2340,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workdir = if cwd.is_empty() {
-            self.git_cwd(cx)
+            self.terminal_cwd(cx)
         } else {
             cwd.to_string()
         };
@@ -2373,13 +2386,13 @@ impl Workspace {
 
     /// `onNewTerminal`.
     pub fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, false, None, cx);
     }
 
     /// `onNewTerminalTab`.
     pub fn new_terminal_tab(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, true, None, cx);
     }
 
@@ -2409,16 +2422,16 @@ impl Workspace {
             self.focus_project_terminal(cx);
             return;
         }
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, false, None, cx);
     }
 
     /// `onToggleProjectTerminal`.
     pub fn toggle_project_terminal(&mut self, cx: &mut Context<Self>) {
         let project = self.project_cwd.clone();
-        let git_cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.terminals
-            .update(cx, |terminals, cx| terminals.toggle(&project, &git_cwd, cx));
+            .update(cx, |terminals, cx| terminals.toggle(&project, &cwd, cx));
         if self.terminals.read(cx).is_focused() {
             self.set_composer_focused(false, cx);
         }

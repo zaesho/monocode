@@ -150,6 +150,10 @@ impl Submit {
         if options.app_request_id.is_none() && !is_link_message(text) {
             Engine::links(cx).update(cx, |links, _| links.reset_budget(session_id));
         }
+        // Output that already arrived belongs before the submitted user
+        // message. Flush before reading the session too, since a pending
+        // error can settle it.
+        sessions.update(cx, |sessions, cx| sessions.flush(cx));
         if let Some(error) = peers
             .orchestration
             .submission_error(session_id, options.managed, cx)

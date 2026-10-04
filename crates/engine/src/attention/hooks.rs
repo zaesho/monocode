@@ -35,6 +35,7 @@ pub struct SubmitRequest {
     pub note_card: Option<NoteComposerCard>,
     pub handoff_card: Option<HandoffComposerCard>,
     pub intent: Option<TurnIntent>,
+    pub app_request_id: Option<String>,
 }
 
 impl SubmitRequest {
@@ -49,6 +50,7 @@ impl SubmitRequest {
             note_card: None,
             handoff_card: None,
             intent: None,
+            app_request_id: None,
         }
     }
 }

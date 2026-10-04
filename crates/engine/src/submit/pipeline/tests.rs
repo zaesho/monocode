@@ -510,6 +510,46 @@ async fn queues_a_follow_up_while_a_turn_runs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn queues_a_linked_message_for_a_busy_session_with_its_request_id(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    insert(
+        Session {
+            busy: Some(true),
+            ..chat("s", HarnessId::Codex)
+        },
+        cx,
+    );
+    let text = crate::runtime::session_links::link_message_text("p", "Peer", "status?");
+    let accepted = submit(
+        &fixture,
+        "s",
+        &text,
+        SubmitOptions {
+            app_request_id: Some("link-1".into()),
+            follow_up_behavior: Some(FollowUpBehavior::Queue),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert!(accepted);
+    let queued = session("s", cx).queued_messages.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].app_request_id.as_deref(), Some("link-1"));
+
+    // Other app requests to a busy session are still refused.
+    assert!(!submit(
+        &fixture,
+        "s",
+        "plain",
+        SubmitOptions {
+            app_request_id: Some("app-2".into()),
+            ..SubmitOptions::default()
+        },
+        cx,
+    ));
+}
+
+#[gpui::test]
 async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
     let fixture = setup(cx);
     insert(
@@ -898,6 +938,7 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
         Engine::sessions(cx).update(cx, |sessions, cx| {
             sessions.update("s", cx, |session| {
                 session.queued_messages = Some(vec![QueuedMessage {
+                    app_request_id: None,
                     id: "q".into(),
                     text: "next".into(),
                     attachments: vec![],

@@ -490,6 +490,7 @@ mod tests {
         }));
         assert!(!can_edit_last_turn(&Session {
             queued_messages: Some(vec![QueuedMessage {
+                app_request_id: None,
                 id: "q1".into(),
                 text: "next".into(),
                 attachments: vec![],

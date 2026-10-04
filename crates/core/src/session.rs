@@ -33,6 +33,10 @@ pub struct QueuedMessage {
     pub handoff_card: Option<HandoffComposerCard>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<TurnIntent>,
+    /// The app CLI request that queued a linked session's message, so a
+    /// retried request is not queued twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

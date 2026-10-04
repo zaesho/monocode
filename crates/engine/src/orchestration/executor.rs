@@ -695,6 +695,20 @@ fn linked_target(
             already_submitted: true,
         }));
     }
+    if let Some(previous) = target
+        .queued_messages
+        .iter()
+        .flatten()
+        .find(|queued| queued.app_request_id.as_deref() == Some(request_id))
+    {
+        if previous.text != text {
+            return Err("Request ID was already used with another prompt".into());
+        }
+        return Ok(Err(LinkedSendResult {
+            queued: true,
+            already_submitted: true,
+        }));
+    }
     if session_draft_block(&target.blocks).is_some() {
         return Err(
             "The linked session has an unsent draft; ask the user to send or remove it".into(),

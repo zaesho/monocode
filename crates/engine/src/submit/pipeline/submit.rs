@@ -188,7 +188,11 @@ impl Submit {
             }
         }
         let stored = sessions.read(cx).get(session_id).cloned();
-        if options.app_request_id.is_some() && stored.as_ref().is_some_and(Session::is_busy) {
+        // A linked session's message to a busy session goes to its queue below.
+        if options.app_request_id.is_some()
+            && !is_link_message(text)
+            && stored.as_ref().is_some_and(Session::is_busy)
+        {
             return SubmissionAcceptance::Ready(false);
         }
         if options.ci_repair.is_some()
@@ -692,6 +696,10 @@ impl Submit {
                 note_card,
                 handoff_card,
                 intent: Some(intent),
+                app_request_id: options
+                    .app_request_id
+                    .clone()
+                    .filter(|_| is_link_message(text)),
             };
             sessions.update(cx, |sessions, cx| {
                 sessions.update(session_id, cx, |session| {

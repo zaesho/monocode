@@ -318,6 +318,158 @@ fn drops_output_a_killed_child_prints_after_it_was_stopped() {
     assert!(drain(&lines).is_empty());
 }
 
+/// Spawns `session_id` and returns once the fake backend has handed out the
+/// next pid from `pids`.
+async fn spawn_with(
+    children: &Children,
+    pids: &async_channel::Sender<u32>,
+    session_id: &str,
+    pid: u32,
+) -> Result<()> {
+    pids.send(pid).await.unwrap();
+    children
+        .spawn_child(session_id, "/bin/claude", vec![], "/repo", None, None)
+        .await
+}
+
+fn stdout_lines(events: &[ChildEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ChildEvent::Stdout(line) => Some(line.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// child.test.ts: "drops late output from a child replaced under the same
+/// session id".
+#[test]
+fn drops_late_output_from_a_child_replaced_under_the_same_session_id() {
+    let (pid_tx, pid_rx) = async_channel::unbounded();
+    let (children, _fake) = children(Fake {
+        pids: Mutex::new(Some(pid_rx)),
+        ..Default::default()
+    });
+    let router = children.router().clone();
+    let _first = children.watch_child("thread");
+    smol::block_on(async {
+        spawn_with(&children, &pid_tx, "thread", 41).await.unwrap();
+        children.kill_child("thread").await.unwrap();
+    });
+
+    let events = children.watch_child("thread");
+    smol::block_on(async {
+        let spawning = {
+            let children = children.clone();
+            smol::spawn(async move {
+                children
+                    .spawn_child("thread", "/bin/claude", vec![], "/repo", None, None)
+                    .await
+            })
+        };
+        smol::Timer::after(Duration::from_millis(10)).await;
+        // The old child's output can still be in flight while the new one
+        // starts.
+        router.on_child_stdout("thread", "old".into(), 41);
+        router.on_child_stderr("thread", "old".into(), 41);
+        pid_tx.send(42).await.unwrap();
+        spawning.await.unwrap();
+    });
+    router.on_child_stdout("thread", "old-late".into(), 41);
+    router.on_child_stdout("thread", "new".into(), 42);
+    router.on_stdout("thread", "no pid".into());
+
+    assert_eq!(
+        drain(&events),
+        vec![
+            ChildEvent::Stdout("new".into()),
+            ChildEvent::Stdout("no pid".into()),
+        ]
+    );
+}
+
+/// child.test.ts: "delivers output that arrives after its child's exit".
+#[test]
+fn delivers_output_that_arrives_after_its_childs_exit() {
+    let (pid_tx, pid_rx) = async_channel::unbounded();
+    let (children, _fake) = children(Fake {
+        pids: Mutex::new(Some(pid_rx)),
+        ..Default::default()
+    });
+    let router = children.router().clone();
+    let events = children.watch_child("thread");
+    smol::block_on(spawn_with(&children, &pid_tx, "thread", 41)).unwrap();
+    router.on_exit("thread", Some(0), 41);
+    router.on_child_stdout("thread", "last".into(), 41);
+    assert_eq!(
+        drain(&events),
+        vec![ChildEvent::Exit(Some(0)), ChildEvent::Stdout("last".into()),]
+    );
+
+    // Once the session starts another child, the exited one is retired.
+    smol::block_on(spawn_with(&children, &pid_tx, "thread", 42)).unwrap();
+    router.on_child_stdout("thread", "stale".into(), 41);
+    router.on_child_stdout("thread", "new".into(), 42);
+    assert_eq!(stdout_lines(&drain(&events)), vec!["new"]);
+}
+
+/// child.test.ts: "keeps the running child's output when a replacement fails
+/// to spawn".
+#[test]
+fn keeps_the_running_childs_output_when_a_replacement_fails_to_spawn() {
+    let (pid_tx, pid_rx) = async_channel::unbounded();
+    let (children, _fake) = children(Fake {
+        pids: Mutex::new(Some(pid_rx)),
+        ..Default::default()
+    });
+    let router = children.router().clone();
+    let events = children.watch_child("thread");
+    smol::block_on(spawn_with(&children, &pid_tx, "thread", 41)).unwrap();
+
+    // A closed pid channel makes the fake backend reject the spawn.
+    drop(pid_tx);
+    let failed = smol::block_on(children.spawn_child(
+        "thread",
+        "/bin/claude",
+        vec![],
+        "/missing",
+        None,
+        None,
+    ));
+    assert!(failed.is_err());
+    router.on_child_stdout("thread", "still here".into(), 41);
+    router.on_exit("thread", Some(0), 41);
+
+    assert_eq!(
+        drain(&events),
+        vec![
+            ChildEvent::Stdout("still here".into()),
+            ChildEvent::Exit(Some(0)),
+        ]
+    );
+}
+
+/// The OS can hand a new child the pid of one the session retired.
+#[test]
+fn delivers_output_from_a_new_child_that_reuses_a_retired_pid() {
+    let (pid_tx, pid_rx) = async_channel::unbounded();
+    let (children, _fake) = children(Fake {
+        pids: Mutex::new(Some(pid_rx)),
+        ..Default::default()
+    });
+    let router = children.router().clone();
+    smol::block_on(async {
+        spawn_with(&children, &pid_tx, "thread", 41).await.unwrap();
+        spawn_with(&children, &pid_tx, "thread", 42).await.unwrap();
+        spawn_with(&children, &pid_tx, "thread", 41).await.unwrap();
+    });
+    let events = children.watch_child("thread");
+    router.on_child_stdout("thread", "stale".into(), 42);
+    router.on_child_stdout("thread", "reused".into(), 41);
+    assert_eq!(stdout_lines(&drain(&events)), vec!["reused"]);
+}
+
 #[test]
 fn spawn_kill_and_write_reach_the_backend() {
     let (children, fake) = children(Fake {

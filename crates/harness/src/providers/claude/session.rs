@@ -255,6 +255,11 @@ struct Live {
     pending_assistant_boundary: bool,
     manual_compaction: bool,
     compaction_confirmed: bool,
+    /// Claude has written this conversation to disk, so `--resume` can find
+    /// it. A fresh process only writes it once it takes the first prompt.
+    conversation_saved: bool,
+    /// `--resume` named a conversation Claude has no transcript for.
+    conversation_missing: bool,
     next_token: u64,
     /// What the live session needs to write, spawn, and time.
     io: SharedChildIo,
@@ -460,6 +465,20 @@ impl Live {
     /// session's lock is released.
     fn emit(&self, event: HarnessEvent) {
         self.outbox.push(&self.on_event, event);
+    }
+
+    /// `bindConversation`: Claude saved the conversation. Reports the binding
+    /// and returns the resume target for the sessions map.
+    fn bind_conversation(&mut self) -> Resume {
+        self.conversation_saved = true;
+        self.emit(HarnessEvent::SessionProviderBound {
+            provider_session_id: self.claude_session_id.clone(),
+        });
+        Resume {
+            session_id: self.claude_session_id.clone(),
+            cwd: self.cwd.clone(),
+            provider_account_id: self.provider_account_id.clone(),
+        }
     }
 
     fn token(&mut self) -> u64 {
@@ -2415,6 +2434,33 @@ impl ClaudeSessions {
             self.stop_session(&thread_id).await?;
         }
 
+        loop {
+            if let Some(cell) = self.start_live(input, on_event.clone()).await? {
+                return Ok(cell);
+            }
+            // The saved id points at a conversation Claude never wrote, for
+            // example when the first prompt was stopped before Claude took
+            // it. There is nothing to resume, so start a new conversation
+            // instead of failing every turn.
+            on_event(HarnessEvent::Status {
+                text: "Claude Code had no saved conversation to resume, so a new one was started."
+                    .into(),
+            });
+        }
+    }
+
+    /// The process half of `ensureLive`: spawn Claude Code and wait for it
+    /// to start. Returns `None` when `--resume` named a conversation Claude
+    /// has no transcript for. The stored id is gone by then, so the next
+    /// call starts a new conversation.
+    async fn start_live(
+        &self,
+        input: &HarnessSessionInput,
+        on_event: EventSink,
+    ) -> Result<Option<LiveRef>> {
+        let thread_id = input.session_id.clone();
+        let settings_key = self.settings_key_for(input);
+        let planning = input.intent == Some(TurnIntent::Plan);
         let resume = {
             let mut globals = self.inner.globals.lock();
             let resume = globals.resume_by_thread.get(&thread_id).cloned();
@@ -2500,6 +2546,8 @@ impl ClaudeSessions {
                 pending_assistant_boundary: false,
                 manual_compaction: false,
                 compaction_confirmed: false,
+                conversation_saved: resume.is_some(),
+                conversation_missing: false,
                 next_token: 0,
                 io: self.inner.io.clone(),
                 spawner: self.inner.spawner.clone(),
@@ -2530,7 +2578,9 @@ impl ClaudeSessions {
                     inner.globals.lock().live_by_thread.remove(&thread_id);
                 }
                 let mut live = cell.lock();
-                if !live.mute_updates {
+                // A missing conversation is retried with a new one, not
+                // reported.
+                if !live.mute_updates && !live.conversation_missing {
                     live.emit(HarnessEvent::SessionEnded { code });
                 }
                 if let Some(turn) = live.turn.take() {
@@ -2554,20 +2604,11 @@ impl ClaudeSessions {
             )
             .await?;
 
-        {
-            let mut globals = self.inner.globals.lock();
-            globals
-                .live_by_thread
-                .insert(thread_id.clone(), cell.clone());
-            globals.resume_by_thread.insert(
-                thread_id.clone(),
-                Resume {
-                    session_id: claude_session_id,
-                    cwd: input.cwd.clone(),
-                    provider_account_id: input.provider_account_id.clone(),
-                },
-            );
-        }
+        self.inner
+            .globals
+            .lock()
+            .live_by_thread
+            .insert(thread_id.clone(), cell.clone());
 
         let started = async {
             let write = {
@@ -2580,20 +2621,36 @@ impl ClaudeSessions {
             };
             write.await?;
             wait_for_init(&cell, self.inner.options.init_timeout).await;
-            let live = cell.lock();
-            live.emit(HarnessEvent::SessionProviderBound {
-                provider_session_id: live.claude_session_id.clone(),
-            });
-            live.emit(HarnessEvent::SessionStarted);
             Ok::<(), anyhow::Error>(())
         };
-        match started.await {
-            Ok(()) => Ok(cell),
-            Err(error) => {
-                self.stop_session(&thread_id).await?;
-                Err(error)
-            }
+        if let Err(error) = started.await {
+            self.stop_session(&thread_id).await?;
+            return Err(error);
         }
+        if cell.lock().conversation_missing {
+            self.stop_session(&thread_id).await?;
+            let mut globals = self.inner.globals.lock();
+            globals.resume_by_thread.remove(&thread_id);
+            globals.tasks_by_thread.remove(&thread_id);
+            return Ok(None);
+        }
+        // A new conversation is bound once Claude saves it. Binding the id
+        // now would leave a `--resume` target that does not exist if the
+        // first prompt never reaches Claude.
+        let bound = {
+            let mut live = cell.lock();
+            let bound = live.conversation_saved.then(|| live.bind_conversation());
+            live.emit(HarnessEvent::SessionStarted);
+            bound
+        };
+        if let Some(resume) = bound {
+            self.inner
+                .globals
+                .lock()
+                .resume_by_thread
+                .insert(thread_id, resume);
+        }
+        Ok(Some(cell))
     }
 
     /// `__claudeTestReset`.
@@ -2680,12 +2737,16 @@ async fn run_turn(
     }
 }
 
-/// A provider conversation change seen on a line, applied to the sessions
-/// map once the live session is unlocked.
+/// Sessions map changes seen on a line, applied once the live session is
+/// unlocked.
+#[derive(Default)]
 struct Rebind {
-    provider_session_id: String,
-    tasks: SharedTasks,
-    resume: Resume,
+    /// `--resume` named a missing conversation: drop the stored id and tasks.
+    forget: bool,
+    /// The task map of a conversation the line switched to.
+    tasks: Option<RetainedTasks>,
+    /// A conversation Claude saved, to resume next time.
+    resume: Option<Resume>,
 }
 
 /// `handleLine`.
@@ -2693,24 +2754,37 @@ fn handle_line(inner: &Inner, thread_id: &str, cell: &LiveRef, line: &str) {
     let Some(rec) = parse_json_line(line) else {
         return;
     };
-    let mut rebind = None;
+    let mut rebind = Rebind::default();
     handle_record(&mut cell.lock(), &rec, &mut rebind);
-    if let Some(rebind) = rebind {
-        let mut globals = inner.globals.lock();
-        globals.tasks_by_thread.insert(
-            thread_id.to_string(),
-            RetainedTasks {
-                provider_session_id: rebind.provider_session_id,
-                tasks: rebind.tasks,
-            },
-        );
+    if !rebind.forget && rebind.tasks.is_none() && rebind.resume.is_none() {
+        return;
+    }
+    let mut globals = inner.globals.lock();
+    if rebind.forget {
+        globals.resume_by_thread.remove(thread_id);
+        globals.tasks_by_thread.remove(thread_id);
+    }
+    if let Some(tasks) = rebind.tasks {
+        globals.tasks_by_thread.insert(thread_id.to_string(), tasks);
+    }
+    if let Some(resume) = rebind.resume {
         globals
             .resume_by_thread
-            .insert(thread_id.to_string(), rebind.resume);
+            .insert(thread_id.to_string(), resume);
     }
 }
 
-fn handle_record(live: &mut Live, rec: &Record, rebind: &mut Option<Rebind>) {
+/// `showsSavedConversation`: lines Claude only sends after it has saved the
+/// user's prompt.
+fn shows_saved_conversation(rec: &Record) -> bool {
+    match string_field(Some(rec), "type") {
+        Some("result") => string_field(Some(rec), "subtype") == Some("success"),
+        Some("assistant" | "user" | "stream_event") => true,
+        _ => false,
+    }
+}
+
+fn handle_record(live: &mut Live, rec: &Record, rebind: &mut Rebind) {
     let kind = string_field(Some(rec), "type");
     if kind == Some("keep_alive") {
         return;
@@ -2747,28 +2821,44 @@ fn handle_record(live: &mut Live, rec: &Record, rebind: &mut Option<Rebind>) {
         return;
     }
 
-    if live.mute_updates {
-        return;
+    let missing = kind == Some("result") && is_missing_conversation_result(rec);
+    if missing {
+        // Forget the id either way so the next process starts a new
+        // conversation.
+        rebind.forget = true;
+        if !live.initialized {
+            // ensure_live retries right away.
+            live.conversation_missing = true;
+            return;
+        }
+        // After startup the result ends the running turn with its error.
     }
 
+    let mut switched = false;
     if let Some(session_id) = session_id_from_message(rec)
+        && !missing
         && session_id != live.claude_session_id
     {
+        switched = true;
         live.claude_session_id = session_id.clone();
         // A different conversation starts with its own task ids.
         live.claude_tasks = Arc::new(Mutex::new(ClaudeTaskMap::new()));
-        *rebind = Some(Rebind {
-            provider_session_id: session_id.clone(),
-            tasks: live.claude_tasks.clone(),
-            resume: Resume {
-                session_id: session_id.clone(),
-                cwd: live.cwd.clone(),
-                provider_account_id: live.provider_account_id.clone(),
-            },
-        });
-        live.emit(HarnessEvent::SessionProviderBound {
+        rebind.tasks = Some(RetainedTasks {
             provider_session_id: session_id,
+            tasks: live.claude_tasks.clone(),
         });
+    }
+    let saved = if live.conversation_saved {
+        switched
+    } else {
+        shows_saved_conversation(rec)
+    };
+    if !missing && saved {
+        rebind.resume = Some(live.bind_conversation());
+    }
+
+    if live.mute_updates {
+        return;
     }
 
     let subtype = string_field(Some(rec), "subtype").unwrap_or("");

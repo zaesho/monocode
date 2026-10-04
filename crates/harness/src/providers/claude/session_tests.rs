@@ -1125,6 +1125,152 @@ fn restarts_a_named_account_with_the_new_model_while_resuming_the_provider_conve
     finish(second).unwrap();
 }
 
+// describe("claude conversation binding")
+
+fn provider_bindings(events: &Events) -> Vec<String> {
+    events
+        .all()
+        .into_iter()
+        .filter_map(|event| match event {
+            HarnessEvent::SessionProviderBound {
+                provider_session_id,
+            } => Some(provider_session_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_arg(args: &[String], arg: &str) -> bool {
+    args.iter().any(|item| item == arg)
+}
+
+/// Answer the replacement process's initialize and finish its turn.
+fn finish_replacement_turn(h: &Harness, turn: Turn, user_count: usize, provider_session_id: &str) {
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_1" },
+    }));
+    h.wait_for(|| h.user_count() == user_count, "retried prompt");
+    h.result(provider_session_id);
+    finish(turn).unwrap();
+}
+
+#[test]
+fn does_not_bind_a_new_conversation_until_claude_saves_the_first_prompt() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    assert!(provider_bindings(&events).is_empty());
+    smol::block_on(h.sessions.cancel_turn("s1")).unwrap();
+    finish(turn).unwrap();
+    h.exit(Some(1));
+
+    let (_, turn) = h.send(
+        "s1",
+        TurnOptions {
+            text: Some("try again"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(|| h.spawned().len() == 2, "replacement Claude process");
+    let args = &h.spawned()[1];
+    assert!(!has_arg(args, "--resume"));
+    assert!(has_arg(args, "--session-id"));
+    finish_replacement_turn(&h, turn, 2, "sess_1");
+}
+
+#[test]
+fn binds_the_conversation_once_claude_streams_the_reply() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "stream_event",
+        "session_id": "sess_1",
+        "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": { "type": "text_delta", "text": "hi" },
+        },
+    }));
+    assert_eq!(provider_bindings(&events), vec!["sess_1".to_string()]);
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+fn missing_conversation_result() -> Value {
+    json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": "gone",
+        "errors": ["No conversation found with session ID: gone"],
+    })
+}
+
+#[test]
+fn starts_a_new_conversation_when_the_saved_one_does_not_exist() {
+    let h = Harness::new();
+    h.sessions.bind_session("s1", "gone", "/repo", None);
+    let (events, turn) = h.send(
+        "s1",
+        TurnOptions {
+            text: Some("keep going"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "resumed Claude process",
+    );
+    assert!(contains_all(&h.spawned()[0], &["--resume", "gone"]));
+    h.emit(missing_conversation_result());
+    h.exit(Some(1));
+
+    h.wait_for(|| h.spawned().len() == 2, "replacement Claude process");
+    let args = &h.spawned()[1];
+    assert!(!has_arg(args, "--resume"));
+    assert!(has_arg(args, "--session-id"));
+    finish_replacement_turn(&h, turn, 1, "sess_2");
+
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionError { .. })));
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionEnded { .. })));
+    assert!(events.any(|event| matches!(
+        event,
+        HarnessEvent::Status { text } if text.contains("no saved conversation")
+    )));
+    assert_eq!(provider_bindings(&events), vec!["sess_2".to_string()]);
+}
+
+// describe("claude missing conversation during a turn")
+
+#[test]
+fn fails_the_turn_and_starts_a_new_conversation_next_time() {
+    let h = Harness::new();
+    h.sessions.bind_session("s1", "gone", "/repo", None);
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    assert!(contains_all(&h.spawned()[0], &["--resume", "gone"]));
+    h.emit(missing_conversation_result());
+    let _ = finish(turn);
+    assert!(events.all().contains(&HarnessEvent::SessionError {
+        message: "No conversation found with session ID: gone".into(),
+    }));
+    h.exit(Some(1));
+
+    let (_, turn) = h.send(
+        "s1",
+        TurnOptions {
+            text: Some("again"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(|| h.spawned().len() == 2, "replacement Claude process");
+    assert!(!has_arg(&h.spawned()[1], "--resume"));
+    finish_replacement_turn(&h, turn, 2, "sess_2");
+}
+
 // describe("claude legacy account resume")
 
 #[test]
@@ -1213,6 +1359,9 @@ fn routes_a_child_permission_decision() {
             ApprovalDecision::Deny => "deny",
         };
         assert_eq!(response["response"]["response"]["behavior"], expected);
+        // A new conversation binds once Claude saves it, here on the result.
+        h.result("sess_1");
+        finish(turn).unwrap();
         let bound = events
             .all()
             .into_iter()
@@ -1224,8 +1373,6 @@ fn routes_a_child_permission_decision() {
                 _ => None,
             });
         assert_eq!(bound.as_deref(), Some("sess_1"));
-        h.result("sess_1");
-        finish(turn).unwrap();
     }
 }
 

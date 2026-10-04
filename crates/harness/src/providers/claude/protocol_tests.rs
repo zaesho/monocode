@@ -507,6 +507,29 @@ fn treats_aborted_terminals_as_interrupted() {
     );
 }
 
+#[test]
+fn recognizes_the_missing_conversation_result() {
+    let missing = json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": "gone",
+        "errors": ["No conversation found with session ID: gone"],
+    });
+    assert!(is_missing_conversation_result(&rec(missing.clone())));
+    let mut not_error = missing.clone();
+    not_error["is_error"] = json!(false);
+    assert!(!is_missing_conversation_result(&rec(not_error)));
+    let mut other_error = missing;
+    other_error["errors"] = json!(["Claude turn failed."]);
+    assert!(!is_missing_conversation_result(&rec(other_error)));
+    assert!(!is_missing_conversation_result(&rec(json!({
+        "type": "assistant",
+        "is_error": true,
+        "errors": ["No conversation found with session ID: gone"],
+    }))));
+}
+
 // describe("modelsForClaudeVersion")
 
 fn native_ids(version: Option<&str>) -> Vec<String> {

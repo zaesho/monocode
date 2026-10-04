@@ -22,9 +22,12 @@ use monocode_platform::{dirs_home, expand_home, passwd_identity};
 /// Receives what harness children and OpenCode event streams produce. The
 /// Tauri app emits these as `harness-stdout`, `harness-stderr`,
 /// `harness-exit`, `harness-sse`, and `harness-sse-end`.
+///
+/// `pid` on a line is the child that wrote it, so a replacement under the
+/// same session id can ignore output from the process it replaced.
 pub trait HarnessEvents: Send + Sync {
-    fn stdout(&self, session_id: &str, line: String);
-    fn stderr(&self, session_id: &str, line: String);
+    fn stdout(&self, session_id: &str, line: String, pid: u32);
+    fn stderr(&self, session_id: &str, line: String, pid: u32);
     fn exit(&self, session_id: &str, code: Option<i32>, pid: u32);
     fn sse(&self, session_id: &str, data: String);
     fn sse_end(&self, session_id: &str, error: Option<String>);
@@ -33,8 +36,8 @@ pub trait HarnessEvents: Send + Sync {
 struct NoHarnessEvents;
 
 impl HarnessEvents for NoHarnessEvents {
-    fn stdout(&self, _session_id: &str, _line: String) {}
-    fn stderr(&self, _session_id: &str, _line: String) {}
+    fn stdout(&self, _session_id: &str, _line: String, _pid: u32) {}
+    fn stderr(&self, _session_id: &str, _line: String, _pid: u32) {}
     fn exit(&self, _session_id: &str, _code: Option<i32>, _pid: u32) {}
     fn sse(&self, _session_id: &str, _data: String) {}
     fn sse_end(&self, _session_id: &str, _error: Option<String>) {}
@@ -952,7 +955,7 @@ pub fn harness_spawn_with_env(
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            stdout_events.stdout(&stdout_id, line);
+            stdout_events.stdout(&stdout_id, line, pid);
         }
     });
 
@@ -961,7 +964,7 @@ pub fn harness_spawn_with_env(
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            stderr_events.stderr(&stderr_id, line);
+            stderr_events.stderr(&stderr_id, line, pid);
         }
     });
 

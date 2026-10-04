@@ -615,6 +615,19 @@ fn string_items(rec: &Record, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `isMissingConversationResult`: the result Claude prints and exits with
+/// when `--resume` names a session it has no transcript for.
+pub fn is_missing_conversation_result(rec: &Record) -> bool {
+    if string_field(Some(rec), "type") != Some("result")
+        || rec.get("is_error").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    string_items(rec, "errors")
+        .iter()
+        .any(|item| item.starts_with("No conversation found with session ID"))
+}
+
 /// `turnStatusFromResult`.
 pub fn turn_status_from_result(rec: &Record) -> ClaudeTurnResult {
     let done = |status| ClaudeTurnResult {

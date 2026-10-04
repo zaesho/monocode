@@ -148,6 +148,7 @@ fn speaks_stream_json_with_stdio_permissions_like_the_agent_sdk() {
         "--input-format",
         "--permission-prompt-tool",
         "stdio",
+        "--forward-subagent-text",
         "--include-partial-messages",
         "--setting-sources=user,project,local",
     ] {
@@ -187,6 +188,24 @@ fn skips_permissions_and_mcp_for_isolated_text_sessions() {
     assert!(contains_all(&args, &["--max-turns", "1"]));
     assert_eq!(settings_arg(&args)["disableAllHooks"], json!(true));
     assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
+    assert!(!args.iter().any(|arg| arg == "--forward-subagent-text"));
+    assert!(!args.iter().any(|arg| arg == "--tools"));
+}
+
+#[test]
+fn passes_the_helper_tool_list_even_when_it_is_empty() {
+    let none = build_claude_spawn_args(&ClaudeSpawnOptions {
+        isolated: true,
+        tools: Some(Vec::new()),
+        ..Default::default()
+    });
+    assert!(contains_all(&none, &["--tools", ""]));
+    let read_only = build_claude_spawn_args(&ClaudeSpawnOptions {
+        isolated: true,
+        tools: Some(vec!["Read".into(), "Glob".into(), "Grep".into()]),
+        ..Default::default()
+    });
+    assert!(contains_all(&read_only, &["--tools", "Read,Glob,Grep"]));
 }
 
 #[test]
@@ -437,7 +456,10 @@ fn skips_advisor_iterations_when_reading_context() {
             { "type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 39219, "output_tokens": 128 },
         ] },
     }));
-    assert_eq!(context_from_result(&result).unwrap().used, Some(37669));
+    assert_eq!(
+        context_from_result(&result, None).unwrap().used,
+        Some(37669)
+    );
 }
 
 // describe("usage limits")
@@ -503,6 +525,38 @@ fn treats_aborted_terminals_as_interrupted() {
     );
     assert_eq!(
         turn_status_from_result(&rec(json!({ "type": "result", "subtype": "success" }))).status,
+        ClaudeTurnStatus::Completed
+    );
+}
+
+#[test]
+fn fails_a_success_result_that_carries_an_api_error() {
+    let result = turn_status_from_result(&rec(json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "result": "API Error: 529 Overloaded",
+        "errors": [],
+    })));
+    assert_eq!(result.status, ClaudeTurnStatus::Failed);
+    assert_eq!(result.error.as_deref(), Some("API Error: 529 Overloaded"));
+    assert_eq!(
+        turn_status_from_result(&rec(json!({
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "max_turns",
+        })))
+        .status,
+        ClaudeTurnStatus::Failed
+    );
+    assert_eq!(
+        turn_status_from_result(&rec(json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "end_turn",
+        })))
+        .status,
         ClaudeTurnStatus::Completed
     );
 }
@@ -955,6 +1009,19 @@ fn keeps_status_messages_that_carry_real_prose() {
 }
 
 #[test]
+fn retains_provider_notifications_about_usage_credits() {
+    assert_eq!(
+        status_text_from_system(&rec(json!({
+            "type": "system",
+            "subtype": "notification",
+            "message": "Fable is now using usage credits instead of your plan limits",
+        })))
+        .as_deref(),
+        Some("Fable is now using usage credits instead of your plan limits")
+    );
+}
+
+#[test]
 fn still_marks_a_compact_boundary_that_carries_no_prose() {
     assert_eq!(
         status_text_from_system(&rec(json!({
@@ -1020,13 +1087,39 @@ fn reads_the_window_the_cli_reports_rather_than_a_model_table() {
         },
         "modelUsage": { "claude-sonnet-5": { "contextWindow": 1_000_000, "maxOutputTokens": 64000 } },
     }));
+    // Top-level usage without iterations sums the turn, so it is no reading.
     assert_eq!(
-        context_from_result(&result),
+        context_from_result(&result, None),
         Some(ClaudeContextReading {
-            used: Some(29608),
+            used: None,
             window: Some(1_000_000)
         })
     );
+}
+
+#[test]
+fn reads_the_main_models_window_when_a_turn_used_several() {
+    let result = rec(json!({
+        "type": "result",
+        "usage": { "iterations": [{ "input_tokens": 5, "output_tokens": 5 }] },
+        "modelUsage": {
+            "claude-haiku-4-5": { "contextWindow": 200_000 },
+            "claude-opus-5[1m]": { "contextWindow": 1_000_000 },
+        },
+    }));
+    assert_eq!(
+        context_from_result(&result, Some("claude-opus-5"))
+            .unwrap()
+            .window,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        context_from_result(&result, Some("claude-haiku-4-5"))
+            .unwrap()
+            .window,
+        Some(200_000)
+    );
+    assert_eq!(context_from_result(&result, None).unwrap().window, None);
 }
 
 #[test]
@@ -1045,7 +1138,7 @@ fn uses_the_last_iteration_since_top_level_usage_sums_the_whole_turn() {
         "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
     }));
     assert_eq!(
-        context_from_result(&result),
+        context_from_result(&result, None),
         Some(ClaudeContextReading {
             used: Some(70_305),
             window: Some(200_000)
@@ -1056,7 +1149,7 @@ fn uses_the_last_iteration_since_top_level_usage_sums_the_whole_turn() {
 #[test]
 fn has_nothing_to_report_for_a_turn_that_never_called_the_api() {
     assert_eq!(
-        context_from_result(&rec(json!({ "type": "result", "usage": {} }))),
+        context_from_result(&rec(json!({ "type": "result", "usage": {} })), None),
         None
     );
 }
@@ -1083,6 +1176,17 @@ fn normalizes_aggregate_input_output_and_cache_usage() {
             extra: Default::default(),
         })
     );
+}
+
+#[test]
+fn keeps_zero_token_fields_so_totals_can_sum_them() {
+    let metrics = turn_metrics_from_result(&rec(json!({
+        "usage": { "input_tokens": 3, "output_tokens": 7 },
+    })))
+    .unwrap();
+    assert_eq!(metrics.cache_read_tokens, Some(0));
+    assert_eq!(metrics.cache_write_tokens, Some(0));
+    assert_eq!(metrics.cache_hit_percent, None);
 }
 
 // describe("subagent messages")

@@ -49,6 +49,9 @@ struct FakeState {
     on_line: Option<LineHandler>,
     on_exit: Option<ExitHandler>,
     reject_writes: VecDeque<String>,
+    kills: usize,
+    /// Holds binary resolution until the test sends or drops the gate.
+    binary_gate: Option<async_channel::Receiver<()>>,
 }
 
 /// The `vi.mock("../../core/child")` of the TypeScript test.
@@ -59,7 +62,14 @@ struct FakeIo {
 
 impl ClaudeChildIo for FakeIo {
     fn resolve_claude_binary(&self) -> BoxFuture<'static, Result<String>> {
-        async { Ok("/fake/claude".to_string()) }.boxed()
+        let gate = self.state.lock().binary_gate.take();
+        async move {
+            if let Some(gate) = gate {
+                let _ = gate.recv().await;
+            }
+            Ok("/fake/claude".to_string())
+        }
+        .boxed()
     }
 
     fn spawn_child(
@@ -92,6 +102,7 @@ impl ClaudeChildIo for FakeIo {
     }
 
     fn kill_child(&self, _child_id: &str) -> BoxFuture<'static, Result<()>> {
+        self.state.lock().kills += 1;
         async { Ok(()) }.boxed()
     }
 
@@ -294,10 +305,29 @@ impl Harness {
         self.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
         self.emit(json!({
             "type": "control_response",
-            "response": { "subtype": "success", "request_id": "monocode_1" },
+            "response": { "subtype": "success", "request_id": "monocode_2" },
         }));
         self.wait_for(|| self.user_count() > 0, "user prompt");
         (events, turn)
+    }
+
+    /// Acknowledge the latest process's `initialize` once it has asked.
+    fn ack_init(&self) {
+        let processes = self.spawned().len();
+        self.wait_for(
+            || {
+                self.parse()
+                    .iter()
+                    .filter(|m| m["request"]["subtype"] == "initialize")
+                    .count()
+                    >= processes
+            },
+            "initialize",
+        );
+        self.emit(json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "monocode_2" },
+        }));
     }
 
     /// `restartedTurn`: a later turn that must launch a new Claude process.
@@ -318,6 +348,7 @@ impl Harness {
         self.emit(
             json!({ "type": "system", "subtype": "init", "session_id": provider_session_id }),
         );
+        self.ack_init();
         self.wait_for(|| self.user_count() > user_count, "follow-up prompt");
         (events, turn)
     }
@@ -1120,6 +1151,7 @@ fn restarts_a_named_account_with_the_new_model_while_resuming_the_provider_conve
     assert!(!args.iter().any(|arg| arg == "--session-id"));
 
     h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    h.ack_init();
     h.wait_for(|| h.user_count() > user_count, "follow-up prompt");
     h.result("sess_1");
     finish(second).unwrap();
@@ -1146,10 +1178,7 @@ fn has_arg(args: &[String], arg: &str) -> bool {
 
 /// Answer the replacement process's initialize and finish its turn.
 fn finish_replacement_turn(h: &Harness, turn: Turn, user_count: usize, provider_session_id: &str) {
-    h.emit(json!({
-        "type": "control_response",
-        "response": { "subtype": "success", "request_id": "monocode_1" },
-    }));
+    h.ack_init();
     h.wait_for(|| h.user_count() == user_count, "retried prompt");
     h.result(provider_session_id);
     finish(turn).unwrap();
@@ -2133,8 +2162,14 @@ fn stops_background_commands_when_the_turn_is_stopped() {
         .into_iter()
         .filter_map(|message| message.get("request").cloned())
         .collect();
-    assert!(requests.contains(&json!({ "subtype": "stop_task", "task_id": "b7" })));
+    // Stop ends the process, and its background commands with it.
     assert_eq!(requests.last(), Some(&json!({ "subtype": "interrupt" })));
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request["subtype"] == "stop_task")
+    );
+    assert_eq!(h.io.state.lock().kills, 1);
     assert!(has_message_completed(&events));
 }
 
@@ -2308,6 +2343,7 @@ fn a_sink_can_answer_an_approval_from_inside_its_callback() {
         "initialize",
     );
     h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    h.ack_init();
     h.wait_for(|| h.user_count() > 0, "user prompt");
     h.emit(json!({
         "type": "control_request",
@@ -2465,4 +2501,311 @@ fn reads_advisor_advice_and_failures_from_the_assistant_snapshot() {
         Some(InterjectionStatus::Failed)
     );
     assert!(!session.blocks.iter().any(|block| block.tool.is_some()));
+}
+
+// describe("official v0.7.0 lifecycle audit")
+
+fn steer(h: &Harness, text: &str) -> Result<()> {
+    smol::block_on(
+        h.sessions
+            .steer_turn(monocode_core::harness_event::SteerTurnInput {
+                session_id: "s1".into(),
+                cwd: "/repo".into(),
+                model: "claude:claude-sonnet-5".into(),
+                model_settings: None,
+                text: text.into(),
+                attachments: None,
+            }),
+    )
+}
+
+#[test]
+fn cancels_binary_discovery_without_cancelling_the_next_send() {
+    let h = Harness::new();
+    let (gate, held) = async_channel::bounded::<()>(1);
+    h.io.state.lock().binary_gate = Some(held);
+    let (_, first) = h.send("s1", TurnOptions::default());
+    std::thread::sleep(Duration::from_millis(20));
+    smol::block_on(h.sessions.cancel_turn("s1")).unwrap();
+    drop(gate);
+    finish(first).unwrap();
+    assert!(h.spawned().is_empty());
+
+    let (_, second) = h.start_turn("s1", TurnOptions::default());
+    h.result("sess_1");
+    finish(second).unwrap();
+}
+
+#[test]
+fn does_not_send_a_prompt_that_was_cancelled_during_initialization() {
+    let h = Harness::new();
+    let (_, turn) = h.send("s1", TurnOptions::default());
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    smol::block_on(h.sessions.cancel_turn("s1")).unwrap();
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_2" },
+    }));
+    finish(turn).unwrap();
+    assert_eq!(h.user_count(), 0);
+}
+
+#[test]
+fn does_not_complete_a_new_turn_with_the_cancelled_turns_delayed_result() {
+    let h = Harness::new();
+    let (_, first) = h.start_turn("s1", TurnOptions::default());
+    let old_line = h.io.state.lock().on_line.clone().unwrap();
+    smol::block_on(h.sessions.cancel_turn("s1")).unwrap();
+    finish(first).unwrap();
+
+    let (_, second) = h.send(
+        "s1",
+        TurnOptions {
+            text: Some("second"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(|| h.spawned().len() == 2, "replacement Claude process");
+    h.ack_init();
+    h.wait_for(|| h.user_count() == 2, "second prompt");
+    old_line(
+        json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "errors": ["Interrupted"],
+            "terminal_reason": "aborted_streaming",
+        })
+        .to_string(),
+    );
+    assert!(!settles_within(&second, Duration::from_millis(100)));
+    h.result("sess_1");
+    finish(second).unwrap();
+}
+
+#[test]
+fn reports_api_errors_carried_by_a_success_result() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "result": "API Error: 529 Overloaded",
+        "errors": [],
+    }));
+    finish(turn).unwrap();
+    assert!(events.all().contains(&HarnessEvent::SessionError {
+        message: "API Error: 529 Overloaded".into(),
+    }));
+}
+
+#[test]
+fn keeps_the_monocode_turn_active_for_a_queued_steer_message() {
+    let h = Harness::new();
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    steer(&h, "second").unwrap();
+    h.emit(json!({ "type": "result", "subtype": "success", "result": "FIRST", "is_error": false }));
+    assert!(!settles_within(&turn, Duration::from_millis(100)));
+    h.emit(
+        json!({ "type": "result", "subtype": "success", "result": "SECOND", "is_error": false }),
+    );
+    finish(turn).unwrap();
+}
+
+#[test]
+fn releases_the_result_a_steer_message_owed_when_it_cannot_be_written() {
+    let h = Harness::new();
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    h.reject_next_write("Write failed");
+    assert!(steer(&h, "second").is_err());
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn sums_token_totals_across_the_parent_and_steer_results() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    steer(&h, "second").unwrap();
+    for (input, output) in [(10, 5), (20, 7)] {
+        h.emit(json!({
+            "type": "result",
+            "subtype": "success",
+            "usage": { "input_tokens": input, "output_tokens": output, "cache_read_input_tokens": 30 },
+        }));
+    }
+    finish(turn).unwrap();
+    let last = events
+        .all()
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            HarnessEvent::TurnMetrics(metrics) => Some(metrics),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last.input_tokens, Some(30));
+    assert_eq!(last.output_tokens, Some(12));
+    assert_eq!(last.cache_read_tokens, Some(60));
+    assert_eq!(last.cache_write_tokens, Some(0));
+    assert_eq!(last.cache_hit_percent, Some(60.0 / 90.0 * 100.0));
+}
+
+#[test]
+fn reads_the_window_of_the_model_claude_reported() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "assistant",
+        "session_id": "sess_1",
+        "message": { "model": "claude-opus-5", "content": [{ "type": "text", "text": "hi" }] },
+    }));
+    h.emit(json!({
+        "type": "result",
+        "subtype": "success",
+        "usage": { "iterations": [{ "input_tokens": 5, "output_tokens": 5 }] },
+        "modelUsage": {
+            "claude-haiku-4-5": { "contextWindow": 200_000 },
+            "claude-opus-5": { "contextWindow": 1_000_000 },
+        },
+    }));
+    finish(turn).unwrap();
+    assert!(events.all().contains(&HarnessEvent::Context {
+        used: Some(10),
+        window: Some(1_000_000),
+    }));
+}
+
+#[test]
+fn waits_for_the_follow_up_of_a_background_task_that_finished_before_the_first_result() {
+    let h = Harness::new();
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "system", "subtype": "task_started", "task_id": "short-bash",
+        "task_type": "local_bash", "is_backgrounded": true, "description": "Audit verification",
+    }));
+    h.emit(json!({ "type": "system", "subtype": "background_tasks_changed", "tasks": [] }));
+    h.emit(json!({
+        "type": "system", "subtype": "task_updated", "task_id": "short-bash",
+        "patch": { "status": "completed" },
+    }));
+    h.emit(json!({
+        "type": "system", "subtype": "task_notification", "task_id": "short-bash",
+        "status": "completed", "summary": "AUDIT_DONE",
+    }));
+    h.result("sess_1");
+    assert!(!settles_within(&turn, Duration::from_millis(100)));
+    h.emit_follow_up_turn("done");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn rejects_an_initialization_error_rather_than_sending_the_prompt() {
+    let h = Harness::new();
+    let (_, turn) = h.send("s1", TurnOptions::default());
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "error", "request_id": "monocode_2", "error": "Initialization failed" },
+    }));
+    let error = finish(turn).unwrap_err();
+    assert!(format!("{error:#}").contains("Initialization failed"));
+    assert_eq!(h.user_count(), 0);
+}
+
+#[test]
+fn ignores_a_control_response_for_another_request_during_initialization() {
+    let h = Harness::new();
+    let (events, turn) = h.send("s1", TurnOptions::default());
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "someone_else" },
+    }));
+    assert!(!settles_within(&turn, Duration::from_millis(100)));
+    assert_eq!(h.user_count(), 0);
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionStarted)));
+    h.ack_init();
+    h.wait_for(|| h.user_count() == 1, "user prompt");
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn does_not_report_initialized_when_no_initialize_acknowledgement_arrives() {
+    let io = Arc::new(FakeIo::default());
+    let options = ClaudeSessionOptions {
+        init_timeout: Duration::from_millis(50),
+        resume_grace: GRACE,
+        ..Default::default()
+    };
+    let h = Harness {
+        sessions: ClaudeSessions::new(io.clone(), Arc::new(SmolSpawner), options),
+        io,
+    };
+    let (events, turn) = h.send("s1", TurnOptions::default());
+    let error = finish(turn).unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"));
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionStarted)));
+    assert_eq!(h.user_count(), 0);
+}
+
+#[test]
+fn does_not_mark_a_child_that_exited_just_after_initialization_as_started() {
+    let h = Harness::new();
+    let (events, turn) = h.send("s1", TurnOptions::default());
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    h.exit(Some(1));
+    let error = finish(turn).unwrap_err();
+    assert!(format!("{error:#}").contains("exited during initialization"));
+    assert!(
+        events
+            .all()
+            .contains(&HarnessEvent::SessionEnded { code: Some(1) })
+    );
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionStarted)));
+}
+
+#[test]
+fn does_not_silently_succeed_when_an_interrupt_cannot_reach_claude() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.reject_next_write("Write failed");
+    let error = smol::block_on(h.sessions.cancel_turn("s1")).unwrap_err();
+    assert!(format!("{error:#}").contains("Write failed"));
+    finish(turn).unwrap();
+    assert!(events.all().contains(&HarnessEvent::SessionError {
+        message: "Write failed".into(),
+    }));
+    assert_eq!(h.io.state.lock().kills, 1);
 }

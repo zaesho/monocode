@@ -73,6 +73,8 @@ pub struct ClaudeControlRequest {
     pub tool_name: Option<String>,
     pub input: Record,
     pub tool_use_id: Option<String>,
+    /// The nested `request` object, which an elicitation reads its form from.
+    pub request: Option<Record>,
 }
 
 /// `ClaudeCliSettings`: the JSON passed to `--settings`.
@@ -310,6 +312,9 @@ pub struct ClaudeSpawnOptions {
     pub include_partial_messages: Option<bool>,
     pub max_turns: Option<i64>,
     pub isolated: bool,
+    /// `--tools`: the only built-in tools Claude may use. An empty list
+    /// turns them all off.
+    pub tools: Option<Vec<String>>,
 }
 
 fn non_empty(value: &Option<String>) -> Option<&str> {
@@ -328,6 +333,8 @@ pub fn build_claude_spawn_args(input: &ClaudeSpawnOptions) -> Vec<String> {
     .map(String::from)
     .to_vec();
     if !input.isolated {
+        // Foreground subagents only report their prose with this flag.
+        args.push("--forward-subagent-text".into());
         args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
     }
     if input.include_partial_messages != Some(false) {
@@ -352,6 +359,9 @@ pub fn build_claude_spawn_args(input: &ClaudeSpawnOptions) -> Vec<String> {
         args.push(format!("--setting-sources={CLAUDE_SETTING_SOURCES}"));
         args.push("--settings".into());
         args.push(settings);
+    }
+    if let Some(tools) = &input.tools {
+        args.extend(["--tools".into(), tools.join(",")]);
     }
     if let Some(model) = non_empty(&input.model) {
         args.extend(["--model".into(), model.to_string()]);
@@ -509,6 +519,7 @@ pub fn parse_control_request(rec: &Record) -> Option<ClaudeControlRequest> {
             .or_else(|| string_field(nested, "toolUseID"))
             .or_else(|| string_field(Some(rec), "tool_use_id"))
             .map(str::to_string),
+        request: nested.cloned(),
     })
 }
 
@@ -573,7 +584,7 @@ pub fn status_text_from_system(rec: &Record) -> Option<String> {
     }
     let subtype = subtype_of(rec).unwrap_or("");
     let compact = subtype.starts_with("compact");
-    if subtype != "status" && !compact {
+    if subtype != "status" && subtype != "notification" && !compact {
         return None;
     }
     // Prose lives in `message`; `status` carries the bare lifecycle token.
@@ -634,9 +645,6 @@ pub fn turn_status_from_result(rec: &Record) -> ClaudeTurnResult {
         status,
         error: None,
     };
-    if subtype_of(rec) == Some("success") {
-        return done(ClaudeTurnStatus::Completed);
-    }
     let errors = string_items(rec, "errors");
     let joined = errors.join(" ").to_lowercase();
     let terminal = string_field(Some(rec), "terminal_reason").unwrap_or("");
@@ -649,9 +657,18 @@ pub fn turn_status_from_result(rec: &Record) -> ClaudeTurnResult {
     if joined.contains("cancel") {
         return done(ClaudeTurnStatus::Cancelled);
     }
+    // A success subtype can still carry an API error in `is_error` or a
+    // failed `terminal_reason`.
+    if subtype_of(rec) == Some("success")
+        && rec.get("is_error").and_then(Value::as_bool) != Some(true)
+        && matches!(terminal, "" | "success" | "end_turn")
+    {
+        return done(ClaudeTurnStatus::Completed);
+    }
     let error = errors
         .into_iter()
-        .find(|item| !item.starts_with("[ede_diagnostic]"));
+        .find(|item| !item.starts_with("[ede_diagnostic]"))
+        .or_else(|| string_field(Some(rec), "result").map(str::to_string));
     ClaudeTurnResult {
         status: ClaudeTurnStatus::Failed,
         error: Some(error.unwrap_or_else(|| "Claude turn failed.".into())),
@@ -1572,10 +1589,6 @@ fn context_used_from_usage(usage: Option<&Record>) -> f64 {
         + number_field(usage, "output_tokens")
 }
 
-fn tokens(value: f64) -> Option<i64> {
-    (value != 0.0).then_some(value as i64)
-}
-
 /// `turnMetricsFromResult`: aggregate token accounting for the completed turn.
 pub fn turn_metrics_from_result(rec: &Record) -> Option<TurnMetrics> {
     let usage = record_field(Some(rec), "usage")?;
@@ -1589,11 +1602,12 @@ pub fn turn_metrics_from_result(rec: &Record) -> Option<TurnMetrics> {
     if input_tokens == 0.0 && output_tokens == 0.0 && cacheable_input == 0.0 {
         return None;
     }
+    // Zero counts stay, so totals summed across results keep every field.
     Some(TurnMetrics {
-        input_tokens: tokens(input_tokens),
-        output_tokens: tokens(output_tokens),
-        cache_read_tokens: tokens(cache_read_tokens),
-        cache_write_tokens: tokens(cache_write_tokens),
+        input_tokens: Some(input_tokens as i64),
+        output_tokens: Some(output_tokens as i64),
+        cache_read_tokens: Some(cache_read_tokens as i64),
+        cache_write_tokens: Some(cache_write_tokens as i64),
         cache_hit_percent: (cache_reported && cacheable_input != 0.0)
             .then(|| (cache_read_tokens / cacheable_input) * 100.0),
         extra: Default::default(),
@@ -1609,6 +1623,12 @@ pub fn context_used_from_assistant(rec: &Record) -> Option<i64> {
     (used > 0.0).then_some(used as i64)
 }
 
+/// `id` without a trailing `[1m]`, compared case-insensitively.
+fn strip_1m_suffix(id: &str) -> String {
+    let lower = id.to_lowercase();
+    lower.strip_suffix("[1m]").unwrap_or(&lower).to_string()
+}
+
 /// Context level and window from a turn `result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClaudeContextReading {
@@ -1621,8 +1641,10 @@ pub struct ClaudeContextReading {
 /// `usage` at the top level sums every iteration of the turn, so the last entry
 /// of `usage.iterations` is what actually sits in the window. `modelUsage`
 /// carries the window itself, which is why we let the CLI tell us rather than
-/// keeping a model table in sync.
-pub fn context_from_result(rec: &Record) -> Option<ClaudeContextReading> {
+/// keeping a model table in sync. It lists every model the turn used,
+/// subagents and helpers included, so only the main `model`'s entry counts.
+/// Without a model, only a lone entry is unambiguous.
+pub fn context_from_result(rec: &Record, model: Option<&str>) -> Option<ClaudeContextReading> {
     let usage = record_field(Some(rec), "usage");
     // An advisor consult runs in its own window, so it says nothing about
     // this one.
@@ -1635,17 +1657,24 @@ pub fn context_from_result(rec: &Record) -> Option<ClaudeContextReading> {
                 .filter_map(as_record)
                 .rfind(|entry| !is_advisor_iteration(entry))
         });
-    let used = context_used_from_usage(last.or(usage));
+    // Without iterations, top-level usage sums the whole turn and overstates
+    // what the window holds, so it gives no reading.
+    let used = context_used_from_usage(last);
 
-    let mut window: Option<f64> = None;
-    if let Some(model_usage) = record_field(Some(rec), "modelUsage") {
-        for entry in model_usage.values() {
-            let context_window = number_field(as_record(entry), "contextWindow");
-            if context_window > 0.0 {
-                window = Some(window.unwrap_or(0.0).max(context_window));
-            }
-        }
-    }
+    let model_usage = record_field(Some(rec), "modelUsage");
+    let entry = match (model_usage, model) {
+        (Some(model_usage), Some(model)) => model_usage.get(model).or_else(|| {
+            let wanted = strip_1m_suffix(model);
+            model_usage
+                .iter()
+                .find(|(id, _)| strip_1m_suffix(id) == wanted)
+                .map(|(_, entry)| entry)
+        }),
+        (Some(model_usage), None) if model_usage.len() == 1 => model_usage.values().next(),
+        _ => None,
+    };
+    let context_window = number_field(entry.and_then(as_record), "contextWindow");
+    let window = (context_window > 0.0).then_some(context_window);
 
     if used == 0.0 && window.is_none() {
         return None;

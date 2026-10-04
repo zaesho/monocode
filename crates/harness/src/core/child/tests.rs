@@ -389,6 +389,52 @@ fn drops_late_output_from_a_child_replaced_under_the_same_session_id() {
     );
 }
 
+/// child.test.ts: "filters late stdout by process id when a session key is
+/// reused". The new child's early output, written while its spawn is still
+/// pending, reaches the watcher; the old child's never does.
+#[test]
+fn filters_late_stdout_by_process_id_when_a_session_key_is_reused() {
+    let (pid_tx, pid_rx) = async_channel::unbounded();
+    let (children, _fake) = children(Fake {
+        pids: Mutex::new(Some(pid_rx)),
+        ..Default::default()
+    });
+    let router = children.router().clone();
+    let first = children.watch_child("same");
+    smol::block_on(spawn_with(&children, &pid_tx, "same", 41)).unwrap();
+    router.on_child_stdout("same", "first".into(), 41);
+    let mut lines: Vec<String> = stdout_lines(&drain(&first))
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    smol::block_on(children.kill_child("same")).unwrap();
+
+    let events = children.watch_child("same");
+    smol::block_on(async {
+        let spawning = {
+            let children = children.clone();
+            smol::spawn(async move {
+                children
+                    .spawn_child("same", "agent", vec![], "/tmp", None, None)
+                    .await
+            })
+        };
+        smol::Timer::after(Duration::from_millis(10)).await;
+        router.on_child_stdout("same", "old buffered result".into(), 41);
+        router.on_child_stdout("same", "early initialization".into(), 42);
+        pid_tx.send(42).await.unwrap();
+        spawning.await.unwrap();
+    });
+    router.on_child_stdout("same", "late old result".into(), 41);
+    router.on_child_stdout("same", "new result".into(), 42);
+    lines.extend(
+        stdout_lines(&drain(&events))
+            .into_iter()
+            .map(str::to_string),
+    );
+    assert_eq!(lines, ["first", "early initialization", "new result"]);
+}
+
 /// child.test.ts: "delivers output that arrives after its child's exit".
 #[test]
 fn delivers_output_that_arrives_after_its_childs_exit() {

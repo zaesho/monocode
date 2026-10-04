@@ -23,6 +23,7 @@ use futures::future::BoxFuture;
 use monocode_core::attachment::Attachment;
 use monocode_core::block::{
     AgentStepKind, ApprovalDecided, InterjectionStatus, TaskListItem, TaskListMeta, TurnIntent,
+    TurnMetrics,
 };
 use monocode_core::harness::RuntimeMode;
 use monocode_core::harness_event::{
@@ -248,8 +249,28 @@ struct Live {
     turn: Option<TurnWaiter>,
     turn_end_pending: bool,
     active_turn: bool,
-    init_done: Option<oneshot::Sender<()>>,
+    /// `initDone` and `initFailed`: settles the wait for the initialize
+    /// acknowledgement.
+    init_done: Option<oneshot::Sender<Result<(), String>>>,
     initialized: bool,
+    /// The id of our `initialize` control request. Only its acknowledgement
+    /// marks the child initialized.
+    init_request_id: String,
+    /// Why initialization failed, for a wait that starts after the failure.
+    init_error: Option<String>,
+    /// The child was stopped or exited. Late output and queued sends for it
+    /// are dropped.
+    closed: bool,
+    /// `ensure_live` finished starting this child.
+    started: bool,
+    /// Results Claude still owes this MonoCode turn: one for the prompt and
+    /// one for each steer message it accepted.
+    outstanding_results: u32,
+    /// Token totals across every result of this MonoCode turn.
+    metrics: TurnMetrics,
+    /// The main model, from Claude's assistant messages. A turn's result
+    /// lists subagent and helper models too.
+    model: String,
     emitted_assistant: String,
     emitted_reasoning: String,
     pending_assistant_boundary: bool,
@@ -366,6 +387,9 @@ struct Globals {
     /// records which one.
     tasks_by_thread: HashMap<String, RetainedTasks>,
     cancelled_threads: HashSet<String>,
+    /// `cancellationEpochs`: bumped on every Stop, so a send that was still
+    /// waiting to start when the user stopped does not run afterwards.
+    cancellation_epochs: HashMap<String, u64>,
 }
 
 struct Inner {
@@ -631,6 +655,9 @@ impl Live {
             return;
         }
 
+        if let Some(model) = string_field(record_field(Some(rec), "message"), "model") {
+            self.model = model.to_string();
+        }
         if let Some(used) = context_used_from_assistant(rec) {
             self.emit(HarnessEvent::Context {
                 used: Some(used),
@@ -950,15 +977,34 @@ impl Live {
         // rebuilt conversation level. The next real turn will provide the
         // fresh reading.
         if !self.manual_compaction
-            && let Some(context) = context_from_result(rec)
+            && let Some(context) = context_from_result(rec, Some(&self.model))
         {
             self.emit(HarnessEvent::Context {
                 used: context.used,
                 window: context.window,
             });
         }
+        // A steer message and a background follow-up each end in their own
+        // result, so the turn's totals sum them.
         if let Some(metrics) = turn_metrics_from_result(rec) {
-            self.emit(HarnessEvent::TurnMetrics(metrics));
+            let totals = &mut self.metrics;
+            for (total, value) in [
+                (&mut totals.input_tokens, metrics.input_tokens),
+                (&mut totals.output_tokens, metrics.output_tokens),
+                (&mut totals.cache_read_tokens, metrics.cache_read_tokens),
+                (&mut totals.cache_write_tokens, metrics.cache_write_tokens),
+            ] {
+                *total = Some(total.unwrap_or(0) + value.unwrap_or(0));
+            }
+            let read = totals.cache_read_tokens.unwrap_or(0);
+            let cacheable =
+                totals.input_tokens.unwrap_or(0) + read + totals.cache_write_tokens.unwrap_or(0);
+            totals.cache_hit_percent = Some(if cacheable == 0 {
+                0.0
+            } else {
+                read as f64 / cacheable as f64 * 100.0
+            });
+            self.emit(HarnessEvent::TurnMetrics(self.metrics.clone()));
         }
 
         let result = turn_status_from_result(rec);
@@ -986,6 +1032,7 @@ impl Live {
                 resets_at: limit.resets_at,
             });
         }
+        self.outstanding_results = self.outstanding_results.saturating_sub(1);
         self.turn_result_seen = true;
         if self.resume_expected {
             self.resume_expected = false;
@@ -1726,7 +1773,8 @@ impl Live {
 
     // `maybeFinishTurn`.
     fn maybe_finish_turn(&mut self) {
-        if !self.turn_result_seen {
+        // A steer message Claude accepted still owes its own result.
+        if !self.turn_result_seen || self.outstanding_results > 0 {
             return;
         }
         if !self.agent_tasks.is_empty() || !self.background_tasks.is_empty() {
@@ -1778,7 +1826,15 @@ impl Live {
         }
         self.initialized = true;
         if let Some(done) = self.init_done.take() {
-            let _ = done.send(());
+            let _ = done.send(Ok(()));
+        }
+    }
+
+    /// `initFailed`: initialization cannot succeed any more.
+    fn fail_init(&mut self, error: &str) {
+        self.init_error = Some(error.to_string());
+        if let Some(done) = self.init_done.take() {
+            let _ = done.send(Err(error.to_string()));
         }
     }
 
@@ -2073,37 +2129,91 @@ impl ClaudeSessions {
         }
     }
 
-    /// `sendClaudeTurn`.
-    pub async fn send_turn(&self, input: SendTurnInput, on_event: EventSink) -> Result<()> {
-        let thread_id = input.session.session_id.clone();
-        let cell = match self.ensure_live(&input.session, on_event.clone()).await {
+    /// The thread's cancellation epoch: how many times Stop was pressed.
+    fn epoch(&self, thread_id: &str) -> u64 {
+        self.inner
+            .globals
+            .lock()
+            .cancellation_epochs
+            .get(thread_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Stop was pressed since `epoch` was read.
+    fn stopped_since(&self, thread_id: &str, epoch: u64) -> bool {
+        self.epoch(thread_id) != epoch
+    }
+
+    /// The start of a send or compaction: the live child, or `None` when the
+    /// user stopped while it was starting.
+    async fn begin_turn(
+        &self,
+        input: &HarnessSessionInput,
+        on_event: EventSink,
+        epoch: u64,
+        reuse: Option<LiveRef>,
+    ) -> Result<Option<LiveRef>> {
+        let thread_id = &input.session_id;
+        let started = match reuse {
+            Some(cell) => Ok(cell),
+            None => self.ensure_live(input, on_event.clone()).await,
+        };
+        let cell = match started {
             Ok(cell) => cell,
             Err(error) => {
                 self.inner
                     .globals
                     .lock()
                     .cancelled_threads
-                    .remove(&thread_id);
+                    .remove(thread_id);
+                if self.stopped_since(thread_id, epoch) {
+                    return Ok(None);
+                }
                 return Err(error);
             }
         };
+        if self.stopped_since(thread_id, epoch) {
+            self.inner
+                .globals
+                .lock()
+                .cancelled_threads
+                .remove(thread_id);
+            return Ok(None);
+        }
         if self
             .inner
             .globals
             .lock()
             .cancelled_threads
-            .remove(&thread_id)
+            .remove(thread_id)
         {
+            return Ok(None);
+        }
+        let mut live = cell.lock();
+        live.on_event = on_event;
+        live.runtime_mode = input.runtime_mode;
+        drop(live);
+        Ok(Some(cell))
+    }
+
+    /// `sendClaudeTurn`.
+    pub async fn send_turn(&self, input: SendTurnInput, on_event: EventSink) -> Result<()> {
+        let thread_id = input.session.session_id.clone();
+        let epoch = self.epoch(&thread_id);
+        let Some(cell) = self
+            .begin_turn(&input.session, on_event, epoch, None)
+            .await?
+        else {
             return Ok(());
-        }
-        {
-            let mut live = cell.lock();
-            live.on_event = on_event;
-            live.runtime_mode = input.session.runtime_mode;
-        }
+        };
         let _turns = cell.turns.lock().await;
         {
             let mut live = cell.lock();
+            // A send queued behind a turn the user stopped does not run.
+            if live.closed || self.stopped_since(&thread_id, epoch) {
+                return Ok(());
+            }
             live.cancelled = false;
             live.mute_updates = false;
         }
@@ -2126,6 +2236,7 @@ impl ClaudeSessions {
         input: HarnessSessionInput,
         on_event: EventSink,
     ) -> Result<()> {
+        let epoch = self.epoch(&input.session_id);
         let settings_key = self.settings_key_for(&input);
         let existing = self
             .inner
@@ -2138,27 +2249,15 @@ impl ClaudeSessions {
             let live = cell.lock();
             live.cwd == input.cwd && live.settings_key == settings_key
         });
-        let cell = match reuse {
-            Some(cell) => cell,
-            None => self.ensure_live(&input, on_event.clone()).await?,
-        };
-        if self
-            .inner
-            .globals
-            .lock()
-            .cancelled_threads
-            .remove(&input.session_id)
-        {
+        let Some(cell) = self.begin_turn(&input, on_event, epoch, reuse).await? else {
             return Ok(());
-        }
-        {
-            let mut live = cell.lock();
-            live.on_event = on_event;
-            live.runtime_mode = input.runtime_mode;
-        }
+        };
         let _turns = cell.turns.lock().await;
         {
             let mut live = cell.lock();
+            if live.closed || self.stopped_since(&input.session_id, epoch) {
+                return Ok(());
+            }
             live.cancelled = false;
             live.mute_updates = false;
             live.manual_compaction = true;
@@ -2180,14 +2279,10 @@ impl ClaudeSessions {
 
     /// `steerClaudeTurn`.
     pub async fn steer_turn(&self, input: SteerTurnInput) -> Result<()> {
-        let live = self
-            .inner
-            .globals
-            .lock()
-            .live_by_thread
-            .get(&input.session_id)
-            .cloned();
-        if !live.is_some_and(|cell| cell.lock().active_turn) {
+        let Some(cell) = self.live(&input.session_id) else {
+            bail!("No active turn to steer");
+        };
+        if !cell.lock().active_turn {
             bail!("No active turn to steer");
         }
         let effort = input
@@ -2204,7 +2299,16 @@ impl ClaudeSessions {
         if user_message_content(&message).is_empty() {
             return Ok(());
         }
-        write_json(&self.inner.io, &input.session_id, &message).await
+        // Claude answers an accepted steer message with a result of its own,
+        // so the first result no longer ends the MonoCode turn.
+        cell.lock().outstanding_results += 1;
+        let written = write_json(&self.inner.io, &input.session_id, &message).await;
+        if written.is_err() {
+            let mut live = cell.lock();
+            live.outstanding_results = live.outstanding_results.saturating_sub(1);
+            live.maybe_finish_turn();
+        }
+        written
     }
 
     fn live(&self, session_id: &str) -> Option<LiveRef> {
@@ -2240,6 +2344,10 @@ impl ClaudeSessions {
     pub async fn cancel_turn(&self, session_id: &str) -> Result<()> {
         let cell = {
             let mut globals = self.inner.globals.lock();
+            *globals
+                .cancellation_epochs
+                .entry(session_id.to_string())
+                .or_default() += 1;
             match globals.live_by_thread.get(session_id).cloned() {
                 Some(cell) => cell,
                 None => {
@@ -2248,39 +2356,37 @@ impl ClaudeSessions {
                 }
             }
         };
-        let task_ids: Vec<String> = {
+        let write = {
             let mut live = cell.lock();
             live.cancelled = true;
             live.mute_updates = true;
-            live.deny_all_pending();
-            live.background_tasks.keys().cloned().collect()
-        };
-        // Stop means the whole run, including what Claude left going in the
-        // background. Otherwise it finishes later and wakes Claude up again.
-        for task_id in task_ids {
-            let write = {
-                let mut live = cell.lock();
+            live.initialized.then(|| {
                 let id = live.next_control_id();
                 live.write_json(&build_control_request(
                     &id,
-                    json!({ "subtype": "stop_task", "task_id": task_id }),
+                    json!({ "subtype": "interrupt" }),
                 ))
-            };
-            let _ = write.await;
-        }
-        let write = {
-            let mut live = cell.lock();
-            let id = live.next_control_id();
-            live.write_json(&build_control_request(
-                &id,
-                json!({ "subtype": "interrupt" }),
-            ))
+            })
         };
-        let _ = write.await;
+        let failure = match write {
+            Some(write) => write.await.err(),
+            None => None,
+        };
         cell.lock().finish_active_turn(&[
             HarnessEvent::MessageCompleted,
             HarnessEvent::ReasoningCompleted,
         ]);
+        // Stopping the process ends what Claude left running in the
+        // background, and a stopped process cannot deliver an old result into
+        // the next send. The stored conversation id stays, so the next
+        // process resumes the same transcript.
+        self.stop_session(session_id).await?;
+        if let Some(error) = failure {
+            cell.lock().emit(HarnessEvent::SessionError {
+                message: format!("{error:#}"),
+            });
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -2294,13 +2400,13 @@ impl ClaudeSessions {
         if let Some(cell) = cell {
             let mut live = cell.lock();
             live.mute_updates = true;
+            live.closed = true;
+            live.clear_awaiting_resume();
+            live.fail_init("Claude Code stopped");
             live.deny_all_pending();
             live.active_turn = false;
             if let Some(turn) = live.turn.take() {
                 let _ = turn.resolve.send(Ok(()));
-            }
-            if let Some(done) = live.init_done.take() {
-                let _ = done.send(());
             }
         }
         self.inner.io.unwatch_child(session_id);
@@ -2477,6 +2583,15 @@ impl ClaudeSessions {
             usable
         };
         let path = self.inner.io.resolve_claude_binary().await?;
+        if self
+            .inner
+            .globals
+            .lock()
+            .cancelled_threads
+            .contains(&thread_id)
+        {
+            bail!("Claude Code stopped before initialization");
+        }
         let claude_session_id = match &resume {
             Some(resume) => resume.session_id.clone(),
             None => uuid::Uuid::new_v4().to_string(),
@@ -2541,6 +2656,13 @@ impl ClaudeSessions {
                 active_turn: false,
                 init_done: None,
                 initialized: false,
+                init_request_id: String::new(),
+                init_error: None,
+                closed: false,
+                started: false,
+                outstanding_results: 0,
+                metrics: TurnMetrics::default(),
+                model: launch.model.clone().unwrap_or_default(),
                 emitted_assistant: String::new(),
                 emitted_reasoning: String::new(),
                 pending_assistant_boundary: false,
@@ -2575,9 +2697,20 @@ impl ClaudeSessions {
             let thread_id = thread_id.clone();
             Arc::new(move |code: Option<i64>| {
                 if let Some(inner) = sessions.upgrade() {
-                    inner.globals.lock().live_by_thread.remove(&thread_id);
+                    let mut globals = inner.globals.lock();
+                    // A replacement may already own the thread.
+                    if globals
+                        .live_by_thread
+                        .get(&thread_id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &cell))
+                    {
+                        globals.live_by_thread.remove(&thread_id);
+                    }
                 }
                 let mut live = cell.lock();
+                live.closed = true;
+                live.clear_awaiting_resume();
+                live.fail_init("Claude Code exited during initialization");
                 // A missing conversation is retried with a new one, not
                 // reported.
                 if !live.mute_updates && !live.conversation_missing {
@@ -2586,14 +2719,12 @@ impl ClaudeSessions {
                 if let Some(turn) = live.turn.take() {
                     let _ = turn.resolve.send(Err("Claude Code exited".into()));
                 }
-                if let Some(done) = live.init_done.take() {
-                    let _ = done.send(());
-                }
             })
         };
         self.inner.io.watch_child(&thread_id, on_line, on_exit);
 
-        self.inner
+        let spawned = self
+            .inner
             .io
             .spawn_child(
                 &thread_id,
@@ -2602,7 +2733,26 @@ impl ClaudeSessions {
                 &input.cwd,
                 Some(claude_account(input.provider_account_id.as_deref())),
             )
-            .await?;
+            .await;
+        if let Err(error) = spawned {
+            cell.lock().closed = true;
+            self.inner.io.unwatch_child(&thread_id);
+            return Err(error);
+        }
+        // The user stopped while the child was spawning.
+        let stopped = cell.lock().closed
+            || self
+                .inner
+                .globals
+                .lock()
+                .cancelled_threads
+                .contains(&thread_id);
+        if stopped {
+            cell.lock().closed = true;
+            self.inner.io.unwatch_child(&thread_id);
+            let _ = self.inner.io.kill_child(&thread_id).await;
+            bail!("Claude Code stopped during initialization");
+        }
 
         self.inner
             .globals
@@ -2614,19 +2764,25 @@ impl ClaudeSessions {
             let write = {
                 let mut live = cell.lock();
                 let id = live.next_control_id();
+                live.init_request_id = id.clone();
                 live.write_json(&build_control_request(
                     &id,
                     json!({ "subtype": "initialize" }),
                 ))
             };
             write.await?;
-            wait_for_init(&cell, self.inner.options.init_timeout).await;
+            wait_for_init(&cell, self.inner.options.init_timeout).await?;
+            let current = self
+                .live(&thread_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &cell));
+            let live = cell.lock();
+            if live.closed || live.cancelled || !current {
+                bail!("Claude Code stopped during initialization");
+            }
             Ok::<(), anyhow::Error>(())
         };
-        if let Err(error) = started.await {
-            self.stop_session(&thread_id).await?;
-            return Err(error);
-        }
+        let outcome = started.await;
+        // Claude exits right after it reports the missing conversation.
         if cell.lock().conversation_missing {
             self.stop_session(&thread_id).await?;
             let mut globals = self.inner.globals.lock();
@@ -2634,12 +2790,17 @@ impl ClaudeSessions {
             globals.tasks_by_thread.remove(&thread_id);
             return Ok(None);
         }
+        if let Err(error) = outcome {
+            self.stop_session(&thread_id).await?;
+            return Err(error);
+        }
         // A new conversation is bound once Claude saves it. Binding the id
         // now would leave a `--resume` target that does not exist if the
         // first prompt never reaches Claude.
         let bound = {
             let mut live = cell.lock();
             let bound = live.conversation_saved.then(|| live.bind_conversation());
+            live.started = true;
             live.emit(HarnessEvent::SessionStarted);
             bound
         };
@@ -2659,20 +2820,30 @@ impl ClaudeSessions {
     }
 }
 
-/// `waitForInit`: resolves when the child reports it is ready, or after the
-/// timeout either way.
-async fn wait_for_init(cell: &LiveRef, wait: Duration) {
+/// `waitForInit`: resolves when Claude acknowledges our `initialize`
+/// request, and fails when it rejects it, exits, is stopped, or stays silent
+/// past the timeout.
+async fn wait_for_init(cell: &LiveRef, wait: Duration) -> Result<()> {
     let ready = {
         let mut live = cell.lock();
+        if let Some(error) = &live.init_error {
+            bail!("{error}");
+        }
         if live.initialized {
-            return;
+            return Ok(());
         }
         let (done, ready) = oneshot::channel();
         live.init_done = Some(done);
         ready
     };
-    if timeout(wait, ready).await.is_none() {
-        cell.lock().init_done = None;
+    match timeout(wait, ready).await {
+        Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(error))) => Err(anyhow!(error)),
+        Some(Err(_)) => Err(anyhow!("Claude Code stopped")),
+        None => {
+            cell.lock().init_done = None;
+            Err(anyhow!("Claude Code initialization timed out"))
+        }
     }
 }
 
@@ -2706,6 +2877,9 @@ async fn run_turn(
         live.background_key.clear();
         live.task_notes.clear();
         live.turn_result_seen = false;
+        live.turn_end_pending = false;
+        live.outstanding_results = 1;
+        live.metrics = TurnMetrics::default();
 
         let (resolve, done) = oneshot::channel();
         let token = live.token();
@@ -2755,7 +2929,13 @@ fn handle_line(inner: &Inner, thread_id: &str, cell: &LiveRef, line: &str) {
         return;
     };
     let mut rebind = Rebind::default();
-    handle_record(&mut cell.lock(), &rec, &mut rebind);
+    {
+        let mut live = cell.lock();
+        if live.closed {
+            return;
+        }
+        handle_record(&mut live, &rec, &mut rebind);
+    }
     if !rebind.forget && rebind.tasks.is_none() && rebind.resume.is_none() {
         return;
     }
@@ -2862,15 +3042,25 @@ fn handle_record(live: &mut Live, rec: &Record, rebind: &mut Rebind) {
     }
 
     let subtype = string_field(Some(rec), "subtype").unwrap_or("");
-    if kind == Some("system") && (subtype == "init" || subtype == "initialized") {
-        live.mark_initialized();
-        if subtype == "init" {
-            live.note_claude_turn_started();
-        }
+    // Claude also sends `system init` at startup, before it acknowledges
+    // `initialize`. Only the acknowledgement marks the child ready.
+    if kind == Some("system") && subtype == "init" && live.initialized {
+        live.note_claude_turn_started();
     }
 
     if kind == Some("control_response") {
-        live.mark_initialized();
+        let response = record_field(Some(rec), "response");
+        if string_field(response, "request_id") != Some(live.init_request_id.as_str()) {
+            return;
+        }
+        if string_field(response, "subtype") == Some("success") {
+            live.mark_initialized();
+        } else {
+            let error = string_field(response, "error")
+                .unwrap_or("Claude Code initialization failed")
+                .to_string();
+            live.fail_init(&error);
+        }
         return;
     }
 

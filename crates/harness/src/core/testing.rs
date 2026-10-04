@@ -36,6 +36,8 @@ pub struct Fake {
     pub missing: Vec<HarnessId>,
     /// Next pid for `spawn`. A receiver lets a test hold the spawn open.
     pub pids: Mutex<Option<async_channel::Receiver<u32>>>,
+    /// Report a headless host's backend.
+    pub headless: bool,
 }
 
 impl Fake {
@@ -138,6 +140,9 @@ impl ChildBackend for Fake {
     }
     fn home_dir(&self) -> ChildFuture<String> {
         done("/home/alice".into())
+    }
+    fn is_headless(&self) -> bool {
+        self.headless
     }
 }
 

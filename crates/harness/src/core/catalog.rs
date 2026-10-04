@@ -37,7 +37,15 @@ impl SharedCatalog {
 
     /// `setHarnessModels`. Listeners run after the write lock is released.
     pub fn set_harness_models(&self, harness: HarnessId, models: Vec<AgentModel>) {
-        self.catalog.write().set_harness_models(harness, models);
+        self.set_harness_catalog(harness, models, true);
+    }
+
+    /// `setHarnessModels` with its `complete` flag. See
+    /// [`ModelCatalog::set_harness_catalog`].
+    pub fn set_harness_catalog(&self, harness: HarnessId, models: Vec<AgentModel>, complete: bool) {
+        self.catalog
+            .write()
+            .set_harness_catalog(harness, models, complete);
         let listeners: Vec<Listener> = self
             .listeners
             .lock()

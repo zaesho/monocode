@@ -899,14 +899,14 @@ pub fn map_tool_item(item: &Record, item_type: &str, completed: bool) -> Option<
     }
 }
 
-struct CommandPresentation {
-    title: String,
-    preview: Option<ToolPreview>,
+pub struct CommandPresentation {
+    pub title: String,
+    pub preview: Option<ToolPreview>,
 }
 
 /// `codexCommandPresentation`: prefer Codex's own best-effort command
 /// parsing, then the shared shell intent fallback.
-fn codex_command_presentation(item: &Record, command: &str) -> CommandPresentation {
+pub fn codex_command_presentation(item: &Record, command: &str) -> CommandPresentation {
     let cwd = string_field(Some(item), "cwd");
     let actions: Vec<&Record> = match item.get("commandActions") {
         Some(Value::Array(values)) => values

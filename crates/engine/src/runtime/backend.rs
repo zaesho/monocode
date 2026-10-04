@@ -17,6 +17,7 @@ use monocode_store::StoreEvents;
 use monocode_store::checkpoint::{
     self, CheckpointApplyResult, CheckpointFileDiff, CheckpointStatus, CheckpointStore,
 };
+use monocode_store::cli_sessions::{CliSession, Entry as CliEntry};
 use monocode_store::session_store::{
     self, InFlightSession, SessionRecord, SessionSearchOptions, SessionSearchResult, SessionStore,
     SessionSummary as StoredSummary, SessionUpsert,
@@ -68,6 +69,29 @@ pub trait SessionBackend: Send + Sync + 'static {
         provider_account_id: Option<String>,
         tool_ids: Vec<String>,
     ) -> StoreFuture<HashMap<String, String>>;
+    /// `cli_sessions_list`: sessions the provider CLIs recorded for `cwd`
+    /// that have no row yet.
+    fn cli_sessions_list(&self, _cwd: String) -> StoreFuture<Vec<CliSession>> {
+        unsupported("Listing CLI sessions")
+    }
+    /// `cli_session_read`: one CLI transcript as import entries.
+    fn cli_session_read(&self, _harness: String, _path: PathBuf) -> StoreFuture<Vec<CliEntry>> {
+        unsupported("Reading CLI sessions")
+    }
+    /// `session_import`: save an imported session with the CLI's own
+    /// timestamps. `None` when that provider session already has a row.
+    fn import_session(
+        &self,
+        _session: SessionUpsert,
+        _created_at: i64,
+        _updated_at: i64,
+    ) -> StoreFuture<Option<StoredSummary>> {
+        unsupported("Importing CLI sessions")
+    }
+}
+
+fn unsupported<T: Send + 'static>(what: &str) -> StoreFuture<T> {
+    futures::future::ready(Err(format!("{what} is not available here"))).boxed()
 }
 
 /// The `session_checkpoint_*` commands.
@@ -189,6 +213,23 @@ impl StoreBackend {
 impl SessionBackend for StoreBackend {
     fn upsert(&self, session: SessionUpsert) -> StoreFuture<StoredSummary> {
         self.run(move |store| session_store::session_upsert(store, session))
+    }
+
+    fn cli_sessions_list(&self, cwd: String) -> StoreFuture<Vec<CliSession>> {
+        self.run(move |store| session_store::cli_sessions_list(store, &cwd))
+    }
+
+    fn cli_session_read(&self, harness: String, path: PathBuf) -> StoreFuture<Vec<CliEntry>> {
+        self.run(move |_| session_store::cli_session_read(&harness, &path))
+    }
+
+    fn import_session(
+        &self,
+        session: SessionUpsert,
+        created_at: i64,
+        updated_at: i64,
+    ) -> StoreFuture<Option<StoredSummary>> {
+        self.run(move |store| session_store::session_import(store, session, created_at, updated_at))
     }
 
     fn get(&self, session_id: String) -> StoreFuture<Option<SessionRecord>> {

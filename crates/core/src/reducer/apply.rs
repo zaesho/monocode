@@ -344,21 +344,47 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::Interjection {
+            id,
             text,
             custom_type,
             severity,
+            model,
+            status,
         } => {
+            let meta = InterjectionMeta {
+                custom_type: custom_type.clone(),
+                severity: *severity,
+                model: model.clone(),
+                status: *status,
+                extra: Extra::new(),
+            };
+            // A provider that reports progress on one interjection repeats its
+            // id. Update that block where it sits so the transcript keeps one
+            // row per consult.
+            if let Some(id) = nonempty(id.as_deref())
+                && let Some(block) = session
+                    .blocks
+                    .iter_mut()
+                    .find(|block| block.id == id && block.interjection.is_some())
+            {
+                if block.text == *text && block.interjection.as_ref() == Some(&meta) {
+                    return false;
+                }
+                block.text = text.clone();
+                block.interjection = Some(meta);
+                return true;
+            }
             // A visible boundary the user must not miss, so unlike status it
             // never deduplicates and never reads as turn lifecycle.
+            let block_id = match nonempty(id.as_deref()) {
+                Some(id) => id.to_string(),
+                None => env.new_id(),
+            };
             append_block(
                 session,
                 Block {
-                    interjection: Some(InterjectionMeta {
-                        custom_type: custom_type.clone(),
-                        severity: *severity,
-                        extra: Extra::new(),
-                    }),
-                    ..Block::new(env.new_id(), BlockRole::System, text.as_str())
+                    interjection: Some(meta),
+                    ..Block::new(block_id, BlockRole::System, text.as_str())
                 },
             );
             true

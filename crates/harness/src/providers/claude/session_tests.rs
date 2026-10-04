@@ -19,8 +19,8 @@ use anyhow::{Result, anyhow};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use monocode_core::block::{
-    AgentStepKind, BlockRole, ModelSettings, PlanStatus, TaskListItem, TaskListItemStatus,
-    TaskListMeta, TurnIntent,
+    AgentStepKind, BlockRole, InterjectionStatus, ModelSettings, PlanStatus, TaskListItem,
+    TaskListItemStatus, TaskListMeta, TurnIntent,
 };
 use monocode_core::harness::{HarnessId, RuntimeMode};
 use monocode_core::harness_event::{
@@ -2181,4 +2181,141 @@ fn a_sink_can_answer_an_approval_from_inside_its_callback() {
             ..
         }
     )));
+}
+
+// describe("claude advisor consults")
+
+fn advisor_interjections(events: &Events) -> Vec<(String, String, Option<String>, Option<String>)> {
+    events
+        .all()
+        .into_iter()
+        .filter_map(|event| match event {
+            HarnessEvent::Interjection {
+                id: Some(id),
+                text,
+                custom_type,
+                model,
+                status,
+                ..
+            } if custom_type == "advisor" => Some((
+                id,
+                text,
+                model,
+                status.map(|status| {
+                    serde_json::to_value(status)
+                        .unwrap()
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                }),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn shows_a_captured_advisor_consult_as_one_interjection() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    for line in include_str!("fixtures/advisor_redacted.jsonl").lines() {
+        h.emit(serde_json::from_str(line).unwrap());
+    }
+    finish(turn).unwrap();
+
+    let id = "advisor-srvtoolu_01Y9zw3xsSCZyzHMr91psFJL";
+    let forwarded = "Claude Code sent the full conversation to the advisor.";
+    let redacted = "The provider encrypts this advisor's advice, so MonoCode can't show it.";
+    assert_eq!(
+        advisor_interjections(&events),
+        vec![
+            (id.into(), forwarded.into(), None, Some("running".into())),
+            (
+                id.into(),
+                format!("{redacted}\n\n{forwarded}"),
+                None,
+                Some("completed".into())
+            ),
+            (
+                id.into(),
+                format!("{redacted}\n\n{forwarded} 39,219 tokens in, 128 out."),
+                Some("claude-fable-5-1".into()),
+                Some("completed".into())
+            ),
+        ]
+    );
+    assert!(!events.any(|event| matches!(
+        event,
+        HarnessEvent::ToolStarted { call_id, .. } if call_id.starts_with("srvtoolu_")
+    )));
+    // The turn's context reading skips the advisor's own window.
+    assert!(events.any(|event| matches!(
+        event,
+        HarnessEvent::Context {
+            used: Some(37826),
+            ..
+        }
+    )));
+
+    let session = events.reduce();
+    let advisor: Vec<_> = session
+        .blocks
+        .iter()
+        .filter(|block| block.interjection.is_some())
+        .collect();
+    assert_eq!(advisor.len(), 1);
+    assert_eq!(advisor[0].id, id);
+    let meta = advisor[0].interjection.as_ref().unwrap();
+    assert_eq!(meta.model.as_deref(), Some("claude-fable-5-1"));
+    assert_eq!(meta.status, Some(InterjectionStatus::Completed));
+    assert!(session.blocks.iter().any(|block| block.text
+        == "I checked with the advisor first, as you asked. 2 + 2 = 4."));
+}
+
+#[test]
+fn reads_advisor_advice_and_failures_from_the_assistant_snapshot() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "assistant",
+        "session_id": "sess_1",
+        "message": { "id": "msg_1", "content": [
+            { "type": "server_tool_use", "id": "srvtoolu_ok", "name": "advisor", "input": {} },
+            { "type": "advisor_tool_result", "tool_use_id": "srvtoolu_ok",
+              "content": { "type": "advisor_result", "text": "Check the fallback.", "stop_reason": "end_turn" } },
+            { "type": "server_tool_use", "id": "srvtoolu_err", "name": "advisor", "input": {} },
+            { "type": "advisor_tool_result", "tool_use_id": "srvtoolu_err",
+              "content": { "type": "advisor_tool_result_error", "error_code": "max_uses_exceeded" } },
+        ] },
+    }));
+    h.result("sess_1");
+    finish(turn).unwrap();
+
+    let forwarded = "Claude Code sent the full conversation to the advisor.";
+    let session = events.reduce();
+    let advisor: Vec<_> = session
+        .blocks
+        .iter()
+        .filter(|block| block.interjection.is_some())
+        .collect();
+    assert_eq!(advisor.len(), 2);
+    assert_eq!(advisor[0].id, "advisor-srvtoolu_ok");
+    assert_eq!(
+        advisor[0].text,
+        format!("Check the fallback.\n\n{forwarded}")
+    );
+    assert_eq!(
+        advisor[0].interjection.as_ref().unwrap().status,
+        Some(InterjectionStatus::Completed)
+    );
+    assert_eq!(advisor[1].id, "advisor-srvtoolu_err");
+    assert_eq!(
+        advisor[1].text,
+        format!("The advisor call failed: max uses exceeded.\n\n{forwarded}")
+    );
+    assert_eq!(
+        advisor[1].interjection.as_ref().unwrap().status,
+        Some(InterjectionStatus::Failed)
+    );
+    assert!(!session.blocks.iter().any(|block| block.tool.is_some()));
 }

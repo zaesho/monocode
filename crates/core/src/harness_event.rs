@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachment::Attachment;
 use crate::block::{
-    AgentStepKind, ApprovalDecided, InterjectionSeverity, ModelSettings, TaskListItem, ToolPreview,
-    TurnIntent, TurnMetrics,
+    AgentStepKind, ApprovalDecided, InterjectionSeverity, InterjectionStatus, ModelSettings,
+    TaskListItem, ToolPreview, TurnIntent, TurnMetrics,
 };
 use crate::harness::RuntimeMode;
 use crate::user_question::UserQuestion;
@@ -53,10 +53,18 @@ pub enum HarnessEvent {
     BackgroundUpdated { tasks: Vec<String> },
     #[serde(rename = "interjection", rename_all = "camelCase")]
     Interjection {
+        /// Stable identity. A repeat with the same id updates the existing
+        /// block in place instead of appending another one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         text: String,
         custom_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         severity: Option<InterjectionSeverity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<InterjectionStatus>,
     },
     #[serde(rename = "message.delta")]
     MessageDelta { text: String },
@@ -382,6 +390,10 @@ mod tests {
         round_trip(
             json!({ "type": "interjection", "text": "note", "customType": "advisor", "severity": "concern" }),
         );
+        round_trip(json!({
+            "type": "interjection", "id": "advisor-srvtoolu_1", "text": "note",
+            "customType": "advisor", "model": "claude-fable-5-1", "status": "running"
+        }));
         let metrics = round_trip(
             json!({ "type": "turn.metrics", "inputTokens": 5, "cacheHitPercent": 40.5 }),
         );

@@ -1658,16 +1658,22 @@ fn interjection_from_custom_message(message: &Rec) -> Option<HarnessEvent> {
         }
         if !bodies.is_empty() {
             return Some(HarnessEvent::Interjection {
+                id: None,
                 text: bodies.join("\n\n"),
                 custom_type,
                 severity,
+                model: None,
+                status: None,
             });
         }
     }
     Some(HarnessEvent::Interjection {
+        id: None,
         text: custom_message_text(message.get("content")),
         custom_type,
         severity: None,
+        model: None,
+        status: None,
     })
 }
 

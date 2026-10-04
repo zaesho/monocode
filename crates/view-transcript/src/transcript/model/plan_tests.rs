@@ -536,7 +536,7 @@ fn renders_an_advisor_interjection_between_answered_work_phases() {
     advisor.interjection = Some(InterjectionMeta {
         custom_type: "advisor".into(),
         severity: Some(InterjectionSeverity::Concern),
-        extra: Default::default(),
+        ..Default::default()
     });
     let rows = plan(
         vec![

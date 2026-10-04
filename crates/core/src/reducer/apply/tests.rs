@@ -742,6 +742,44 @@ fn appends_every_interjection_as_a_distinct_persisted_boundary() {
     );
 }
 
+#[test]
+fn updates_an_interjection_with_a_known_id_in_place() {
+    let mut t = T::new();
+    let session = t.user(&t.session(HarnessId::Claude, "/tmp"), "go");
+    let running = json!({
+        "type": "interjection", "id": "advisor-srvtoolu_1",
+        "text": "Claude Code sent the full conversation to the advisor.",
+        "customType": "advisor", "status": "running",
+    });
+    let done = json!({
+        "type": "interjection", "id": "advisor-srvtoolu_1",
+        "text": "Check the fallback.\n\nClaude Code sent the full conversation to the advisor.",
+        "customType": "advisor", "status": "completed", "model": "claude-fable-5-1",
+    });
+    let session = t.apply_all(
+        &session,
+        &[running.clone(), delta("Checked."), done.clone()],
+    );
+    let interjections: Vec<&Block> = session
+        .blocks
+        .iter()
+        .filter(|block| block.interjection.is_some())
+        .collect();
+    assert_eq!(interjections.len(), 1);
+    assert_eq!(interjections[0].id, "advisor-srvtoolu_1");
+    assert!(interjections[0].text.starts_with("Check the fallback."));
+    assert_eq!(
+        serde_json::to_value(interjections[0].interjection.as_ref().unwrap()).unwrap(),
+        json!({ "customType": "advisor", "model": "claude-fable-5-1", "status": "completed" })
+    );
+    // The block keeps its place ahead of the prose that followed it.
+    assert_eq!(session.blocks[1].id, "advisor-srvtoolu_1");
+    assert_eq!(session.blocks[2].text, "Checked.");
+
+    let mut again = session.clone();
+    assert!(!apply_harness_event_mut(&mut t.env, &mut again, &ev(done)));
+}
+
 // task list updates
 fn task_blocks(session: &Session) -> Vec<&Block> {
     session

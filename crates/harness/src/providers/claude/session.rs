@@ -22,7 +22,7 @@ use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use monocode_core::attachment::Attachment;
 use monocode_core::block::{
-    AgentStepKind, ApprovalDecided, TaskListItem, TaskListMeta, TurnIntent,
+    AgentStepKind, ApprovalDecided, InterjectionStatus, TaskListItem, TaskListMeta, TurnIntent,
 };
 use monocode_core::harness::RuntimeMode;
 use monocode_core::harness_event::{
@@ -125,6 +125,56 @@ struct InFlightTool {
     title: String,
 }
 
+/// One advisor consult, shown as an interjection. Claude Code reports the
+/// call, its result, and the advisor's model and tokens in separate records,
+/// so each one re-emits the interjection with what is known so far.
+#[derive(Debug, Clone)]
+struct AdvisorCall {
+    /// Provider id of the assistant message that made the call.
+    message_id: Option<String>,
+    model: Option<String>,
+    /// Input and output tokens the advisor used.
+    tokens: Option<(i64, i64)>,
+    /// The advice, or a note that stands in for it.
+    body: Option<String>,
+    status: InterjectionStatus,
+}
+
+const ADVISOR_FORWARDED: &str = "Claude Code sent the full conversation to the advisor.";
+
+/// `1234567` as `1,234,567`.
+fn group_thousands(value: i64) -> String {
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    if value < 0 {
+        out.insert(0, '-');
+    }
+    out
+}
+
+impl AdvisorCall {
+    fn text(&self) -> String {
+        let mut footer = ADVISOR_FORWARDED.to_string();
+        if let Some((input, output)) = self.tokens {
+            footer.push_str(&format!(
+                " {} tokens in, {} out.",
+                group_thousands(input),
+                group_thousands(output)
+            ));
+        }
+        match &self.body {
+            Some(body) => format!("{body}\n\n{footer}"),
+            None => footer,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LiveAgentTask {
     tool_use_id: Option<String>,
@@ -166,6 +216,10 @@ struct Live {
     /// Content block index to tool id. The tool itself is in `tools_by_id`.
     tools_by_index: HashMap<i64, String>,
     tools_by_id: OrderedMap<InFlightTool>,
+    /// Advisor consults this turn, by `srvtoolu_` id.
+    advisor_calls: OrderedMap<AdvisorCall>,
+    /// Provider id of the message the stream is on, from `message_start`.
+    stream_message_id: Option<String>,
     agent_tasks: OrderedMap<LiveAgentTask>,
     /// Every task Claude still runs for this session, by id: subagents, shells
     /// it backgrounded, monitors. Each one ends in a notification that wakes
@@ -463,6 +517,23 @@ impl Live {
             return;
         }
 
+        if !subagent {
+            if let Some(message_id) = message_id_from_stream_start(rec) {
+                self.stream_message_id = Some(message_id);
+                return;
+            }
+            if let Some(call_id) = advisor_call_from_event(rec) {
+                let message_id = self.stream_message_id.clone();
+                self.note_advisor_call(&call_id, message_id);
+                return;
+            }
+            let usages = advisor_usages_from_message_delta(rec);
+            if !usages.is_empty() {
+                self.note_advisor_usages(&usages);
+                return;
+            }
+        }
+
         if let Some(started) = tool_start_from_event(rec) {
             if subagent {
                 self.note_subagent_tool(rec, &started.id, &started.name, &started.input);
@@ -548,6 +619,16 @@ impl Live {
             });
         }
 
+        let message_id = assistant_message_id(rec);
+        for tool_use in assistant_tool_uses(rec) {
+            if tool_use.is_advisor() {
+                self.note_advisor_call(&tool_use.id, message_id.clone());
+            }
+        }
+        for result in assistant_advisor_results(rec) {
+            self.note_advisor_result(result, message_id.clone());
+        }
+
         let snapshot = assistant_text_blocks(rec).join("");
         if !snapshot.is_empty() {
             self.close_pending_assistant_message();
@@ -559,6 +640,9 @@ impl Live {
         }
 
         for tool_use in assistant_tool_uses(rec) {
+            if tool_use.is_advisor() {
+                continue;
+            }
             if let Some(streamed) = self.tools_by_id.get_mut(&tool_use.id) {
                 // content_block_start often has an empty input. The input JSON
                 // delta may never form a parseable object before the complete
@@ -638,6 +722,93 @@ impl Live {
             !snapshot.is_empty() || !self.emitted_assistant.is_empty();
         self.emitted_assistant.clear();
         self.emitted_reasoning.clear();
+    }
+
+    fn emit_advisor(&self, call_id: &str) {
+        let Some(call) = self.advisor_calls.get(call_id) else {
+            return;
+        };
+        self.emit(HarnessEvent::Interjection {
+            id: Some(format!("advisor-{call_id}")),
+            text: call.text(),
+            custom_type: "advisor".into(),
+            severity: None,
+            model: call.model.clone(),
+            status: Some(call.status),
+        });
+    }
+
+    /// The stream and the assistant snapshot both report an advisor call;
+    /// whichever comes first opens the interjection.
+    fn note_advisor_call(&mut self, call_id: &str, message_id: Option<String>) {
+        if let Some(call) = self.advisor_calls.get_mut(call_id) {
+            if call.message_id.is_none() {
+                call.message_id = message_id;
+            }
+            return;
+        }
+        self.advisor_calls.set(
+            call_id.to_string(),
+            AdvisorCall {
+                message_id,
+                model: None,
+                tokens: None,
+                body: None,
+                status: InterjectionStatus::Running,
+            },
+        );
+        self.emit_advisor(call_id);
+    }
+
+    fn note_advisor_result(&mut self, result: ClaudeAdvisorResult, message_id: Option<String>) {
+        self.note_advisor_call(&result.tool_use_id, message_id);
+        let Some(call) = self.advisor_calls.get_mut(&result.tool_use_id) else {
+            return;
+        };
+        let (status, body) = match result.outcome {
+            ClaudeAdvisorOutcome::Advice(text) => (InterjectionStatus::Completed, Some(text)),
+            ClaudeAdvisorOutcome::Redacted => (
+                InterjectionStatus::Completed,
+                Some(
+                    "The provider encrypts this advisor's advice, so MonoCode can't show it."
+                        .into(),
+                ),
+            ),
+            ClaudeAdvisorOutcome::Error(code) => (
+                InterjectionStatus::Failed,
+                Some(format!(
+                    "The advisor call failed: {}.",
+                    code.replace('_', " ")
+                )),
+            ),
+            ClaudeAdvisorOutcome::Unknown => (InterjectionStatus::Completed, None),
+        };
+        call.status = status;
+        call.body = body;
+        self.emit_advisor(&result.tool_use_id);
+    }
+
+    /// `message_delta` usage lists one `advisor_message` per consult, in
+    /// order, so pair them with this message's calls that have no model yet.
+    fn note_advisor_usages(&mut self, usages: &[ClaudeAdvisorUsage]) {
+        let message_id = self.stream_message_id.clone();
+        let calls: Vec<String> = self
+            .advisor_calls
+            .iter()
+            .filter(|(_, call)| message_id.is_none() || call.message_id == message_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for (call_id, usage) in calls.iter().zip(usages) {
+            let Some(call) = self.advisor_calls.get_mut(call_id) else {
+                continue;
+            };
+            if call.model.is_some() {
+                continue;
+            }
+            call.model = usage.model.clone();
+            call.tokens = Some((usage.input_tokens, usage.output_tokens));
+            self.emit_advisor(call_id);
+        }
     }
 
     fn emit_plan(&self, text: String) {
@@ -2305,6 +2476,8 @@ impl ClaudeSessions {
                 next_control_id: 1,
                 tools_by_index: HashMap::new(),
                 tools_by_id: OrderedMap::new(),
+                advisor_calls: OrderedMap::new(),
+                stream_message_id: None,
                 agent_tasks: OrderedMap::new(),
                 background_tasks: OrderedMap::new(),
                 background_rows: HashMap::new(),
@@ -2466,6 +2639,8 @@ async fn run_turn(
         live.pending_assistant_boundary = false;
         live.tools_by_index.clear();
         live.tools_by_id.clear();
+        live.advisor_calls.clear();
+        live.stream_message_id = None;
         live.agent_tasks.clear();
         live.background_tasks.clear();
         live.background_rows.clear();

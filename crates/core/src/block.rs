@@ -267,13 +267,30 @@ pub enum InterjectionSeverity {
     Blocker,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Where a live interjection stands, such as a Claude Code advisor consult
+/// that has not answered yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InterjectionStatus {
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InterjectionMeta {
     pub custom_type: String,
     /// Highest severity among this interjection's retained notes, when any is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<InterjectionSeverity>,
+    /// Model that wrote the interjection, such as `claude-fable-5-1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<InterjectionStatus>,
     #[serde(flatten)]
     pub extra: Extra,
 }

@@ -38,7 +38,7 @@ pub fn irc(id: &str, text: &str) -> Block {
     block.interjection = Some(InterjectionMeta {
         custom_type: "irc:incoming".into(),
         severity: None,
-        extra: Default::default(),
+        ..Default::default()
     });
     block
 }

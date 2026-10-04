@@ -16,6 +16,7 @@ mod footer;
 mod github_star;
 mod glass_backdrop;
 mod hosts;
+mod import_cli_sessions;
 mod launch_host;
 mod live_agents;
 mod main_pane;

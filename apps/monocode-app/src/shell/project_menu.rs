@@ -156,6 +156,12 @@ impl Shell {
             IconName::FolderOpen,
         );
         reveal.disabled = !local;
+        let mut import = TabGroupMenuExtraItem::new(
+            "import-cli-sessions",
+            "Import terminal sessions",
+            IconName::Terminal,
+        );
+        import.disabled = !local;
         let mut editor =
             TabGroupMenuExtraItem::new("external-editor", "Open in editor", IconName::AppWindow);
         editor.disabled = true;
@@ -200,6 +206,7 @@ impl Shell {
                 },
             ),
             reveal,
+            import,
             editor,
             mute,
             TabGroupMenuExtraItem::new(
@@ -519,6 +526,9 @@ impl Shell {
                 projects.set_group_assignment(project, None, cx)
             }),
             "background" => self.show_project_background(project, window, cx),
+            "import-cli-sessions" if !is_remote_project_path(project) => {
+                self.show_import_cli_sessions(project, window, cx)
+            }
             "notifications-settings" => {
                 self.open_page(crate::slots::Page::Settings, cx);
                 crate::pages::settings::reveal_project_notifications(project, window, cx);
@@ -638,6 +648,39 @@ impl Shell {
         if let Some(focus) = self.project_dialog_return_focus.take() {
             focus.focus(window, cx);
         }
+        cx.notify();
+    }
+
+    /// Close the project dialog from the dialog itself, which has no window.
+    pub(super) fn dismiss_project_dialog(&mut self, cx: &mut Context<Self>) {
+        self.project_dialog = None;
+        self.project_dialog_subscription = None;
+        self.project_dialog_return_focus = None;
+        cx.notify();
+    }
+
+    fn show_import_cli_sessions(
+        &mut self,
+        project: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let projects = ProjectsGlobal::projects(cx);
+        let key = project_key(project);
+        let name = projects
+            .update(cx, |projects, _| projects.labels().get(&key).cloned())
+            .unwrap_or_else(|| project_name(project));
+        self.project_dialog_return_focus = self
+            .project_menu_return_focus
+            .take()
+            .or_else(|| window.focused(cx));
+        let shell = cx.weak_entity();
+        let cwd = project.to_string();
+        let dialog = cx.new(|cx| {
+            super::import_cli_sessions::ImportCliSessionsDialog::new(cwd, name, shell, cx)
+        });
+        self.project_dialog = Some(dialog.into());
+        self.project_dialog_subscription = None;
         cx.notify();
     }
 

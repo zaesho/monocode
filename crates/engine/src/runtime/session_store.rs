@@ -1291,6 +1291,45 @@ impl SessionWriter {
         })
     }
 
+    /// Sessions the provider CLIs recorded for `cwd` that MonoCode has no
+    /// row for yet.
+    pub fn cli_sessions_list(
+        &self,
+        cwd: &str,
+    ) -> Task<Result<Vec<monocode_store::cli_sessions::CliSession>, String>> {
+        let future = self.backend.cli_sessions_list(cwd.to_string());
+        self.executor.spawn(future)
+    }
+
+    /// One CLI transcript as import entries.
+    pub fn cli_session_read(
+        &self,
+        harness: &str,
+        path: &str,
+    ) -> Task<Result<Vec<monocode_store::cli_sessions::Entry>, String>> {
+        let future = self
+            .backend
+            .cli_session_read(harness.to_string(), std::path::PathBuf::from(path));
+        self.executor.spawn(future)
+    }
+
+    /// Save an imported session with the CLI's own timestamps. `None` when
+    /// that provider session already has a row.
+    pub fn import_session(
+        &self,
+        session: &Session,
+        created_at: i64,
+        updated_at: i64,
+    ) -> Task<Result<Option<SessionSummary>, String>> {
+        let future = self.backend.import_session(
+            sanitize_session_for_persist(session),
+            created_at,
+            updated_at,
+        );
+        self.executor
+            .spawn(async move { future.await.map(|summary| summary.map(normalize_summary)) })
+    }
+
     /// `session_get` without the load-time repairs. `getSession` with the
     /// repairs is `Sessions::get_stored`.
     pub fn get_record(&self, session_id: &str) -> Task<Result<Option<SessionRecord>, String>> {

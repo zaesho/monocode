@@ -26,7 +26,7 @@ use crate::history::session_folders::{
     SessionFolderTarget, load_session_folders, place_session_in_folder, save_session_folders,
 };
 use crate::projects::recents::looks_like_project;
-use crate::runtime::session_links::link_message_text;
+use crate::runtime::session_links::{LinkSpend, link_message_text};
 use crate::submit::operator_command::{consume_operator_command, operator_enabled_in_thread};
 
 /// `AppSessionListing`.
@@ -155,10 +155,10 @@ pub trait AgentAppHost {
     /// A linked session in any project. Callers check the link first.
     fn peer_session(&self, id: &str, cx: &mut App) -> Task<Result<Option<Session>, String>>;
     /// Count one agent message from `from` to `to`, or fail past the link's
-    /// budget. Returns the messages left.
-    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<u32, String>;
+    /// budget. Returns the messages left and the budget epoch to refund with.
+    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<LinkSpend, String>;
     /// Give back a counted message that was not delivered.
-    fn refund_link_message(&self, from: &str, to: &str, cx: &mut App);
+    fn refund_link_message(&self, from: &str, to: &str, epoch: u64, cx: &mut App);
     /// Deliver `text` to a linked session. A busy session queues it and runs
     /// it when its current turn ends.
     fn send_linked(
@@ -899,7 +899,8 @@ pub async fn handle_agent_app(
                 return Err("Invalid request ID".into());
             }
             linked_session(source, &id, host, cx).await?;
-            let left = cx.update(|cx| host.spend_link_message(&source.id, &id, cx))?;
+            let spent = cx.update(|cx| host.spend_link_message(&source.id, &id, cx))?;
+            let left = spent.left;
             let text = link_message_text(&source.id, &source.title, &prompt);
             let key = format!("link-{}-{request_id}", source.id);
             match cx
@@ -908,7 +909,7 @@ pub async fn handle_agent_app(
             {
                 Ok(result) => {
                     if result.already_submitted {
-                        cx.update(|cx| host.refund_link_message(&source.id, &id, cx));
+                        cx.update(|cx| host.refund_link_message(&source.id, &id, spent.epoch, cx));
                     }
                     Ok(json!({
                         "sessionId": id,
@@ -919,7 +920,7 @@ pub async fn handle_agent_app(
                     }))
                 }
                 Err(error) => {
-                    cx.update(|cx| host.refund_link_message(&source.id, &id, cx));
+                    cx.update(|cx| host.refund_link_message(&source.id, &id, spent.epoch, cx));
                     Err(error)
                 }
             }

@@ -24,7 +24,18 @@ pub struct SessionLinks {
     links: Vec<(String, String)>,
     /// Agent messages sent since the last user message, per pair.
     sent: HashMap<(String, String), u32>,
+    /// Resets per pair, so a late refund of a message counted before a reset
+    /// cannot lower the new count.
+    epochs: HashMap<(String, String), u64>,
     loaded: bool,
+}
+
+/// One counted agent message. Pass `epoch` back to `refund` it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkSpend {
+    /// Messages the link has left after this one.
+    pub left: u32,
+    pub epoch: u64,
 }
 
 fn pair(a: &str, b: &str) -> (String, String) {
@@ -139,31 +150,45 @@ impl SessionLinks {
 
     /// Count one agent message from `from` to `to`. Fails when the sessions
     /// are not linked or the link used its budget.
-    pub fn spend(&mut self, from: &str, to: &str) -> Result<u32, String> {
+    pub fn spend(&mut self, from: &str, to: &str) -> Result<LinkSpend, String> {
         let key = pair(from, to);
         if !self.links.contains(&key) {
             return Err("That session is not linked to this one".into());
         }
-        let sent = self.sent.entry(key).or_insert(0);
+        let sent = self.sent.entry(key.clone()).or_insert(0);
         if *sent >= LINK_MESSAGE_BUDGET {
             return Err(format!(
                 "This link already carried {LINK_MESSAGE_BUDGET} agent messages. Wait for the user to send a message in either session before messaging again."
             ));
         }
         *sent += 1;
-        Ok(LINK_MESSAGE_BUDGET - *sent)
+        let left = LINK_MESSAGE_BUDGET - *sent;
+        let epoch = self.epochs.get(&key).copied().unwrap_or(0);
+        Ok(LinkSpend { left, epoch })
     }
 
-    /// Give back a message counted by `spend` that was never delivered.
-    pub fn refund(&mut self, from: &str, to: &str) {
-        if let Some(sent) = self.sent.get_mut(&pair(from, to)) {
+    /// Give back a message counted by `spend` that was never delivered. A
+    /// reset since then already cleared it.
+    pub fn refund(&mut self, from: &str, to: &str, epoch: u64) {
+        let key = pair(from, to);
+        if self.epochs.get(&key).copied().unwrap_or(0) != epoch {
+            return;
+        }
+        if let Some(sent) = self.sent.get_mut(&key) {
             *sent = sent.saturating_sub(1);
         }
     }
 
     /// A user message in `id` resets the budget of every link it has.
     pub fn reset_budget(&mut self, id: &str) {
-        self.sent.retain(|(a, b), _| a != id && b != id);
+        let epochs = &mut self.epochs;
+        self.sent.retain(|key, _| {
+            let touched = key.0 == id || key.1 == id;
+            if touched {
+                *epochs.entry(key.clone()).or_insert(0) += 1;
+            }
+            !touched
+        });
     }
 }
 
@@ -232,10 +257,28 @@ mod tests {
             let error = links.spend("b", "a").unwrap_err();
             assert!(error.contains("5 agent messages"), "{error}");
             links.reset_budget("b");
-            assert_eq!(links.spend("b", "a"), Ok(LINK_MESSAGE_BUDGET - 1));
-            links.refund("b", "a");
+            let spent = links.spend("b", "a").unwrap();
+            assert_eq!(spent.left, LINK_MESSAGE_BUDGET - 1);
+            links.refund("b", "a", spent.epoch);
             assert_eq!(links.sent("a", "b"), 0);
             assert!(links.spend("a", "c").is_err());
+        });
+    }
+
+    #[gpui::test]
+    fn a_refund_from_before_a_reset_leaves_the_new_budget_alone(cx: &mut TestAppContext) {
+        init(cx);
+        let links = cx.update(|cx| Engine::global(cx).links.clone());
+        links.update(cx, |links, cx| {
+            links.link("a", "b", cx).unwrap();
+            let stale = links.spend("a", "b").unwrap();
+            links.reset_budget("a");
+            for _ in 0..LINK_MESSAGE_BUDGET {
+                links.spend("a", "b").unwrap();
+            }
+            links.refund("a", "b", stale.epoch);
+            assert_eq!(links.sent("a", "b"), LINK_MESSAGE_BUDGET);
+            assert!(links.spend("a", "b").is_err());
         });
     }
 

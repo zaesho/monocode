@@ -29,6 +29,7 @@ use super::orchestrator::{Orchestrator, handle};
 use super::peers::OrchestrationPeers;
 use crate::history::HistoryPackage;
 use crate::projects::backend::{Worktree, Worktrees};
+use crate::runtime::session_links::LinkSpend;
 use crate::runtime::sessions::get_stored_session;
 use crate::runtime::util::project_path::same_project_path;
 use crate::runtime::{Engine, LINK_MESSAGE_BUDGET};
@@ -607,12 +608,12 @@ impl AgentAppHost for EngineAppHost {
         })
     }
 
-    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<u32, String> {
+    fn spend_link_message(&self, from: &str, to: &str, cx: &mut App) -> Result<LinkSpend, String> {
         Engine::links(cx).update(cx, |links, _| links.spend(from, to))
     }
 
-    fn refund_link_message(&self, from: &str, to: &str, cx: &mut App) {
-        Engine::links(cx).update(cx, |links, _| links.refund(from, to));
+    fn refund_link_message(&self, from: &str, to: &str, epoch: u64, cx: &mut App) {
+        Engine::links(cx).update(cx, |links, _| links.refund(from, to, epoch));
     }
 
     fn send_linked(

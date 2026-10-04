@@ -19,6 +19,7 @@ use super::agent_app::{
 use super::testing::finish;
 use crate::history::session_folders::{SessionFolder, load_session_folders, save_session_folders};
 use crate::projects::backend::{Worktree, Worktrees};
+use crate::runtime::session_links::LinkSpend;
 
 const CWD: &str = "/tmp/project";
 
@@ -266,7 +267,12 @@ impl AgentAppHost for FakeAppHost {
         })))
     }
 
-    fn spend_link_message(&self, _from: &str, to: &str, _cx: &mut App) -> Result<u32, String> {
+    fn spend_link_message(
+        &self,
+        _from: &str,
+        to: &str,
+        _cx: &mut App,
+    ) -> Result<LinkSpend, String> {
         let mut links = self.links.borrow_mut();
         let entry = links
             .iter_mut()
@@ -276,10 +282,13 @@ impl AgentAppHost for FakeAppHost {
             return Err("This link already carried 5 agent messages.".into());
         }
         entry.1 += 1;
-        Ok(5 - entry.1)
+        Ok(LinkSpend {
+            left: 5 - entry.1,
+            epoch: 0,
+        })
     }
 
-    fn refund_link_message(&self, _from: &str, to: &str, _cx: &mut App) {
+    fn refund_link_message(&self, _from: &str, to: &str, _epoch: u64, _cx: &mut App) {
         if let Some(entry) = self
             .links
             .borrow_mut()

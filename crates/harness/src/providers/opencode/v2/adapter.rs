@@ -1002,6 +1002,7 @@ impl HarnessAdapter for Adapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         async move {
             generate_open_code_commit_message(self, self.inner.git.as_ref(), &cwd, signal).await
@@ -1011,6 +1012,7 @@ impl HarnessAdapter for Adapter {
     fn generate_pr_content(
         &self,
         cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         async move { generate_open_code_pr_content(self, self.inner.git.as_ref(), &cwd).await }
             .boxed()
@@ -1019,6 +1021,7 @@ impl HarnessAdapter for Adapter {
         &self,
         cwd: String,
         message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         async move { Ok(generate_open_code_branch_name(self, &cwd, &message).await) }.boxed()
     }

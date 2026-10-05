@@ -1329,6 +1329,7 @@ fn registers_once_with_every_optional_capability() {
         HarnessId::Opencode,
         "/repo",
         None,
+        None,
     ))
     .unwrap_err();
     assert_eq!(error.to_string(), "Git context is not available");

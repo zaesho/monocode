@@ -1037,9 +1037,20 @@ impl TurnRun {
         let tree_path = tree_path.to_string();
         let session_id = self.session_id.clone();
         let peers = self.peers.clone();
+        // The session's account names its branch when its own harness runs
+        // the helper. Another harness's account means nothing there.
+        let account = self
+            .provider_account_id
+            .clone()
+            .filter(|_| text_harness == self.harness());
         cx.spawn(async move |cx| {
             let Ok(Some(fragment)) = registry
-                .generate_harness_branch_name(text_harness, &tree_path, &message)
+                .generate_harness_branch_name(
+                    text_harness,
+                    &tree_path,
+                    &message,
+                    account.as_deref(),
+                )
                 .await
             else {
                 return;

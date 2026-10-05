@@ -1018,6 +1018,7 @@ impl HarnessAdapter for GrokAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
             super::git::generate_grok_commit_message(
@@ -1033,6 +1034,7 @@ impl HarnessAdapter for GrokAdapter {
     fn generate_pr_content(
         &self,
         cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         Box::pin(async move {
             super::git::generate_grok_pr_content(&self.inner.text, self.inner.git.as_ref(), &cwd)
@@ -1044,6 +1046,7 @@ impl HarnessAdapter for GrokAdapter {
         &self,
         cwd: String,
         message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         Box::pin(async move {
             Ok(super::git::generate_grok_branch_name(&self.inner.text, &cwd, &message).await)

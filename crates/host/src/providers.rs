@@ -179,7 +179,7 @@ impl HostProvider for AdapterProvider {
         let (adapter, cwd, text) = (self.adapter.clone(), cwd.to_string(), text.to_string());
         async move {
             adapter
-                .generate_branch_name(cwd, text)
+                .generate_branch_name(cwd, text, None)
                 .await
                 .map_err(message)
         }

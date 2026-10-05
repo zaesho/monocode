@@ -257,6 +257,7 @@ pub trait HarnessAdapter: Send + Sync {
         &self,
         _cwd: String,
         _signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         unsupported(self.id(), "commit message generation")
     }
@@ -265,6 +266,7 @@ pub trait HarnessAdapter: Send + Sync {
     fn generate_pr_content(
         &self,
         _cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         ok(None)
     }
@@ -274,6 +276,7 @@ pub trait HarnessAdapter: Send + Sync {
         &self,
         _cwd: String,
         _message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         ok(None)
     }
@@ -1040,6 +1043,7 @@ impl HarnessRegistry {
         harness: HarnessId,
         cwd: &str,
         signal: Option<AbortSignal>,
+        provider_account_id: Option<&str>,
     ) -> Result<String> {
         let adapter = self.require_harness(harness)?;
         if !adapter.capabilities().generate_commit_message {
@@ -1049,7 +1053,11 @@ impl HarnessRegistry {
             signal.throw_if_aborted()?;
         }
         adapter
-            .generate_commit_message(cwd.to_string(), signal)
+            .generate_commit_message(
+                cwd.to_string(),
+                signal,
+                provider_account_id.map(str::to_string),
+            )
             .await
     }
 
@@ -1058,10 +1066,13 @@ impl HarnessRegistry {
         &self,
         harness: HarnessId,
         cwd: &str,
+        provider_account_id: Option<&str>,
     ) -> Result<Option<GeneratedPrContent>> {
         match self.get_harness(harness) {
             Some(adapter) if adapter.capabilities().generate_pr_content => {
-                adapter.generate_pr_content(cwd.to_string()).await
+                adapter
+                    .generate_pr_content(cwd.to_string(), provider_account_id.map(str::to_string))
+                    .await
             }
             _ => Ok(None),
         }
@@ -1073,11 +1084,16 @@ impl HarnessRegistry {
         harness: HarnessId,
         cwd: &str,
         message: &str,
+        provider_account_id: Option<&str>,
     ) -> Result<Option<String>> {
         match self.get_harness(harness) {
             Some(adapter) if adapter.capabilities().generate_branch_name => {
                 adapter
-                    .generate_branch_name(cwd.to_string(), message.to_string())
+                    .generate_branch_name(
+                        cwd.to_string(),
+                        message.to_string(),
+                        provider_account_id.map(str::to_string),
+                    )
                     .await
             }
             _ => Ok(None),

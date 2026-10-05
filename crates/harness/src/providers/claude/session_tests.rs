@@ -3638,3 +3638,41 @@ fn discovers_models_in_the_selected_project_with_the_selected_account() {
     assert_eq!(places[1].1.as_ref().unwrap().id, "default");
     assert_eq!(set.lock().len(), 2);
 }
+
+// describe("Git helpers forward the account")
+
+#[test]
+fn names_a_branch_under_the_selected_account() {
+    let h = Harness::new();
+    let text = super::text::ClaudeText::with_init_timeout(
+        h.io.clone(),
+        Arc::new(Vec::new),
+        Duration::from_secs(2),
+    );
+    let branch = smol::spawn(async move {
+        super::git::generate_claude_branch_name(&text, "/repo", "Fix login", Some("account-work"))
+            .await
+    });
+    h.wait_for(|| h.spawned().len() == 1, "text helper");
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request_id"] == "monocode_text_init")
+        },
+        "helper initialize",
+    );
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_text_init" },
+    }));
+    h.wait_for(|| h.user_count() == 1, "helper prompt");
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "text", "text": "fix-login" }] },
+    }));
+    h.emit(json!({ "type": "result", "subtype": "success" }));
+    assert_eq!(smol::block_on(branch).as_deref(), Some("fix-login"));
+    let places = h.io.state.lock().spawn_places.clone();
+    assert_eq!(places[0].1.as_ref().unwrap().id, "account-work");
+}

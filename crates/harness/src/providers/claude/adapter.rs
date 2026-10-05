@@ -238,27 +238,51 @@ impl HarnessAdapter for ClaudeAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
-            generate_claude_commit_message(&self.text, self.git.as_ref(), &cwd, signal).await
+            generate_claude_commit_message(
+                &self.text,
+                self.git.as_ref(),
+                &cwd,
+                provider_account_id.as_deref(),
+                signal,
+            )
+            .await
         })
     }
 
     fn generate_pr_content(
         &self,
         cwd: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
-        Box::pin(
-            async move { generate_claude_pr_content(&self.text, self.git.as_ref(), &cwd).await },
-        )
+        Box::pin(async move {
+            generate_claude_pr_content(
+                &self.text,
+                self.git.as_ref(),
+                &cwd,
+                provider_account_id.as_deref(),
+            )
+            .await
+        })
     }
 
     fn generate_branch_name(
         &self,
         cwd: String,
         message: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
-        Box::pin(async move { Ok(generate_claude_branch_name(&self.text, &cwd, &message).await) })
+        Box::pin(async move {
+            Ok(generate_claude_branch_name(
+                &self.text,
+                &cwd,
+                &message,
+                provider_account_id.as_deref(),
+            )
+            .await)
+        })
     }
 
     fn warmup_text(&self, cwd: String) -> BoxFuture<'_, Result<()>> {

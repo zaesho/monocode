@@ -17,13 +17,14 @@ use monocode_core::models::AgentModel;
 use parking_lot::Mutex;
 use regex::Regex;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::core::registry::{EventSink, TextPromptInput};
 use crate::core::task::{AbortSignal, timeout};
 
 use super::io::{SharedChildIo, claude_account};
 use super::protocol::*;
-use super::shared::{OrderedMap, is_agent_tool_name, join_stream_text};
+use super::shared::{OrderedMap, is_agent_tool_name, snapshot_remainder};
 
 /// `TEXT_CHILD_ID`.
 pub const TEXT_CHILD_ID: &str = "monocode-claude-text";
@@ -31,6 +32,10 @@ pub const TEXT_CHILD_ID: &str = "monocode-claude-text";
 const INIT_TIMEOUT: Duration = Duration::from_millis(8_000);
 /// `REQUEST_TIMEOUT_MS`.
 pub const REQUEST_TIMEOUT_MS: i64 = 45_000;
+/// The request id of the helper's `initialize`.
+const TEXT_INIT_REQUEST_ID: &str = "monocode_text_init";
+/// The most of a tool's output a result event carries, in characters.
+const TOOL_OUTPUT_LIMIT: usize = 32_000;
 /// `TEXT_MODEL`.
 pub const TEXT_MODEL: &str = "claude-haiku-4-5";
 
@@ -44,9 +49,12 @@ pub struct TextSettings {
     settings: ClaudeCliSettings,
     permission_mode: Option<ClaudePermissionMode>,
     max_turns: Option<i64>,
+    /// `--tools`. Automatic helpers get none; a read-only side question may
+    /// read and search.
+    tools: Vec<String>,
 }
 
-/// The `JSON.stringify({ effort, context, thinking, fast, readOnly })` key.
+/// The `JSON.stringify({ effort, context, settings, readOnly })` key.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TextSettingsKey<'a> {
@@ -54,8 +62,7 @@ struct TextSettingsKey<'a> {
     effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context: Option<&'a str>,
-    thinking: bool,
-    fast: bool,
+    settings: &'a ClaudeCliSettings,
     read_only: bool,
 }
 
@@ -80,12 +87,12 @@ pub fn text_settings(
             .map(String::as_str)
             == Some("true")
     };
-    let thinking = flag("thinking");
     let fast = flag("fast");
     let read_only = intent == Some(TurnIntent::Plan);
     let mut settings = ClaudeCliSettings::default();
-    if thinking {
-        settings.always_thinking_enabled = Some(true);
+    // An explicit Off overrides thinking the user's settings turn on.
+    if model_settings.is_some_and(|settings| settings.contains_key("thinking")) {
+        settings.always_thinking_enabled = Some(flag("thinking"));
     }
     if fast {
         settings.fast_mode = Some(true);
@@ -97,8 +104,7 @@ pub fn text_settings(
         key: serde_json::to_string(&TextSettingsKey {
             effort,
             context,
-            thinking,
-            fast,
+            settings: &settings,
             read_only,
         })
         .unwrap_or_default(),
@@ -107,7 +113,14 @@ pub fn text_settings(
         prompt_effort: effort.map(str::to_string),
         settings,
         permission_mode: read_only.then_some(ClaudePermissionMode::Plan),
-        max_turns: read_only.then_some(1),
+        // A read-only side question may need a few tool calls before it can
+        // answer. Titles and Git text answer in one turn with no tools.
+        max_turns: Some(if read_only { 12 } else { 1 }),
+        tools: if read_only {
+            ["Read", "Glob", "Grep"].map(String::from).to_vec()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -153,10 +166,14 @@ struct LiveText {
     settings_key: String,
     collecting: bool,
     output: String,
+    /// Text the current assistant message streamed, so its snapshot only
+    /// adds what the stream missed.
+    message_text: String,
     closed: bool,
     ready: bool,
+    init_error: Option<String>,
     turn: Option<oneshot::Sender<Result<(), String>>>,
-    ready_done: Option<oneshot::Sender<()>>,
+    ready_done: Option<oneshot::Sender<Result<(), String>>>,
     on_event: Option<EventSink>,
     tools_by_index: std::collections::HashMap<i64, String>,
     tools_by_id: OrderedMap<InFlightTool>,
@@ -243,6 +260,7 @@ impl ClaudeText {
         let done = {
             let mut live = session.lock();
             live.output.clear();
+            live.message_text.clear();
             live.collecting = true;
             live.on_event = input.on_event.clone();
             live.tools_by_index.clear();
@@ -336,8 +354,10 @@ impl ClaudeText {
             settings_key: settings.key.clone(),
             collecting: false,
             output: String::new(),
+            message_text: String::new(),
             closed: false,
             ready: false,
+            init_error: None,
             turn: None,
             ready_done: None,
             on_event: None,
@@ -371,7 +391,7 @@ impl ClaudeText {
                     let _ = turn.send(Err("Claude text generator exited".into()));
                 }
                 if let Some(ready) = live.ready_done.take() {
-                    let _ = ready.send(());
+                    let _ = ready.send(Err("Claude text generator exited".into()));
                 }
             })
         };
@@ -390,6 +410,7 @@ impl ClaudeText {
                         settings: Some(settings.settings.clone()),
                         permission_mode: settings.permission_mode,
                         max_turns: settings.max_turns,
+                        tools: Some(settings.tools.clone()),
                         ..Default::default()
                     }),
                     cwd,
@@ -397,7 +418,21 @@ impl ClaudeText {
                 )
                 .await?;
             *self.inner.live.lock() = Some(session.clone());
-            wait_for_ready(&session, self.inner.init_timeout).await
+            // Only the acknowledgement of this request means the helper is
+            // ready; `system init` arrives before it.
+            let initialize =
+                build_control_request(TEXT_INIT_REQUEST_ID, json!({ "subtype": "initialize" }));
+            self.inner
+                .io
+                .write_child(TEXT_CHILD_ID, serde_json::to_string(&initialize)?)
+                .await?;
+            wait_for_ready(&session, self.inner.init_timeout).await?;
+            if session.lock().closed {
+                return Err(anyhow!(
+                    "Claude text generator exited during initialization"
+                ));
+            }
+            Ok(())
         };
         match started.await {
             Ok(()) => Ok(session),
@@ -417,7 +452,7 @@ impl ClaudeText {
             let mut live = current.lock();
             live.closed = true;
             if let Some(ready) = live.ready_done.take() {
-                let _ = ready.send(());
+                let _ = ready.send(Err("Claude text generator stopped".into()));
             }
             if let Some(turn) = live.turn.take() {
                 let _ = turn.send(Err("Claude text generator stopped".into()));
@@ -449,11 +484,18 @@ async fn abort_wait(signal: Option<AbortSignal>, session: Weak<Mutex<LiveText>>)
     Err(anyhow!("By-the-way request cancelled"))
 }
 
-/// `waitForReady`: resolves when the child reports it is ready, or after the
-/// timeout either way. Fails when the child closed first.
+/// `waitForReady`: resolves when Claude acknowledges the helper's
+/// `initialize`. Fails when it rejects it, the child closes, or the timeout
+/// passes first.
 async fn wait_for_ready(session: &TextCell, wait: Duration) -> Result<()> {
     let ready = {
         let mut live = session.lock();
+        if let Some(error) = &live.init_error {
+            return Err(anyhow!("{error}"));
+        }
+        if live.closed {
+            return Err(anyhow!("Claude text generator exited"));
+        }
         if live.ready {
             return Ok(());
         }
@@ -461,43 +503,88 @@ async fn wait_for_ready(session: &TextCell, wait: Duration) -> Result<()> {
         live.ready_done = Some(done);
         ready
     };
-    if timeout(wait, ready).await.is_none() {
-        session.lock().ready_done = None;
-        return Ok(());
+    match timeout(wait, ready).await {
+        Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(error))) => Err(anyhow!(error)),
+        Some(Err(_)) => Err(anyhow!("Claude text generator exited")),
+        None => {
+            session.lock().ready_done = None;
+            Err(anyhow!("Claude text generator initialization timed out"))
+        }
     }
-    if session.lock().closed {
-        return Err(anyhow!("Claude text generator exited"));
-    }
-    Ok(())
 }
 
-/// `handleLine`. The event a line produces reaches the sink after the
+/// `handleLine`. The events a line produces reach the sink after the
 /// session unlocks, so the sink may call back into the runner.
 fn handle_line(session: &TextCell, line: &str) {
     let Some(rec) = parse_json_line(line) else {
         return;
     };
-    let delivery = {
+    let (sink, events) = {
         let mut live = session.lock();
-        if is_claude_init_message(&rec) {
-            live.ready = true;
+        if let Some(control) = parse_control_response(&rec)
+            && control.request_id == TEXT_INIT_REQUEST_ID
+        {
+            let outcome = if control.ok {
+                live.ready = true;
+                Ok(())
+            } else {
+                let error = control
+                    .error
+                    .unwrap_or_else(|| "Claude text generator initialization failed".into());
+                live.init_error = Some(error.clone());
+                Err(error)
+            };
             if let Some(ready) = live.ready_done.take() {
-                let _ = ready.send(());
+                let _ = ready.send(outcome);
             }
+            return;
         }
         if !live.collecting {
             return;
         }
-        match string_field(Some(&rec), "type") {
+        let events = match string_field(Some(&rec), "type") {
             Some("assistant") => {
+                // The snapshot ends one message. Add only what its stream
+                // did not deliver, then close the message.
                 let snapshot = assistant_text_blocks(&rec).join("");
-                if !snapshot.is_empty() {
-                    live.output = join_stream_text(&live.output, &snapshot);
+                let extra = snapshot_remainder(&live.message_text, &snapshot).to_string();
+                live.message_text.clear();
+                live.output.push_str(&extra);
+                let mut events = Vec::new();
+                if !extra.is_empty() {
+                    events.push(HarnessEvent::MessageDelta {
+                        text: extra,
+                        append: Some(true),
+                    });
                 }
-                None
+                events.push(HarnessEvent::MessageCompleted);
+                events
             }
-            Some("stream_event") => handle_stream_event(&mut live, &rec)
-                .and_then(|event| Some((live.on_event.clone()?, event))),
+            Some("user") => tool_results_from_user_message(&rec)
+                .into_iter()
+                .filter_map(|result| {
+                    let tool = live.tools_by_id.get(&result.tool_use_id)?;
+                    Some(HarnessEvent::ToolUpdated {
+                        agent_model: None,
+                        call_id: tool.id.clone(),
+                        title: None,
+                        kind: None,
+                        status: Some(
+                            if result.is_error {
+                                "failed"
+                            } else {
+                                "completed"
+                            }
+                            .into(),
+                        ),
+                        detail: Some(result.text.chars().take(TOOL_OUTPUT_LIMIT).collect()),
+                        preview: preview_from_tool(&tool.name, &tool.input, Some(&result.text)),
+                        paths: None,
+                    })
+                })
+                .collect(),
+            Some("stream_event") => handle_stream_event(&mut live, &rec).into_iter().collect(),
             Some("result") => {
                 let result = turn_status_from_result(&rec);
                 if let Some(turn) = live.turn.take() {
@@ -507,13 +594,16 @@ fn handle_line(session: &TextCell, line: &str) {
                         Ok(())
                     });
                 }
-                None
+                Vec::new()
             }
-            _ => None,
-        }
+            _ => Vec::new(),
+        };
+        (live.on_event.clone(), events)
     };
-    if let Some((sink, event)) = delivery {
-        sink(event);
+    if let Some(sink) = sink {
+        for event in events {
+            sink(event);
+        }
     }
 }
 
@@ -529,15 +619,16 @@ fn handle_stream_event(live: &mut LiveText, rec: &Record) -> Option<HarnessEvent
     if let Some(delta) = stream_delta_from_event(rec) {
         return Some(match delta.kind {
             ClaudeDeltaKind::Assistant => {
-                live.output = join_stream_text(&live.output, &delta.text);
+                live.output.push_str(&delta.text);
+                live.message_text.push_str(&delta.text);
                 HarnessEvent::MessageDelta {
                     text: delta.text,
-                    append: None,
+                    append: Some(true),
                 }
             }
             ClaudeDeltaKind::Reasoning => HarnessEvent::ReasoningDelta {
                 text: delta.text,
-                append: None,
+                append: Some(true),
             },
         });
     }
@@ -612,7 +703,20 @@ mod tests {
     }
 
     #[test]
-    fn read_only_text_prompts_run_one_plan_mode_turn() {
+    fn automatic_helpers_get_no_tools_and_one_turn() {
+        let text = text_settings("claude-haiku-4-5", None, None);
+        assert!(text.tools.is_empty());
+        assert_eq!(text.max_turns, Some(1));
+        assert_eq!(text.permission_mode, None);
+        assert_eq!(text.settings.always_thinking_enabled, None);
+        let mut off = ModelSettings::new();
+        off.insert("thinking".into(), "false".into());
+        let text = text_settings("claude-haiku-4-5", Some(&off), None);
+        assert_eq!(text.settings.always_thinking_enabled, Some(false));
+    }
+
+    #[test]
+    fn read_only_text_prompts_run_a_short_plan_mode_tool_loop() {
         let mut settings = ModelSettings::new();
         settings.insert("effort".into(), " ultracode ".into());
         settings.insert("context".into(), "1m".into());
@@ -622,10 +726,11 @@ mod tests {
         assert_eq!(text.prompt_effort.as_deref(), Some("ultracode"));
         assert_eq!(text.settings.ultracode, Some(true));
         assert_eq!(text.permission_mode, Some(ClaudePermissionMode::Plan));
-        assert_eq!(text.max_turns, Some(1));
+        assert_eq!(text.max_turns, Some(12));
+        assert_eq!(text.tools, ["Read", "Glob", "Grep"]);
         assert_eq!(
             text.key,
-            r#"{"effort":"ultracode","context":"1m","thinking":false,"fast":false,"readOnly":true}"#
+            r#"{"effort":"ultracode","context":"1m","settings":{"ultracode":true},"readOnly":true}"#
         );
     }
 }

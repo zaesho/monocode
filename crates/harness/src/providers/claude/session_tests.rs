@@ -3029,3 +3029,108 @@ fn passes_an_explicit_thinking_off_to_claude() {
     h.result("sess_1");
     finish(turn).unwrap();
 }
+
+// describe("audit transcript text helper")
+
+fn text_prompt(
+    h: &Harness,
+    intent: Option<TurnIntent>,
+    events: &Events,
+) -> smol::Task<Result<String>> {
+    let text = super::text::ClaudeText::with_init_timeout(
+        h.io.clone(),
+        Arc::new(Vec::new),
+        Duration::from_secs(2),
+    );
+    let input = crate::core::registry::TextPromptInput {
+        cwd: "/repo".into(),
+        provider_account_id: None,
+        model: Some("claude-haiku-4-5".into()),
+        model_settings: None,
+        thread_id: None,
+        on_thread_id: None,
+        intent,
+        prompt: "Where is auth?".into(),
+        timeout_ms: Some(5_000),
+        signal: None,
+        on_event: Some(events.sink()),
+    };
+    smol::spawn(async move { text.run(input).await })
+}
+
+#[test]
+fn the_read_only_helper_finishes_a_tool_loop_and_publishes_tool_results() {
+    let h = Harness::new();
+    let events = Events::default();
+    let prompt = text_prompt(&h, Some(TurnIntent::Plan), &events);
+    h.wait_for(|| h.spawned().len() == 1, "text helper");
+    let args = &h.spawned()[0];
+    assert!(contains_all(args, &["--tools", "Read,Glob,Grep"]));
+    assert!(contains_all(args, &["--max-turns", "12"]));
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request_id"] == "monocode_text_init")
+        },
+        "helper initialize",
+    );
+    // `system init` alone does not make the helper ready.
+    h.emit(json!({ "type": "system", "subtype": "init" }));
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(h.user_count(), 0);
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_text_init" },
+    }));
+    h.wait_for(|| h.user_count() == 1, "helper prompt");
+    h.emit(json!({
+        "type": "stream_event",
+        "event": { "type": "content_block_start", "index": 0, "content_block": {
+            "type": "tool_use", "id": "read-1", "name": "Read", "input": { "file_path": "/repo/auth.rs" },
+        } },
+    }));
+    h.emit(json!({
+        "type": "user",
+        "message": { "content": [{ "type": "tool_result", "tool_use_id": "read-1", "content": "fn login() {}" }] },
+    }));
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "text", "text": "Auth is in auth.rs." }] },
+    }));
+    h.emit(json!({ "type": "result", "subtype": "success" }));
+    let output = smol::block_on(prompt).unwrap();
+    assert_eq!(output, "Auth is in auth.rs.");
+    assert!(events.any(|event| matches!(
+        event,
+        HarnessEvent::ToolUpdated { call_id, status: Some(status), detail: Some(detail), .. }
+            if call_id == "read-1" && status == "completed" && detail == "fn login() {}"
+    )));
+}
+
+#[test]
+fn automatic_helpers_launch_with_no_tools_and_fail_a_rejected_initialize() {
+    let h = Harness::new();
+    let events = Events::default();
+    let prompt = text_prompt(&h, None, &events);
+    h.wait_for(|| h.spawned().len() == 1, "text helper");
+    assert!(contains_all(
+        &h.spawned()[0],
+        &["--tools", "", "--max-turns", "1"]
+    ));
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request_id"] == "monocode_text_init")
+        },
+        "helper initialize",
+    );
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "error", "request_id": "monocode_text_init", "error": "bad flags" },
+    }));
+    let error = smol::block_on(prompt).unwrap_err();
+    assert!(format!("{error:#}").contains("bad flags"));
+    assert_eq!(h.user_count(), 0);
+}

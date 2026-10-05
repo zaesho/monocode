@@ -94,6 +94,8 @@ fn limits(provider: RateLimitProvider, session: Option<RateLimitWindow>) -> Prov
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: NOW,
         error: None,
         status: RateLimitStatus::Ok,

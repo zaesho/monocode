@@ -1,7 +1,15 @@
 // @vitest-environment happy-dom
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockInstance,
+} from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(async () => {}),
@@ -85,8 +93,10 @@ function index(overrides: Partial<GitDiffIndex> = {}): GitDiffIndex {
 
 let container: HTMLDivElement;
 let root: Root;
+let setTimeoutSpy: MockInstance<typeof window.setTimeout>;
 
 beforeEach(() => {
+  setTimeoutSpy = vi.spyOn(window, "setTimeout");
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.stubGlobal(
     "ResizeObserver",
@@ -176,6 +186,13 @@ describe("GitChangesPanel commit message generation", () => {
 
 afterEach(() => {
   act(() => root.unmount());
+  // A mutation repeats its file invalidation 150 ms later, after the panel
+  // may have unmounted. Cancel it so it can't land in the next test.
+  setTimeoutSpy.mock.calls.forEach(([, delay], index) => {
+    if (delay === 150)
+      window.clearTimeout(setTimeoutSpy.mock.results[index].value);
+  });
+  setTimeoutSpy.mockRestore();
   container.remove();
   document.body
     .querySelectorAll("[data-popover-side]")

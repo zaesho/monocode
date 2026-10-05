@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -95,6 +95,17 @@ struct LiveChild {
 
 struct LiveSse {
     stop: Arc<AtomicBool>,
+    /// A clone of the stream's socket, shut down to end a blocked read.
+    socket: Mutex<Option<TcpStream>>,
+}
+
+impl LiveSse {
+    fn cancel(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(socket) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 struct HarnessInner {
@@ -269,11 +280,17 @@ impl HarnessShared {
         terminate_all(&pids);
     }
 
+    /// Register `live` and cancel the stream it replaces.
     fn insert_sse(&self, session_id: String, live: Arc<LiveSse>) -> Option<Arc<LiveSse>> {
-        self.sse
+        let previous = self
+            .sse
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id, live)
+            .insert(session_id, live);
+        if let Some(previous) = &previous {
+            previous.cancel();
+        }
+        previous
     }
 
     fn stop_sse(&self, session_id: &str) {
@@ -283,7 +300,7 @@ impl HarnessShared {
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id)
         {
-            live.stop.store(true, Ordering::SeqCst);
+            live.cancel();
         }
     }
 
@@ -293,7 +310,7 @@ impl HarnessShared {
             map.drain().map(|(_, live)| live).collect()
         };
         for live in streams {
-            live.stop.store(true, Ordering::SeqCst);
+            live.cancel();
         }
     }
 }
@@ -894,14 +911,19 @@ pub fn harness_spawn_with_env(
         terminate(prev.pid);
     }
 
-    let mut cmd = Command::new(&command);
-    cmd.args(&args)
-        .current_dir(&workdir)
+    let mut cmd = harness_command(&command, &args)?;
+    cmd.current_dir(&workdir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
     apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
+    let environment = crate::opencode_config::apply_opencode_server_env(
+        &mut cmd,
+        binary_provider.as_deref(),
+        &args,
+        environment,
+    )?;
     cmd.envs(environment);
 
     crate::control::configure_child(control, &session_id, &mut cmd);
@@ -1136,7 +1158,11 @@ pub fn harness_http(
 ) -> Result<HarnessHttpResponse, String> {
     assert_loopback(&url)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
-    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    // A redirect could send the request off loopback.
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
     let mut request = agent.request(&method, &url);
     if let Some(headers) = &headers {
         for (key, value) in headers {
@@ -1157,6 +1183,9 @@ pub fn harness_http(
     }
 }
 
+/// Open the OpenCode event stream for `session_id`. Returns once the server
+/// has answered with an event stream, so a prompt sent afterwards cannot
+/// finish before the stream sees it. Blocks; call it off the UI thread.
 pub fn harness_sse_open(
     host: &HarnessHost,
     session_id: String,
@@ -1164,51 +1193,51 @@ pub fn harness_sse_open(
     headers: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
     assert_loopback(&url)?;
-    host.stop_sse(&session_id);
-    let stop = Arc::new(AtomicBool::new(false));
-    host.insert_sse(
-        session_id.clone(),
-        Arc::new(LiveSse {
-            stop: Arc::clone(&stop),
-        }),
-    );
-
-    let events = host.events.clone();
-    thread::spawn(move || {
-        let events = events.as_ref();
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(60 * 60 * 6))
-            .timeout_write(Duration::from_secs(30))
-            .build();
-        let mut request = agent.get(&url).set("Accept", "text/event-stream");
-        if let Some(headers) = &headers {
-            for (key, value) in headers {
-                request = request.set(key, value);
-            }
-        }
-        let result = request.call();
-        if stop.load(Ordering::SeqCst) {
-            emit_sse_end(events, &session_id, None);
-            return;
-        }
-        match result {
-            Ok(response) => {
-                let reader = BufReader::new(response.into_reader());
-                read_sse(reader, events, &session_id, &stop);
-                emit_sse_end(events, &session_id, None);
+    let live = Arc::new(LiveSse {
+        stop: Arc::new(AtomicBool::new(false)),
+        socket: Mutex::new(None),
+    });
+    host.insert_sse(session_id.clone(), live.clone());
+    let events = CurrentSseEvents {
+        host: Arc::downgrade(&host.0),
+        events: host.events.clone(),
+        session_id: session_id.clone(),
+        live: live.clone(),
+    };
+    let stream_live = live.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    thread::spawn(
+        move || match open_sse_body(&url, headers.as_ref(), &stream_live) {
+            Ok(body) => {
+                if ready_tx.send(Ok(())).is_err() {
+                    stream_live.cancel();
+                    return;
+                }
+                read_sse(BufReader::new(body), &events, &stream_live.stop);
+                events.end(None);
             }
             Err(error) => {
-                emit_sse_end(
-                    events,
-                    &session_id,
-                    Some(format!("OpenCode event stream failed: {error}")),
-                );
+                let _ = ready_tx.send(Err(error));
+            }
+        },
+    );
+    match ready_rx.recv_timeout(Duration::from_secs(12)) {
+        Ok(Ok(())) if !live.stop.load(Ordering::SeqCst) => Ok(()),
+        result => {
+            live.cancel();
+            let mut streams = host.sse.lock().unwrap_or_else(|e| e.into_inner());
+            if streams
+                .get(&session_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &live))
+            {
+                streams.remove(&session_id);
+            }
+            match result {
+                Ok(Err(error)) => Err(error),
+                _ => Err("OpenCode event stream handshake was cancelled or timed out".into()),
             }
         }
-    });
-
-    Ok(())
+    }
 }
 
 pub fn harness_sse_close(host: &HarnessHost, session_id: String) -> Result<(), String> {
@@ -1224,12 +1253,52 @@ fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, S
     Ok(HarnessHttpResponse { status, body })
 }
 
-fn read_sse<R: BufRead>(
-    reader: R,
-    events: &dyn HarnessEvents,
-    session_id: &str,
-    stop: &AtomicBool,
-) {
+/// Delivers one stream's frames only while it is still the registered
+/// stream for its session, so a replaced stream cannot reach the new one.
+struct CurrentSseEvents {
+    host: std::sync::Weak<HarnessShared>,
+    events: Arc<dyn HarnessEvents>,
+    session_id: String,
+    live: Arc<LiveSse>,
+}
+
+impl CurrentSseEvents {
+    fn sse(&self, data: String) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let current = host
+            .sse
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.session_id)
+            .is_some_and(|live| Arc::ptr_eq(live, &self.live));
+        if current && !self.live.stop.load(Ordering::SeqCst) {
+            self.events.sse(&self.session_id, data);
+        }
+    }
+
+    fn end(&self, error: Option<String>) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let current = {
+            let mut streams = host.sse.lock().unwrap_or_else(|e| e.into_inner());
+            let current = streams
+                .get(&self.session_id)
+                .is_some_and(|live| Arc::ptr_eq(live, &self.live));
+            if current {
+                streams.remove(&self.session_id);
+            }
+            current
+        };
+        if current {
+            self.events.sse_end(&self.session_id, error);
+        }
+    }
+}
+
+fn read_sse<R: BufRead>(reader: R, events: &CurrentSseEvents, stop: &AtomicBool) {
     let mut data = String::new();
     for line in reader.lines() {
         if stop.load(Ordering::SeqCst) {
@@ -1244,7 +1313,7 @@ fn read_sse<R: BufRead>(
                 continue;
             }
             let payload = std::mem::take(&mut data);
-            events.sse(session_id, payload);
+            events.sse(payload);
             continue;
         }
         if let Some(rest) = line.strip_prefix("data:") {
@@ -1257,21 +1326,241 @@ fn read_sse<R: BufRead>(
     }
 }
 
-fn emit_sse_end(events: &dyn HarnessEvents, session_id: &str, error: Option<String>) {
-    events.sse_end(session_id, error);
+/// One CRLF- or LF-terminated HTTP line of at most 64 KiB.
+fn http_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
+    let mut line = String::new();
+    reader.take(64 * 1024).read_line(&mut line)?;
+    if !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid HTTP line",
+        ));
+    }
+    Ok(line)
 }
 
+/// The stream's socket, read so that a cancel always ends the read.
+struct SseSocket {
+    reader: BufReader<TcpStream>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SseSocket {
+    fn new(reader: BufReader<TcpStream>, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
+        // Winsock shutdown on a duplicate need not interrupt an existing recv.
+        // Nonblocking reads let this thread observe cancellation itself.
+        reader.get_ref().set_read_timeout(None)?;
+        if cfg!(windows) {
+            reader.get_ref().set_nonblocking(true)?;
+        }
+        Ok(Self { reader, stop })
+    }
+}
+
+impl Read for SseSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if buf.is_empty() || self.stop.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            match self.reader.read(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// The response body, with chunked transfer decoding. A partial chunk
+/// header or chunk stays buffered across idle reads.
+struct SseBody {
+    reader: BufReader<SseSocket>,
+    chunked: bool,
+    remaining: usize,
+    chunk_end: bool,
+    finished: bool,
+}
+
+impl Read for SseBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.finished {
+            return Ok(0);
+        }
+        if !self.chunked {
+            return self.reader.read(buf);
+        }
+        if self.remaining == 0 {
+            if self.chunk_end {
+                let mut separator = [0; 2];
+                self.reader.read_exact(&mut separator)?;
+                if separator != *b"\r\n" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid HTTP chunk separator",
+                    ));
+                }
+                self.chunk_end = false;
+            }
+            let size = http_line(&mut self.reader)?;
+            self.remaining = usize::from_str_radix(size.trim().split(';').next().unwrap_or(""), 16)
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid HTTP chunk size")
+                })?;
+            if self.remaining == 0 {
+                self.finished = true;
+                return Ok(0);
+            }
+        }
+        let length = buf.len().min(self.remaining);
+        let read = self.reader.read(&mut buf[..length])?;
+        if read == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.remaining -= read;
+        self.chunk_end = self.remaining == 0;
+        Ok(read)
+    }
+}
+
+/// Connect, send the request, and read the response head. Fails unless the
+/// server answers 200 with an identity-encoded event stream; redirects are
+/// not followed.
+fn open_sse_body(
+    url: &str,
+    headers: Option<&HashMap<String, String>>,
+    live: &LiveSse,
+) -> Result<SseBody, String> {
+    let open = || -> Result<SseBody, String> {
+        let parsed = url::Url::parse(url).map_err(|error| error.to_string())?;
+        let host = parsed.host_str().ok_or("Missing OpenCode host")?;
+        let port = parsed
+            .port_or_known_default()
+            .ok_or("Missing OpenCode port")?;
+        let address = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| error.to_string())?
+            .find(|address| address.ip().is_loopback())
+            .ok_or("OpenCode host did not resolve to loopback")?;
+        let socket = TcpStream::connect_timeout(&address, Duration::from_secs(10))
+            .map_err(|error| error.to_string())?;
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        socket
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        {
+            let mut handle = live.socket.lock().unwrap_or_else(|e| e.into_inner());
+            if live.stop.load(Ordering::SeqCst) {
+                return Err("OpenCode event stream was cancelled".into());
+            }
+            *handle = Some(socket.try_clone().map_err(|error| error.to_string())?);
+        }
+        let mut reader = BufReader::new(socket);
+        let path = match parsed.query() {
+            Some(query) => format!("{}?{query}", parsed.path()),
+            None => parsed.path().into(),
+        };
+        let mut request = format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
+        );
+        for (key, value) in headers.into_iter().flatten() {
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+                || value.contains(['\r', '\n'])
+            {
+                return Err("Invalid OpenCode event stream header".into());
+            }
+            if [
+                "host",
+                "connection",
+                "accept-encoding",
+                "content-length",
+                "transfer-encoding",
+            ]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+            {
+                return Err("Unsupported OpenCode event stream header".into());
+            }
+            request.push_str(&format!("{key}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        reader
+            .get_mut()
+            .write_all(request.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let status = http_line(&mut reader).map_err(|error| error.to_string())?;
+        if status.split_whitespace().nth(1) != Some("200") {
+            return Err(format!("OpenCode event stream returned {}", status.trim()));
+        }
+        let mut sse = false;
+        let mut chunked = false;
+        let mut total = 0;
+        loop {
+            let line = http_line(&mut reader).map_err(|error| error.to_string())?;
+            total += line.len();
+            if total > 64 * 1024 {
+                return Err("OpenCode event stream headers are too large".into());
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((key, value)) = line.split_once(':') {
+                if key.eq_ignore_ascii_case("content-type") {
+                    sse = value.trim().starts_with("text/event-stream");
+                }
+                if key.eq_ignore_ascii_case("transfer-encoding") {
+                    if !value.trim().eq_ignore_ascii_case("chunked") {
+                        return Err("Unsupported OpenCode transfer encoding".into());
+                    }
+                    chunked = true;
+                }
+                if key.eq_ignore_ascii_case("content-encoding")
+                    && !value.trim().eq_ignore_ascii_case("identity")
+                {
+                    return Err("Unsupported OpenCode stream encoding".into());
+                }
+            }
+        }
+        if !sse {
+            return Err("OpenCode server did not return an event stream".into());
+        }
+        Ok(SseBody {
+            reader: BufReader::new(
+                SseSocket::new(reader, live.stop.clone()).map_err(|error| error.to_string())?,
+            ),
+            chunked,
+            remaining: 0,
+            chunk_end: false,
+            finished: false,
+        })
+    };
+    open().map_err(|error| format!("OpenCode event stream failed: {error}"))
+}
+
+/// Plain `http` to `127.0.0.1` or `localhost`, with no credentials in the
+/// URL.
 fn assert_loopback(url: &str) -> Result<(), String> {
-    let lower = url.to_ascii_lowercase();
-    if lower.starts_with("http://127.0.0.1:")
-        || lower.starts_with("http://127.0.0.1/")
-        || lower.starts_with("http://localhost:")
-        || lower.starts_with("http://localhost/")
+    let parsed =
+        url::Url::parse(url).map_err(|_| "OpenCode HTTP is limited to localhost".to_string())?;
+    if parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
     {
         return Ok(());
     }
     Err("OpenCode HTTP is limited to localhost".into())
 }
+
+#[cfg(test)]
+#[path = "harness_transport_tests.rs"]
+mod transport_tests;
 
 const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["--version"],
@@ -1346,9 +1635,8 @@ pub fn exec_output(
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    let mut cmd = Command::new(command);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    let mut cmd = harness_command(command, args)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
@@ -1374,6 +1662,42 @@ pub fn exec_output(
             Err(format!("{command} timed out"))
         }
     }
+}
+
+/// The command that runs `command`. Node cannot run npm's Windows `.cmd`
+/// shim for OpenCode without a console, so that shim runs its JavaScript
+/// entry point under `node` instead.
+fn harness_command(command: &str, args: &[String]) -> Result<Command, String> {
+    let entry = opencode_npm_entry(command, cfg!(windows))?;
+    let mut process = Command::new(if entry.is_some() { "node" } else { command });
+    if let Some(entry) = entry {
+        process.arg(entry);
+    }
+    process.args(args);
+    Ok(process)
+}
+
+/// The entry point beside npm's `opencode.cmd` or `opencode.bat` shim.
+fn opencode_npm_entry(command: &str, windows: bool) -> Result<Option<PathBuf>, String> {
+    let path = Path::new(command);
+    let shim = windows
+        && path
+            .file_stem()
+            .is_some_and(|name| name.eq_ignore_ascii_case("opencode"))
+        && path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if !shim {
+        return Ok(None);
+    }
+    let entry = path
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join("node_modules/opencode-ai/bin/opencode");
+    if !entry.is_file() {
+        return Err("Missing npm OpenCode entry point".into());
+    }
+    Ok(Some(entry))
 }
 
 const KILL_ESCALATE: Duration = Duration::from_secs(2);

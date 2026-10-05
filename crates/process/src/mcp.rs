@@ -654,7 +654,7 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 /// Remove JSONC comments and trailing commas without touching quoted text.
-fn strip_jsonc(raw: &str) -> String {
+pub(crate) fn strip_jsonc(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut clean = Vec::with_capacity(bytes.len());
     let mut index = 0;

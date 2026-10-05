@@ -1,6 +1,7 @@
 //! The native account usage footer and running terminal controls.
 use super::Shell;
 use gpui::{AppContext as _, Context, IntoElement};
+use monocode_core::HarnessId;
 use monocode_view_settings::accounts::model::RateLimitProvider;
 use monocode_view_settings::accounts::{
     UsageFooter, UsageFooterCallbacks, UsageFooterProps, UsageFooterSession,
@@ -11,19 +12,18 @@ impl Shell {
     pub(super) fn render_footer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let props = if let Some(workspace) = &self.workspace {
             let workspace = workspace.read(cx);
+            let active = workspace.active_session_ref(cx);
             UsageFooterProps {
-                providers: RateLimitProvider::ALL.to_vec(),
-                session: workspace
-                    .active_session_ref(cx)
-                    .map(|session| UsageFooterSession {
-                        id: Some(session.id.clone()),
-                        harness: session.harness,
-                        model: Some(session.model.clone()),
-                        auth_required: false,
-                        provider_account_id: session.provider_account_id.clone(),
-                        environment_id: monocode_layout::paths::parse_remote_path(&session.cwd)
-                            .map(|remote| remote.environment_id),
-                    }),
+                providers: footer_providers(active.map(|session| session.harness)),
+                session: active.map(|session| UsageFooterSession {
+                    id: Some(session.id.clone()),
+                    harness: session.harness,
+                    model: Some(session.model.clone()),
+                    auth_required: false,
+                    provider_account_id: session.provider_account_id.clone(),
+                    environment_id: monocode_layout::paths::parse_remote_path(&session.cwd)
+                        .map(|remote| remote.environment_id),
+                }),
                 project: Some(workspace.sidebar_cwd(cx)),
                 terminals: workspace.running_terminals(cx),
                 terminal_open: workspace.running_terminal_open(cx),
@@ -102,5 +102,16 @@ impl Shell {
             footer.update(cx, |footer, cx| footer.set_props(props, cx));
         }
         footer
+    }
+}
+
+/// The usage chips the footer shows: only the active session's harness.
+/// With no session open, every provider shows.
+fn footer_providers(harness: Option<HarnessId>) -> Vec<RateLimitProvider> {
+    match harness {
+        Some(harness) => RateLimitProvider::from_harness(harness)
+            .into_iter()
+            .collect(),
+        None => RateLimitProvider::ALL.to_vec(),
     }
 }

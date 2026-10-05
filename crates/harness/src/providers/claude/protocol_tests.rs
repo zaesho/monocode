@@ -1529,3 +1529,45 @@ mod file_attachments {
         assert!(error.contains("no local file path"), "{error}");
     }
 }
+
+// describe("release catalog regression probes")
+
+#[test]
+fn preserves_a_custom_gateway_id_advertised_by_the_installed_cli() {
+    let models = models_from_claude_list_models(&json!([
+        { "value": "my-gateway/claude-opus-5-5", "displayName": "Audit custom gateway" },
+        { "value": "us.anthropic.claude-sonnet-4-5-v1.0", "displayName": "Bedrock Sonnet" },
+        { "value": "opus-5-5", "displayName": "Opus 5.5" },
+    ]));
+    let native = |name: &str| {
+        models
+            .iter()
+            .find(|model| model.name == name)
+            .and_then(|model| model.native_id.clone())
+    };
+    assert_eq!(
+        native("Audit custom gateway").as_deref(),
+        Some("my-gateway/claude-opus-5-5")
+    );
+    assert_eq!(
+        native("Bedrock Sonnet").as_deref(),
+        Some("us.anthropic.claude-sonnet-4-5-v1.0")
+    );
+    assert_eq!(native("Opus 5.5").as_deref(), Some("claude-opus-5-5"));
+}
+
+#[test]
+fn retains_the_1m_option_when_base_and_extended_context_rows_coexist() {
+    let models = models_from_claude_list_models(&json!([
+        { "value": "opus", "resolvedModel": "claude-opus-4-6", "displayName": "Opus" },
+        { "value": "opus[1m]", "resolvedModel": "claude-opus-4-6", "displayName": "Opus 1M" },
+    ]));
+    let options: Vec<String> = models[0]
+        .settings
+        .iter()
+        .flatten()
+        .filter(|setting| setting.id == "context")
+        .flat_map(|setting| setting.options.iter().map(|option| option.value.clone()))
+        .collect();
+    assert!(options.contains(&"1m".to_string()), "{options:?}");
+}

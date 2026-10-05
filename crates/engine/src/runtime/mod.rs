@@ -35,8 +35,8 @@ pub use checkpoint::{
 };
 pub use engine::{Engine, EngineConfig};
 pub use hooks::{
-    AttentionHooks, EngineHooks, HarnessHooks, NoopHooks, OrchestrationHooks, RecoveredSession,
-    RemoteHooks, SideThreadHooks, SubmitHooks, WorkspaceHooks,
+    AttentionHooks, CatalogScope, EngineHooks, HarnessHooks, NoopHooks, OrchestrationHooks,
+    RecoveredSession, RemoteHooks, SideThreadHooks, SubmitHooks, WorkspaceHooks,
 };
 pub use in_flight::ResumedWorkspace;
 pub use lifecycle::{BootWorkspace, Lifecycle, LifecycleEvent, QuitMode};

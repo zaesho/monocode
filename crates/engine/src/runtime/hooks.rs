@@ -116,7 +116,14 @@ pub trait HarnessHooks {
     fn probe_availability(&self, _cx: &mut App) {}
 
     /// `refreshHarnessCatalogs` for the harnesses already in the window.
-    fn refresh_catalogs(&self, _harnesses: Vec<HarnessId>, _cx: &mut App) -> Task<()> {
+    /// `scope` is the working directory and account of the session in
+    /// front, whose settings can change Claude's model list.
+    fn refresh_catalogs(
+        &self,
+        _harnesses: Vec<HarnessId>,
+        _scope: CatalogScope,
+        _cx: &mut App,
+    ) -> Task<()> {
         Task::ready(())
     }
 
@@ -125,6 +132,15 @@ pub trait HarnessHooks {
     fn resolve_model(&self, _session: &Session, _cx: &App) -> Option<(String, ModelSettings)> {
         None
     }
+}
+
+/// Where a catalog refresh reads models: the working directory and
+/// provider account of the session in front. The harness crate's
+/// `CatalogScope`, kept here so the runtime does not depend on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogScope {
+    pub cwd: Option<String>,
+    pub provider_account_id: Option<String>,
 }
 
 /// The submit pipeline and message queue.

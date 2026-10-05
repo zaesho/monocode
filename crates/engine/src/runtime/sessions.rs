@@ -19,6 +19,7 @@ use monocode_core::{HarnessEvent, HarnessId, Session};
 
 use super::engine::Engine;
 use super::harness_flush::{FlushKind, ScheduledFlush, schedule_harness_flush};
+use super::hooks::CatalogScope;
 use super::in_flight::{in_flight_refs, in_flight_snapshot_key, should_write_in_flight_snapshot};
 use super::reducer::{Reducer, apply_harness_events, last_user_block_id};
 use super::session_cache::SessionCache;
@@ -993,7 +994,21 @@ impl Sessions {
                 harnesses.push(session.harness);
             }
         }
-        let refresh = hooks.harness.refresh_catalogs(harnesses, cx);
+        // Claude lists models by project and account, so read them where the
+        // session in front works.
+        let scope = self
+            .list
+            .iter()
+            .find(|session| {
+                session.harness == HarnessId::Claude
+                    && hooks.workspace.is_foreground(&session.id, cx)
+            })
+            .map(|session| CatalogScope {
+                cwd: Some(monocode_core::session::session_work_cwd(session).to_string()),
+                provider_account_id: session.provider_account_id.clone(),
+            })
+            .unwrap_or_default();
+        let refresh = hooks.harness.refresh_catalogs(harnesses, scope, cx);
         cx.spawn(async move |this, cx| {
             refresh.await;
             this.update(cx, |this, cx| {

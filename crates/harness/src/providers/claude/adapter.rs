@@ -15,7 +15,7 @@ use monocode_core::user_question::UserQuestionReply;
 
 use crate::core::register::HarnessContext;
 use crate::core::registry::{
-    AcceptedHook, AdapterCapabilities, EventSink, GeneratedPrContent, HarnessAdapter,
+    AcceptedHook, AdapterCapabilities, CatalogScope, EventSink, GeneratedPrContent, HarnessAdapter,
     TextPromptInput, TitleInput,
 };
 use crate::core::session_title::GeneratedSessionTitle;
@@ -216,6 +216,13 @@ impl HarnessAdapter for ClaudeAdapter {
     fn refresh_catalog(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.catalog.refresh().await;
+            Ok(())
+        })
+    }
+
+    fn refresh_catalog_in(&self, scope: CatalogScope) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.catalog.refresh_in(scope).await;
             Ok(())
         })
     }

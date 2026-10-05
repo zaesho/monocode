@@ -50,6 +50,8 @@ struct FakeState {
     on_exit: Option<ExitHandler>,
     reject_writes: VecDeque<String>,
     kills: usize,
+    /// The working directory and account of every spawn.
+    spawn_places: Vec<(String, Option<ChildAccount>)>,
     /// Holds binary resolution until the test sends or drops the gate.
     binary_gate: Option<async_channel::Receiver<()>>,
 }
@@ -77,10 +79,12 @@ impl ClaudeChildIo for FakeIo {
         _child_id: &str,
         _command: &str,
         args: Vec<String>,
-        _cwd: &str,
-        _account: Option<ChildAccount>,
+        cwd: &str,
+        account: Option<ChildAccount>,
     ) -> BoxFuture<'static, Result<()>> {
-        self.state.lock().spawned.push(args);
+        let mut state = self.state.lock();
+        state.spawned.push(args);
+        state.spawn_places.push((cwd.to_string(), account));
         async { Ok(()) }.boxed()
     }
 
@@ -3568,4 +3572,69 @@ fn gives_an_unsolicited_wakeup_a_native_turn_of_its_own() {
         HarnessEvent::MessageDelta { text, .. } if text == "The scheduled check has started."
     )));
     assert!(!h.sessions.needs_process("s1"));
+}
+
+// describe("catalog discovery scope")
+
+fn discover_in(h: &Harness, catalog: &super::catalog::ClaudeCatalog, cwd: &str, account: &str) {
+    let spawns = h.spawned().len();
+    let refresh = catalog.refresh_in(crate::core::registry::CatalogScope {
+        cwd: Some(cwd.into()),
+        provider_account_id: Some(account.into()),
+        force: false,
+    });
+    let running = smol::spawn(refresh);
+    h.wait_for(|| h.spawned().len() == spawns + 1, "catalog probe");
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .filter(|m| m["request"]["subtype"] == "initialize")
+                .count()
+                > spawns
+        },
+        "probe initialize",
+    );
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_init", "response": {} },
+    }));
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .filter(|m| m["request"]["subtype"] == "list_models")
+                .count()
+                > spawns
+        },
+        "list_models",
+    );
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_list_models", "response": {
+            "models": [{ "value": "sonnet", "resolvedModel": "claude-sonnet-5", "displayName": "Sonnet" }],
+        } },
+    }));
+    smol::block_on(running);
+}
+
+#[test]
+fn discovers_models_in_the_selected_project_with_the_selected_account() {
+    let h = Harness::new();
+    let set: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let catalog = super::catalog::ClaudeCatalog::new(h.io.clone(), Arc::new(SmolSpawner), {
+        let set = set.clone();
+        Arc::new(move |models: Vec<monocode_core::models::AgentModel>| {
+            set.lock()
+                .push(models.into_iter().map(|model| model.name).collect());
+        })
+    });
+    discover_in(&h, &catalog, "/audit-project", "account-work");
+    discover_in(&h, &catalog, "/audit-project", "default");
+    let places = h.io.state.lock().spawn_places.clone();
+    assert_eq!(places.len(), 2);
+    assert_eq!(places[0].0, "/audit-project");
+    assert_eq!(places[0].1.as_ref().unwrap().id, "account-work");
+    assert_eq!(places[1].1.as_ref().unwrap().id, "default");
+    assert_eq!(set.lock().len(), 2);
 }

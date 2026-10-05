@@ -348,10 +348,11 @@ impl ModelCatalog {
             {
                 return bundled.clone();
             }
-            // A saved concrete Claude version may be absent from both catalogs.
-            // Keep the requested id so a new session does not silently switch models.
+            // A saved Claude model may belong to another profile's or a
+            // gateway's catalog. Keep the requested id so a new session does
+            // not silently switch models.
             let requested = crate::js::trim(id);
-            if harness == HarnessId::Claude && is_concrete_claude_key(requested) {
+            if harness == HarnessId::Claude && is_saved_claude_key(requested) {
                 let native_id = native_id_for_unknown_key(requested);
                 return AgentModel {
                     id: requested.to_string(),
@@ -583,20 +584,22 @@ fn has_digit(value: &str) -> bool {
     value.chars().any(|c| c.is_ascii_digit())
 }
 
-/// `/^claude:[a-z][a-z0-9-]*-\d/`.
-fn is_concrete_claude_key(value: &str) -> bool {
-    let Some(rest) = value.strip_prefix("claude:") else {
-        return false;
-    };
-    let bytes = rest.as_bytes();
-    if !bytes.first().is_some_and(u8::is_ascii_lowercase) {
-        return false;
-    }
-    let prefix = bytes
+/// A `claude:` key with a model after the prefix.
+fn is_saved_claude_key(value: &str) -> bool {
+    value.starts_with("claude:") && !crate::js::trim(&native_id_from(value)).is_empty()
+}
+
+/// `/^(opus|sonnet|haiku|fable)-\d/i`: a bare family name with a version,
+/// the only form that needs the `claude-` prefix.
+fn is_versioned_family(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    ["opus-", "sonnet-", "haiku-", "fable-"]
         .iter()
-        .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || **b == b'-')
-        .count();
-    (1..prefix).any(|i| bytes[i] == b'-' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        .any(|family| {
+            lower
+                .strip_prefix(family)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
 }
 
 /// `nativeIdForUnknownKey`: last-resort native id for a saved key no catalog
@@ -613,6 +616,15 @@ fn native_id_for_unknown_key(id: &str) -> String {
     if harness != "claude" {
         return slug;
     }
+    // Only family versions are dotted picker keys. A gateway or cloud id
+    // keeps its dots.
+    let family = slug
+        .to_ascii_lowercase()
+        .strip_prefix("claude-")
+        .map_or_else(|| is_versioned_family(&slug), is_versioned_family);
+    if !family {
+        return claude_native_id(HarnessId::Claude, &slug);
+    }
     let chars: Vec<char> = slug.chars().collect();
     let dashed: String = chars
         .iter()
@@ -628,13 +640,14 @@ fn native_id_for_unknown_key(id: &str) -> String {
     claude_native_id(HarnessId::Claude, &dashed)
 }
 
-/// `claudeNativeId`: Claude's CLI rejects digit-bearing slugs without the
-/// `claude-` prefix (`opus-5-5`), while bare aliases (`opus`) work.
+/// `claudeNativeId`: Claude's CLI rejects a versioned family name without
+/// the `claude-` prefix (`opus-5-5`), while bare aliases (`opus`) and
+/// gateway or cloud ids (`us.anthropic.claude-opus-4`) must stay unchanged.
 fn claude_native_id(harness: HarnessId, native: &str) -> String {
     if harness != HarnessId::Claude || native.is_empty() || native.starts_with("claude-") {
         return native.to_string();
     }
-    if has_digit(native) {
+    if is_versioned_family(native) {
         format!("claude-{native}")
     } else {
         native.to_string()
@@ -1158,6 +1171,49 @@ impl<'a> ModelEnv<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retains_a_saved_gateway_model_while_another_profiles_catalog_is_active() {
+        let catalog = ModelCatalog::new();
+        let model = catalog.resolve_model(
+            HarnessId::Claude,
+            Some("claude:us.anthropic.claude-sonnet-4-5-v1.0"),
+        );
+        assert_eq!(model.id, "claude:us.anthropic.claude-sonnet-4-5-v1.0");
+        assert_eq!(
+            native_model_id(&model),
+            "us.anthropic.claude-sonnet-4-5-v1.0"
+        );
+        assert_eq!(
+            catalog.native_model_id_for("claude:us.anthropic.claude-sonnet-4-5-v1.0"),
+            "us.anthropic.claude-sonnet-4-5-v1.0"
+        );
+    }
+
+    #[test]
+    fn passes_a_provider_model_id_through_without_adding_claude() {
+        let mut catalog = ModelCatalog::new();
+        catalog.set_harness_models(
+            HarnessId::Claude,
+            vec![
+                AgentModel::new(
+                    "claude:my-gateway/claude-opus-5-5",
+                    HarnessId::Claude,
+                    "Gateway",
+                )
+                .with_native_id("my-gateway/claude-opus-5-5"),
+            ],
+        );
+        assert_eq!(
+            catalog.native_model_id_for("claude:my-gateway/claude-opus-5-5"),
+            "my-gateway/claude-opus-5-5"
+        );
+        // A dotted family key still becomes the hyphenated CLI id.
+        assert_eq!(
+            ModelCatalog::new().native_model_id_for("claude:opus-4.8"),
+            "claude-opus-4-8"
+        );
+    }
 
     fn choice(values: &[(&str, &str)]) -> Vec<ModelSettingChoice> {
         values

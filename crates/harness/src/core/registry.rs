@@ -36,6 +36,23 @@ use super::task::{AbortSignal, BoxFuture, SharedSpawner};
 /// `onEvent`: where an adapter reports what its harness did.
 pub type EventSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
 
+/// Where a catalog refresh looks: the working directory and provider
+/// account whose settings decide the models a CLI offers. `force` re-reads
+/// a catalog that already loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogScope {
+    pub cwd: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub force: bool,
+}
+
+impl CatalogScope {
+    /// A scope names a working directory or an account.
+    pub fn is_scoped(&self) -> bool {
+        self.cwd.is_some() || self.provider_account_id.is_some()
+    }
+}
+
 /// Where events go that belong to no running send: a turn the provider
 /// started on its own after the last one ended, such as a scheduled wakeup.
 /// Takes the session id.
@@ -219,6 +236,12 @@ pub trait HarnessAdapter: Send + Sync {
     /// Refresh the model catalog overlay.
     fn refresh_catalog(&self) -> BoxFuture<'_, Result<()>> {
         ok(())
+    }
+
+    /// Refresh the model catalog overlay for a working directory and
+    /// account. Adapters whose models do not depend on them ignore the scope.
+    fn refresh_catalog_in(&self, _scope: CatalogScope) -> BoxFuture<'_, Result<()>> {
+        self.refresh_catalog()
     }
 
     /// LLM tab title for the first turn.
@@ -954,6 +977,24 @@ impl HarnessRegistry {
         force: bool,
         has_live_catalog: impl Fn(HarnessId) -> bool,
     ) {
+        let scope = CatalogScope {
+            force,
+            ..CatalogScope::default()
+        };
+        self.refresh_harness_catalogs_in(ids, scope, has_live_catalog)
+            .await;
+    }
+
+    /// [`Self::refresh_harness_catalogs`] for a working directory and
+    /// account. Claude's models depend on both, so a scoped refresh reads its
+    /// catalog again even when one already loaded.
+    pub async fn refresh_harness_catalogs_in(
+        &self,
+        ids: impl IntoIterator<Item = HarnessId>,
+        scope: CatalogScope,
+        has_live_catalog: impl Fn(HarnessId) -> bool,
+    ) {
+        let force = scope.force;
         let wanted: HashSet<HarnessId> = ids.into_iter().collect();
         if wanted.is_empty() {
             return;
@@ -963,10 +1004,17 @@ impl HarnessRegistry {
             .into_iter()
             .filter(|adapter| wanted.contains(&adapter.id()))
             .filter(|adapter| adapter.capabilities().refresh_catalog)
-            .filter(|adapter| force || !has_live_catalog(adapter.id()))
-            .map(|adapter| async move {
-                if let Err(error) = adapter.refresh_catalog().await {
-                    log::debug!("[monocode] {} catalog {error:#}", adapter.id());
+            .filter(|adapter| {
+                force
+                    || (adapter.id() == HarnessId::Claude && scope.is_scoped())
+                    || !has_live_catalog(adapter.id())
+            })
+            .map(|adapter| {
+                let scope = scope.clone();
+                async move {
+                    if let Err(error) = adapter.refresh_catalog_in(scope).await {
+                        log::debug!("[monocode] {} catalog {error:#}", adapter.id());
+                    }
                 }
             });
         futures::future::join_all(refreshes).await;

@@ -35,7 +35,7 @@ use super::worktrees::{
 use super::{ProjectsGlobal, notify_git_changed, notify_review_changed, project_data};
 use crate::runtime::engine::Engine;
 use crate::runtime::reducer::stop_streaming;
-use crate::runtime::session_store::should_persist_session;
+use crate::runtime::session_store::{is_storable_session, should_persist_session};
 use crate::runtime::sessions::{Sessions, bind_resumed_sessions};
 
 // Small helpers over the runtime.
@@ -259,9 +259,44 @@ pub fn on_cwd_change(session_id: &str, cwd: &str, cx: &mut App) {
             *session = next;
         });
     });
+    if let Some(current) = current.filter(|current| !should_persist_session(current)) {
+        keep_reminder_after_move(session_id, current, cx);
+    }
     // A group only holds tabs of one project, so the tab may have to leave.
     hooks.session_project_changed(session_id, &normalized, cx);
     notify_review_changed(session_id, cx);
+}
+
+/// Regular saves skip blank sessions, so one saved only to hold a reminder
+/// would keep its old project. Save it again, or drop the reminder when the
+/// new place cannot be stored.
+fn keep_reminder_after_move(session_id: &str, before: Session, cx: &mut App) {
+    let Some(package) = crate::automations::AutomationsPackage::try_global(cx) else {
+        return;
+    };
+    let reminders = package.reminders.clone();
+    let has_reminder = reminders
+        .read(cx)
+        .reminders()
+        .iter()
+        .any(|reminder| reminder.session_id == session_id);
+    if !has_reminder {
+        return;
+    }
+    let Some(moved) = find_session(session_id, cx).filter(|moved| moved.cwd != before.cwd) else {
+        return;
+    };
+    if is_storable_session(&moved) {
+        Engine::writer(cx)
+            .upsert_session_allow_empty(&moved)
+            .detach();
+    } else {
+        reminders
+            .update(cx, |reminders, cx| {
+                reminders.cancel(vec![session_id.to_owned()], None, cx)
+            })
+            .detach();
+    }
 }
 
 /// `onBranchChange`: the branch picker checked out another branch. The

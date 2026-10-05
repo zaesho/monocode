@@ -328,9 +328,16 @@ impl Orchestrator {
         if let Some(dependency) = run
             .tasks
             .iter()
-            .find(|entry| task.depends_on.contains(&entry.id) && !entry.accepted)
+            .find(|entry| task.depends_on.contains(&entry.id) && !dependency_met(run, entry))
         {
-            return Some(format!("Waiting for review: {}", dependency.title));
+            return Some(if dependency.accepted {
+                format!(
+                    "Waiting for out-of-scope files to be resolved: {}",
+                    dependency.title
+                )
+            } else {
+                format!("Waiting for review: {}", dependency.title)
+            });
         }
         if let Some(owner) = run
             .tasks
@@ -752,6 +759,35 @@ async fn patch_dispatch(
     commit(this, next, cx).await
 }
 
+/// `pendingOutside`: files an accepted task left unapplied in its kept
+/// worktree, as `(outside, ignored)`. These are changes outside its write
+/// scope and gitignored files it created. They are gone once that worktree
+/// is cleaned up.
+fn pending_outside(run: &OrchestrationRun, task: &OrchestrationTask) -> (Vec<String>, Vec<String>) {
+    let Some(dispatch) = run
+        .dispatch_list()
+        .iter()
+        .find(|entry| Some(&entry.id) == task.accepted_dispatch_id.as_ref())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    if dispatch.stage == DispatchStage::Cleaned {
+        return (Vec::new(), Vec::new());
+    }
+    (
+        dispatch.outside_assignment.clone().unwrap_or_default(),
+        dispatch.ignored_created.clone().unwrap_or_default(),
+    )
+}
+
+/// `dependencyMet`: a dependency is met once it is accepted and the lead has
+/// resolved any out-of-scope files, so dependents start from the checkout it
+/// settled on.
+fn dependency_met(run: &OrchestrationRun, task: &OrchestrationTask) -> bool {
+    let (outside, ignored) = pending_outside(run, task);
+    task.accepted && outside.is_empty() && ignored.is_empty()
+}
+
 /// `cleanupUnchangedWorker`: remove an isolated checkout that holds no
 /// unreviewed work. `Ok(false)` keeps it.
 async fn cleanup_unchanged_worker(
@@ -774,7 +810,7 @@ async fn cleanup_unchanged_worker(
             return Ok(false);
         };
         let cleaned = cx
-            .update(|cx| host.cleanup_worker(&run, &task, true, cx))
+            .update(|cx| host.cleanup_worker(&run, &task, true, false, cx))
             .await?;
         if !cleaned {
             return Ok(false);
@@ -1895,6 +1931,7 @@ async fn review(
         return Err("This task has no completed dispatch to review".into());
     };
     let isolated = target.workspace_policy != Some(WorkspacePolicy::Shared);
+    let discard_outside = input.get("discardOutside") == Some(&Value::Bool(true));
     if !target.accepted {
         if isolated {
             if target.workspace.is_none() {
@@ -1912,8 +1949,23 @@ async fn review(
             )
             .await?;
             let current = require_run(this, lead_id, cx)?;
-            cx.update(|cx| host.integrate_worker(&current, &target, cx))
+            let integration = cx
+                .update(|cx| host.integrate_worker(&current, &target, cx))
                 .await?;
+            if !integration.skipped.is_empty() || !integration.ignored.is_empty() {
+                patch_dispatch(
+                    this,
+                    lead_id,
+                    &dispatch_id,
+                    |dispatch| {
+                        dispatch.outside_assignment = Some(integration.skipped);
+                        dispatch.ignored_created =
+                            (!integration.ignored.is_empty()).then_some(integration.ignored);
+                    },
+                    cx,
+                )
+                .await?;
+            }
         }
         let mut next = (*require_run(this, lead_id, cx)?).clone();
         next.map_task(&target.id, |entry| {
@@ -1936,7 +1988,7 @@ async fn review(
     if isolated {
         let current = require_run(this, lead_id, cx)?;
         match cx
-            .update(|cx| host.cleanup_worker(&current, &target, false, cx))
+            .update(|cx| host.cleanup_worker(&current, &target, false, discard_outside, cx))
             .await
         {
             Ok(result) => cleaned = result,
@@ -1956,11 +2008,35 @@ async fn review(
         });
         commit(this, next, cx).await?;
     }
+    let next = (*require_run(this, lead_id, cx)?).clone();
+    let (outside, ignored) = next
+        .task(&target.id)
+        .map(|task| pending_outside(&next, task))
+        .unwrap_or_default();
     let mut result = json!({ "accepted": true, "integrated": isolated, "cleaned": cleaned });
     if let Some(error) = cleanup_error {
         result["cleanupError"] = Value::String(error);
     }
-    let next = (*require_run(this, lead_id, cx)?).clone();
+    let mut kept = Vec::new();
+    if !outside.is_empty() {
+        kept.push("changed outside the task's write scope");
+        result["outsideAssignment"] = json!(outside);
+    }
+    if !ignored.is_empty() {
+        kept.push("are gitignored files the worker created");
+        result["ignoredCreated"] = json!(ignored);
+    }
+    if !kept.is_empty() {
+        let checkout = target
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.checkout_cwd.as_str())
+            .unwrap_or_default();
+        result["note"] = Value::String(format!(
+            "These files {}, so they were not applied. They are still in {checkout}, which was kept. Tasks that depend on this one wait until it is removed. Copy any you need into the lead checkout, then call review again with \"discardOutside\": true to remove the worktree and its branch.",
+            kept.join(" or ")
+        ));
+    }
     record(this, next, request_id, signature, result, cx).await
 }
 
@@ -2017,7 +2093,7 @@ async fn finish(
         let attempt: Result<bool, String> = async {
             let current = require_run(this, lead_id, cx)?;
             let cleaned = cx
-                .update(|cx| host.cleanup_worker(&current, &retained, false, cx))
+                .update(|cx| host.cleanup_worker(&current, &retained, false, false, cx))
                 .await?;
             if cleaned {
                 let mut next = (*require_run(this, lead_id, cx)?).clone();
@@ -2175,10 +2251,10 @@ async fn pump_runs(
                 continue;
             };
             if task.status != TaskStatus::Queued
-                || task
-                    .depends_on
-                    .iter()
-                    .any(|id| !run.task(id).is_some_and(|entry| entry.accepted))
+                || task.depends_on.iter().any(|id| {
+                    !run.task(id)
+                        .is_some_and(|entry| dependency_met(&run, entry))
+                })
             {
                 continue;
             }
@@ -2207,6 +2283,8 @@ async fn pump_runs(
                 result: None,
                 error: None,
                 cleanup_error: None,
+                outside_assignment: None,
+                ignored_created: None,
                 extra: Extra::new(),
             };
             // Persist authority before any external worker/resource operation.

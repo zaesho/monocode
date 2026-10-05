@@ -14,7 +14,7 @@ use monocode_core::user_question::{UserQuestionPrompt, UserQuestionReply};
 use monocode_core::{Block, Extra, HarnessEvent, HarnessId};
 use serde_json::{Value, json};
 
-use super::host::{ChoiceModel, HarnessChoice};
+use super::host::{ChoiceModel, HarnessChoice, WorkerIntegration};
 use super::orchestrator::{
     Orchestrator, delete_session, handle, hydrate, start, start_approved, stop_run,
 };
@@ -682,7 +682,12 @@ fn persists_dispatch_authority_and_binds_review_to_the_completed_attempt(cx: &mu
         Some(dispatch_id.as_str())
     );
     assert_eq!(*f.host.integrated.borrow(), vec![task.id.clone()]);
-    assert!(f.host.cleanups.borrow().contains(&(task.id.clone(), false)));
+    assert!(
+        f.host
+            .cleanups
+            .borrow()
+            .contains(&(task.id.clone(), false, false))
+    );
     assert_eq!(f.tasks(cx)[0].workspace, None);
     assert_eq!(
         f.run(cx).unwrap().dispatch_list()[0].stage,
@@ -714,7 +719,12 @@ fn reports_a_cancelled_dirty_worktree_instead_of_silently_orphaning_it(cx: &mut 
         f.tasks(cx)[0].workspace.as_ref().unwrap().checkout_cwd,
         format!("/worktrees/{}", task.id)
     );
-    assert!(f.host.cleanups.borrow().contains(&(task.id.clone(), true)));
+    assert!(
+        f.host
+            .cleanups
+            .borrow()
+            .contains(&(task.id.clone(), true, false))
+    );
 }
 
 #[gpui::test]
@@ -798,6 +808,119 @@ fn keeps_a_dependency_queued_until_the_lead_accepts_the_upstream_result(cx: &mut
     assert_eq!(f.tasks(cx)[1].status, TaskStatus::Queued);
     f.call(cx, "review", json!({ "taskId": upstream.id }))
         .unwrap();
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
+}
+
+#[gpui::test]
+fn keeps_out_of_scope_files_until_the_lead_discards_them_and_holds_dependents(
+    cx: &mut TestAppContext,
+) {
+    let f = setup(cx);
+    f.start(cx);
+    f.delegate(cx, &["src/types.ts"], json!({})).unwrap();
+    let upstream = f.tasks(cx)[0].clone();
+    f.delegate(cx, &["src/ui"], json!({ "dependsOn": [upstream.id] }))
+        .unwrap();
+    f.complete(cx, &upstream.session_id, completed("Done"));
+    assert_eq!(f.tasks(cx)[0].status, TaskStatus::Completed);
+    f.host
+        .integrations
+        .borrow_mut()
+        .push_back(WorkerIntegration {
+            files: vec!["src/types.ts".into()],
+            skipped: vec!["coverage/out.json".into()],
+            ..WorkerIntegration::default()
+        });
+    // The host keeps a worktree that still holds out-of-scope files.
+    f.host.cleanup_result.set(false);
+
+    let first = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(first["outsideAssignment"], json!(["coverage/out.json"]));
+    let note = first["note"].as_str().unwrap();
+    assert!(
+        note.contains(&format!("still in /worktrees/{}", upstream.id)),
+        "{note}"
+    );
+    assert!(note.contains("discardOutside"), "{note}");
+    assert!(f.tasks(cx)[0].accepted);
+    assert_eq!(
+        f.store.saved.borrow()["lead"].dispatch_list()[0].outside_assignment,
+        Some(vec!["coverage/out.json".to_string()])
+    );
+
+    // A repeated review reports the files again and applies nothing twice.
+    let again = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(again["outsideAssignment"], json!(["coverage/out.json"]));
+    assert_eq!(*f.host.integrated.borrow(), vec![upstream.id.clone()]);
+    f.call(cx, "list", json!({})).unwrap();
+    let run = f.run(cx).unwrap();
+    assert_eq!(run.tasks[1].status, TaskStatus::Queued);
+    assert_eq!(
+        Orchestrator::waiting_for(&run, &run.tasks[1]).as_deref(),
+        Some("Waiting for out-of-scope files to be resolved: Task")
+    );
+
+    f.host.cleanup_result.set(true);
+    let discarded = f
+        .call(
+            cx,
+            "review",
+            json!({ "taskId": upstream.id, "discardOutside": true }),
+        )
+        .unwrap();
+    assert_eq!(
+        f.host.cleanups.borrow().last(),
+        Some(&(upstream.id.clone(), false, true))
+    );
+    assert!(discarded.get("outsideAssignment").is_none());
+    assert_eq!(f.tasks(cx)[0].workspace, None);
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
+}
+
+#[gpui::test]
+fn keeps_gitignored_files_a_worker_created_until_the_lead_discards_them(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    f.start(cx);
+    f.delegate(cx, &["src/types.ts"], json!({})).unwrap();
+    let upstream = f.tasks(cx)[0].clone();
+    f.delegate(cx, &["src/ui"], json!({ "dependsOn": [upstream.id] }))
+        .unwrap();
+    f.complete(cx, &upstream.session_id, completed("Done"));
+    f.host
+        .integrations
+        .borrow_mut()
+        .push_back(WorkerIntegration {
+            files: vec!["src/types.ts".into()],
+            ignored: vec![".env.local".into()],
+            ..WorkerIntegration::default()
+        });
+    f.host.cleanup_result.set(false);
+
+    let result = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(result["ignoredCreated"], json!([".env.local"]));
+    assert!(result.get("outsideAssignment").is_none());
+    assert!(
+        result["note"]
+            .as_str()
+            .unwrap()
+            .contains("gitignored files the worker created")
+    );
+    f.call(cx, "list", json!({})).unwrap();
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Queued);
+
+    f.host.cleanup_result.set(true);
+    f.call(
+        cx,
+        "review",
+        json!({ "taskId": upstream.id, "discardOutside": true }),
+    )
+    .unwrap();
     assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
 }
 

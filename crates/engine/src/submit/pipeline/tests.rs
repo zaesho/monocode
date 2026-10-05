@@ -1036,6 +1036,76 @@ async fn removes_a_new_worktree_when_its_checkpoint_fails(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn keeps_an_integrated_worktree_with_outside_files_until_the_lead_discards_them(
+    cx: &mut TestAppContext,
+) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::tests::{run, task};
+    use crate::orchestration::state::{
+        DispatchStage, DispatchState, OrchestrationDispatch, OrchestrationTask, workspace_identity,
+    };
+    use crate::projects::backend::{Worktree, Worktrees};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, projects) = worker_host(cx);
+    let path = format!("{CWD}-worktrees/mc-orch-a");
+    let workspace = workspace_identity(CWD, &path, Some("mc/orch-a"));
+    let mut lead = Worktree::new(CWD, Some("main"));
+    lead.is_main = true;
+    projects.set_worktrees(
+        CWD,
+        Ok(Worktrees {
+            worktrees: vec![lead, Worktree::new(path.clone(), Some("mc/orch-a"))],
+            default_root: String::new(),
+        }),
+    );
+    let worker = OrchestrationTask {
+        accepted: true,
+        accepted_dispatch_id: Some("d1".into()),
+        workspace: Some(workspace.clone()),
+        ..task("a")
+    };
+    let mut current = run(vec![worker.clone()]);
+    current.dispatches = Some(vec![OrchestrationDispatch {
+        id: "d1".into(),
+        task_id: "a".into(),
+        session_id: "a".into(),
+        workspace,
+        state: DispatchState::Completed,
+        stage: DispatchStage::Integrated,
+        started_at: 0,
+        updated_at: 0,
+        result: None,
+        error: None,
+        cleanup_error: None,
+        outside_assignment: Some(vec!["coverage/out.json".into()]),
+        ignored_created: None,
+        extra: Extra::new(),
+    }]);
+
+    let kept = cx.update(|cx| host.cleanup_worker(&current, &worker, false, false, cx));
+    cx.run_until_parked();
+    assert_eq!(kept.now_or_never(), Some(Ok(false)));
+    // An integrated dispatch is never applied again.
+    assert!(fixture.backend.calls("session_checkpoint_apply").is_empty());
+    assert!(
+        projects
+            .calls("git_orchestration_worktree_remove")
+            .is_empty()
+    );
+
+    let removed = cx.update(|cx| host.cleanup_worker(&current, &worker, false, true, cx));
+    cx.run_until_parked();
+    assert_eq!(removed.now_or_never(), Some(Ok(true)));
+    assert!(fixture.backend.calls("session_checkpoint_apply").is_empty());
+    assert_eq!(
+        projects.calls("git_orchestration_worktree_remove"),
+        [json!({ "cwd": CWD, "path": path })]
+    );
+}
+
+#[gpui::test]
 async fn says_so_when_a_harness_cannot_take_a_follow_up(cx: &mut TestAppContext) {
     let fixture = setup(cx);
     insert(

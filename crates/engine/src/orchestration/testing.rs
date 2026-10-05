@@ -150,7 +150,10 @@ pub struct FakeHost {
     pub created: RefCell<Vec<OrchestrationTask>>,
     pub integrated: RefCell<Vec<String>>,
     pub integrate_failures: RefCell<VecDeque<String>>,
-    pub cleanups: RefCell<Vec<(String, bool)>>,
+    /// The next `integrate_worker` results, before the default empty one.
+    pub integrations: RefCell<VecDeque<WorkerIntegration>>,
+    /// `(task id, only_if_unchanged, discard_outside)` per cleanup.
+    pub cleanups: RefCell<Vec<(String, bool, bool)>>,
     pub cleanup_result: Cell<bool>,
     /// Workers share this checkout instead of `/worktrees/<task id>`.
     pub worker_checkout: RefCell<Option<String>>,
@@ -177,6 +180,7 @@ impl FakeHost {
             created: RefCell::default(),
             integrated: RefCell::default(),
             integrate_failures: RefCell::default(),
+            integrations: RefCell::default(),
             cleanups: RefCell::default(),
             cleanup_result: Cell::new(true),
             worker_checkout: RefCell::new(None),
@@ -273,7 +277,8 @@ impl OrchestrationHost for FakeHost {
         if let Some(error) = self.integrate_failures.borrow_mut().pop_front() {
             return Task::ready(Err(error));
         }
-        Task::ready(Ok(WorkerIntegration::default()))
+        let integration = self.integrations.borrow_mut().pop_front();
+        Task::ready(Ok(integration.unwrap_or_default()))
     }
 
     fn cleanup_worker(
@@ -281,11 +286,12 @@ impl OrchestrationHost for FakeHost {
         _run: &OrchestrationRun,
         task: &OrchestrationTask,
         only_if_unchanged: bool,
+        discard_outside: bool,
         _cx: &mut App,
     ) -> Task<Result<bool, String>> {
         self.cleanups
             .borrow_mut()
-            .push((task.id.clone(), only_if_unchanged));
+            .push((task.id.clone(), only_if_unchanged, discard_outside));
         Task::ready(Ok(self.cleanup_result.get()))
     }
 

@@ -17,6 +17,7 @@ use monocode_settings::{Kv, Subscription};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::projects::project_machines::project_home;
 use crate::runtime::session_history::compare_session_summaries;
 use crate::runtime::session_store::SessionSummary;
 use crate::runtime::util::project_path::normalize_project_path;
@@ -582,7 +583,7 @@ pub fn prune_session_folders(
 
 /// `loadSessionFolders`.
 pub fn load_session_folders(kv: &Kv, cwd: &str) -> Vec<SessionFolder> {
-    let Some(key) = storage_key(cwd) else {
+    let Some(key) = storage_key(kv, cwd) else {
         return Vec::new();
     };
     parse_store(kv).remove(&key).unwrap_or_default()
@@ -590,7 +591,7 @@ pub fn load_session_folders(kv: &Kv, cwd: &str) -> Vec<SessionFolder> {
 
 /// `saveSessionFolders`. Saving no folders drops the project's key.
 pub fn save_session_folders(kv: &Kv, cwd: &str, folders: &[SessionFolder]) {
-    let Some(key) = storage_key(cwd) else {
+    let Some(key) = storage_key(kv, cwd) else {
         return;
     };
     let mut store = parse_store(kv);
@@ -607,7 +608,7 @@ pub fn save_session_folders(kv: &Kv, cwd: &str, folders: &[SessionFolder]) {
 /// `rebaseSessionFolderSettings`: move folder and collapsed-group state when a
 /// project path changes.
 pub fn rebase_session_folder_settings(kv: &Kv, from: &str, to: &str) {
-    let (Some(old_key), Some(new_key)) = (storage_key(from), storage_key(to)) else {
+    let (Some(old_key), Some(new_key)) = (storage_key(kv, from), storage_key(kv, to)) else {
         return;
     };
     if old_key == new_key {
@@ -658,7 +659,7 @@ pub fn save_reminder_sessions_collapsed(kv: &Kv, cwd: &str, collapsed: bool) {
 }
 
 fn load_group_collapsed(kv: &Kv, cwd: &str, store_key: &str) -> bool {
-    let Some(key) = storage_key(cwd) else {
+    let Some(key) = storage_key(kv, cwd) else {
         return false;
     };
     match read_json(kv, store_key) {
@@ -668,7 +669,7 @@ fn load_group_collapsed(kv: &Kv, cwd: &str, store_key: &str) -> bool {
 }
 
 fn save_group_collapsed(kv: &Kv, cwd: &str, collapsed: bool, store_key: &str) {
-    let Some(key) = storage_key(cwd) else {
+    let Some(key) = storage_key(kv, cwd) else {
         return;
     };
     let raw = kv.get_item(store_key);
@@ -701,7 +702,7 @@ pub fn subscribe_session_folders(
     cwd: &str,
     on_change: impl Fn() + Send + Sync + 'static,
 ) -> Option<Subscription> {
-    let key = storage_key(cwd)?;
+    let key = storage_key(kv, cwd)?;
     Some(kv.subscribe_key(SESSION_FOLDERS_KEY, move |change| {
         let before = parse_store_raw(change.old_value.as_deref()).remove(&key);
         let after = parse_store_raw(change.new_value.as_deref()).remove(&key);
@@ -711,11 +712,12 @@ pub fn subscribe_session_folders(
     }))
 }
 
-fn storage_key(cwd: &str) -> Option<String> {
+fn storage_key(kv: &Kv, cwd: &str) -> Option<String> {
     if cwd.is_empty() || cwd == "~" {
         return None;
     }
-    Some(normalize_project_path(cwd))
+    // Folders belong to the project, whichever machine's folder is open.
+    Some(normalize_project_path(&project_home(kv, cwd)))
 }
 
 fn read_json(kv: &Kv, key: &str) -> Option<Value> {

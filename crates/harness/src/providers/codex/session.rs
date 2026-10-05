@@ -496,6 +496,7 @@ impl CodexSessions {
             .await?;
         live.emit(HarnessEvent::TurnStarted {
             provider_turn_id: turn_id,
+            native: None,
         });
         Ok(())
     }
@@ -1027,6 +1028,7 @@ impl CodexSessions {
             if let Some(turn_id) = started {
                 live.emit(HarnessEvent::TurnStarted {
                     provider_turn_id: turn_id,
+                    native: None,
                 });
             }
             settle_pending_turn(live);

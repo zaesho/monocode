@@ -44,6 +44,8 @@ struct Fake {
     title: Mutex<Option<async_channel::Receiver<GeneratedSessionTitle>>>,
     branches: AtomicUsize,
     branch: Mutex<Option<async_channel::Receiver<String>>>,
+    persistent: AtomicBool,
+    needs_process: AtomicBool,
 }
 
 impl Fake {
@@ -124,6 +126,14 @@ impl HostProvider for Fake {
         self.stops.fetch_add(1, Ordering::SeqCst);
         self.finish_last();
         async { Ok(()) }.boxed()
+    }
+
+    fn persistent(&self) -> bool {
+        self.persistent.load(Ordering::SeqCst)
+    }
+
+    fn needs_process(&self, _id: &str) -> bool {
+        self.needs_process.load(Ordering::SeqCst)
     }
 
     fn bind(&self, id: &str, provider_id: &str, cwd: &str) {
@@ -1333,4 +1343,91 @@ mod worktrees {
         let _ = setup.directory.path();
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+// describe("native Claude turns")
+
+fn persistent_claude() -> Setup {
+    let setup = setup_with(HarnessId::Claude, None);
+    setup.provider.persistent.store(true, Ordering::SeqCst);
+    setup
+        .engine
+        .command(&json!({
+            "type": "send", "commandId": "explicit", "sessionId": setup.id, "text": "Schedule work",
+        }))
+        .unwrap();
+    wait_for("the send", || setup.provider.turn_count() == 1);
+    setup
+}
+
+fn status(setup: &Setup) -> HostSessionStatus {
+    setup.store.session(&setup.id).unwrap().status
+}
+
+#[test]
+fn parks_idle_claude_only_after_its_scheduled_tasks_are_gone() {
+    let setup = persistent_claude();
+    setup.engine.set_idle_park(Duration::from_millis(100));
+    setup.provider.needs_process.store(true, Ordering::SeqCst);
+    setup.provider.finish(0);
+    wait_for("idle", || status(&setup) == HostSessionStatus::Idle);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(setup.provider.stops.load(Ordering::SeqCst), 0);
+    setup.provider.needs_process.store(false, Ordering::SeqCst);
+    wait_for("parked", || {
+        setup.provider.stops.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(status(&setup), HostSessionStatus::Idle);
+}
+
+#[test]
+fn retains_claude_and_gives_each_native_wakeup_a_new_persisted_turn() {
+    let setup = persistent_claude();
+    setup.provider.finish(0);
+    wait_for("idle", || status(&setup) == HostSessionStatus::Idle);
+    assert_eq!(setup.provider.stops.load(Ordering::SeqCst), 0);
+    for run_id in ["native-one", "native-two"] {
+        setup.provider.emit(
+            0,
+            json!({ "type": "turn.started", "native": true, "providerTurnId": run_id }),
+        );
+        let value = setup.store.session(&setup.id).unwrap();
+        assert_eq!(value.run_id.as_deref(), Some(run_id));
+        assert_eq!(value.status, HostSessionStatus::Running);
+        assert_eq!(value.session.busy, Some(true));
+        setup.provider.emit(
+            0,
+            json!({ "type": "message.delta", "text": run_id, "append": true }),
+        );
+        setup
+            .provider
+            .emit(0, json!({ "type": "turn.finished", "native": true }));
+        let value = setup.store.session(&setup.id).unwrap();
+        assert_eq!(value.run_id.as_deref(), Some(run_id));
+        assert_eq!(value.status, HostSessionStatus::Idle);
+        assert_eq!(value.session.busy, Some(false));
+        assert!(
+            value
+                .session
+                .blocks
+                .iter()
+                .any(|block| block.text == run_id)
+        );
+    }
+}
+
+#[test]
+fn interrupts_a_native_claude_wakeup_when_the_host_closes() {
+    let setup = persistent_claude();
+    setup.provider.finish(0);
+    wait_for("idle", || status(&setup) == HostSessionStatus::Idle);
+    setup.provider.emit(
+        0,
+        json!({ "type": "turn.started", "native": true, "providerTurnId": "native" }),
+    );
+    setup.engine.close();
+    assert!(setup.provider.stops.load(Ordering::SeqCst) >= 1);
+    let value = setup.store.session(&setup.id).unwrap();
+    assert_eq!(value.status, HostSessionStatus::Interrupted);
+    assert_ne!(value.session.busy, Some(true));
 }

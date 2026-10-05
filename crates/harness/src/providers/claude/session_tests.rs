@@ -3325,3 +3325,247 @@ fn reuses_the_process_for_build_when_claude_left_plan_mode() {
     h.result("sess_1");
     finish(build).unwrap();
 }
+
+// describe("native activity after an ordinary result")
+
+/// A harness whose clock the test sets, in epoch ms.
+fn clocked(now: i64) -> (Harness, Arc<std::sync::atomic::AtomicI64>) {
+    let clock = Arc::new(std::sync::atomic::AtomicI64::new(now));
+    let io = Arc::new(FakeIo::default());
+    let read = clock.clone();
+    let options = ClaudeSessionOptions {
+        init_timeout: Duration::from_secs(2),
+        resume_grace: GRACE,
+        now_ms: Arc::new(move || read.load(std::sync::atomic::Ordering::SeqCst)),
+        ..Default::default()
+    };
+    let sessions = ClaudeSessions::new(io.clone(), Arc::new(SmolSpawner), options);
+    (Harness { io, sessions }, clock)
+}
+
+fn complete_tool(
+    h: &Harness,
+    id: &str,
+    name: &str,
+    input: Value,
+    result: Option<Value>,
+    text: &str,
+) {
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] },
+    }));
+    let mut record = json!({
+        "type": "user",
+        "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": text }] },
+    });
+    if let Some(result) = result {
+        record["tool_use_result"] = result;
+    }
+    h.emit(record);
+}
+
+fn local_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+    use chrono::TimeZone;
+    chrono::Local
+        .with_ymd_and_hms(year, month, day, hour, minute, 0)
+        .earliest()
+        .unwrap()
+        .timestamp_millis()
+}
+
+#[test]
+fn reads_a_native_cron_id_from_the_result_text() {
+    for recurring in [false, true] {
+        let h = Harness::new();
+        let (_, turn) = h.start_turn("s1", TurnOptions::default());
+        let kind = if recurring {
+            "recurring job"
+        } else {
+            "one-shot task"
+        };
+        complete_tool(
+            &h,
+            "create",
+            "CronCreate",
+            json!({ "cron": "* * * * *", "recurring": recurring }),
+            None,
+            &format!("Scheduled {kind} native-job (* * * * *)."),
+        );
+        h.result("sess_1");
+        finish(turn).unwrap();
+        assert!(h.sessions.needs_process("s1"));
+        complete_tool(
+            &h,
+            "delete",
+            "CronDelete",
+            json!({ "id": "native-job" }),
+            Some(json!({})),
+            "ok",
+        );
+        h.result("sess_1");
+        assert!(!h.sessions.needs_process("s1"), "recurring={recurring}");
+    }
+}
+
+#[test]
+fn uses_the_structured_cron_id_when_a_job_is_deleted() {
+    let h = Harness::new();
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    complete_tool(
+        &h,
+        "create",
+        "CronCreate",
+        json!({ "cron": "* * * * *", "recurring": true }),
+        Some(json!({ "id": "cron-1", "recurring": true })),
+        "Scheduled",
+    );
+    h.result("sess_1");
+    finish(turn).unwrap();
+    assert!(h.sessions.needs_process("s1"));
+    complete_tool(
+        &h,
+        "delete",
+        "CronDelete",
+        json!({ "id": "cron-1" }),
+        Some(json!({})),
+        "ok",
+    );
+    h.result("sess_1");
+    assert!(!h.sessions.needs_process("s1"));
+}
+
+#[test]
+fn removes_only_due_one_shot_jobs_when_claude_wakes_up() {
+    let (h, clock) = clocked(local_ms(2026, 10, 3, 12, 3));
+    let set = |ms: i64| clock.store(ms, std::sync::atomic::Ordering::SeqCst);
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    complete_tool(
+        &h,
+        "once",
+        "CronCreate",
+        json!({ "cron": "5 12 * * *" }),
+        Some(json!({ "id": "once", "recurring": false })),
+        "ok",
+    );
+    complete_tool(
+        &h,
+        "later",
+        "CronCreate",
+        json!({ "cron": "5 13 * * *" }),
+        Some(json!({ "id": "later", "recurring": false })),
+        "ok",
+    );
+    h.result("sess_1");
+    finish(turn).unwrap();
+    set(local_ms(2026, 10, 3, 12, 5));
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    h.result("sess_1");
+    assert!(h.sessions.needs_process("s1"));
+    set(local_ms(2026, 10, 3, 13, 5));
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    h.result("sess_1");
+    assert!(!h.sessions.needs_process("s1"));
+}
+
+#[test]
+fn reconciles_the_scheduled_jobs_reported_by_cron_list() {
+    let h = Harness::new();
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    complete_tool(
+        &h,
+        "create",
+        "CronCreate",
+        json!({ "cron": "* * * * *", "recurring": true }),
+        Some(json!({ "id": "expired", "recurring": true })),
+        "ok",
+    );
+    complete_tool(
+        &h,
+        "list",
+        "CronList",
+        json!({}),
+        Some(json!({ "jobs": [] })),
+        "No jobs",
+    );
+    h.result("sess_1");
+    finish(turn).unwrap();
+    assert!(!h.sessions.needs_process("s1"));
+}
+
+#[test]
+fn releases_recurring_jobs_after_their_expiry_and_final_fire_jitter() {
+    let start = local_ms(2026, 10, 3, 12, 0);
+    let (h, clock) = clocked(start);
+    let (_, turn) = h.start_turn("s1", TurnOptions::default());
+    complete_tool(
+        &h,
+        "create",
+        "CronCreate",
+        json!({ "cron": "* * * * *", "recurring": true }),
+        Some(json!({ "id": "recurring", "recurring": true })),
+        "ok",
+    );
+    h.result("sess_1");
+    finish(turn).unwrap();
+    assert!(h.sessions.needs_process("s1"));
+    clock.store(
+        start + 7 * 86_400_000 + 31 * 60_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    assert!(!h.sessions.needs_process("s1"));
+}
+
+#[test]
+fn releases_finished_ambient_work() {
+    for subtype in ["task_notification", "task_updated"] {
+        let h = Harness::new();
+        let (_, turn) = h.start_turn("s1", TurnOptions::default());
+        h.emit(json!({ "type": "system", "subtype": "task_started", "task_id": "ambient-1", "ambient": true }));
+        h.result("sess_1");
+        finish(turn).unwrap();
+        assert!(h.sessions.needs_process("s1"));
+        h.emit(json!({
+            "type": "system", "subtype": subtype, "task_id": "ambient-1", "ambient": true,
+            "status": "completed", "patch": { "status": "completed" },
+        }));
+        assert!(!h.sessions.needs_process("s1"), "{subtype}");
+    }
+}
+
+#[test]
+fn gives_an_unsolicited_wakeup_a_native_turn_of_its_own() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({ "type": "result", "subtype": "success", "result": "Scheduled" }));
+    finish(turn).unwrap();
+    assert!(!h.sessions.needs_process("s1"));
+
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    delta(&h, "The scheduled check has started.");
+    assert!(h.sessions.needs_process("s1"));
+    h.result("sess_1");
+    let all = events.all();
+    let started = all
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                HarnessEvent::TurnStarted {
+                    native: Some(true),
+                    ..
+                }
+            )
+        })
+        .expect("native turn.started");
+    let finished = all
+        .iter()
+        .position(|event| *event == HarnessEvent::TurnFinished { native: Some(true) })
+        .expect("native turn.finished");
+    assert!(started < finished);
+    assert!(all[started..finished].iter().any(|event| matches!(
+        event,
+        HarnessEvent::MessageDelta { text, .. } if text == "The scheduled check has started."
+    )));
+    assert!(!h.sessions.needs_process("s1"));
+}

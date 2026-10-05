@@ -294,6 +294,7 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         RegistryOptions {
             turn_control: None,
             idle_park: Duration::from_secs(86_400),
+            ambient_events: None,
         },
     );
     let codex = FakeAdapter::new(HarnessId::Codex);

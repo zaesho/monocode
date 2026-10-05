@@ -36,6 +36,11 @@ use super::task::{AbortSignal, BoxFuture, SharedSpawner};
 /// `onEvent`: where an adapter reports what its harness did.
 pub type EventSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
 
+/// Where events go that belong to no running send: a turn the provider
+/// started on its own after the last one ended, such as a scheduled wakeup.
+/// Takes the session id.
+pub type AmbientEvents = Arc<dyn Fn(&str, HarnessEvent) + Send + Sync>;
+
 /// `onAccepted`: called once the provider has accepted the user turn.
 pub type AcceptedHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -190,6 +195,12 @@ pub trait HarnessAdapter: Send + Sync {
     /// Kill the child but keep resume state for a later rebind.
     fn stop_session(&self, session_id: String) -> BoxFuture<'_, Result<()>>;
 
+    /// `needsProcess`: the child still has work that can wake it, such as a
+    /// scheduled job, so idle parking must keep it.
+    fn needs_process(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Drop resume state and kill the child (delete, harness switch, idle detach).
     fn forget_session(&self, session_id: String) -> BoxFuture<'_, Result<()>>;
 
@@ -291,6 +302,81 @@ impl TurnControl for ControlTurns {
     }
 }
 
+/// Marks a send as over, so its sink hands later native turns to the
+/// ambient handler.
+struct TurnEnded(Arc<Mutex<SinkPhase>>);
+
+impl TurnEnded {
+    fn end(&self) {
+        let mut phase = self.0.lock();
+        if *phase == SinkPhase::Turn {
+            *phase = SinkPhase::Ended;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkPhase {
+    /// The send is running: every event goes to its sink.
+    Turn,
+    /// The send ended. Events are dropped until a native turn starts.
+    Ended,
+    /// A native turn is running after the send ended: its events go to the
+    /// ambient handler until it finishes.
+    Native,
+}
+
+/// A provider can keep emitting through a send's sink after the send ended,
+/// when it starts a turn on its own. The caller's sink is gone by then, so
+/// those turns go to `ambient`. Other late events are dropped, as before.
+fn outlive_turn(
+    on_event: EventSink,
+    session_id: &str,
+    ambient: Option<AmbientEvents>,
+) -> (EventSink, TurnEnded) {
+    let phase = Arc::new(Mutex::new(SinkPhase::Turn));
+    let ended = TurnEnded(phase.clone());
+    let session_id = session_id.to_string();
+    let sink: EventSink = Arc::new(move |event| {
+        // `None` sends the event to the turn's own sink.
+        let ambient_event = {
+            let mut phase = phase.lock();
+            match *phase {
+                SinkPhase::Turn => None,
+                SinkPhase::Ended => {
+                    let native_start = matches!(
+                        event,
+                        HarnessEvent::TurnStarted {
+                            native: Some(true),
+                            ..
+                        }
+                    );
+                    if native_start {
+                        *phase = SinkPhase::Native;
+                    }
+                    Some(native_start)
+                }
+                SinkPhase::Native => {
+                    if matches!(event, HarnessEvent::TurnFinished { native: Some(true) }) {
+                        *phase = SinkPhase::Ended;
+                    }
+                    Some(true)
+                }
+            }
+        };
+        match ambient_event {
+            None => on_event(event),
+            Some(true) => {
+                if let Some(ambient) = &ambient {
+                    ambient(&session_id, event);
+                }
+            }
+            Some(false) => {}
+        }
+    });
+    (sink, ended)
+}
+
 /// `HARNESS_IDLE_PARK_MS`. After a turn settles, keep the child warm for
 /// follow-ups, then park it. Resume state stays, so the next prompt respawns
 /// instead of starting over.
@@ -302,6 +388,8 @@ pub struct RegistryOptions {
     pub turn_control: Option<Arc<dyn TurnControl>>,
     /// Defaults to [`HARNESS_IDLE_PARK_MS`]. Tests shorten it.
     pub idle_park: Duration,
+    /// Receives native turns that start after their session's send ended.
+    pub ambient_events: Option<AmbientEvents>,
 }
 
 impl Default for RegistryOptions {
@@ -309,6 +397,7 @@ impl Default for RegistryOptions {
         Self {
             turn_control: None,
             idle_park: Duration::from_millis(HARNESS_IDLE_PARK_MS as u64),
+            ambient_events: None,
         }
     }
 }
@@ -608,6 +697,13 @@ impl HarnessRegistry {
                     state.idle_park_timers.remove(&session_id);
                 }
                 let registry = HarnessRegistry { inner };
+                if registry
+                    .get_harness(harness)
+                    .is_some_and(|adapter| adapter.needs_process(&session_id))
+                {
+                    registry.schedule_idle_park(harness, &session_id);
+                    return;
+                }
                 let _ = registry.stop_harness_session(harness, &session_id).await;
             }
             .boxed(),
@@ -651,7 +747,13 @@ impl HarnessRegistry {
                 .lock()
                 .active_turns
                 .insert(session_id.clone());
+            let (on_event, ended) = outlive_turn(
+                on_event,
+                &session_id,
+                registry.inner.options.ambient_events.clone(),
+            );
             let result = adapter.send_turn(input, on_event, on_accepted).await;
+            ended.end();
             registry.inner.state.lock().active_turns.remove(&session_id);
             if let Some(control) = &control {
                 control.turn_finished(&session_id);

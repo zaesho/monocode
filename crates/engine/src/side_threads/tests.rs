@@ -249,6 +249,7 @@ fn install(cx: &mut TestAppContext, backend: Arc<FakeBackend>) -> Fixture {
         RegistryOptions {
             turn_control: None,
             idle_park: Duration::from_secs(86_400),
+            ambient_events: None,
         },
     );
     let claude = FakeText::new(HarnessId::Claude);

@@ -18,6 +18,7 @@ pub mod elicitation;
 pub mod git;
 pub mod io;
 pub mod protocol;
+pub mod schedule;
 pub mod session;
 pub mod shared;
 pub mod text;

@@ -44,6 +44,7 @@ use crate::core::task::{SharedSpawner, sleep, timeout};
 use super::elicitation::{elicitation_questions, elicitation_response};
 use super::io::{SharedChildIo, claude_account};
 use super::protocol::*;
+use super::schedule::next_claude_cron_fire;
 use super::shared::{OrderedMap, is_agent_tool_name, snapshot_remainder};
 
 /// Task-list block key for TaskCreate and TaskUpdate items.
@@ -68,6 +69,8 @@ pub struct ClaudeSessionOptions {
     pub native_model_id: Arc<dyn Fn(&str) -> String + Send + Sync>,
     pub init_timeout: Duration,
     pub resume_grace: Duration,
+    /// Epoch ms, for scheduled job times. Tests move it.
+    pub now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl Default for ClaudeSessionOptions {
@@ -79,6 +82,7 @@ impl Default for ClaudeSessionOptions {
             }),
             init_timeout: INIT_TIMEOUT,
             resume_grace: RESUME_GRACE,
+            now_ms: Arc::new(monocode_core::reducer::apply::now_ms),
         }
     }
 }
@@ -202,6 +206,52 @@ struct TurnWaiter {
     resolve: oneshot::Sender<Result<(), String>>,
 }
 
+/// `ScheduledTask`: a job Claude scheduled with CronCreate, which wakes it
+/// for a turn of its own. Times are epoch ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScheduledTask {
+    /// When a one-shot job fires. It is gone once Claude wakes after this.
+    fire_at: Option<i64>,
+    /// When a recurring job expires.
+    expires_at: Option<i64>,
+}
+
+static CRON_ID_IN_TEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:job|task)\s+(?:with\s+)?id[:\s]+([\w-]+)").unwrap());
+static CRON_SCHEDULED_TEXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)Scheduled\s+(?:(?:one-shot|recurring)\s+)?(?:task|job)\s+([\w-]+)").unwrap()
+});
+
+/// `scheduledTask`: when a new job fires or expires. Claude can fire a
+/// one-shot job up to 90 seconds early at :00 and :30, and a recurring job
+/// expires after seven days with up to 30 minutes of jitter.
+fn scheduled_task(input: &Record, result: Option<&Record>, now: i64) -> ScheduledTask {
+    let recurring = result
+        .and_then(|result| result.get("recurring"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| input.get("recurring").and_then(Value::as_bool) == Some(true));
+    let fire_at = (!recurring)
+        .then(|| string_field(Some(input), "cron"))
+        .flatten()
+        .and_then(|cron| next_claude_cron_fire(cron, now));
+    let jitter = fire_at.map_or(0, |fire_at| {
+        use chrono::{TimeZone, Timelike};
+        let minute = chrono::Local
+            .timestamp_millis_opt(fire_at)
+            .single()
+            .map(|time| time.minute());
+        if matches!(minute, Some(0 | 30)) {
+            90_000
+        } else {
+            0
+        }
+    });
+    ScheduledTask {
+        fire_at: fire_at.map(|fire_at| fire_at - jitter),
+        expires_at: recurring.then_some(now + 7 * 86_400_000 + 30 * 60_000),
+    }
+}
+
 /// `Live`: one running Claude Code child.
 struct Live {
     thread_id: String,
@@ -274,6 +324,12 @@ struct Live {
     /// Results Claude still owes this MonoCode turn: one for the prompt and
     /// one for each steer message it accepted.
     outstanding_results: u32,
+    /// Ambient tasks Claude runs on its own, which can wake it later.
+    native_tasks: HashSet<String>,
+    /// Jobs Claude scheduled, by job id.
+    scheduled_tasks: HashMap<String, ScheduledTask>,
+    /// The running turn is one Claude started on its own.
+    native_turn: bool,
     /// Subagent prose so far, by `{parent}:{message}:text`. Claude can send
     /// one message's text in several records.
     narration: HashMap<String, String>,
@@ -297,6 +353,7 @@ struct Live {
     io: SharedChildIo,
     spawner: SharedSpawner,
     resume_grace: Duration,
+    now_ms: Arc<dyn Fn() -> i64 + Send + Sync>,
     cell: Weak<LiveCell>,
     outbox: Arc<Outbox>,
 }
@@ -917,6 +974,9 @@ impl Live {
                 match tool.name.as_str() {
                     "EnterPlanMode" => self.provider_planning = true,
                     "ExitPlanMode" => self.provider_planning = false,
+                    "CronCreate" | "CronDelete" | "CronList" => {
+                        self.note_cron_result(rec, &tool, &result);
+                    }
                     _ => {}
                 }
             }
@@ -1179,6 +1239,7 @@ impl Live {
     fn handle_agent_lifecycle(&mut self, rec: &Record) -> bool {
         if let Some(started) = parse_task_started(rec) {
             if started.ambient {
+                self.native_tasks.insert(started.task_id);
                 return true;
             }
             self.background_tasks.set(
@@ -1257,6 +1318,7 @@ impl Live {
                 background.description = description.clone();
             }
             if is_terminal_agent_task_status(updated.status.as_deref()) {
+                self.native_tasks.remove(&updated.task_id);
                 self.settle_background_row(
                     &updated.task_id,
                     updated.status.as_deref().unwrap_or("completed"),
@@ -1277,6 +1339,7 @@ impl Live {
         }
 
         if let Some(notice) = parse_task_notification(rec) {
+            self.native_tasks.remove(&notice.task_id);
             if !notice.ambient {
                 self.note_task_notification(&notice);
                 self.finish_background_task(&notice.task_id);
@@ -1661,7 +1724,25 @@ impl Live {
     /// while it waited. Its own result, not the earlier one, decides when the
     /// MonoCode turn ends.
     fn note_claude_turn_started(&mut self) {
-        if !self.active_turn || !self.turn_result_seen {
+        if !self.started {
+            return;
+        }
+        // No MonoCode turn is running, so Claude woke on its own: a scheduled
+        // job fired or a native task reported. It gets a turn of its own.
+        if !self.active_turn {
+            let now = (self.now_ms)();
+            self.scheduled_tasks
+                .retain(|_, task| task.fire_at.is_none_or(|fire_at| fire_at > now));
+            self.active_turn = true;
+            self.native_turn = true;
+            self.metrics = TurnMetrics::default();
+            self.outstanding_results = 1;
+            self.emit(HarnessEvent::TurnStarted {
+                provider_turn_id: uuid::Uuid::new_v4().to_string(),
+                native: Some(true),
+            });
+        }
+        if !self.turn_result_seen {
             return;
         }
         self.turn_result_seen = false;
@@ -1840,6 +1921,10 @@ impl Live {
         self.resume_expected = false;
         self.turn_end_pending = false;
         self.active_turn = false;
+        if self.native_turn {
+            self.native_turn = false;
+            self.emit(HarnessEvent::TurnFinished { native: Some(true) });
+        }
         for event in extra_events {
             self.emit(event.clone());
         }
@@ -1859,6 +1944,60 @@ impl Live {
             return;
         }
         self.finish_active_turn(&[]);
+    }
+
+    /// Track the jobs Claude schedules, so idle parking keeps the process
+    /// that will run them.
+    fn note_cron_result(&mut self, rec: &Record, tool: &InFlightTool, result: &ClaudeToolResult) {
+        let structured = record_field(Some(rec), "tool_use_result")
+            .cloned()
+            .or_else(|| try_parse_json_record(&result.text));
+        let now = (self.now_ms)();
+        match tool.name.as_str() {
+            "CronCreate" => {
+                let id = string_field(structured.as_ref(), "id")
+                    .map(str::to_string)
+                    .or_else(|| {
+                        [&*CRON_ID_IN_TEXT, &*CRON_SCHEDULED_TEXT]
+                            .iter()
+                            .find_map(|pattern| pattern.captures(&result.text))
+                            .map(|found| found[1].to_string())
+                    })
+                    .unwrap_or_else(|| result.tool_use_id.clone());
+                let task = scheduled_task(&tool.input, structured.as_ref(), now);
+                self.scheduled_tasks.insert(id, task);
+            }
+            "CronDelete" => {
+                let id = string_field(Some(&tool.input), "id")
+                    .or_else(|| string_field(Some(&tool.input), "job_id"));
+                if let Some(id) = id {
+                    self.scheduled_tasks.remove(id);
+                }
+            }
+            _ => {
+                // CronList reports every job, so it replaces what we knew.
+                let Some(jobs) = structured
+                    .as_ref()
+                    .and_then(|listed| listed.get("jobs"))
+                    .and_then(Value::as_array)
+                else {
+                    return;
+                };
+                let mut known = HashMap::new();
+                for job in jobs.iter().filter_map(as_record) {
+                    let Some(id) = string_field(Some(job), "id") else {
+                        continue;
+                    };
+                    let task = self
+                        .scheduled_tasks
+                        .get(id)
+                        .copied()
+                        .unwrap_or_else(|| scheduled_task(job, Some(job), now));
+                    known.insert(id.to_string(), task);
+                }
+                self.scheduled_tasks = known;
+            }
+        }
     }
 
     /// Allowing EnterPlanMode or ExitPlanMode changes Claude's Plan Mode.
@@ -2499,6 +2638,20 @@ impl ClaudeSessions {
             .cloned()
     }
 
+    /// `claudeSessionNeedsProcess`: the child still has work that can wake
+    /// it, so idle parking must not stop it: a running turn, an ambient
+    /// task, or a scheduled job that has not expired.
+    pub fn needs_process(&self, session_id: &str) -> bool {
+        let Some(cell) = self.live(session_id) else {
+            return false;
+        };
+        let mut live = cell.lock();
+        let now = (self.inner.options.now_ms)();
+        live.scheduled_tasks
+            .retain(|_, task| task.expires_at.is_none_or(|expires_at| expires_at > now));
+        live.active_turn || !live.native_tasks.is_empty() || !live.scheduled_tasks.is_empty()
+    }
+
     /// `respondClaudeApproval`.
     pub fn respond_approval(&self, session_id: &str, request_id: i64, decision: ApprovalDecision) {
         let Some(cell) = self.live(session_id) else {
@@ -2848,6 +3001,9 @@ impl ClaudeSessions {
                 outstanding_results: 0,
                 metrics: TurnMetrics::default(),
                 narration: HashMap::new(),
+                native_tasks: HashSet::new(),
+                scheduled_tasks: HashMap::new(),
+                native_turn: false,
                 model: launch.model.clone().unwrap_or_default(),
                 emitted_assistant: String::new(),
                 emitted_reasoning: String::new(),
@@ -2860,6 +3016,7 @@ impl ClaudeSessions {
                 io: self.inner.io.clone(),
                 spawner: self.inner.spawner.clone(),
                 resume_grace: self.inner.options.resume_grace,
+                now_ms: self.inner.options.now_ms.clone(),
                 cell: cell.clone(),
                 outbox: outbox.clone(),
             }),
@@ -2897,6 +3054,13 @@ impl ClaudeSessions {
                 live.closed = true;
                 live.clear_awaiting_resume();
                 live.fail_init("Claude Code exited during initialization");
+                // A turn Claude started on its own has no send to fail, so
+                // end it here.
+                if live.native_turn {
+                    live.native_turn = false;
+                    live.active_turn = false;
+                    live.emit(HarnessEvent::TurnFinished { native: Some(true) });
+                }
                 // A missing conversation is retried with a new one, not
                 // reported.
                 if !live.mute_updates && !live.conversation_missing {
@@ -3063,6 +3227,7 @@ async fn run_turn(
         live.background_key.clear();
         live.task_notes.clear();
         live.narration.clear();
+        live.native_turn = false;
         live.turn_result_seen = false;
         live.turn_end_pending = false;
         live.outstanding_results = 1;

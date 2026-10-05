@@ -190,6 +190,10 @@ impl HarnessAdapter for ClaudeAdapter {
         Box::pin(async move { self.sessions.stop_session(&session_id).await })
     }
 
+    fn needs_process(&self, session_id: &str) -> bool {
+        self.sessions.needs_process(session_id)
+    }
+
     fn forget_session(&self, session_id: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move { self.sessions.forget_session(&session_id).await })
     }

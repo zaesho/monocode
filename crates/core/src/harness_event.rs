@@ -31,7 +31,19 @@ pub enum HarnessEvent {
     #[serde(rename = "session.providerBound", rename_all = "camelCase")]
     SessionProviderBound { provider_session_id: String },
     #[serde(rename = "turn.started", rename_all = "camelCase")]
-    TurnStarted { provider_turn_id: String },
+    TurnStarted {
+        provider_turn_id: String,
+        /// The provider started this turn on its own, for example a
+        /// scheduled wakeup, with no user prompt behind it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<bool>,
+    },
+    /// A turn the provider started on its own (`native`) has ended.
+    #[serde(rename = "turn.finished")]
+    TurnFinished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<bool>,
+    },
     #[serde(rename = "session.configChanged", rename_all = "camelCase")]
     SessionConfigChanged {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -424,6 +436,8 @@ mod tests {
             json!({ "type": "session.error", "message": "boom" }),
             json!({ "type": "session.providerBound", "providerSessionId": "p" }),
             json!({ "type": "turn.started", "providerTurnId": "t" }),
+            json!({ "type": "turn.started", "providerTurnId": "t", "native": true }),
+            json!({ "type": "turn.finished", "native": true }),
             json!({ "type": "session.configChanged", "model": "m", "modelSettings": { "effort": "high" } }),
             json!({ "type": "status", "text": "Working" }),
             json!({ "type": "usage.limited", "resetsAt": 1000 }),

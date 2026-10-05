@@ -335,6 +335,27 @@ fn does_not_double_an_assistant_block_when_a_completed_snapshot_repeats_it() {
 }
 
 #[test]
+fn shows_a_native_provider_turn_as_busy_until_it_finishes() {
+    let mut t = T::new();
+    let session = t.session(HarnessId::Claude, "/tmp");
+    let session = t.apply(
+        &session,
+        json!({ "type": "turn.started", "providerTurnId": "wake", "native": true }),
+    );
+    assert!(session.is_busy());
+    let session = t.apply(
+        &session,
+        json!({ "type": "message.delta", "text": "Reminder", "append": true }),
+    );
+    let session = t.apply(&session, json!({ "type": "turn.finished", "native": true }));
+    assert_eq!(session.busy, Some(false));
+    assert_eq!(session.blocks.last().unwrap().streaming, Some(false));
+    // A plain turn.finished changes nothing.
+    let unchanged = t.apply(&session, json!({ "type": "turn.finished" }));
+    assert_eq!(unchanged, session);
+}
+
+#[test]
 fn appends_marked_deltas_without_folding_repeated_chunks() {
     let mut t = T::new();
     let append = |text: &str| json!({ "type": "message.delta", "text": text, "append": true });

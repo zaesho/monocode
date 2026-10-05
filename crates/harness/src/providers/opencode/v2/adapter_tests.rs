@@ -115,7 +115,7 @@ fn preserves_turn_acceptance_native_control_identity_and_stop_cleanup() {
             .collect();
         assert_eq!(text, "hello");
         assert!(events.iter().any(|event| matches!(event, HarnessEvent::SessionProviderBound { provider_session_id } if provider_session_id == PROVIDER)));
-        assert!(events.iter().any(|event| matches!(event, HarnessEvent::TurnStarted { provider_turn_id } if provider_turn_id.starts_with("msg_"))));
+        assert!(events.iter().any(|event| matches!(event, HarnessEvent::TurnStarted { provider_turn_id, .. } if provider_turn_id.starts_with("msg_"))));
         let spawned = host.spawns();
         assert_eq!(spawned[0].session_id, THREAD);
         assert!(spawned[0].args.contains(&"--stdio".into()));

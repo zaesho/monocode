@@ -35,6 +35,15 @@ pub trait HostProvider: Send + Sync {
     fn cancel(&self, id: &str) -> ProviderFuture<()>;
     /// Stops the child and drops its callbacks.
     fn stop(&self, id: &str) -> ProviderFuture<()>;
+    /// The child stays running between turns, so it can start turns of its
+    /// own, until idle parking stops it.
+    fn persistent(&self) -> bool {
+        false
+    }
+    /// The idle child still has work that can wake it.
+    fn needs_process(&self, _id: &str) -> bool {
+        false
+    }
     /// Keeps the provider conversation for an explicit later follow-up.
     fn bind(&self, id: &str, provider_id: &str, cwd: &str);
     fn approve(&self, id: &str, request: i64, decision: ApprovalDecision) -> Result<(), String>;
@@ -126,6 +135,14 @@ impl HostProvider for AdapterProvider {
     fn stop(&self, id: &str) -> ProviderFuture<()> {
         let (adapter, id) = (self.adapter.clone(), id.to_string());
         async move { adapter.forget_session(id).await.map_err(message) }.boxed()
+    }
+
+    fn persistent(&self) -> bool {
+        self.adapter.id() == HarnessId::Claude
+    }
+
+    fn needs_process(&self, id: &str) -> bool {
+        self.adapter.needs_process(id)
     }
 
     fn bind(&self, id: &str, provider_id: &str, cwd: &str) {

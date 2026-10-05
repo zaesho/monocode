@@ -53,6 +53,9 @@ pub const FLUSH_MS: u64 = 120;
 const PLACEHOLDER_TITLE: &str = "New remote session";
 /// How long `close` waits for stopped turns to settle.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
+/// How long a persistent provider stays running after its session goes
+/// idle, so a scheduled wakeup can still reach it.
+const IDLE_PARK: Duration = Duration::from_secs(5 * 60);
 const STORAGE_FAILED: &str =
     "Session storage failed during this turn. Inspect its work before continuing.";
 
@@ -117,6 +120,11 @@ struct State {
     running: HashMap<String, Active>,
     live: HashMap<String, Live>,
     retry_timers: HashMap<String, u64>,
+    /// Persistent providers waiting to be parked, by session id.
+    idle_timers: HashMap<String, u64>,
+    /// Providers being parked. A new turn waits for this before it starts,
+    /// so the stop cannot kill the turn's new child.
+    parking: HashMap<String, (u64, Done)>,
     next_token: u64,
 }
 
@@ -139,6 +147,7 @@ struct Inner {
     state: Mutex<State>,
     closing: AtomicBool,
     retry_delay: Duration,
+    idle_park: Mutex<Duration>,
     /// The real provider processes, when this engine serves a host.
     harness: Option<Arc<HostHarness>>,
     workspace: WorkspaceCommands,
@@ -218,19 +227,36 @@ impl Inner {
         let Err(error) = self.flush(state, id) else {
             return;
         };
-        if let Some(active) = state.running.get_mut(id) {
-            active.persistence_failed = true;
-        }
+        let active = match state.running.get_mut(id) {
+            Some(active) => {
+                active.persistence_failed = true;
+                true
+            }
+            None => false,
+        };
         log::error!("Session persistence failed; stopping its provider: {error}");
-        let harness = state.live.get(id).map(|live| live.value.session.harness);
-        if let Some(provider) = harness.and_then(|harness| self.provider(harness).ok()) {
-            let id = id.to_string();
+        let live = state
+            .live
+            .get(id)
+            .map(|live| (live.value.session.harness, live.value.run_id.clone()));
+        if let Some((harness, run_id)) = live
+            && let Ok(provider) = self.provider(harness)
+        {
+            let stopping = provider.clone();
+            let stop_id = id.to_string();
             self.spawner.spawn(
                 async move {
-                    let _ = provider.stop(&id).await;
+                    let _ = stopping.stop(&stop_id).await;
                 }
                 .boxed(),
             );
+            // A native turn has no send that would settle it.
+            if !active && let Some(run_id) = run_id {
+                let engine = self.clone();
+                let id = id.to_string();
+                self.spawner
+                    .spawn(async move { engine.retry_settlement(&id, &run_id, provider) }.boxed());
+            }
         }
     }
 
@@ -272,12 +298,26 @@ impl Inner {
     fn event(self: &Arc<Self>, id: &str, run_id: &str, event: HarnessEvent) {
         let mut state = self.state.lock();
         let state = &mut *state;
+        if matches!(
+            event,
+            HarnessEvent::TurnStarted {
+                native: Some(true),
+                ..
+            }
+        ) && !self.closing.load(Ordering::SeqCst)
+        {
+            self.start_native_turn(state, id, run_id);
+        }
         let Some(live) = state.live.get_mut(id) else {
             return;
         };
         if live.value.run_id.as_deref() != Some(run_id)
             || live.value.status != HostSessionStatus::Running
         {
+            return;
+        }
+        if matches!(event, HarnessEvent::TurnFinished { native: Some(true) }) {
+            self.settle_native_turn(state, id, run_id);
             return;
         }
         if !apply_harness_event_mut(&mut SystemEnv, &mut live.value.session, &event) {
@@ -310,12 +350,162 @@ impl Inner {
         }
     }
 
+    /// `startNativeTurn`: Claude woke on its own, for example for a job it
+    /// scheduled. The idle session runs again under the provider's turn id.
+    fn start_native_turn(self: &Arc<Self>, state: &mut State, id: &str, run_id: &str) {
+        state.idle_timers.remove(id);
+        let Ok(current) = self.store.session(id) else {
+            return;
+        };
+        if current.session.harness != RemoteProvider::Claude
+            || (current.status != HostSessionStatus::Idle && !state.running.contains_key(id))
+        {
+            return;
+        }
+        let previous = Self::settled(&current, HostSessionStatus::Idle, None, now_ms());
+        let mut session = previous.session.clone();
+        session.busy = Some(true);
+        let value = HostSession {
+            run_id: Some(run_id.to_string()),
+            status: HostSessionStatus::Running,
+            session,
+            ..previous
+        };
+        match self.save(value, &json!({ "type": "native.started" })) {
+            Ok(saved) => {
+                state.live.insert(
+                    id.to_string(),
+                    Live {
+                        value: (*saved).clone(),
+                        events: Vec::new(),
+                        timer: None,
+                    },
+                );
+            }
+            Err(error) => log::error!("Could not start a native turn: {error}"),
+        }
+    }
+
+    /// `settleNativeTurn`: the turn Claude started on its own ended.
+    fn settle_native_turn(self: &Arc<Self>, state: &mut State, id: &str, run_id: &str) {
+        let Some(harness) = state.live.get(id).map(|live| live.value.session.harness) else {
+            return;
+        };
+        let Ok(provider) = self.provider(harness) else {
+            return;
+        };
+        let settled = self.flush(state, id).and_then(|()| {
+            let latest = self.store.session(id)?;
+            self.save(
+                Self::settled(&latest, HostSessionStatus::Idle, None, now_ms()),
+                &json!({ "type": "native.settled" }),
+            )
+        });
+        match settled {
+            Ok(_) => {
+                state.live.remove(id);
+                self.park_idle_provider(state, id, provider);
+            }
+            Err(error) => {
+                log::error!("Could not settle a native turn: {error}");
+                let engine = self.clone();
+                let (id, run_id) = (id.to_string(), run_id.to_string());
+                self.spawner
+                    .spawn(async move { engine.retry_settlement(&id, &run_id, provider) }.boxed());
+            }
+        }
+    }
+
+    /// `parkIdleProvider`: stop a persistent provider once its session has
+    /// been idle for a while, unless it still has work that can wake it.
+    /// Its conversation stays bound for the next turn.
+    fn park_idle_provider(
+        self: &Arc<Self>,
+        state: &mut State,
+        id: &str,
+        provider: Arc<dyn HostProvider>,
+    ) {
+        if self.closing.load(Ordering::SeqCst) || state.idle_timers.contains_key(id) {
+            return;
+        }
+        let token = state.token();
+        state.idle_timers.insert(id.to_string(), token);
+        let engine = Arc::downgrade(self);
+        let id = id.to_string();
+        let delay = *self.idle_park.lock();
+        self.spawner.spawn(
+            async move {
+                smol::Timer::after(delay).await;
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                let parking = {
+                    let mut state = engine.state.lock();
+                    if state.idle_timers.get(&id) != Some(&token) {
+                        return;
+                    }
+                    state.idle_timers.remove(&id);
+                    let running = engine
+                        .store
+                        .session(&id)
+                        .is_ok_and(|value| value.status == HostSessionStatus::Running);
+                    if running || provider.needs_process(&id) {
+                        engine.park_idle_provider(&mut state, &id, provider);
+                        return;
+                    }
+                    let stopping = provider.clone();
+                    let store = engine.store.clone();
+                    let stop_id = id.clone();
+                    let parking: Done = async move {
+                        if let Err(error) = stopping.stop(&stop_id).await {
+                            log::error!("Could not park provider: {error}");
+                            return;
+                        }
+                        if let Ok(value) = store.session(&stop_id)
+                            && let Some(provider_session_id) = &value.session.provider_session_id
+                        {
+                            stopping.bind(&stop_id, provider_session_id, &value.session.cwd);
+                        }
+                    }
+                    .boxed()
+                    .shared();
+                    let token = state.token();
+                    state.parking.insert(id.clone(), (token, parking.clone()));
+                    (token, parking)
+                };
+                parking.1.await;
+                let mut state = engine.state.lock();
+                if state
+                    .parking
+                    .get(&id)
+                    .is_some_and(|(token, _)| *token == parking.0)
+                {
+                    state.parking.remove(&id);
+                }
+            }
+            .boxed(),
+        );
+    }
+
     fn sink(self: &Arc<Self>, id: &str, run_id: &str) -> EventSink {
         let engine: Weak<Self> = Arc::downgrade(self);
-        let (id, run_id) = (id.to_string(), run_id.to_string());
+        let id = id.to_string();
+        // A turn Claude starts on its own runs under its own id.
+        let run_id = Mutex::new(run_id.to_string());
         Arc::new(move |event| {
             if let Some(engine) = engine.upgrade() {
-                engine.event(&id, &run_id, event);
+                let current = {
+                    let mut run_id = run_id.lock();
+                    if let HarnessEvent::TurnStarted {
+                        provider_turn_id,
+                        native: Some(true),
+                    } = &event
+                    {
+                        *run_id = provider_turn_id.clone();
+                    }
+                    run_id.clone()
+                };
+                engine.event(&id, &current, event);
             }
         })
     }
@@ -334,6 +524,7 @@ impl Inner {
         let Ok(provider) = self.provider(session.harness) else {
             return;
         };
+        state.idle_timers.remove(&session.id);
         let (done, finished) = futures::channel::oneshot::channel::<()>();
         state.running.insert(
             session.id.clone(),
@@ -390,6 +581,15 @@ impl Inner {
     ) -> Result<(), String> {
         let id = session.id.as_str();
         let mut error: Option<String> = None;
+        let parking = self
+            .state
+            .lock()
+            .parking
+            .get(id)
+            .map(|(_, parking)| parking.clone());
+        if let Some(parking) = parking {
+            parking.await;
+        }
         let cancelled = self
             .state
             .lock()
@@ -433,15 +633,37 @@ impl Inner {
             };
             error = result.err();
         }
-        // Keep the session running until the old process has stopped.
-        // Otherwise a follow-up can race cleanup and have its newly spawned
-        // child killed.
-        provider.stop(id).await?;
+        // A persistent provider keeps its child for later wakeups unless the
+        // turn ended badly. Otherwise keep the session running until the old
+        // process has stopped, so a follow-up cannot race cleanup and have
+        // its newly spawned child killed.
+        let (cancelled, failed) = self
+            .state
+            .lock()
+            .running
+            .get(id)
+            .map(|active| (active.cancelled, active.persistence_failed))
+            .unwrap_or_default();
+        let stop = !provider.persistent()
+            || self.closing.load(Ordering::SeqCst)
+            || cancelled
+            || failed
+            || error.is_some();
+        if stop {
+            provider.stop(id).await?;
+        }
         let persisted = {
             let mut state = self.state.lock();
             let state = &mut *state;
             self.flush(state, id)?;
-            state.live.remove(id);
+            // A native turn may already own the session.
+            if state
+                .live
+                .get(id)
+                .is_some_and(|live| live.value.run_id.as_deref() == Some(run_id))
+            {
+                state.live.remove(id);
+            }
             let latest = self.store.session(id)?;
             if latest.run_id.as_deref() == Some(run_id) {
                 let closing = self.closing.load(Ordering::SeqCst);
@@ -471,6 +693,9 @@ impl Inner {
                 self.save(Self::settled(&latest, status, message, now_ms()), &event)?;
             }
             state.running.remove(id);
+            if provider.persistent() {
+                self.park_idle_provider(state, id, provider.clone());
+            }
             self.store.session(id)?.session.clone()
         };
         // Stopping released the provider's callbacks; binding keeps only its
@@ -752,6 +977,7 @@ impl HostEngine {
                 state: Mutex::new(State::default()),
                 closing: AtomicBool::new(false),
                 retry_delay: Duration::from_secs(1),
+                idle_park: Mutex::new(IDLE_PARK),
                 harness,
                 #[cfg(test)]
                 save_fault: Mutex::new(None),
@@ -791,6 +1017,11 @@ impl HostEngine {
 
     pub fn catalog(&self) -> &SharedCatalog {
         &self.inner.catalog
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_idle_park(&self, delay: Duration) {
+        *self.inner.idle_park.lock() = delay;
     }
 
     #[cfg(test)]
@@ -1302,9 +1533,19 @@ impl HostEngine {
         let (stops, dones) = {
             let mut state = inner.state.lock();
             state.retry_timers.clear();
-            let stops: Vec<_> = state
-                .running
-                .keys()
+            state.idle_timers.clear();
+            // Persistent providers keep children for idle sessions too.
+            let mut ids: HashSet<String> = state.running.keys().cloned().collect();
+            ids.extend(
+                inner
+                    .store
+                    .sessions(None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|value| value.session.id),
+            );
+            let stops: Vec<_> = ids
+                .iter()
                 .filter_map(|id| {
                     let harness = inner.store.session(id).ok()?.session.harness;
                     let provider = inner.provider(harness).ok()?;
@@ -1344,6 +1585,35 @@ impl HostEngine {
                 log::error!("A provider turn did not stop; closing the host anyway");
             }
         });
+        // A native turn has no send to settle it.
+        {
+            let mut state = inner.state.lock();
+            let state = &mut *state;
+            let native: Vec<String> = state
+                .live
+                .keys()
+                .filter(|id| !state.running.contains_key(*id))
+                .cloned()
+                .collect();
+            for id in native {
+                let saved = inner.flush(state, &id).and_then(|()| {
+                    let latest = inner.store.session(&id)?;
+                    inner.save(
+                        Inner::settled(
+                            &latest,
+                            HostSessionStatus::Interrupted,
+                            Some("Host stopped. This turn was interrupted."),
+                            now_ms(),
+                        ),
+                        &json!({ "type": "interrupted" }),
+                    )
+                });
+                if let Err(error) = saved {
+                    log::error!("Could not settle a native turn on close: {error}");
+                }
+                state.live.remove(&id);
+            }
+        }
         if let Some(harness) = &inner.harness {
             harness.close();
         }

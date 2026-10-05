@@ -342,7 +342,27 @@ pub fn apply_harness_event_mut(
             session.provider_session_id = Some(provider_session_id.clone());
             true
         }
-        HarnessEvent::TurnStarted { provider_turn_id } => {
+        // A turn the provider started on its own has no user block to stamp;
+        // it only shows the session working until it finishes.
+        HarnessEvent::TurnStarted {
+            native: Some(true), ..
+        } => {
+            let changed = session.busy != Some(true);
+            session.busy = Some(true);
+            changed
+        }
+        HarnessEvent::TurnFinished { native } => {
+            if *native != Some(true) {
+                return false;
+            }
+            finish_role(session, BlockRole::Assistant);
+            finish_role(session, BlockRole::Reasoning);
+            session.busy = Some(false);
+            true
+        }
+        HarnessEvent::TurnStarted {
+            provider_turn_id, ..
+        } => {
             let Some(index) = last_user_index(&session.blocks) else {
                 return false;
             };

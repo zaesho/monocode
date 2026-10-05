@@ -381,6 +381,7 @@ impl Adapter {
         live.with(|state| {
             state.outbox.push(HarnessEvent::TurnStarted {
                 provider_turn_id: id,
+                native: None,
             })
         });
         receiver

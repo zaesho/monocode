@@ -135,7 +135,8 @@ impl ModelSource for CatalogModelSource {
     }
 }
 
-/// `SkillCatalogContext` from the composer's key.
+/// `SkillCatalogContext` from the composer's key, with the session's
+/// provider account so Claude and Codex read that profile's skills.
 fn catalog_context(context: &SkillContext, cx: &App) -> SkillCatalogContext {
     let mut catalog = SkillCatalogContext::new(context.harness, context.cwd.clone());
     if let Some(id) = &context.session_id {
@@ -145,14 +146,7 @@ fn catalog_context(context: &SkillContext, cx: &App) -> SkillCatalogContext {
         let account = context
             .session_id
             .as_ref()
-            .and_then(|id| {
-                Engine::try_global(cx)?;
-                Engine::sessions(cx)
-                    .read(cx)
-                    .get(id)?
-                    .provider_account_id
-                    .clone()
-            })
+            .and_then(|id| session_account(id, cx))
             .or_else(|| {
                 let services = AppServices::try_global(cx)?;
                 Some(
@@ -254,6 +248,16 @@ fn mcp_connection(server: &monocode_engine::submit::mcp::McpConnection) -> McpCo
         transport: server.transport.clone(),
         enabled: server.enabled,
     }
+}
+
+/// The provider account a session runs under.
+fn session_account(session_id: &str, cx: &App) -> Option<String> {
+    monocode_engine::runtime::Engine::try_global(cx)?;
+    monocode_engine::runtime::Engine::sessions(cx)
+        .read(cx)
+        .get(session_id)?
+        .provider_account_id
+        .clone()
 }
 
 fn engine_mcp_connection(
@@ -720,6 +724,11 @@ impl ComposerHost for SessionComposerHost {
         let Some(cache) = &self.mcp_cache else {
             return McpServers::default();
         };
+        // Claude's servers depend on the session's profile.
+        let account = session_account(&self.session_id, cx);
+        let key =
+            monocode_engine::submit::mcp_settings_cache::mcp_scope_key(cwd, account.as_deref());
+        let cwd = key.as_str();
         if !self.mcp_watches.borrow().contains_key(cwd)
             && let Some(composer) = self.composer.borrow().clone()
         {

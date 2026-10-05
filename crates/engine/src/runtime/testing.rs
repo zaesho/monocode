@@ -233,6 +233,7 @@ fn record_from_upsert(payload: &SessionUpsert) -> SessionRecord {
         title: payload.title.clone(),
         provider_session_id: payload.provider_session_id.clone(),
         provider_account_id: payload.provider_account_id.clone(),
+        provider_context: payload.provider_context.clone(),
         blocks: payload.blocks.clone(),
         context_used: payload.context_used,
         context_window: payload.context_window,
@@ -355,6 +356,17 @@ impl SessionBackend for FakeBackend {
         )
     }
 
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        self.call(
+            "session_discard_draft",
+            serde_json::json!({ "sessionId": session_id }),
+            move |state| {
+                state.records.remove(&session_id);
+                Ok(())
+            },
+        )
+    }
+
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()> {
         self.call(
             "session_set_archived",
@@ -445,6 +457,51 @@ impl SessionBackend for FakeBackend {
         let path = format!("/data/context-snapshots/{session_id}/{name}.md");
         self.state.lock().snapshots.insert(path.clone(), text);
         futures::future::ready(Ok(path)).boxed()
+    }
+
+    fn write_switch_snapshot(
+        &self,
+        session_id: String,
+        switch_id: String,
+        content: String,
+    ) -> StoreFuture<String> {
+        self.call(
+            "session_context_snapshot",
+            serde_json::json!({ "sessionId": session_id, "switchId": switch_id }),
+            move |state| {
+                let path = format!("/data/context-history/{session_id}/{switch_id}.md");
+                state.snapshots.insert(path.clone(), content);
+                Ok(path)
+            },
+        )
+    }
+
+    fn snapshot_context_assets(
+        &self,
+        session_id: String,
+        attachments: Vec<monocode_store::context_history::ContextAssetSource>,
+    ) -> StoreFuture<Vec<monocode_store::context_history::ContextAssetSnapshot>> {
+        let ids: Vec<String> = attachments.iter().map(|source| source.id.clone()).collect();
+        self.call(
+            "session_context_assets",
+            serde_json::json!({ "sessionId": session_id, "ids": ids }),
+            move |_| {
+                Ok(attachments
+                    .into_iter()
+                    .map(
+                        |source| monocode_store::context_history::ContextAssetSnapshot {
+                            path: Some(format!(
+                                "/data/context-history/{session_id}/assets/{}",
+                                source.id
+                            )),
+                            sha256: Some("0".repeat(64)),
+                            unavailable_reason: None,
+                            id: source.id,
+                        },
+                    )
+                    .collect())
+            },
+        )
     }
 
     fn claude_shell_commands(

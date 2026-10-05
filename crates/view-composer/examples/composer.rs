@@ -308,6 +308,7 @@ fn props_for(scene: &str) -> ComposerProps {
         "busy" => {
             props.busy = true;
             props.queued_messages = vec![QueuedMessage {
+                selection: None,
                 app_request_id: None,
                 id: "q1".into(),
                 text: "Then run the arcade tests again".into(),

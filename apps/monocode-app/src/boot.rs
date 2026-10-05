@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context as _, Result, anyhow};
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Global, Task};
+use monocode_core::harness_event::HarnessEvent;
 use monocode_core::platform::Platform;
 use monocode_core::settings::AppSettings;
 use monocode_engine::attention::{
@@ -305,6 +306,9 @@ pub fn boot_with_skill_home(
     }
     let bridge = children.start_harness_bridge();
     let catalog = SharedCatalog::new();
+    // Turns a provider starts on its own after a send ended, such as a
+    // Claude scheduled wakeup. They apply to the session like any turn.
+    let (ambient_events, ambient_received) = async_channel::unbounded::<(String, HarnessEvent)>();
     let registry = HarnessRegistry::new(
         spawner.clone(),
         RegistryOptions {
@@ -314,6 +318,9 @@ pub fn boot_with_skill_home(
                     owner: CONTROL_OWNER.into(),
                 }) as _
             }),
+            ambient_events: Some(Arc::new(move |session_id: &str, event| {
+                let _ = ambient_events.try_send((session_id.to_string(), event));
+            })),
             ..RegistryOptions::default()
         },
     );
@@ -330,6 +337,16 @@ pub fn boot_with_skill_home(
         cursor_store: Arc::new(CursorSessionStore),
     });
     Engine::init(config, cx);
+    cx.spawn(async move |cx| {
+        while let Ok((session_id, event)) = ambient_received.recv().await {
+            cx.update(|cx| {
+                Engine::sessions(cx).update(cx, |sessions, cx| {
+                    sessions.enqueue_event(&session_id, event, cx)
+                })
+            });
+        }
+    })
+    .detach();
 
     // Attention, the way `Attention::init_native` builds it, with
     // notifications only inside the app bundle.
@@ -394,6 +411,7 @@ pub fn boot_with_skill_home(
             Arc::new(
                 monocode_engine::submit::mcp_settings_cache::ProcessMcpSources {
                     host: host.clone(),
+                    data_dir: data_dir.clone(),
                 },
             ),
             registry.spawner().clone(),

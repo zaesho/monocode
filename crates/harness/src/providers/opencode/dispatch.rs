@@ -245,10 +245,11 @@ impl HarnessAdapter for OpenCodeAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         async move {
             self.adapter(self.select().await?)
-                .generate_commit_message(cwd, signal)
+                .generate_commit_message(cwd, signal, provider_account_id)
                 .await
         }
         .boxed()
@@ -256,10 +257,11 @@ impl HarnessAdapter for OpenCodeAdapter {
     fn generate_pr_content(
         &self,
         cwd: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         async move {
             self.adapter(self.select().await?)
-                .generate_pr_content(cwd)
+                .generate_pr_content(cwd, provider_account_id)
                 .await
         }
         .boxed()
@@ -268,10 +270,11 @@ impl HarnessAdapter for OpenCodeAdapter {
         &self,
         cwd: String,
         message: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         async move {
             self.adapter(self.select().await?)
-                .generate_branch_name(cwd, message)
+                .generate_branch_name(cwd, message, provider_account_id)
                 .await
         }
         .boxed()

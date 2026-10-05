@@ -6,6 +6,7 @@
 pub mod automations;
 pub mod checkpoint;
 pub mod cli_sessions;
+pub mod context_history;
 pub mod cursor_store;
 pub mod notes;
 pub mod reminders;

@@ -195,8 +195,8 @@ impl ChildBackend for FakeBackend {
         _command: String,
         _provider: HarnessId,
         _binary_path: Option<String>,
-    ) -> ChildFuture<()> {
-        async { Ok(()) }.boxed()
+    ) -> ChildFuture<String> {
+        async { Ok(String::new()) }.boxed()
     }
 
     fn home_dir(&self) -> ChildFuture<String> {

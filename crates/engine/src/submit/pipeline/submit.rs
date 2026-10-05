@@ -8,7 +8,8 @@ use futures::FutureExt;
 use gpui::{App, Context};
 use monocode_core::attachment::display_attachments;
 use monocode_core::block::{
-    Block, BlockNotice, BlockRole, PlanBlockMeta, PlanStatus, SecondOpinionKind, TurnIntent,
+    Block, BlockNotice, BlockRole, ModelTarget, PlanBlockMeta, PlanStatus, SecondOpinionKind,
+    TurnIntent,
 };
 use monocode_core::harness::HarnessId;
 use monocode_core::harness_event::SteerTurnInput;
@@ -18,6 +19,7 @@ use monocode_core::orchestration::{
     proposal_block,
 };
 use monocode_core::paths::path_key;
+use monocode_core::provider_context::running_provider_selection;
 use monocode_core::reducer::{
     SystemEnv, UserTurnExtra, append_steer_user_mut, append_user_mut, now_ms, stop_streaming_mut,
 };
@@ -32,7 +34,7 @@ use monocode_harness::core::provider_accounts::{
 };
 use monocode_harness::core::session_title::should_generate_session_title;
 
-use super::actions::{cancel_harness, forget_harness, sync_dock_badge};
+use super::actions::sync_dock_badge;
 use super::session_edits::{apply_user_turn_fields, with_plan_build_target};
 use super::turn::{TurnRun, Wrap, run_turn};
 use super::{Submit, SubmitOptions, settle};
@@ -49,7 +51,7 @@ use crate::submit::handoff::{
     append_preparing_handoff, handoff_turn_card, is_preparing_handoff, pending_handoff,
 };
 use crate::submit::message_queue::{
-    QueueSubmitMode, dequeue_queued_message, queued_message_for_submit,
+    QueueSubmitMode, can_steer_with_selection, dequeue_queued_message, queued_message_for_submit,
 };
 use crate::submit::operator_command::{
     OPERATOR_DEFAULT_PROMPT, consume_operator_command, operator_enabled_in_thread,
@@ -57,6 +59,7 @@ use crate::submit::operator_command::{
 use crate::submit::paths::{is_equal_or_inside, looks_like_project};
 use crate::submit::prefs::{KvStore, save_recent_model_choice};
 use crate::submit::prompt::compose_note_message;
+use crate::submit::provider_switch::{AcceptanceSubmission, SWITCH_BEFORE_COMMAND};
 use crate::submit::second_opinion::SECOND_OPINION_TITLE;
 use crate::submit::skills::SkillCatalogContext;
 
@@ -167,6 +170,38 @@ impl Submit {
                 cx,
             ));
         }
+        let busy_now = sessions
+            .read(cx)
+            .get(session_id)
+            .is_some_and(Session::is_busy);
+        match self.acceptance.submission_mode(session_id, busy_now) {
+            AcceptanceSubmission::Reconcile => {
+                self.reconcile_acceptance(session_id, cx);
+                return SubmissionAcceptance::Ready(false);
+            }
+            AcceptanceSubmission::Wait => return SubmissionAcceptance::Ready(false),
+            AcceptanceSubmission::Submit | AcceptanceSubmission::Queue => {}
+        }
+        let inspection = sessions
+            .read(cx)
+            .get(session_id)
+            .and_then(|session| session.provider_context.as_ref())
+            .and_then(|state| state.delivery.as_ref())
+            .filter(|delivery| delivery.needs_inspection())
+            .map(|delivery| delivery.switch_id.clone());
+        if let Some(switch_id) = inspection {
+            // The request may have run. A plain submit asks the user to
+            // confirm they inspected it, and sends nothing.
+            if !busy_now
+                && options.queued_message_id.is_none()
+                && !options.managed
+                && options.ci_repair.is_none()
+                && options.app_request_id.is_none()
+            {
+                self.confirm_delivery_inspection(session_id, &switch_id, cx);
+            }
+            return SubmissionAcceptance::Ready(false);
+        }
         if self.edited_resends.is_active(session_id) {
             return SubmissionAcceptance::Ready(false);
         }
@@ -231,6 +266,33 @@ impl Submit {
         let Some(stored) = stored else {
             return SubmissionAcceptance::Ready(false);
         };
+        let acceptance_save_pending = match self
+            .acceptance
+            .submission_mode(session_id, stored.is_busy())
+        {
+            AcceptanceSubmission::Wait | AcceptanceSubmission::Reconcile => {
+                return SubmissionAcceptance::Ready(false);
+            }
+            AcceptanceSubmission::Queue => true,
+            AcceptanceSubmission::Submit => false,
+        };
+        if let Some(queued_id) = &options.queued_message_id {
+            let mode = if options.follow_up_behavior == Some(FollowUpBehavior::Steer) {
+                QueueSubmitMode::Steer
+            } else {
+                QueueSubmitMode::Dispatch
+            };
+            let active = running_provider_selection(&stored, self.running_selection(session_id));
+            let catalog = self.config.catalog.read();
+            let allowed =
+                queued_message_for_submit(&stored, queued_id, mode).is_some_and(|message| {
+                    mode == QueueSubmitMode::Dispatch
+                        || can_steer_with_selection(&stored, message, &active, &catalog)
+                });
+            if !allowed {
+                return SubmissionAcceptance::Ready(false);
+            }
+        }
         let removing_paths = peers.projects.removing_worktree_paths(cx);
         if stored.worktree_removed == Some(true)
             || removing_paths
@@ -292,16 +354,6 @@ impl Submit {
             && approved_plan.as_ref().is_none_or(|plan| blank(&plan.text))
         {
             return SubmissionAcceptance::Ready(false);
-        }
-        if let Some(queued_id) = &options.queued_message_id {
-            let mode = if options.follow_up_behavior == Some(FollowUpBehavior::Steer) {
-                QueueSubmitMode::Steer
-            } else {
-                QueueSubmitMode::Dispatch
-            };
-            if queued_message_for_submit(&current, queued_id, mode).is_none() {
-                return SubmissionAcceptance::Ready(false);
-            }
         }
         let note_card = match &options.note_card {
             Some(card) => card.clone(),
@@ -428,10 +480,16 @@ impl Submit {
             .pending_switch
             .clone()
             .filter(|pending| pending.from != current.harness);
+        if pending_switch.is_some() && raw_command {
+            status(session_id, SWITCH_BEFORE_COMMAND, cx);
+            return SubmissionAcceptance::Ready(false);
+        }
 
-        if current.is_busy() && pending_switch.is_none() {
+        if current.is_busy() {
             return self.follow_up(
                 FollowUp {
+                    // A switch or an open acceptance save waits for the turn.
+                    force_queue: pending_switch.is_some() || acceptance_save_pending,
                     session_id,
                     text,
                     attachments,
@@ -558,12 +616,6 @@ impl Submit {
             None
         };
 
-        if let Some(pending) = &pending_switch
-            && current.is_busy()
-        {
-            cancel_harness(&registry, pending.from, session_id, cx);
-        }
-
         peers
             .attention
             .dismiss_notices_for_continued_session(session_id, cx);
@@ -593,9 +645,6 @@ impl Submit {
         }
 
         if !live {
-            if let Some(pending) = &pending_switch {
-                forget_harness(&registry, pending.from, session_id, cx);
-            }
             reject_edited(edited.as_deref(), &options, cx);
             settle(
                 &options,
@@ -635,7 +684,6 @@ impl Submit {
             session_id: session_id.to_string(),
             generation,
             current: current.clone(),
-            text: text.to_string(),
             attachments,
             options: options.clone(),
             intent,
@@ -673,7 +721,17 @@ impl Submit {
             config: self.config.clone(),
             peers,
             skills: self.skills.clone(),
+            selection_revision: self.selection_revision(session_id),
+            submit: None,
         };
+        self.running_selections.insert(
+            session_id.to_string(),
+            ModelTarget {
+                harness: current.harness,
+                model: current.model.clone(),
+                model_settings: current.model_settings.clone(),
+            },
+        );
         cx.spawn(async move |this, cx| run_turn(this, run, cx).await)
             .detach();
         SubmissionAcceptance::Ready(true)
@@ -708,6 +766,7 @@ impl Submit {
     /// the running turn.
     fn follow_up(&mut self, follow: FollowUp<'_>, cx: &mut Context<Self>) -> SubmissionAcceptance {
         let FollowUp {
+            force_queue,
             session_id,
             text,
             attachments,
@@ -733,7 +792,8 @@ impl Submit {
             );
             return SubmissionAcceptance::Ready(false);
         }
-        let behavior = if current.worktree_preparing == Some(true)
+        let behavior = if force_queue
+            || current.worktree_preparing == Some(true)
             || intent == TurnIntent::Plan
             || intent == TurnIntent::Orchestrate
             || operator_matched
@@ -756,6 +816,12 @@ impl Submit {
         let sessions = Engine::sessions(cx);
         if behavior == FollowUpBehavior::Queue {
             let message = QueuedMessage {
+                // The request keeps the provider and model it was sent with.
+                selection: Some(ModelTarget {
+                    harness: current.harness,
+                    model: current.model.clone(),
+                    model_settings: current.model_settings.clone(),
+                }),
                 id: uuid::Uuid::new_v4().to_string(),
                 text: text.to_string(),
                 attachments,
@@ -774,10 +840,13 @@ impl Submit {
                         session.note_card = None;
                         session.handoff_card = None;
                     }
-                    session
-                        .queued_messages
-                        .get_or_insert_with(Vec::new)
-                        .push(message);
+                    // A queued row that waits again keeps its place.
+                    if options.queued_message_id.is_none() {
+                        session
+                            .queued_messages
+                            .get_or_insert_with(Vec::new)
+                            .push(message);
+                    }
                     session.queue_status = Some(
                         if session.queue_status == Some(MessageQueueStatus::Paused) {
                             MessageQueueStatus::Paused
@@ -793,8 +862,10 @@ impl Submit {
             return SubmissionAcceptance::Ready(true);
         }
         let registry = self.config.registry.clone();
-        if !registry.is_live_harness(current.harness)
-            || !registry.can_steer_harness(current.harness)
+        // The running turn keeps its provider and model while the picker
+        // changes.
+        let active = running_provider_selection(current, self.running_selection(session_id));
+        if !registry.is_live_harness(active.harness) || !registry.can_steer_harness(active.harness)
         {
             // Harnesses that cannot steer (fx) used to drop the message on the
             // floor here, so a follow-up sent mid-turn just vanished. Say so.
@@ -802,7 +873,7 @@ impl Submit {
                 session_id,
                 &format!(
                     "{} cannot take a follow-up mid-turn — wait for this turn to finish, or stop it first.",
-                    current.harness
+                    active.harness
                 ),
                 cx,
             );
@@ -831,21 +902,27 @@ impl Submit {
                     if let Some(queued_id) = &queued_id {
                         dequeue_queued_message(session, queued_id);
                     }
+                    // The steered turn is labeled with the running selection.
+                    let mut steered = session.clone();
+                    steered.harness = active.harness;
+                    steered.model = active.model.clone();
+                    steered.model_settings = active.model_settings.clone();
                     append_steer_user_mut(
                         &mut SystemEnv,
                         &catalog,
-                        session,
+                        &mut steered,
                         &submitted,
                         &visible,
                         has_cards.then_some(&cards),
                     );
+                    session.blocks = steered.blocks;
                 });
             });
         }
-        let harness = current.harness;
+        let harness = active.harness;
         let id = session_id.to_string();
-        let model = current.model.clone();
-        let model_settings = current.model_settings.clone();
+        let model = active.model.clone();
+        let model_settings = active.model_settings.clone();
         let inbox_ask = (!raw_command).then(|| current.inbox_ask.clone()).flatten();
         let io = self.config.attachment_io.clone();
         let skills = self.skills.clone();
@@ -1054,6 +1131,8 @@ impl Submit {
 
 /// Everything the busy branch needs.
 struct FollowUp<'a> {
+    /// Queue regardless of the follow-up setting.
+    force_queue: bool,
     session_id: &'a str,
     text: &'a str,
     attachments: Vec<Attachment>,
@@ -1151,7 +1230,6 @@ impl CommitTurn {
         }
         if !self.live {
             session.title = titled;
-            session.pending_switch = None;
             session.busy = Some(false);
             let mut user = Block {
                 attachments: (!self.visible.is_empty()).then(|| self.visible.clone()),
@@ -1178,7 +1256,7 @@ impl CommitTurn {
         }
         session.title = titled;
         if let Some(from) = self.pending_switch {
-            session.pending_switch = None;
+            // The switch stays armed until the target accepts the request.
             stop_streaming_mut(session, now_ms());
             let to = session.harness;
             *session = append_preparing_handoff(session, from, to);

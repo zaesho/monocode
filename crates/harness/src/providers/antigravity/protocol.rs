@@ -328,7 +328,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::MessageDelta { text }]
+            vec![HarnessEvent::MessageDelta { text, append: None }]
         };
     }
 
@@ -337,7 +337,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::ReasoningDelta { text }]
+            vec![HarnessEvent::ReasoningDelta { text, append: None }]
         };
     }
 

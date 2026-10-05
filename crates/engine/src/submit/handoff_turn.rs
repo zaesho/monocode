@@ -53,7 +53,7 @@ pub async fn request_outgoing_handoff_with_timeout(
         let harness = input.harness;
         let session_id = input.session_id.clone();
         event_sink(move |event| match event {
-            HarnessEvent::MessageDelta { text } => {
+            HarnessEvent::MessageDelta { text, .. } => {
                 let mut brief = brief.lock();
                 *brief = join_stream_text(&brief, &text);
             }

@@ -55,17 +55,23 @@ struct Script {
     result: Result<(), String>,
     /// Wait for `cancel_turn` before resolving.
     hold: bool,
+    /// Report acceptance before the events.
+    accept: bool,
 }
 
 impl Script {
     fn reply(text: &str) -> Self {
         Self {
             events: vec![
-                HarnessEvent::MessageDelta { text: text.into() },
+                HarnessEvent::MessageDelta {
+                    text: text.into(),
+                    append: None,
+                },
                 HarnessEvent::MessageCompleted,
             ],
             result: Ok(()),
             hold: false,
+            accept: true,
         }
     }
 }
@@ -152,7 +158,7 @@ impl HarnessAdapter for FakeAdapter {
             .unwrap_or_else(|| Script::reply("done"));
         let release = self.release.1.clone();
         async move {
-            if let Some(accepted) = on_accepted {
+            if let Some(accepted) = on_accepted.filter(|_| script.accept) {
                 accepted();
             }
             for event in script.events {
@@ -295,6 +301,7 @@ fn setup_with_skill_sources(cx: &mut TestAppContext, skills: Arc<dyn SkillSource
         RegistryOptions {
             turn_control: None,
             idle_park: Duration::from_secs(86_400),
+            ambient_events: None,
         },
     );
     let codex = FakeAdapter::new(HarnessId::Codex);
@@ -735,6 +742,7 @@ async fn a_failed_turn_reports_the_error_and_parks_the_provider(cx: &mut TestApp
         events: vec![],
         result: Err("boom".into()),
         hold: false,
+        accept: true,
     });
     let (outcomes, on_settled) = recorder();
     submit(
@@ -861,7 +869,14 @@ async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
 /// Queue output from the running turn without letting its flush run.
 fn queue_output(id: &str, text: &str, cx: &mut App) {
     Engine::sessions(cx).update(cx, |sessions, cx| {
-        sessions.enqueue_event(id, HarnessEvent::MessageDelta { text: text.into() }, cx);
+        sessions.enqueue_event(
+            id,
+            HarnessEvent::MessageDelta {
+                text: text.into(),
+                append: None,
+            },
+            cx,
+        );
     });
 }
 
@@ -1357,7 +1372,15 @@ async fn removes_a_draft_and_discards_a_draft_only_session(cx: &mut TestAppConte
             .backend
             .commands()
             .iter()
-            .any(|command| command.contains("delete"))
+            .any(|command| command == "session_discard_draft")
+    );
+    // A discard is not a delete, so the id stays usable.
+    assert!(
+        !fixture
+            .backend
+            .commands()
+            .iter()
+            .any(|command| command == "session_delete")
     );
     cx.executor()
         .advance_clock(crate::runtime::sessions::PERSIST_DEBOUNCE);
@@ -1371,9 +1394,11 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
     fixture.codex.push(Script {
         events: vec![HarnessEvent::MessageDelta {
             text: "working".into(),
+            append: None,
         }],
         result: Ok(()),
         hold: true,
+        accept: true,
     });
     let (outcomes, on_settled) = recorder();
     submit(
@@ -1391,6 +1416,7 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
         Engine::sessions(cx).update(cx, |sessions, cx| {
             sessions.update("s", cx, |session| {
                 session.queued_messages = Some(vec![QueuedMessage {
+                    selection: None,
                     app_request_id: None,
                     id: "q".into(),
                     text: "next".into(),
@@ -1452,9 +1478,7 @@ async fn compacts_context_or_says_the_provider_cannot(cx: &mut TestAppContext) {
     assert_eq!(fixture.codex.calls.lock().compacts, 1);
 }
 
-#[gpui::test]
-async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut TestAppContext) {
-    let fixture = setup(cx);
+fn switched(fixture: &Fixture, cx: &mut TestAppContext) {
     let mut started = chat("s", HarnessId::Fx);
     started.blocks = vec![
         Block::new("u1", BlockRole::User, "fix the footer"),
@@ -1466,6 +1490,28 @@ async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut
             submit.set_model("s", HarnessId::Codex, "codex:default", cx)
         })
     });
+}
+
+fn delivery(session: &Session) -> Option<monocode_core::provider_context::ProviderContextDelivery> {
+    session.provider_context.as_ref()?.delivery.clone()
+}
+
+fn transfer(session: &Session) -> monocode_core::block::HandoffTransfer {
+    session
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| block.handoff.as_ref()?.transfer.clone())
+        .unwrap()
+}
+
+#[gpui::test]
+async fn switching_providers_sends_the_shared_history_with_the_next_request(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::block::{TransferMode, TransferStatus};
+    let fixture = setup(cx);
+    switched(&fixture, cx);
     let armed = session("s", cx);
     assert_eq!(armed.harness, HarnessId::Codex);
     assert_eq!(
@@ -1488,12 +1534,132 @@ async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut
         .find(|block| block.role == BlockRole::Handoff)
         .unwrap();
     assert_eq!(handoff.handoff.as_ref().unwrap().pending, Some(false));
-    assert!(handoff.text.contains("fix the footer"));
-    assert_eq!(fixture.fx.calls.lock().forgets, ["s"]);
+    assert!(
+        handoff
+            .text
+            .starts_with("Continue with shared history. 2 saved items")
+    );
+    let shown = transfer(&session);
+    assert_eq!(shown.status, TransferStatus::Accepted);
+    assert_eq!(shown.mode, TransferMode::Inline);
+    assert_eq!(shown.included, 2);
+    assert_eq!(delivery(&session).unwrap().status, TransferStatus::Accepted);
+    // The source keeps its conversation; the fresh target starts clean.
+    assert_eq!(fixture.fx.calls.lock().stops, ["s"]);
+    assert!(fixture.fx.calls.lock().forgets.is_empty());
+    assert_eq!(fixture.codex.calls.lock().forgets, ["s"]);
     let sent = &fixture.codex.calls.lock().sends[0].text;
-    assert!(sent.starts_with("You are continuing an existing conversation handed off from fx."));
-    assert!(sent.contains("now the header"));
-    assert!(sent.contains("<handoff>"));
+    assert!(sent.starts_with("Continue this existing MonoCode conversation."));
+    assert!(sent.contains("fix the footer"));
+    assert_eq!(sent.matches("now the header").count(), 1);
+    // The accepted switch reached storage.
+    assert!(
+        fixture
+            .backend
+            .commands()
+            .iter()
+            .any(|command| command == "session_upsert")
+    );
+}
+
+#[gpui::test]
+async fn a_request_during_the_source_turn_waits_with_its_selection(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update("s", cx, |session| session.busy = Some(true))
+        })
+    });
+    let accepted = submit(
+        &fixture,
+        "s",
+        "after the switch",
+        SubmitOptions {
+            follow_up_behavior: Some(FollowUpBehavior::Steer),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert!(accepted);
+    let session = session("s", cx);
+    let queued = session.queued_messages.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0]
+            .selection
+            .as_ref()
+            .map(|selection| selection.harness),
+        Some(HarnessId::Codex)
+    );
+    // The source turn keeps running.
+    assert!(fixture.fx.calls.lock().cancels.is_empty());
+    assert!(fixture.fx.calls.lock().steers.is_empty());
+    assert!(fixture.codex.calls.lock().sends.is_empty());
+}
+
+#[gpui::test]
+async fn an_unacknowledged_switch_waits_for_inspection_without_resending(cx: &mut TestAppContext) {
+    use monocode_core::block::TransferStatus;
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    fixture.codex.push(Script {
+        events: vec![],
+        result: Err("The connection dropped".into()),
+        hold: false,
+        accept: false,
+    });
+    submit(&fixture, "s", "apply it once", SubmitOptions::default(), cx);
+    let recovered = session("s", cx);
+    let saved = delivery(&recovered).unwrap();
+    assert_eq!(saved.status, TransferStatus::Uncertain);
+    assert!(saved.is_submitted() && saved.needs_inspection());
+    assert!(
+        recovered
+            .blocks
+            .iter()
+            .filter(|block| block.role == BlockRole::User)
+            .all(|block| !block.is_draft())
+    );
+    assert_eq!(transfer(&recovered).needs_inspection, Some(true));
+    assert_eq!(fixture.codex.calls.lock().stops, ["s"]);
+
+    let accepted = submit(&fixture, "s", "next request", SubmitOptions::default(), cx);
+    assert!(!accepted);
+    assert_eq!(fixture.codex.calls.lock().sends.len(), 1);
+    let inspected = session("s", cx);
+    assert!(delivery(&inspected).is_none());
+    assert_eq!(transfer(&inspected).inspection_confirmed, Some(true));
+    assert!(
+        inspected
+            .blocks
+            .iter()
+            .any(|block| block.text == crate::submit::provider_switch::INSPECTION_SAVED)
+    );
+}
+
+#[gpui::test]
+async fn a_switch_that_fails_before_dispatch_returns_the_request_as_a_draft(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::block::TransferStatus;
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    fixture.backend.set_failing("session_upsert", true);
+    submit(&fixture, "s", "not yet sent", SubmitOptions::default(), cx);
+    let failed = session("s", cx);
+    assert!(fixture.codex.calls.lock().sends.is_empty());
+    let saved = delivery(&failed).unwrap();
+    assert_eq!(saved.status, TransferStatus::Uncertain);
+    assert_eq!(saved.failed_before_submission, Some(true));
+    assert!(
+        failed
+            .blocks
+            .iter()
+            .any(|block| block.role == BlockRole::User && block.is_draft())
+    );
+    // The switch stays armed for a retry.
+    assert!(failed.pending_switch.is_some());
 }
 
 #[gpui::test]
@@ -1914,6 +2080,7 @@ fn edit_script() -> Script {
         ],
         result: Ok(()),
         hold: false,
+        accept: true,
     }
 }
 

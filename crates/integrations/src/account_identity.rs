@@ -63,10 +63,9 @@ fn capitalize(value: &str) -> String {
 }
 
 fn claude_identity(dir: Option<PathBuf>) -> Option<ProviderAccountIdentity> {
-    let path = match dir {
-        Some(dir) => dir.join(".claude.json"),
-        None => home()?.join(".claude.json"),
-    };
+    // `dir` is the profile's directory, or CLAUDE_CONFIG_DIR for the
+    // default account when the user set one.
+    let path = monocode_process::harness::claude_config_path(dir.as_deref())?;
     parse_claude_identity(&read_json(&path)?)
 }
 

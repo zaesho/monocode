@@ -290,14 +290,20 @@ fn maps_agent_message_thought_and_grok_tool_updates() {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "Hi" },
         })),
-        vec![HarnessEvent::MessageDelta { text: "Hi".into() }]
+        vec![HarnessEvent::MessageDelta {
+            text: "Hi".into(),
+            append: None
+        }]
     );
     assert_eq!(
         events_from_acp_update(&json!({
             "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": "Hmm" },
         })),
-        vec![HarnessEvent::ReasoningDelta { text: "Hmm".into() }]
+        vec![HarnessEvent::ReasoningDelta {
+            text: "Hmm".into(),
+            append: None
+        }]
     );
 
     let early = events_from_acp_update(&json!({

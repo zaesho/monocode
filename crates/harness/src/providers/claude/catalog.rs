@@ -2,7 +2,8 @@
 //! bundled Claude model list, the `list_models` row mapping, and live
 //! discovery through a probe process.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -17,9 +18,10 @@ use parking_lot::Mutex;
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::core::registry::CatalogScope;
 use crate::core::task::{SharedSpawner, timeout};
 
-use super::io::SharedChildIo;
+use super::io::{SharedChildIo, claude_account};
 use super::protocol::{
     ClaudeSpawnOptions, MINIMUM_CLAUDE_FABLE_5_VERSION, MINIMUM_CLAUDE_OPUS_4_7_VERSION,
     MINIMUM_CLAUDE_OPUS_4_8_VERSION, MINIMUM_CLAUDE_OPUS_5_5_VERSION,
@@ -281,13 +283,32 @@ pub fn models_from_claude_list_models(raw: &Value) -> Vec<AgentModel> {
             continue;
         };
         let key = model.native_id.clone().unwrap_or_else(|| model.id.clone());
-        if seen.contains(&key) {
+        if let Some(index) = seen.iter().position(|seen| *seen == key) {
+            // Claude can list one model twice, for example once per context
+            // size. Keep one row with every choice.
+            merge_settings(&mut models[index], model.settings.unwrap_or_default());
             continue;
         }
         seen.push(key);
         models.push(model);
     }
     models
+}
+
+/// Add `settings` and their choices to `model`'s, without repeats.
+fn merge_settings(model: &mut AgentModel, settings: Vec<ModelSetting>) {
+    for setting in settings {
+        let existing = model.settings.get_or_insert_with(Vec::new);
+        let Some(prior) = existing.iter_mut().find(|row| row.id == setting.id) else {
+            existing.push(setting);
+            continue;
+        };
+        for option in setting.options {
+            if !prior.options.iter().any(|row| row.value == option.value) {
+                prior.options.push(option);
+            }
+        }
+    }
 }
 
 static DATE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"-\d{8}$").unwrap());
@@ -552,6 +573,10 @@ fn claude_catalog_id(native_id: &str) -> String {
     format!("claude:{slug}")
 }
 
+/// `opus-5`, `sonnet-4-6`: a bare family name with a version.
+static VERSIONED_FAMILY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(opus|sonnet|haiku|fable)-\d").unwrap());
+
 /// `claudeLaunchId`: the `--model` argument for a `list_models` row.
 ///
 /// Claude advertises family aliases (`opus`) that must stay bare, and concrete
@@ -567,7 +592,9 @@ fn claude_launch_id(value_id: &str, resolved_id: &str) -> String {
     if native_id.is_empty() {
         return String::new();
     }
-    if native_id.starts_with("claude-") || !native_id.chars().any(|c| c.is_ascii_digit()) {
+    // Only a bare versioned family name needs the prefix. Gateway and cloud
+    // ids, such as Bedrock's `us.anthropic.claude-...`, stay as they are.
+    if !VERSIONED_FAMILY.is_match(native_id) {
         return native_id.to_string();
     }
     if resolved_id.starts_with("claude-") {
@@ -608,9 +635,14 @@ struct CatalogInner {
     spawner: SharedSpawner,
     /// `setHarnessModels("claude", models)` on the app's catalog.
     set_models: Arc<dyn Fn(Vec<AgentModel>) + Send + Sync>,
-    inflight: Mutex<Option<Shared<BoxFuture<'static, ()>>>>,
+    /// Running refreshes by working directory and account, with a token.
+    inflight: Mutex<HashMap<(String, String), (u64, Refresh)>>,
+    /// Bumped by every refresh. Only the latest one may set the catalog.
+    generation: AtomicU64,
     timeout: Duration,
 }
+
+type Refresh = Shared<BoxFuture<'static, ()>>;
 
 impl ClaudeCatalog {
     pub fn new(
@@ -623,37 +655,96 @@ impl ClaudeCatalog {
                 io,
                 spawner,
                 set_models,
-                inflight: Mutex::new(None),
+                inflight: Mutex::new(HashMap::new()),
+                generation: AtomicU64::new(0),
                 timeout: Duration::from_millis(DISCOVERY_TIMEOUT_MS as u64),
             }),
         }
     }
 
-    /// `refreshClaudeCatalog`. Calls made while one runs share it. Failures
-    /// are logged, not returned.
-    pub fn refresh(&self) -> Shared<BoxFuture<'static, ()>> {
+    /// `refreshClaudeCatalog` for the home directory and default account.
+    pub fn refresh(&self) -> Refresh {
+        self.refresh_in(CatalogScope::default())
+    }
+
+    /// `refreshClaudeCatalog`: list the models Claude offers in a working
+    /// directory under an account, since project settings and profiles can
+    /// change them. Calls for the same scope while one runs share it; a
+    /// forced call runs again after it. Only the latest refresh sets the
+    /// catalog. Failures are logged, not returned.
+    pub fn refresh_in(&self, scope: CatalogScope) -> Refresh {
+        let key = (
+            scope.cwd.clone().unwrap_or_default(),
+            scope
+                .provider_account_id
+                .clone()
+                .unwrap_or_else(|| "default".into()),
+        );
         let mut inflight = self.inner.inflight.lock();
-        if let Some(running) = inflight.as_ref() {
-            return running.clone();
+        if let Some((_, running)) = inflight.get(&key) {
+            if !scope.force {
+                return running.clone();
+            }
+            let (running, catalog) = (running.clone(), self.clone());
+            return async move {
+                running.await;
+                catalog
+                    .refresh_in(CatalogScope {
+                        force: false,
+                        ..scope
+                    })
+                    .await;
+            }
+            .boxed()
+            .shared();
         }
+        let generation = self.inner.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let catalog = self.clone();
+        let run_key = key.clone();
         let run = async move {
-            match catalog.discover(None).await {
-                Ok(models) if !models.is_empty() => (catalog.inner.set_models)(models),
+            let models = catalog
+                .discover_as(scope.cwd.as_deref(), scope.provider_account_id.as_deref())
+                .await;
+            match models {
+                Ok(models)
+                    if !models.is_empty()
+                        && catalog.inner.generation.load(Ordering::SeqCst) == generation =>
+                {
+                    (catalog.inner.set_models)(models)
+                }
                 Ok(_) => {}
                 Err(error) => log::debug!("[monocode] claude catalog {error:#}"),
             }
-            *catalog.inner.inflight.lock() = None;
+            let mut inflight = catalog.inner.inflight.lock();
+            if inflight
+                .get(&run_key)
+                .is_some_and(|(token, _)| *token == generation)
+            {
+                inflight.remove(&run_key);
+            }
         }
         .boxed()
         .shared();
-        *inflight = Some(run.clone());
+        inflight.insert(key, (generation, run.clone()));
         run
     }
 
-    /// `discoverClaudeModels`.
+    /// `discoverClaudeModels` under the default account.
     pub async fn discover(&self, working_directory: Option<&str>) -> Result<Vec<AgentModel>> {
-        let listed = match self.discover_via_list_models(working_directory).await {
+        self.discover_as(working_directory, None).await
+    }
+
+    /// `discoverClaudeModels`: the models Claude lists in
+    /// `working_directory` under `provider_account_id`.
+    pub async fn discover_as(
+        &self,
+        working_directory: Option<&str>,
+        provider_account_id: Option<&str>,
+    ) -> Result<Vec<AgentModel>> {
+        let listed = match self
+            .discover_via_list_models(working_directory, provider_account_id)
+            .await
+        {
             Ok(models) => models,
             Err(error) => {
                 log::debug!("[monocode] claude list_models catalog failed {error:#}");
@@ -677,6 +768,7 @@ impl ClaudeCatalog {
     async fn discover_via_list_models(
         &self,
         working_directory: Option<&str>,
+        provider_account_id: Option<&str>,
     ) -> Result<Vec<AgentModel>> {
         let io = self.inner.io.clone();
         let path = io.resolve_claude_binary().await?;
@@ -762,7 +854,7 @@ impl ClaudeCatalog {
                     ..Default::default()
                 }),
                 &cwd,
-                None,
+                Some(claude_account(provider_account_id)),
             )
             .await?;
             io.write_child(

@@ -255,9 +255,10 @@ pub(super) fn run_update(
     let harness = update.harness;
     let run = host.update_cli(harness, cx);
     cx.spawn(async move |cx| {
-        if let Err(error) = run.await {
-            return RowState::Failed(error);
-        }
+        let printed = match run.await {
+            Ok(printed) => printed,
+            Err(error) => return RowState::Failed(error),
+        };
         let after = match cx.update(|cx| host.installed_version(harness, cx)).await {
             Ok(after) => after,
             Err(error) => return RowState::Failed(error),
@@ -269,10 +270,15 @@ pub(super) fn run_update(
                 cx.update(|cx| host.announce_updated(harness, cx));
                 RowState::Updated(version)
             }
-            version => RowState::Failed(format!(
-                "Still on {} after updating.",
-                version.unwrap_or(update.installed)
-            )),
+            // A CLI installed by a package manager prints how to update it
+            // and leaves the version as it was.
+            version => RowState::Failed(match monocode_core::js::trim(&printed) {
+                "" => format!(
+                    "Still on {} after updating.",
+                    version.unwrap_or(update.installed)
+                ),
+                instructions => instructions.to_string(),
+            }),
         }
     })
 }

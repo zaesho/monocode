@@ -631,6 +631,13 @@ impl UsageFooter {
 
     fn chip_props(&self, provider: RateLimitProvider, cx: &App) -> ChipProps {
         let mut props = ChipProps::new(self.limits(provider, cx), self.now);
+        // Claude's model-scoped weekly limits only count for that model.
+        props.model = self
+            .props
+            .session
+            .as_ref()
+            .filter(|session| session.harness == provider.harness())
+            .and_then(|session| session.model.clone());
         if provider != RateLimitProvider::Claude {
             props.project = self.props.project.clone();
         }

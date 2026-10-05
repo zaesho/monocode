@@ -33,7 +33,7 @@ CREATE INDEX IF NOT EXISTS sessions_cwd_updated_idx
 "#;
 
 pub struct SessionStore {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     read_conn: Mutex<Option<Connection>>,
 }
 
@@ -51,10 +51,16 @@ impl SessionStore {
         read_conn
             .execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")
             .map_err(|e| e.to_string())?;
-        Ok(Self {
+        let store = Self {
             conn: Mutex::new(conn),
             read_conn: Mutex::new(Some(read_conn)),
-        })
+        };
+        if let Some(root) = path.parent()
+            && let Err(error) = crate::context_history::retry_context_cleanup(&store, root)
+        {
+            eprintln!("Shared context cleanup will need a retry: {error}");
+        }
+        Ok(store)
     }
 
     /// An in-memory database with the full schema, for tests here and in
@@ -137,6 +143,10 @@ pub struct SessionUpsert {
     pub provider_session_id: Option<String>,
     #[serde(default)]
     pub provider_account_id: Option<String>,
+    /// The versioned provider-context envelope: native bindings, the
+    /// delivery receipt, and the pending switch.
+    #[serde(default)]
+    pub provider_context: Option<Value>,
     pub blocks: Value,
     /// Last context-window reading reported by the harness, if any.
     #[serde(default)]
@@ -210,6 +220,8 @@ pub struct SessionRecord {
     pub provider_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_account_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_context: Option<Value>,
     pub blocks: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_used: Option<i64>,
@@ -609,21 +621,59 @@ pub fn session_delete(
     session_id: String,
     mut image_paths: Vec<String>,
 ) -> Result<(), String> {
-    validate_id(&session_id, "session")?;
-    let conn = store.conn.lock().map_err(|_| "Session store is locked")?;
-    let persisted_paths = get_session(&conn, &session_id)
-        .ok()
-        .flatten()
-        .map(|record| generated_image_paths(&record.blocks))
-        .unwrap_or_default();
+    let persisted_paths = delete_stored_session(store, Some(data_dir), &session_id)?;
     image_paths.extend(persisted_paths);
-    delete_session(&conn, &session_id).map_err(|e| e.to_string())?;
-    drop(conn);
     if !image_paths.is_empty()
         && let Err(error) = monocode_git::fs::delete_generated_images_sync(data_dir, &image_paths)
     {
         eprintln!("Generated image cleanup will need a retry: {error}");
     }
+    events.reminders_changed();
+    Ok(())
+}
+
+/// Delete the record and record its cleanup obligation, then remove its
+/// shared-context files. Returns the generated image paths the record held.
+pub(crate) fn delete_stored_session(
+    store: &SessionStore,
+    data_dir: Option<&Path>,
+    session_id: &str,
+) -> Result<Vec<String>, String> {
+    validate_id(session_id, "session")?;
+    let delete = || {
+        let conn = store.lock_conn()?;
+        let paths = get_session(&conn, session_id)
+            .ok()
+            .flatten()
+            .map(|record| generated_image_paths(&record.blocks))
+            .unwrap_or_default();
+        delete_session(&conn, session_id).map_err(|error| error.to_string())?;
+        Ok(paths)
+    };
+    let paths = match data_dir {
+        Some(root) => crate::context_history::with_context_lifecycle(root, session_id, delete)?,
+        None => delete()?,
+    };
+    if let Some(root) = data_dir
+        && let Err(error) = crate::context_history::retry_context_cleanup(store, root)
+    {
+        eprintln!("Shared context cleanup will need a retry: {error}");
+    }
+    Ok(paths)
+}
+
+/// `session_discard_draft`: remove a transient draft record and keep its id
+/// usable for the next request. Settled history and provider execution are
+/// refused.
+pub fn session_discard_draft(
+    store: &SessionStore,
+    events: &dyn StoreEvents,
+    session_id: String,
+) -> Result<(), String> {
+    validate_id(&session_id, "session")?;
+    let conn = store.lock_conn()?;
+    discard_draft_session(&conn, &session_id).map_err(|error| error.to_string())?;
+    drop(conn);
     events.reminders_changed();
     Ok(())
 }
@@ -863,6 +913,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         ("pinned", "INTEGER NOT NULL DEFAULT 0"),
         ("linked_work_item_json", "TEXT"),
         ("provider_account_id", "TEXT"),
+        ("provider_context_json", "TEXT"),
         ("worktree_removed", "INTEGER NOT NULL DEFAULT 0"),
         ("is_draft", "INTEGER NOT NULL DEFAULT 0"),
         ("automation_id", "TEXT"),
@@ -1010,6 +1061,27 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (18, ?1)",
+            params![now_millis()],
+        )?;
+    }
+    // 19 and 20 match the Tauri app's numbers and SQL, so a database opened
+    // by either app stays consistent.
+    if current < 19 {
+        ensure_session_column(conn, "provider_context_json", "TEXT")?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (19, ?1)",
+            params![now_millis()],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS context_history_cleanup (
+           session_id TEXT PRIMARY KEY,
+           pending INTEGER NOT NULL CHECK (pending IN (0, 1))
+         );",
+    )?;
+    if current < 20 {
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (20, ?1)",
             params![now_millis()],
         )?;
     }
@@ -1176,7 +1248,11 @@ fn orchestration_summary(conn: &Connection, id: &str) -> rusqlite::Result<Option
     ))
 }
 
-fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Result<SessionSummary> {
+pub(crate) fn upsert_session(
+    conn: &Connection,
+    session: &SessionUpsert,
+) -> rusqlite::Result<SessionSummary> {
+    ensure_context_writable(conn, &session.id)?;
     let now = now_millis();
     let model_settings = serde_json::to_string(&session.model_settings)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -1185,6 +1261,13 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
     let linked_work_item_json = session
         .linked_work_item
         .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    let provider_context_json = session
+        .provider_context
+        .as_ref()
+        .filter(|value| value.is_object())
         .map(serde_json::to_string)
         .transpose()
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -1265,8 +1348,8 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
            provider_session_id, blocks_json, created_at, updated_at, branch,
            context_used, context_window, worktree_cwd, has_user_message,
            linked_work_item_json, provider_account_id, worktree_removed, is_draft,
-           automation_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+           automation_id, provider_context_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          ON CONFLICT(id) DO UPDATE SET
            cwd = excluded.cwd,
            harness = excluded.harness,
@@ -1286,7 +1369,8 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
            provider_account_id = excluded.provider_account_id,
            worktree_removed = excluded.worktree_removed,
            is_draft = excluded.is_draft,
-           automation_id = excluded.automation_id",
+           automation_id = excluded.automation_id,
+           provider_context_json = excluded.provider_context_json",
         params![
             session.id,
             session.cwd,
@@ -1309,6 +1393,7 @@ fn upsert_session(conn: &Connection, session: &SessionUpsert) -> rusqlite::Resul
             i64::from(session.worktree_removed),
             i64::from(is_draft),
             automation_id,
+            provider_context_json,
         ],
     )?;
 
@@ -1793,8 +1878,14 @@ fn optional_json(raw: Option<String>) -> Option<Value> {
     raw.and_then(|value| serde_json::from_str(&value).ok())
 }
 
-fn delete_session(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
+pub(crate) fn delete_session(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    // Keep the deleted id after cleanup to reject delayed writes.
+    tx.execute(
+        "INSERT INTO context_history_cleanup (session_id, pending) VALUES (?1, 1)
+         ON CONFLICT(session_id) DO UPDATE SET pending = 1",
+        [session_id],
+    )?;
     let parent = worker_parent(&tx, session_id)?;
     // Ownership is also carried in transcripts for older clients. Release
     // that metadata along with the index so reopening a worker stays detached.
@@ -1905,6 +1996,199 @@ fn delete_session(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
     tx.commit()
 }
 
+pub(crate) fn discard_draft_session(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    ensure_context_writable(&tx, session_id)?;
+    let stored: Option<(String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT blocks_json, provider_session_id, provider_context_json FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((raw_blocks, provider_id, raw_context)) = stored else {
+        return tx.commit();
+    };
+    let parse = |raw: &str| {
+        serde_json::from_str::<Value>(raw)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    };
+    let blocks = parse(&raw_blocks)?;
+    let context = raw_context.as_deref().map(parse).transpose()?;
+    let failed_delivery = context
+        .as_ref()
+        .filter(|context| !draft_context_has_history(context))
+        .and_then(|context| {
+            context
+                .get("state")
+                .filter(|state| !state.is_null())
+                .unwrap_or(context)
+                .get("delivery")
+        })
+        .filter(|delivery| {
+            delivery.get("status").and_then(Value::as_str) == Some("uncertain")
+                && delivery
+                    .get("failedBeforeSubmission")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        });
+    let draft_only = blocks.as_array().is_some_and(|blocks| {
+        blocks.iter().all(|block| {
+            (block.get("role").and_then(Value::as_str) == Some("user")
+                && block.get("draft").and_then(Value::as_bool) == Some(true)
+                && block.get("orchestrationLeadId").is_none_or(Value::is_null))
+                || failed_delivery.is_some_and(|delivery| draft_failure_metadata(block, delivery))
+        })
+    });
+    let orchestration: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM orchestration_runs WHERE lead_id = ?1)
+             OR EXISTS(SELECT 1 FROM orchestration_sidebar WHERE lead_id = ?1)
+             OR EXISTS(SELECT 1 FROM orchestration_workers WHERE session_id = ?1 OR lead_id = ?1)",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    if !draft_only
+        || provider_id
+            .as_deref()
+            .is_some_and(|id| !id.trim().is_empty())
+        || context.as_ref().is_some_and(draft_context_has_history)
+        || orchestration
+    {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Only an unsubmitted blank or draft-only session can be discarded",
+            ),
+        )));
+    }
+    tx.execute("DELETE FROM sessions WHERE id = ?1", [session_id])?;
+    tx.commit()
+}
+
+/// The saved provider context proves a provider saw this session: a
+/// binding, a source conversation, or a delivery past preparation.
+fn draft_context_has_history(context: &Value) -> bool {
+    if context.is_null() {
+        return false;
+    }
+    let Some(envelope) = context.as_object() else {
+        return true;
+    };
+    let nonempty_id = |value: Option<&Value>| {
+        value.is_some_and(|value| {
+            !value.is_null() && value.as_str().is_none_or(|id| !id.trim().is_empty())
+        })
+    };
+    if nonempty_id(
+        envelope
+            .get("pendingSwitch")
+            .and_then(|pending| pending.get("fromProviderSessionId")),
+    ) {
+        return true;
+    }
+    let state = envelope
+        .get("state")
+        .filter(|state| !state.is_null())
+        .unwrap_or(context);
+    if !state.is_object() {
+        return true;
+    }
+    if state.get("bindings").is_some_and(|bindings| {
+        bindings
+            .as_array()
+            .is_none_or(|bindings| !bindings.is_empty())
+    }) {
+        return true;
+    }
+    let Some(delivery) = state.get("delivery").filter(|delivery| !delivery.is_null()) else {
+        return false;
+    };
+    let proven_failure = delivery.get("status").and_then(Value::as_str) == Some("uncertain")
+        && delivery.get("mode").and_then(Value::as_str) == Some("pending")
+        && delivery
+            .get("failedBeforeSubmission")
+            .and_then(Value::as_bool)
+            == Some(true);
+    (delivery.get("status").and_then(Value::as_str) != Some("preparing") && !proven_failure)
+        || delivery.get("requestSubmitted").and_then(Value::as_bool) == Some(true)
+        || delivery.get("needsInspection").and_then(Value::as_bool) == Some(true)
+        || nonempty_id(delivery.get("targetProviderSessionId"))
+        || nonempty_id(delivery.get("sourceThroughBlockId"))
+        || ["includedBlockIds", "omittedBlockIds"].iter().any(|key| {
+            delivery
+                .get(key)
+                .is_some_and(|items| items.as_array().is_none_or(|items| !items.is_empty()))
+        })
+}
+
+/// A row a switch that failed before submission left behind: its error
+/// notice, or its handoff divider with empty transfer details.
+fn draft_failure_metadata(block: &Value, delivery: &Value) -> bool {
+    if [
+        "tool",
+        "approval",
+        "image",
+        "plan",
+        "tasks",
+        "orchestrationLeadId",
+        "providerTurnId",
+        "providerSessionId",
+    ]
+    .iter()
+    .any(|key| block.get(key).is_some_and(|value| !value.is_null()))
+    {
+        return false;
+    }
+    match block.get("role").and_then(Value::as_str) {
+        Some("system") => block.get("notice").and_then(Value::as_str) == Some("error"),
+        Some("handoff") => {
+            let Some(handoff) = block.get("handoff") else {
+                return false;
+            };
+            let Some(transfer) = handoff.get("transfer") else {
+                return false;
+            };
+            handoff.get("from") == delivery.get("from")
+                && handoff.get("to") == delivery.get("to")
+                && matches!(
+                    handoff.get("status").and_then(Value::as_str),
+                    Some("preparing" | "ready")
+                )
+                && transfer.get("switchId") == delivery.get("switchId")
+                && transfer.get("status").and_then(Value::as_str) == Some("uncertain")
+                && transfer.get("mode").and_then(Value::as_str) == Some("pending")
+                && transfer
+                    .get("failedBeforeSubmission")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && ["included", "omitted", "historicalAttachments"]
+                    .iter()
+                    .all(|key| transfer.get(key).and_then(Value::as_u64) == Some(0))
+                && transfer.get("retrievalPath").is_none_or(Value::is_null)
+                && ["requestSubmitted", "needsInspection", "inspectionConfirmed"]
+                    .iter()
+                    .all(|key| transfer.get(key).and_then(Value::as_bool) != Some(true))
+        }
+        _ => false,
+    }
+}
+
+/// `ensure_context_writable`: a deleted session id rejects later session,
+/// snapshot, and attachment writes.
+pub(crate) fn ensure_context_writable(conn: &Connection, session_id: &str) -> rusqlite::Result<()> {
+    let deleted: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM context_history_cleanup WHERE session_id = ?1)",
+        [session_id],
+        |row| row.get(0),
+    )?;
+    if deleted {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Session was deleted"),
+        )));
+    }
+    Ok(())
+}
+
 fn set_archived(conn: &Connection, session_id: &str, archived: bool) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE sessions SET archived = ?1 WHERE id = ?2",
@@ -1937,13 +2221,16 @@ fn set_linked_work_item(
     Ok(())
 }
 
-fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<SessionRecord>> {
+pub(crate) fn get_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<SessionRecord>> {
     conn.query_row(
         "SELECT id, cwd, harness, model, model_settings, runtime_mode, title,
                 provider_session_id, blocks_json, created_at, updated_at,
                 context_used, context_window, branch, worktree_cwd,
                 linked_work_item_json, provider_account_id, worktree_removed,
-                automation_id
+                automation_id, provider_context_json
          FROM sessions
          WHERE id = ?1 AND inbox_ask IS NULL",
         params![session_id],
@@ -1983,6 +2270,7 @@ fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<S
                 linked_work_item: optional_json(row.get(15)?),
                 provider_account_id: row.get(16)?,
                 automation_id: nonempty(row.get(18)?),
+                provider_context: optional_json(row.get(19)?),
                 created_at: row.get(9)?,
                 updated_at: row.get(10)?,
             })
@@ -2079,7 +2367,7 @@ pub fn now_millis() -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rusqlite::hooks::{AuthAction, Authorization};
     use serde_json::json;
@@ -2144,7 +2432,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
-    fn sample(id: &str, cwd: &str, title: &str) -> SessionUpsert {
+    pub(crate) fn sample(id: &str, cwd: &str, title: &str) -> SessionUpsert {
         SessionUpsert {
             id: id.into(),
             cwd: cwd.into(),
@@ -2155,6 +2443,7 @@ mod tests {
             title: title.into(),
             provider_session_id: Some("acp-session-1".into()),
             provider_account_id: None,
+            provider_context: None,
             blocks: json!([{ "id": "b1", "role": "user", "text": "hello" }]),
             context_used: None,
             context_window: None,
@@ -2327,7 +2616,7 @@ mod tests {
                        ON sessions (cwd, has_user_message, updated_at DESC, id, harness,
                                     model, runtime_mode, title, provider_session_id,
                                     created_at, branch, archived, pinned, linked_work_item_json);
-                     DELETE FROM schema_migrations WHERE version IN (16, 17, 18);",
+                     DELETE FROM schema_migrations WHERE version >= 16;",
                 )
                 .unwrap();
                 migrate(&conn).unwrap();
@@ -2631,6 +2920,297 @@ mod tests {
     }
 
     #[test]
+    fn provider_context_survives_reopen_and_can_be_cleared() {
+        let path = std::env::temp_dir().join(format!(
+            "monocode-provider-context-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let expected = json!({
+            "version": 1,
+            "state": {"version": 1, "bindings": [], "delivery": {"switchId": "switch-1", "status": "imported"}},
+            "pendingSwitch": {"from": "cursor", "fromModel": "gpt-5", "fromSettings": {}}
+        });
+        {
+            let store = SessionStore::open(path.clone()).unwrap();
+            let conn = store.lock_conn().unwrap();
+            let mut session = sample("s1", "/tmp/a", "Continue");
+            session.provider_context = Some(expected.clone());
+            upsert_session(&conn, &session).unwrap();
+        }
+        {
+            let store = SessionStore::open(path.clone()).unwrap();
+            let conn = store.lock_conn().unwrap();
+            assert_eq!(
+                get_session(&conn, "s1").unwrap().unwrap().provider_context,
+                Some(expected)
+            );
+            upsert_session(&conn, &sample("s1", "/tmp/a", "Continue")).unwrap();
+            assert_eq!(
+                get_session(&conn, "s1").unwrap().unwrap().provider_context,
+                None
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn deleted_context_records_cleanup_and_blocks_late_session_writes() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let session = sample("deleted-session", "/tmp/a", "First");
+        upsert_session(&conn, &session).unwrap();
+        delete_session(&conn, &session.id).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT pending FROM context_history_cleanup WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+        assert!(upsert_session(&conn, &session).is_err());
+        delete_session(&conn, &session.id).unwrap();
+        assert!(get_session(&conn, &session.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleted_context_obligation_rolls_back_when_record_deletion_fails() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        upsert_session(&conn, &sample("deleted-session", "/tmp/a", "First")).unwrap();
+        conn.execute_batch("CREATE TRIGGER prevent_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'deletion rejected'); END;").unwrap();
+        assert!(delete_session(&conn, "deleted-session").is_err());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_history_cleanup", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(get_session(&conn, "deleted-session").unwrap().is_some());
+    }
+
+    #[test]
+    fn deleted_context_migration_repairs_a_missing_cleanup_table() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("DROP TABLE context_history_cleanup;")
+            .unwrap();
+        migrate(&conn).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_history_cleanup", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let versions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version IN (19, 20)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 2);
+    }
+
+    #[test]
+    fn draft_discard_keeps_the_open_session_id_for_its_next_turn() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut draft = sample("draft-session", "/tmp/a", "Draft");
+        draft.provider_session_id = None;
+        draft.blocks = json!([{"id": "draft", "role": "user", "text": "Not sent", "draft": true}]);
+        upsert_session(&conn, &draft).unwrap();
+        discard_draft_session(&conn, &draft.id).unwrap();
+        assert!(get_session(&conn, &draft.id).unwrap().is_none());
+        draft.blocks = json!([{"id": "user", "role": "user", "text": "Send this turn"}]);
+        assert!(upsert_session(&conn, &draft).is_ok());
+    }
+
+    fn proven_unsubmitted_failure_draft() -> SessionUpsert {
+        let mut draft = sample("draft-session", "/repo", "Draft");
+        draft.provider_session_id = None;
+        draft.blocks = json!([
+            {"id": "switch-card", "role": "handoff", "text": "", "handoff": {
+                "from": "codex", "to": "claude", "status": "preparing", "transfer": {
+                    "switchId": "failed-switch", "status": "uncertain", "mode": "pending", "failedBeforeSubmission": true, "included": 0, "omitted": 0, "historicalAttachments": 0
+                }
+            }},
+            {"id": "draft", "role": "user", "text": "Do this", "draft": true},
+            {"id": "error", "role": "system", "text": "Could not prepare the provider process", "notice": "error"}
+        ]);
+        draft.provider_context = Some(json!({"version": 1, "state": {
+            "version": 1, "bindings": [], "delivery": {
+                "switchId": "failed-switch", "from": "codex", "to": "claude", "cwd": "/repo",
+                "currentUserBlockId": "draft", "status": "uncertain", "mode": "pending",
+                "failedBeforeSubmission": true, "includedBlockIds": [], "omittedBlockIds": []
+            }
+        }, "pendingSwitch": {"from": "codex", "fromModel": "one", "fromSettings": {}}}));
+        draft
+    }
+
+    #[test]
+    fn draft_discard_accepts_a_proven_unsubmitted_transfer_failure() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut draft = proven_unsubmitted_failure_draft();
+        upsert_session(&conn, &draft).unwrap();
+        discard_draft_session(&conn, &draft.id).unwrap();
+        assert!(get_session(&conn, &draft.id).unwrap().is_none());
+        draft.provider_context = None;
+        draft.blocks = json!([{"id": "user", "role": "user", "text": "A later turn"}]);
+        assert!(upsert_session(&conn, &draft).is_ok());
+    }
+
+    #[test]
+    fn draft_discard_does_not_read_unsubmitted_proof_as_permission_to_delete_history() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let original = proven_unsubmitted_failure_draft();
+        for role in ["assistant", "tool", "user"] {
+            let mut record = original.clone();
+            record
+                .blocks
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id": "settled", "role": role, "text": "Completed work"}));
+            upsert_session(&conn, &record).unwrap();
+            assert!(discard_draft_session(&conn, &record.id).is_err());
+        }
+        for (key, value) in [
+            ("failedBeforeSubmission", json!(false)),
+            ("requestSubmitted", json!(true)),
+            ("needsInspection", json!(true)),
+            ("targetProviderSessionId", json!("native-session")),
+            ("sourceThroughBlockId", json!("earlier-user")),
+            ("includedBlockIds", json!(["earlier-user"])),
+            ("omittedBlockIds", json!(["earlier-user"])),
+        ] {
+            let mut record = original.clone();
+            record.provider_context.as_mut().unwrap()["state"]["delivery"][key] = value;
+            upsert_session(&conn, &record).unwrap();
+            assert!(discard_draft_session(&conn, &record.id).is_err());
+            assert!(get_session(&conn, &record.id).unwrap().is_some());
+        }
+        let mut record = original;
+        record.blocks[0]["handoff"]["transfer"]["switchId"] = json!("another-switch");
+        upsert_session(&conn, &record).unwrap();
+        assert!(discard_draft_session(&conn, &record.id).is_err());
+    }
+
+    #[test]
+    fn draft_discard_accepts_empty_context_and_unsubmitted_picker_retries() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        for context in [
+            json!({}),
+            json!({"version": 1, "state": {"version": 1, "bindings": []}}),
+            json!({"version": 1, "pendingSwitch": {"from": "codex", "fromModel": "one", "fromSettings": {}}}),
+            json!({"version": 1, "state": {"version": 1, "bindings": [], "delivery": {"status": "preparing", "mode": "pending", "includedBlockIds": [], "omittedBlockIds": []}}}),
+        ] {
+            let mut draft = sample("draft-session", "/tmp/a", "Draft");
+            draft.provider_session_id = None;
+            draft.blocks =
+                json!([{"id": "draft", "role": "user", "text": "Not sent", "draft": true}]);
+            draft.provider_context = Some(context);
+            upsert_session(&conn, &draft).unwrap();
+            discard_draft_session(&conn, &draft.id).unwrap();
+            discard_draft_session(&conn, &draft.id).unwrap();
+            assert!(get_session(&conn, &draft.id).unwrap().is_none());
+        }
+        let mut blank = sample("blank-session", "/tmp/a", "Blank");
+        blank.provider_session_id = None;
+        blank.blocks = json!([]);
+        upsert_session(&conn, &blank).unwrap();
+        discard_draft_session(&conn, &blank.id).unwrap();
+        assert!(upsert_session(&conn, &blank).is_ok());
+    }
+
+    #[test]
+    fn draft_discard_keeps_settled_history_and_provider_execution() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut draft = sample("draft-session", "/tmp/a", "Draft");
+        draft.provider_session_id = None;
+        for blocks in [
+            json!([{"id": "user", "role": "user", "text": "Sent"}]),
+            json!([{"id": "assistant", "role": "assistant", "text": "Reply"}]),
+        ] {
+            draft.blocks = blocks;
+            upsert_session(&conn, &draft).unwrap();
+            assert!(discard_draft_session(&conn, &draft.id).is_err());
+            assert!(get_session(&conn, &draft.id).unwrap().is_some());
+        }
+        draft.blocks = json!([{"id": "draft", "role": "user", "text": "Not sent", "draft": true}]);
+        for context in [
+            json!({"version": 1, "bindings": [{"providerSessionId": "native-session"}]}),
+            json!({"version": 1, "state": {"version": 1, "bindings": [{"providerSessionId": "native-session"}]}}),
+            json!({"version": 1, "state": {"bindings": [], "delivery": {"status": "preparing", "requestSubmitted": true}}}),
+            json!({"version": 1, "state": {"bindings": [], "delivery": {"status": "uncertain"}}}),
+            json!({"version": 1, "pendingSwitch": {"fromProviderSessionId": "source-session"}}),
+        ] {
+            draft.provider_context = Some(context);
+            upsert_session(&conn, &draft).unwrap();
+            assert!(discard_draft_session(&conn, &draft.id).is_err());
+            assert!(get_session(&conn, &draft.id).unwrap().is_some());
+        }
+        draft.provider_context = None;
+        draft.provider_session_id = Some("native-session".into());
+        upsert_session(&conn, &draft).unwrap();
+        assert!(discard_draft_session(&conn, &draft.id).is_err());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_history_cleanup", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn draft_discard_rejects_orchestration_and_rolls_back_a_failed_delete() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut draft = sample("draft-session", "/tmp/a", "Draft");
+        draft.provider_session_id = None;
+        draft.blocks = json!([{"id": "draft", "role": "user", "text": "Not sent", "draft": true}]);
+        upsert_session(&conn, &draft).unwrap();
+        conn.execute(
+            "INSERT INTO orchestration_workers (session_id, lead_id) VALUES (?1, 'lead')",
+            [&draft.id],
+        )
+        .unwrap();
+        assert!(discard_draft_session(&conn, &draft.id).is_err());
+        conn.execute(
+            "DELETE FROM orchestration_workers WHERE session_id = ?1",
+            [&draft.id],
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TRIGGER prevent_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'deletion rejected'); END;").unwrap();
+        assert!(discard_draft_session(&conn, &draft.id).is_err());
+        assert!(get_session(&conn, &draft.id).unwrap().is_some());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_history_cleanup", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn draft_discard_cannot_reenable_a_permanently_deleted_session() {
+        let store = SessionStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let mut draft = sample("draft-session", "/tmp/a", "Draft");
+        draft.provider_session_id = None;
+        draft.blocks = json!([{"id": "draft", "role": "user", "text": "Not sent", "draft": true}]);
+        upsert_session(&conn, &draft).unwrap();
+        delete_session(&conn, &draft.id).unwrap();
+        assert!(discard_draft_session(&conn, &draft.id).is_err());
+        assert!(upsert_session(&conn, &draft).is_err());
+    }
+
+    #[test]
     fn delete_removes_session() {
         let store = SessionStore::open_in_memory().unwrap();
         let conn = store.conn.lock().unwrap();
@@ -2913,11 +3493,20 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let mut session = sample("s1", "/tmp/a", "First");
         session.provider_account_id = Some("account-work".into());
+        session.provider_context = Some(json!({
+            "version": 1,
+            "state": {
+                "version": 1,
+                "bindings": [{"harness": "cursor", "providerSessionId": "acp-session-1", "cwd": "/tmp/a"}]
+            },
+            "pendingSwitch": {"from": "cursor", "fromModel": "gpt-5", "fromSettings": {}}
+        }));
         upsert_session(&conn, &session).unwrap();
         let record = get_session(&conn, "s1").unwrap().unwrap();
         assert_eq!(record.id, "s1");
         assert_eq!(record.provider_session_id.as_deref(), Some("acp-session-1"));
         assert_eq!(record.provider_account_id.as_deref(), Some("account-work"));
+        assert_eq!(record.provider_context, session.provider_context);
         assert_eq!(record.model_settings["thinking"], "high");
         assert_eq!(record.blocks.as_array().unwrap().len(), 1);
         assert_eq!(record.blocks[0]["text"], "hello");

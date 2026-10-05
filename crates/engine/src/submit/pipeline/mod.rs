@@ -12,18 +12,21 @@ mod actions;
 mod options;
 mod session_edits;
 mod submit;
+mod switch;
+mod transfer;
 mod turn;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use futures::future::Shared;
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global, Task};
 use monocode_core::HarnessId;
+use monocode_core::block::ModelTarget;
 use monocode_harness::core::catalog::SharedCatalog;
 use monocode_harness::core::registry::HarnessRegistry;
 use monocode_harness::core::task::SharedSpawner;
@@ -44,6 +47,7 @@ use super::hooks::SubmitPeers;
 use super::link_preview::LinkPreviews;
 use super::mcp_settings_cache::McpSettingsCache;
 use super::prefs::KvStore;
+use super::provider_switch::AcceptancePersistence;
 use super::skills::{ProcessSkillSources, SkillCatalog, SkillCatalogContext, SkillSources};
 
 pub type SkillContextResolver =
@@ -119,6 +123,16 @@ pub struct Submit {
     /// The last `<monocode_app>` note each session's agent received, so a
     /// note goes out again only when it changes.
     pub(crate) app_notes: HashMap<String, String>,
+    /// Acceptance saves for provider switches, by session.
+    pub(crate) acceptance: AcceptancePersistence,
+    /// Sessions whose inspection acknowledgment is being confirmed or saved.
+    pub(crate) inspection_pending: HashSet<String>,
+    /// The provider and model each running turn started with. The picker
+    /// can move while the turn runs.
+    pub(crate) running_selections: HashMap<String, ModelTarget>,
+    /// Bumped on every picker or model-settings change, so a running turn
+    /// can tell its configuration reports from the new selection.
+    pub(crate) selection_revisions: HashMap<String, u64>,
 }
 
 impl EventEmitter<SubmitEvent> for Submit {}
@@ -144,6 +158,10 @@ impl Submit {
             edited_resends: EditedResendCoordinator::new(),
             project_location_syncs: HashMap::new(),
             app_notes: HashMap::new(),
+            acceptance: AcceptancePersistence::default(),
+            inspection_pending: HashSet::new(),
+            running_selections: HashMap::new(),
+            selection_revisions: HashMap::new(),
         }
     }
 

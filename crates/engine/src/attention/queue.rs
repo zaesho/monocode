@@ -81,7 +81,12 @@ pub fn can_dispatch_queued_head(session: &Session) -> bool {
     if is_preparing_handoff(session) {
         return false;
     }
-    true
+    // A provider request may have run without acknowledgment.
+    !session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .is_some_and(|delivery| delivery.needs_inspection())
 }
 
 /// `queuedMessageForSubmit`: resolve a queued row for auto-dispatch (the
@@ -117,6 +122,7 @@ pub(crate) mod tests {
 
     pub(crate) fn queued(id: &str, text: &str) -> QueuedMessage {
         QueuedMessage {
+            selection: None,
             app_request_id: None,
             id: id.into(),
             text: text.into(),
@@ -199,6 +205,7 @@ pub(crate) mod tests {
             to: HarnessId::Cursor,
             status: HandoffStatus::Preparing,
             pending: Some(false),
+            transfer: None,
             extra: Extra::new(),
         });
         preparing.blocks.push(block);

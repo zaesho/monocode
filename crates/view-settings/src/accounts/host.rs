@@ -314,8 +314,8 @@ pub trait HarnessUpdateHost {
     /// Promise.resolve([])`).
     fn dismiss_updates(&self, _cx: &mut App) {}
 
-    /// `updateHarnessCli`.
-    fn update_cli(&self, _harness: HarnessId, _cx: &mut App) -> HostTask<()> {
+    /// `updateHarnessCli`: what the updater printed.
+    fn update_cli(&self, _harness: HarnessId, _cx: &mut App) -> HostTask<String> {
         unavailable()
     }
 

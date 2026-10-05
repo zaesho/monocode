@@ -20,6 +20,10 @@ use monocode_core::block::{Block, BlockRole};
 use monocode_core::context_usage::ContextUsage;
 use monocode_core::harness::{HARNESSES, HarnessId, RUNTIME_MODES, RuntimeMode};
 use monocode_core::inbox::WorkItemKind;
+use monocode_core::provider_context::{
+    fail_provider_delivery, fail_unstarted_provider_request, recover_submitted_provider_delivery,
+    restore_provider_context, stored_provider_context,
+};
 use monocode_core::session::{LinkedWorkItem, Session};
 use monocode_core::{Extra, ModelSettings};
 use monocode_store::session_store::{
@@ -197,6 +201,7 @@ fn persistable_meta(session: &Session) -> SessionUpsert {
         title: session.title.clone(),
         provider_session_id: persistable(&session.provider_session_id),
         provider_account_id: persistable(&session.provider_account_id),
+        provider_context: stored_provider_context(session),
         blocks: Value::Array(Vec::new()),
         context_used: session.context.map(|context| context.used),
         context_window: session
@@ -290,7 +295,7 @@ pub fn sanitize_session_for_persist(session: &Session) -> SessionUpsert {
             {
                 object.insert("orchestrationLeadId".into(), Value::String(lead.clone()));
             }
-            sanitize_block(&value, false)
+            sanitize_block_with(&value, false, session.pending_switch.is_some())
         })
         .collect();
     SessionUpsert {
@@ -324,6 +329,16 @@ fn trimmed_str<'a>(rec: &'a Map<String, Value>, key: &str) -> &'a str {
 
 /// `sanitizeBlock`. `hydrate` marks a load from disk rather than a save.
 pub fn sanitize_block(block: &Value, hydrate: bool) -> Option<Value> {
+    sanitize_block_with(block, hydrate, false)
+}
+
+/// [`sanitize_block`]. `preserve_preparing` keeps a preparing handoff while
+/// a provider switch waits, so a restart can tell the switch never started.
+pub fn sanitize_block_with(
+    block: &Value,
+    hydrate: bool,
+    preserve_preparing: bool,
+) -> Option<Value> {
     let block = block.as_object()?;
     let role = block.get("role").and_then(Value::as_str).unwrap_or("");
     let is_user = role == "user";
@@ -443,7 +458,7 @@ pub fn sanitize_block(block: &Value, hydrate: bool) -> Option<Value> {
         }
         None => {}
     }
-    match sanitize_handoff(block.get("handoff")) {
+    match sanitize_handoff(block.get("handoff"), preserve_preparing) {
         Some(handoff) => {
             next.insert("handoff".into(), handoff);
         }
@@ -889,7 +904,7 @@ fn harness_name(value: Option<&Value>) -> Option<&str> {
         .filter(|name| HarnessId::parse(name).is_some())
 }
 
-fn sanitize_handoff(value: Option<&Value>) -> Option<Value> {
+fn sanitize_handoff(value: Option<&Value>, preserve_preparing: bool) -> Option<Value> {
     if !truthy(value) {
         return None;
     }
@@ -901,12 +916,59 @@ fn sanitize_handoff(value: Option<&Value>) -> Option<Value> {
         return None;
     }
     let interrupted = status == "preparing";
-    Some(json!({
+    let mut handoff = json!({
         "from": from,
         "to": to,
-        "status": "ready",
+        "status": if preserve_preparing { status } else { "ready" },
         "pending": interrupted || truthy(value.get("pending")),
-    }))
+    });
+    if let Some(transfer) = sanitize_handoff_transfer(value.get("transfer")) {
+        handoff["transfer"] = transfer;
+    }
+    Some(handoff)
+}
+
+/// The transfer details on a handoff row, kept only when well formed.
+fn sanitize_handoff_transfer(value: Option<&Value>) -> Option<Value> {
+    let transfer = value?.as_object()?;
+    let switch_id = transfer
+        .get("switchId")
+        .and_then(Value::as_str)
+        .filter(|id| is_persistable_id(id))?;
+    let status = transfer.get("status").and_then(Value::as_str)?;
+    let mode = transfer.get("mode").and_then(Value::as_str)?;
+    if !matches!(status, "preparing" | "imported" | "accepted" | "uncertain")
+        || !matches!(mode, "pending" | "native" | "inline")
+    {
+        return None;
+    }
+    let count = |key: &str| safe_integer(transfer.get(key)?).filter(|count| *count >= 0);
+    let mut next = json!({
+        "switchId": switch_id,
+        "status": status,
+        "mode": mode,
+        "included": count("included")?,
+        "omitted": count("omitted")?,
+        "historicalAttachments": count("historicalAttachments")?,
+    });
+    if let Some(path) = transfer
+        .get("retrievalPath")
+        .and_then(Value::as_str)
+        .filter(|path| !path.contains('\0'))
+    {
+        next["retrievalPath"] = Value::String(path.to_string());
+    }
+    for key in [
+        "requestSubmitted",
+        "failedBeforeSubmission",
+        "needsInspection",
+        "inspectionConfirmed",
+    ] {
+        if transfer.get(key) == Some(&Value::Bool(true)) {
+            next[key] = Value::Bool(true);
+        }
+    }
+    Some(next)
 }
 
 fn sanitize_second_opinion(value: Option<&Value>) -> Option<Value> {
@@ -1093,6 +1155,17 @@ pub fn normalize_summary(summary: StoredSummary) -> SessionSummary {
 /// `recordToSession`: a stored row as a live session, with its blocks
 /// sanitized for hydration.
 pub fn record_to_session(record: SessionRecord) -> Session {
+    let preparing_handoff_id = record.blocks.as_array().and_then(|blocks| {
+        blocks
+            .iter()
+            .rev()
+            .find(|block| {
+                block.get("role").and_then(Value::as_str) == Some("handoff")
+                    && block.pointer("/handoff/status").and_then(Value::as_str) == Some("preparing")
+            })
+            .and_then(|block| block.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+    });
     let blocks: Vec<Block> = record
         .blocks
         .as_array()
@@ -1147,7 +1220,34 @@ pub fn record_to_session(record: SessionRecord) -> Session {
     session.automation_id = record.automation_id.filter(|id| is_persistable_id(id));
     session.context = context_from_record(record.context_used, record.context_window);
     session.blocks = blocks;
+    let (provider_context, pending_switch) =
+        restore_provider_context(record.provider_context.as_ref());
+    session.provider_context = provider_context;
+    session.pending_switch = pending_switch;
+    recover_provider_delivery(&mut session, preparing_handoff_id.as_deref());
     session
+}
+
+/// Restart recovery for a provider switch the app stopped in the middle
+/// of. A submitted request may have run, so it waits for inspection with
+/// its bindings kept. One that never reached the provider goes back to a
+/// draft, and a preparing handoff with no receipt becomes a failure.
+fn recover_provider_delivery(session: &mut Session, preparing_handoff_id: Option<&str>) {
+    let delivery = session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.clone());
+    match delivery {
+        Some(delivery) if delivery.needs_inspection() => {}
+        Some(delivery) if delivery.in_progress() => {
+            if delivery.is_submitted() {
+                recover_submitted_provider_delivery(session, &delivery.switch_id);
+            } else {
+                fail_provider_delivery(session, &delivery.switch_id, false);
+            }
+        }
+        _ => fail_unstarted_provider_request(session, preparing_handoff_id),
+    }
 }
 
 /// `contextFromRecord`: the last reading from a stored session. The harness
@@ -1469,11 +1569,69 @@ impl SessionWriter {
 
     /// `discardDraftSessionRecord`: delete a draft-only record while its
     /// still-open blank session id may be saved later.
+    /// `saveProviderContextSnapshot`: the immutable shared history of one
+    /// provider switch, for the target's file tools to read.
+    pub fn save_switch_snapshot(
+        &self,
+        session_id: &str,
+        switch_id: &str,
+        content: String,
+    ) -> Task<Result<String, String>> {
+        let future = self.backend.write_switch_snapshot(
+            session_id.to_string(),
+            switch_id.to_string(),
+            content,
+        );
+        self.executor.spawn(future)
+    }
+
+    /// `snapshotContextAssets`: durable copies of historical attachments.
+    /// Only the original path or bytes travel to the store.
+    pub fn snapshot_context_assets(
+        &self,
+        session_id: &str,
+        attachments: &[monocode_core::Attachment],
+    ) -> Task<Result<Vec<monocode_core::portable_context::ContextAssetSnapshot>, String>> {
+        if attachments.is_empty() {
+            return Task::ready(Ok(Vec::new()));
+        }
+        let sources = attachments
+            .iter()
+            .map(
+                |attachment| monocode_store::context_history::ContextAssetSource {
+                    id: attachment.id.clone(),
+                    name: attachment.name.clone(),
+                    path: attachment.path.clone().filter(|path| !path.is_empty()),
+                    data: attachment.data.clone().filter(|data| !data.is_empty()),
+                },
+            )
+            .collect();
+        let future = self
+            .backend
+            .snapshot_context_assets(session_id.to_string(), sources);
+        self.executor.spawn(async move {
+            Ok(future
+                .await?
+                .into_iter()
+                .map(
+                    |saved| monocode_core::portable_context::ContextAssetSnapshot {
+                        id: saved.id,
+                        path: saved.path,
+                        sha256: saved.sha256,
+                        unavailable_reason: saved.unavailable_reason,
+                    },
+                )
+                .collect())
+        })
+    }
+
+    /// `discardDraftSessionRecord`: `session_discard_draft`, which keeps the
+    /// open session id usable for its next request, unlike a delete.
     pub fn discard_draft_session_record(&self, session_id: &str) -> Task<Result<(), String>> {
         let backend = self.backend.clone();
         let id = session_id.to_string();
         self.enqueue(QueueKey::Session(session_id.to_string()), move || {
-            backend.delete(id, Vec::new())
+            backend.discard_draft(id)
         })
     }
 
@@ -1620,6 +1778,254 @@ mod tests {
             &[],
             Some(&extra),
         )
+    }
+
+    fn switching_session() -> Session {
+        let mut session = session(HarnessId::Codex, "/repo");
+        session.blocks = vec![Block::new(
+            "user-1",
+            BlockRole::User,
+            "Preserve my first instruction",
+        )];
+        session.pending_switch = serde_json::from_value(json!({
+            "from": "claude", "fromModel": "claude-opus", "fromSettings": { "effort": "high" },
+            "fromProviderSessionId": "claude-1", "fromProviderAccountId": "work-account",
+        }))
+        .ok();
+        session.provider_context = serde_json::from_value(json!({
+            "version": 1,
+            "bindings": [{ "harness": "claude", "providerSessionId": "claude-1", "providerAccountId": "work-account", "cwd": "/repo", "deliveredThroughBlockId": "user-1" }],
+            "delivery": {
+                "switchId": "switch-1", "status": "imported", "mode": "native", "from": "claude", "to": "codex",
+                "cwd": "/repo", "currentUserBlockId": "user-2", "sourceThroughBlockId": "user-1",
+                "includedBlockIds": ["user-1"], "omittedBlockIds": [], "targetProviderSessionId": "codex-1",
+            },
+        }))
+        .ok();
+        session
+    }
+
+    fn reload(session: &Session) -> Session {
+        let payload = sanitize_session_for_persist(session);
+        record_to_session(SessionRecord {
+            id: payload.id,
+            orchestration_lead_id: None,
+            cwd: payload.cwd,
+            harness: payload.harness,
+            model: payload.model,
+            model_settings: payload.model_settings,
+            runtime_mode: payload.runtime_mode,
+            title: payload.title,
+            provider_session_id: payload.provider_session_id,
+            provider_account_id: payload.provider_account_id,
+            provider_context: payload.provider_context,
+            blocks: payload.blocks,
+            context_used: payload.context_used,
+            context_window: payload.context_window,
+            branch: payload.branch,
+            worktree_cwd: payload.worktree_cwd,
+            worktree_removed: payload.worktree_removed,
+            linked_work_item: payload.linked_work_item,
+            automation_id: payload.automation_id,
+            created_at: 1,
+            updated_at: 2,
+        })
+    }
+
+    fn drafts(session: &Session) -> Vec<&str> {
+        session
+            .blocks
+            .iter()
+            .filter(|block| block.is_draft())
+            .map(|block| block.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn round_trips_picker_intent_and_bindings_and_recovers_a_partial_transfer() {
+        let original = switching_session();
+        let restored = reload(&original);
+        assert_eq!(restored.pending_switch, original.pending_switch);
+        let mut expected = original.provider_context.clone().unwrap();
+        expected.delivery.as_mut().unwrap().status =
+            monocode_core::block::TransferStatus::Uncertain;
+        assert_eq!(restored.provider_context, Some(expected));
+        assert_eq!(restored.blocks[0].text, original.blocks[0].text);
+        assert_eq!(restored.busy, Some(false));
+    }
+
+    #[test]
+    fn fingerprint_covers_picker_intent_and_delivery_receipts() {
+        let original = switching_session();
+        let mut settled = original.clone();
+        settled.pending_switch = None;
+        assert_ne!(
+            persist_fingerprint(&settled),
+            persist_fingerprint(&original)
+        );
+        let mut accepted = original.clone();
+        accepted
+            .provider_context
+            .as_mut()
+            .unwrap()
+            .delivery
+            .as_mut()
+            .unwrap()
+            .status = monocode_core::block::TransferStatus::Accepted;
+        assert_ne!(
+            persist_fingerprint(&accepted),
+            persist_fingerprint(&original)
+        );
+    }
+
+    #[test]
+    fn recovers_an_interrupted_transfer_as_one_draft_with_a_fresh_target() {
+        use monocode_core::block::TransferStatus;
+        for status in [TransferStatus::Preparing, TransferStatus::Imported] {
+            let mut original = switching_session();
+            original.provider_session_id = Some("codex-1".into());
+            let state = original.provider_context.as_mut().unwrap();
+            state.delivery.as_mut().unwrap().status = status;
+            state.bindings.push(
+                serde_json::from_value(
+                    json!({ "harness": "codex", "providerSessionId": "codex-1", "cwd": "/repo" }),
+                )
+                .unwrap(),
+            );
+            original.blocks.push(Block::new(
+                "user-2",
+                BlockRole::User,
+                "Submit this request once",
+            ));
+            let restored = reload(&original);
+            assert!(restored.provider_session_id.is_none());
+            let state = restored.provider_context.as_ref().unwrap();
+            assert_eq!(
+                state.delivery.as_ref().unwrap().status,
+                TransferStatus::Uncertain
+            );
+            assert_eq!(
+                state
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.harness)
+                    .collect::<Vec<_>>(),
+                [HarnessId::Claude]
+            );
+            assert_eq!(
+                restored
+                    .pending_switch
+                    .as_ref()
+                    .and_then(|pending| pending.from_provider_session_id.as_deref()),
+                Some("claude-1")
+            );
+            assert_eq!(drafts(&restored), ["user-2"]);
+        }
+    }
+
+    #[test]
+    fn requires_inspection_when_a_submitted_request_lost_its_acceptance_save() {
+        use monocode_core::block::TransferStatus;
+        for status in [TransferStatus::Preparing, TransferStatus::Imported] {
+            let mut original = switching_session();
+            original.provider_session_id = Some("codex-1".into());
+            let state = original.provider_context.as_mut().unwrap();
+            let delivery = state.delivery.as_mut().unwrap();
+            delivery.status = status;
+            delivery.request_submitted = Some(true);
+            state.bindings.push(
+                serde_json::from_value(
+                    json!({ "harness": "codex", "providerSessionId": "codex-1", "cwd": "/repo" }),
+                )
+                .unwrap(),
+            );
+            original.blocks.push(Block::new(
+                "user-2",
+                BlockRole::User,
+                "Apply the external action once",
+            ));
+            let restored = reload(&original);
+            let delivery = restored
+                .provider_context
+                .as_ref()
+                .and_then(|state| state.delivery.as_ref())
+                .unwrap();
+            assert_eq!(delivery.status, TransferStatus::Uncertain);
+            assert!(delivery.is_submitted() && delivery.needs_inspection());
+            assert!(drafts(&restored).is_empty());
+            assert_eq!(restored.provider_session_id.as_deref(), Some("codex-1"));
+            assert_eq!(
+                restored.provider_context.as_ref().unwrap().bindings,
+                original.provider_context.as_ref().unwrap().bindings
+            );
+            // A later reload keeps it waiting for inspection.
+            let again = reload(&restored);
+            assert!(drafts(&again).is_empty());
+            assert_eq!(again.provider_context, restored.provider_context);
+        }
+    }
+
+    #[test]
+    fn recovers_a_crash_during_snapshot_preparation() {
+        let mut original = switching_session();
+        original.provider_context.as_mut().unwrap().delivery = None;
+        original.blocks.push(block(json!({
+            "id": "preflight", "role": "handoff", "text": "Preparing shared history",
+            "handoff": { "from": "claude", "to": "codex", "status": "preparing" }
+        })));
+        original.blocks.push(Block::new(
+            "user-2",
+            BlockRole::User,
+            "Do not send this twice",
+        ));
+        assert_eq!(blocks_of(&original)[1]["handoff"]["status"], "preparing");
+        let restored = reload(&original);
+        assert_eq!(drafts(&restored), ["user-2"]);
+        assert_eq!(
+            restored.blocks[1].handoff.as_ref().unwrap().status,
+            monocode_core::block::HandoffStatus::Ready
+        );
+        assert_eq!(
+            restored
+                .pending_switch
+                .as_ref()
+                .and_then(|pending| pending.from_provider_session_id.as_deref()),
+            Some("claude-1")
+        );
+    }
+
+    #[test]
+    fn loads_old_records_and_drops_malformed_switch_state() {
+        let mut old = switching_session();
+        old.pending_switch = None;
+        old.provider_context = None;
+        let restored = reload(&old);
+        assert!(restored.provider_context.is_none());
+        assert!(restored.pending_switch.is_none());
+        assert_eq!(restored.blocks.len(), 1);
+        let mut record = sanitize_session_for_persist(&switching_session());
+        record.provider_context = Some(json!({
+            "version": 1,
+            "state": { "version": 99, "bindings": [] },
+            "pendingSwitch": { "from": "unknown", "fromModel": "anything", "fromSettings": {} },
+        }));
+        let (state, pending) = restore_provider_context(record.provider_context.as_ref());
+        assert!(state.is_none() && pending.is_none());
+    }
+
+    #[test]
+    fn keeps_transfer_details_on_saved_handoff_rows() {
+        let mut session = switching_session();
+        let transfer = json!({
+            "switchId": "switch-1", "status": "uncertain", "mode": "native", "included": 12,
+            "omitted": 4, "historicalAttachments": 2, "retrievalPath": "/data/history/switch-1.md",
+            "requestSubmitted": true, "needsInspection": true,
+        });
+        session.blocks.push(block(json!({
+            "id": "handoff", "role": "handoff", "text": "Shared history",
+            "handoff": { "from": "claude", "to": "codex", "status": "ready", "pending": true, "transfer": transfer },
+        })));
+        assert_eq!(blocks_of(&session)[1]["handoff"]["transfer"], transfer);
     }
 
     #[test]
@@ -2347,6 +2753,7 @@ mod tests {
             title: "codex · Fix".into(),
             provider_session_id: Some(String::new()),
             provider_account_id: Some("acct".into()),
+            provider_context: None,
             blocks,
             context_used: Some(120),
             context_window: Some(0),

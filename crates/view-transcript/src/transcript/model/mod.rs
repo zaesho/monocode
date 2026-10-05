@@ -7,6 +7,7 @@
 //! engine and provider tests can use it too.
 
 pub mod chat_context;
+pub mod handoff;
 pub mod link;
 pub mod plan;
 pub mod pool;

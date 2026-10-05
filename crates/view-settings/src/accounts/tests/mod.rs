@@ -188,7 +188,7 @@ pub(super) struct FakeUsage {
 }
 
 pub(super) enum PiAnswer {
-    Now(ProviderRateLimits),
+    Now(Box<ProviderRateLimits>),
     Later(oneshot::Receiver<ProviderRateLimits>),
 }
 
@@ -375,7 +375,7 @@ impl UsageHost for FakeUsage {
     fn fetch_pi_usage(&self, provider: PiUsageProvider, cx: &mut App) -> Task<ProviderRateLimits> {
         self.pi_fetches.borrow_mut().push(provider);
         match self.pi_answers.borrow_mut().pop_front() {
-            Some(PiAnswer::Now(value)) => Task::ready(value),
+            Some(PiAnswer::Now(value)) => Task::ready(*value),
             Some(PiAnswer::Later(receiver)) => {
                 let fallback = idle_rate_limits(pi_billing_provider(provider));
                 cx.foreground_executor()

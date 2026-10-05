@@ -839,7 +839,7 @@ mod tests {
             _command: String,
             _provider: HarnessId,
             _binary_path: Option<String>,
-        ) -> ChildFuture<()> {
+        ) -> ChildFuture<String> {
             unsupported()
         }
         fn home_dir(&self) -> ChildFuture<String> {

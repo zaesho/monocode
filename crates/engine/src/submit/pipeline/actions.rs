@@ -103,6 +103,17 @@ impl Submit {
         if is_preparing_handoff(&current) {
             return;
         }
+        // A switch that is still delivering its history owns the selection.
+        if current.is_busy()
+            && current
+                .provider_context
+                .as_ref()
+                .and_then(|state| state.delivery.as_ref())
+                .is_some_and(|delivery| delivery.in_progress())
+        {
+            return;
+        }
+        self.bump_selection_revision(session_id);
         let kv = self.config.kv.clone();
         let (resolved, model_settings) = {
             let catalog = self.config.catalog.read();
@@ -122,12 +133,25 @@ impl Submit {
         if let ComposerSwitchPlan::Empty { forget } = &plan {
             forget_harness(&self.config.registry, *forget, session_id, cx);
         }
+        let revert = matches!(plan, ComposerSwitchPlan::Revert { .. });
         sessions.update(cx, |sessions, cx| {
             sessions.update(session_id, cx, |session| {
                 with_harness_choice(session, harness, &resolved.id, model_settings);
                 apply_switch_plan(session, plan);
             });
         });
+        let selected = sessions.read(cx).get(session_id).cloned();
+        if revert
+            && let Some(selected) = &selected
+            && selected
+                .provider_session_id
+                .as_ref()
+                .is_some_and(|id| !id.is_empty())
+        {
+            Engine::hooks(cx).harness.bind_session(selected, cx);
+        }
+        // The picker intent survives a restart.
+        sessions.update(cx, |sessions, cx| sessions.persist(session_id, cx));
     }
 
     /// `onModelSettingsChange`.
@@ -137,6 +161,7 @@ impl Submit {
         model_settings: ModelSettings,
         cx: &mut Context<Self>,
     ) {
+        self.bump_selection_revision(session_id);
         save_last_model_settings(
             &self.config.kv,
             &model_settings,
@@ -510,6 +535,7 @@ impl Submit {
             sessions.bump_turn_gen(session_id);
             sessions.flush(cx);
         });
+        self.running_selections.remove(session_id);
         if let Some(session) = &session {
             for harness in session_child_harnesses(session) {
                 cancel_harness(&self.config.registry, harness, session_id, cx);

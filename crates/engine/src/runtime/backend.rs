@@ -18,6 +18,7 @@ use monocode_store::checkpoint::{
     self, CheckpointApplyResult, CheckpointFileDiff, CheckpointStatus, CheckpointStore,
 };
 use monocode_store::cli_sessions::{CliSession, Entry as CliEntry};
+use monocode_store::context_history::{self, ContextAssetSnapshot, ContextAssetSource};
 use monocode_store::session_store::{
     self, InFlightSession, SessionRecord, SessionSearchOptions, SessionSearchResult, SessionStore,
     SessionSummary as StoredSummary, SessionUpsert,
@@ -45,6 +46,9 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn cancel_search(&self, search_owner: String) -> StoreFuture<()>;
     /// `session_delete`.
     fn delete(&self, session_id: String, image_paths: Vec<String>) -> StoreFuture<()>;
+    /// `session_discard_draft`: drop a transient draft record. The id stays
+    /// usable, and settled history or provider execution is refused.
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()>;
     /// `session_set_archived`.
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()>;
     /// `session_set_pinned`.
@@ -81,6 +85,24 @@ pub trait SessionBackend: Send + Sync + 'static {
         provider_account_id: Option<String>,
         tool_ids: Vec<String>,
     ) -> StoreFuture<HashMap<String, String>>;
+    /// `session_context_snapshot`: save the shared history of one provider
+    /// switch and return its path. The same content returns the same path.
+    fn write_switch_snapshot(
+        &self,
+        _session_id: String,
+        _switch_id: String,
+        _content: String,
+    ) -> StoreFuture<String> {
+        unsupported("Saving shared history")
+    }
+    /// `session_context_assets`: durable copies of historical attachments.
+    fn snapshot_context_assets(
+        &self,
+        _session_id: String,
+        _attachments: Vec<ContextAssetSource>,
+    ) -> StoreFuture<Vec<ContextAssetSnapshot>> {
+        unsupported("Saving historical attachments")
+    }
     /// `cli_sessions_list`: sessions the provider CLIs recorded for `cwd`
     /// that have no row yet.
     fn cli_sessions_list(&self, _cwd: String) -> StoreFuture<Vec<CliSession>> {
@@ -303,6 +325,13 @@ impl SessionBackend for StoreBackend {
         })
     }
 
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        let events = self.events.clone();
+        self.run(move |store| {
+            session_store::session_discard_draft(store, events.as_ref(), session_id)
+        })
+    }
+
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()> {
         self.run(move |store| session_store::session_set_archived(store, session_id, archived))
     }
@@ -353,6 +382,35 @@ impl SessionBackend for StoreBackend {
         self.executor
             .spawn(async move { write_context_snapshot(&dir, &session_id, &name, &text) })
             .boxed()
+    }
+
+    fn write_switch_snapshot(
+        &self,
+        session_id: String,
+        switch_id: String,
+        content: String,
+    ) -> StoreFuture<String> {
+        let data_dir = self.data_dir.clone();
+        self.run(move |store| {
+            context_history::session_context_snapshot(
+                store,
+                &data_dir,
+                &session_id,
+                &switch_id,
+                &content,
+            )
+        })
+    }
+
+    fn snapshot_context_assets(
+        &self,
+        session_id: String,
+        attachments: Vec<ContextAssetSource>,
+    ) -> StoreFuture<Vec<ContextAssetSnapshot>> {
+        let data_dir = self.data_dir.clone();
+        self.run(move |store| {
+            context_history::session_context_assets(store, &data_dir, &session_id, attachments)
+        })
     }
 
     fn claude_shell_commands(

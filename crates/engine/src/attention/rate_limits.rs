@@ -133,6 +133,27 @@ pub struct RateLimitResetCredits {
     pub credits: Option<Vec<RateLimitResetCredit>>,
 }
 
+/// A weekly limit that applies to one model: `label` names it for people,
+/// `model` is what a selected model id is matched against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedRateLimitWindow {
+    #[serde(flatten)]
+    pub window: RateLimitWindow,
+    pub label: String,
+    pub model: String,
+}
+
+/// `extraUsage`: Claude usage credits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraUsage {
+    pub enabled: bool,
+    pub used_credits: Option<f64>,
+    pub monthly_limit: Option<f64>,
+    pub used_percent: Option<f64>,
+}
+
 /// `ProviderRateLimits`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +164,12 @@ pub struct ProviderRateLimits {
     pub monthly: Option<RateLimitWindow>,
     /// Codex-only banked rate-limit reset rewards, when supplied by app-server.
     pub reset_credits: Option<RateLimitResetCredits>,
+    /// Claude's weekly limits for one model family, such as Opus or Fable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_weekly: Vec<ScopedRateLimitWindow>,
+    /// Claude's usage credits, which take over once plan limits run out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_usage: Option<ExtraUsage>,
     pub updated_at: i64,
     pub error: Option<String>,
     pub status: RateLimitStatus,
@@ -184,6 +211,8 @@ pub fn idle_rate_limits(provider: RateLimitProvider) -> ProviderRateLimits {
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: 0,
         error: None,
         status: RateLimitStatus::Idle,
@@ -207,6 +236,8 @@ pub fn fetching_rate_limits(
         weekly: previous.and_then(|previous| previous.weekly),
         monthly: previous.and_then(|previous| previous.monthly),
         reset_credits: previous.and_then(|previous| previous.reset_credits.clone()),
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: previous.map(|previous| previous.updated_at).unwrap_or(0),
         error: None,
         status: RateLimitStatus::Fetching,
@@ -225,6 +256,8 @@ pub fn unavailable_rate_limits(
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: Some(error.to_string()),
         status: RateLimitStatus::Unavailable,
@@ -252,6 +285,8 @@ pub fn error_rate_limits(
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: Some(error.to_string()),
         status: RateLimitStatus::Error,
@@ -360,14 +395,54 @@ pub fn rate_limit_window_tooltip(window: &RateLimitWindow, now: i64) -> String {
     }
 }
 
-/// `exhaustedWindowResetAt`: when a used-up window resets; the later one
-/// when several are spent.
-pub fn exhausted_window_reset_at(limits: &ProviderRateLimits) -> Option<i64> {
-    let mut latest: Option<i64> = None;
-    for window in [limits.session, limits.weekly, limits.monthly]
+/// The lowercase letter runs of `text`: `/[a-z]+/g` on its lowercase form.
+fn letter_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_lowercase())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `relevantRateLimitWindows`: the windows that limit `model`. A scoped
+/// weekly limit counts when it names the model's family, or names no family
+/// at all. Without a model every window counts.
+pub fn relevant_rate_limit_windows(
+    limits: &ProviderRateLimits,
+    model: Option<&str>,
+) -> Vec<RateLimitWindow> {
+    let selected = model.map(letter_words).unwrap_or_default();
+    let scoped = limits.scoped_weekly.iter().filter(|scoped| {
+        if selected.is_empty() {
+            return true;
+        }
+        let words = letter_words(&scoped.model);
+        let family = words
+            .iter()
+            .find(|word| matches!(word.as_str(), "opus" | "sonnet" | "haiku"))
+            .or_else(|| words.iter().find(|word| *word != "claude"));
+        family.is_none_or(|family| selected.contains(family))
+    });
+    [limits.session, limits.weekly, limits.monthly]
         .into_iter()
         .flatten()
-    {
+        .chain(scoped.map(|scoped| scoped.window))
+        .collect()
+}
+
+/// `exhaustedWindowResetAt`: when a used-up window resets; the later one
+/// when several are spent. Every scoped limit counts.
+pub fn exhausted_window_reset_at(limits: &ProviderRateLimits) -> Option<i64> {
+    exhausted_window_reset_at_for(limits, None)
+}
+
+/// [`exhausted_window_reset_at`] over the windows that limit `model`.
+pub fn exhausted_window_reset_at_for(
+    limits: &ProviderRateLimits,
+    model: Option<&str>,
+) -> Option<i64> {
+    let mut latest: Option<i64> = None;
+    for window in relevant_rate_limit_windows(limits, model) {
         let Some(resets_at) = window.resets_at else {
             continue;
         };
@@ -474,6 +549,60 @@ fn used_percent_from(rec: &Map<String, Value>) -> Option<f64> {
         .or_else(|| number_field(rec, "utilization"))
 }
 
+/// Claude's model-scoped weekly limits: the older `seven_day_opus` style
+/// fields, then `weekly_scoped` rows in `limits`, which replace a field of
+/// the same name.
+fn claude_scoped_weekly(rec: &Map<String, Value>) -> Vec<ScopedRateLimitWindow> {
+    let mut scoped: Vec<ScopedRateLimitWindow> = Vec::new();
+    for (key, label) in [
+        ("seven_day_opus", "Opus"),
+        ("seven_day_sonnet", "Sonnet"),
+        ("seven_day_fable", "Fable"),
+    ] {
+        if let Some(window) = map_usage_window(rec.get(key), WEEKLY_WINDOW_MINUTES) {
+            scoped.push(ScopedRateLimitWindow {
+                window,
+                label: label.into(),
+                model: label.into(),
+            });
+        }
+    }
+    let limits = rec.get("limits").and_then(Value::as_array);
+    for limit in limits.into_iter().flatten().filter_map(Value::as_object) {
+        let scope_model =
+            as_record(limit.get("scope")).and_then(|scope| as_record(scope.get("model")));
+        let label = scope_model.and_then(|model| string_field(model, "display_name"));
+        let (Some("weekly_scoped"), Some(label)) =
+            (limit.get("kind").and_then(Value::as_str), label)
+        else {
+            continue;
+        };
+        let raw = serde_json::json!({
+            "utilization": limit.get("percent"),
+            "resets_at": limit.get("resets_at"),
+        });
+        let Some(window) = map_usage_window(Some(&raw), WEEKLY_WINDOW_MINUTES) else {
+            continue;
+        };
+        let model = scope_model
+            .and_then(|model| string_field(model, "id"))
+            .unwrap_or_else(|| label.clone());
+        let row = ScopedRateLimitWindow {
+            window,
+            label: label.clone(),
+            model,
+        };
+        match scoped
+            .iter_mut()
+            .find(|existing| existing.label.to_lowercase() == label.to_lowercase())
+        {
+            Some(existing) => *existing = row,
+            None => scoped.push(row),
+        }
+    }
+    scoped
+}
+
 /// `parseClaudeOAuthUsage`.
 pub fn parse_claude_oauth_usage(body: &str, now: i64) -> ProviderRateLimits {
     let Ok(parsed) = serde_json::from_str::<Value>(body) else {
@@ -492,12 +621,20 @@ pub fn parse_claude_oauth_usage(body: &str, now: i64) -> ProviderRateLimits {
             now,
         );
     };
+    let extra = as_record(rec.get("extra_usage"));
     ProviderRateLimits {
         provider: RateLimitProvider::Claude,
         session: map_usage_window(rec.get("five_hour"), SESSION_WINDOW_MINUTES),
         weekly: map_usage_window(rec.get("seven_day"), WEEKLY_WINDOW_MINUTES),
         monthly: None,
         reset_credits: None,
+        scoped_weekly: claude_scoped_weekly(rec),
+        extra_usage: extra.map(|extra| ExtraUsage {
+            enabled: extra.get("is_enabled") == Some(&Value::Bool(true)),
+            used_credits: number_field(extra, "used_credits"),
+            monthly_limit: number_field(extra, "monthly_limit"),
+            used_percent: number_field(extra, "utilization"),
+        }),
         updated_at: now,
         error: None,
         status: RateLimitStatus::Ok,
@@ -529,6 +666,8 @@ pub fn parse_codex_rate_limits(result: &Value, now: i64) -> ProviderRateLimits {
         weekly: map_codex_snapshot(classified.1, WEEKLY_WINDOW_MINUTES),
         monthly: map_codex_snapshot(classified.2, MONTHLY_WINDOW_MINUTES),
         reset_credits: parse_reset_credits(credits),
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: None,
         status: RateLimitStatus::Ok,
@@ -548,6 +687,8 @@ pub fn parse_opencode_go_usage(result: &Value, now: i64) -> ProviderRateLimits {
         weekly: map_opencode_go_window(field("weekly"), WEEKLY_WINDOW_MINUTES),
         monthly: map_opencode_go_window(field("monthly"), MONTHLY_WINDOW_MINUTES),
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: None,
         status: RateLimitStatus::Ok,
@@ -567,6 +708,8 @@ pub fn parse_droid_usage(result: &Value, now: i64) -> ProviderRateLimits {
         weekly: map_droid_window(field("weekly"), WEEKLY_WINDOW_MINUTES),
         monthly: map_droid_window(field("monthly"), MONTHLY_WINDOW_MINUTES),
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: None,
         status: RateLimitStatus::Ok,
@@ -609,6 +752,8 @@ pub fn parse_grok_billing(result: &Value, now: i64) -> ProviderRateLimits {
         weekly: if monthly { None } else { window },
         monthly: if monthly { window } else { None },
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: now,
         error: None,
         status: RateLimitStatus::Ok,
@@ -944,6 +1089,87 @@ mod tests {
         assert_eq!(weekly.used_percent, 41.0);
         assert_eq!(weekly.window_minutes, 10_080);
         assert_eq!(weekly.resets_at, Some(iso("2026-09-01T00:00:00.000Z")));
+    }
+
+    #[test]
+    fn retains_legacy_and_reported_model_scoped_claude_quotas_and_usage_credits() {
+        let parsed = parse_claude_oauth_usage(
+            &serde_json::json!({
+                "five_hour": { "utilization": 10 },
+                "seven_day": { "utilization": 20 },
+                "seven_day_opus": { "utilization": 60 },
+                "limits": [
+                    {
+                        "kind": "weekly_scoped",
+                        "scope": { "model": { "display_name": "Fable 5.1" } },
+                        "percent": 100,
+                        "resets_at": "2026-10-05T00:00:00Z",
+                    },
+                    { "kind": "unknown", "percent": 90 },
+                ],
+                "extra_usage": {
+                    "is_enabled": true,
+                    "used_credits": 25,
+                    "monthly_limit": 100,
+                    "utilization": 25,
+                },
+            })
+            .to_string(),
+            0,
+        );
+        let rows: Vec<(&str, f64)> = parsed
+            .scoped_weekly
+            .iter()
+            .map(|row| (row.label.as_str(), row.window.used_percent))
+            .collect();
+        assert_eq!(rows, [("Opus", 60.0), ("Fable 5.1", 100.0)]);
+        assert_eq!(
+            parsed.extra_usage,
+            Some(ExtraUsage {
+                enabled: true,
+                used_credits: Some(25.0),
+                monthly_limit: Some(100.0),
+                used_percent: Some(25.0),
+            })
+        );
+        let reset = date_parse("2026-10-05T00:00:00Z");
+        assert_eq!(
+            exhausted_window_reset_at_for(&parsed, Some("claude:fable-5-1")),
+            reset
+        );
+        assert_eq!(
+            exhausted_window_reset_at_for(&parsed, Some("claude:sonnet-5")),
+            None
+        );
+    }
+
+    #[test]
+    fn matches_scoped_quotas_against_the_selected_model() {
+        for (scope, model, relevant) in [
+            ("5.1", "claude:sonnet-5", true),
+            ("opus", "claude:octopus-5", false),
+            ("claude-4-opus", "claude:claude-opus-4", true),
+            ("us.anthropic.claude-opus-4", "claude:opus-4", true),
+            ("Fable 5.1", "claude:fable-5-1", true),
+            ("opus", "claude:sonnet-5", false),
+        ] {
+            let window = RateLimitWindow {
+                used_percent: 100.0,
+                window_minutes: WEEKLY_WINDOW_MINUTES,
+                resets_at: Some(5),
+            };
+            let mut limits = idle_rate_limits(RateLimitProvider::Claude);
+            limits.scoped_weekly = vec![ScopedRateLimitWindow {
+                window,
+                label: scope.into(),
+                model: scope.into(),
+            }];
+            assert_eq!(
+                !relevant_rate_limit_windows(&limits, Some(model)).is_empty(),
+                relevant,
+                "{scope} against {model}"
+            );
+        }
     }
 
     #[test]

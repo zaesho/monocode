@@ -20,6 +20,7 @@ use monocode_core::{HarnessEvent, HarnessId, Session};
 
 use super::engine::Engine;
 use super::harness_flush::{FlushKind, ScheduledFlush, schedule_harness_flush};
+use super::hooks::CatalogScope;
 use super::in_flight::{in_flight_refs, in_flight_snapshot_key, should_write_in_flight_snapshot};
 use super::reducer::{Reducer, apply_harness_events, last_user_block_id};
 use super::session_cache::SessionCache;
@@ -935,15 +936,7 @@ impl Sessions {
             return Some(appeared.clone());
         }
         let hooks = Engine::hooks(cx);
-        if restored.worktree_removed != Some(true)
-            && restored
-                .provider_session_id
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-            && hooks.harness.is_live_harness(restored.harness)
-        {
-            hooks.harness.bind_session(&restored, cx);
-        }
+        bind_resumed_sessions(std::slice::from_ref(&restored), &hooks, cx);
         self.last_persisted
             .insert(restored.id.clone(), persist_fingerprint(&restored));
         self.list.push(restored.clone());
@@ -1002,7 +995,21 @@ impl Sessions {
                 harnesses.push(session.harness);
             }
         }
-        let refresh = hooks.harness.refresh_catalogs(harnesses, cx);
+        // Claude lists models by project and account, so read them where the
+        // session in front works.
+        let scope = self
+            .list
+            .iter()
+            .find(|session| {
+                session.harness == HarnessId::Claude
+                    && hooks.workspace.is_foreground(&session.id, cx)
+            })
+            .map(|session| CatalogScope {
+                cwd: Some(monocode_core::session::session_work_cwd(session).to_string()),
+                provider_account_id: session.provider_account_id.clone(),
+            })
+            .unwrap_or_default();
+        let refresh = hooks.harness.refresh_catalogs(harnesses, scope, cx);
         let projects = hooks
             .harness
             .refresh_project_catalogs(opencode_directories, cx);
@@ -1046,12 +1053,37 @@ pub fn bind_resumed_sessions(
     cx: &mut App,
 ) {
     for session in sessions {
-        if session.worktree_removed == Some(true)
-            || session
-                .provider_session_id
+        if session.worktree_removed == Some(true) {
+            continue;
+        }
+        let cwd = monocode_core::session::session_work_cwd(session);
+        // The source of a pending switch keeps its conversation, so a
+        // switch back can resume it.
+        if let Some(source) = &session.pending_switch
+            && source
+                .from_provider_session_id
                 .as_ref()
-                .is_none_or(|id| id.is_empty())
+                .is_some_and(|id| !id.is_empty())
+            && source.from != session.harness
+            && hooks.harness.is_live_harness(source.from)
+        {
+            let mut from = session.clone();
+            from.harness = source.from;
+            from.provider_session_id = source.from_provider_session_id.clone();
+            from.provider_account_id = source.from_provider_account_id.clone();
+            hooks.harness.bind_session(&from, cx);
+        }
+        if session
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|id| id.is_empty())
             || !hooks.harness.is_live_harness(session.harness)
+            || monocode_core::provider_context::requires_fresh_provider_binding(
+                session,
+                session.harness,
+                cwd,
+                session.provider_account_id.as_deref(),
+            )
         {
             continue;
         }

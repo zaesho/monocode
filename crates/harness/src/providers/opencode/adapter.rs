@@ -3161,6 +3161,7 @@ impl HarnessAdapter for OpenCodeAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         let text = self.inner.text.clone();
         let git = self.inner.git.clone();
@@ -3171,6 +3172,7 @@ impl HarnessAdapter for OpenCodeAdapter {
     fn generate_pr_content(
         &self,
         cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         let text = self.inner.text.clone();
         let git = self.inner.git.clone();
@@ -3181,6 +3183,7 @@ impl HarnessAdapter for OpenCodeAdapter {
         &self,
         cwd: String,
         message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         let text = self.inner.text.clone();
         async move { Ok(generate_open_code_branch_name(&text, &cwd, &message).await) }.boxed()

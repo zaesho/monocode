@@ -29,6 +29,8 @@ pub(super) struct FakeUpdates {
     pub hold_checks: Cell<bool>,
     pub hold_updates: Cell<bool>,
     held: RefCell<Vec<oneshot::Sender<()>>>,
+    /// What an updater that installs nothing prints.
+    pub update_instructions: RefCell<String>,
     listeners: RefCell<Vec<Listener>>,
 }
 
@@ -48,6 +50,7 @@ impl Default for FakeUpdates {
             hold_checks: Cell::new(false),
             hold_updates: Cell::new(false),
             held: RefCell::default(),
+            update_instructions: RefCell::default(),
             listeners: RefCell::default(),
         }
     }
@@ -130,18 +133,21 @@ impl HarnessUpdateHost for FakeUpdates {
         self.dismissed.set(self.dismissed.get() + 1);
     }
 
-    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<()> {
+    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<String> {
         self.updates.borrow_mut().push(harness);
-        if self.updater_installs.get() {
+        let printed = if self.updater_installs.get() {
             let latest = self.latest.borrow()[&harness].clone();
             self.set(&self.installed, harness, &latest);
-        }
+            "Updated".to_string()
+        } else {
+            self.update_instructions.borrow().clone()
+        };
         let gate = self.gate(self.hold_updates.get());
         cx.foreground_executor().spawn(async move {
             if let Some(gate) = gate {
                 gate.await.ok();
             }
-            Ok(())
+            Ok(printed)
         })
     }
 
@@ -477,4 +483,21 @@ fn describes_each_row_state() {
         row_description(&unknown, &RowState::Idle),
         "Could not check: offline"
     );
+}
+
+#[gpui::test]
+fn shows_package_manager_instructions_when_the_installed_version_is_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let host = Rc::new(FakeUpdates::default());
+    host.updater_installs.set(false);
+    *host.update_instructions.borrow_mut() =
+        "Claude is managed by Homebrew. Run brew upgrade claude-code.".into();
+    let (notice, cx) = mount_notice(cx, host.clone());
+    click(cx, "button:Update:claude");
+    assert_eq!(
+        notice.read_with(cx, |notice, cx| notice.row(HarnessId::Claude, cx)),
+        RowState::Failed("Claude is managed by Homebrew. Run brew upgrade claude-code.".into())
+    );
+    assert!(host.refreshed.borrow().is_empty());
 }

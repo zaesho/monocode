@@ -104,18 +104,21 @@ fn normalize_path_for_compare(path: &str) -> String {
 /// harness folders. Same name: earlier roots win.
 /// Excludes disabled paths before deduplication so lower-priority enabled
 /// same-name files can fall through.
+///
+/// Claude's user skills and plugins come from the default account's config
+/// directory, which `CLAUDE_CONFIG_DIR` can move.
 pub fn list_skills(
     cwd: String,
     disabled_paths: Option<Vec<String>>,
 ) -> Result<Vec<DiscoveredSkill>, String> {
-    list_skills_with_context(
-        cwd,
-        disabled_paths,
-        SkillDiscoveryContext {
-            home: dirs_home().map(PathBuf::from),
-            ..Default::default()
-        },
-    )
+    let mut context = SkillDiscoveryContext {
+        home: dirs_home().map(PathBuf::from),
+        ..Default::default()
+    };
+    if let Some(claude_dir) = crate::harness::configured_claude_dir() {
+        context.provider_homes.insert("claude".into(), claude_dir);
+    }
+    list_skills_with_context(cwd, disabled_paths, context)
 }
 
 pub fn list_skills_with_context(
@@ -711,6 +714,52 @@ mod tests {
         let dir = root.join(folder);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+
+    #[test]
+    fn named_claude_profile_uses_its_skills_and_plugin_registry() {
+        let project = tmp("profile-project");
+        let home = tmp("profile-home");
+        let profile = tmp("profile");
+        write_skill(
+            &home.0.join(".claude/skills"),
+            "default-only",
+            "---\nname: default-only\ndescription: Default skill\n---\nDefault",
+        );
+        write_skill(
+            &profile.0.join("skills"),
+            "named-only",
+            "---\nname: named-only\ndescription: Named skill\n---\nNamed",
+        );
+        write_skill(
+            &project.0.join(".claude/skills"),
+            "project-only",
+            "---\nname: project-only\ndescription: Project skill\n---\nProject",
+        );
+        let plugin = profile.0.join("plugins/cache/community/workflow-kit/1.0.0");
+        write_skill(
+            &plugin.join("skills"),
+            "plugin-only",
+            "---\nname: plugin-only\ndescription: Profile plugin\n---\nPlugin",
+        );
+        let registry = serde_json::json!({"version": 2, "plugins": {"workflow-kit@community": [{"scope": "user", "installPath": plugin, "version": "1.0.0"}]}});
+        std::fs::write(
+            profile.0.join("plugins/installed_plugins.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let context = SkillDiscoveryContext {
+            home: Some(home.0.clone()),
+            provider_homes: HashMap::from([("claude".to_string(), profile.0.clone())]),
+        };
+        let found =
+            list_skills_with_context(project.0.to_string_lossy().into_owned(), None, context)
+                .unwrap();
+        let names: Vec<_> = found.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["named-only", "project-only", "workflow-kit:plugin-only"]
+        );
     }
 
     fn write_plugin_setting(root: &Path, file: &str, plugin_id: &str, enabled: bool) {

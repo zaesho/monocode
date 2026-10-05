@@ -43,7 +43,10 @@ fn busy(id: &str) -> Session {
 }
 
 fn delta(text: &str) -> HarnessEvent {
-    HarnessEvent::MessageDelta { text: text.into() }
+    HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: None,
+    }
 }
 
 /// Records harness registry calls.
@@ -1324,7 +1327,7 @@ async fn discards_a_draft_only_record_before_reusing_its_open_session_id(cx: &mu
     let _ = futures::future::join3(draft, discarding, later).await;
     assert_eq!(
         t.backend.commands(),
-        vec!["session_upsert", "session_delete", "session_upsert"]
+        vec!["session_upsert", "session_discard_draft", "session_upsert"]
     );
 }
 

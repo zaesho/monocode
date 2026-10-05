@@ -92,11 +92,17 @@ fn entry_at(entry: &CliEntry) -> Option<i64> {
 fn events_for_entry(source: &CliSession, entry: &CliEntry) -> Vec<HarnessEvent> {
     match entry {
         CliEntry::Assistant { text, .. } => vec![
-            HarnessEvent::MessageDelta { text: text.clone() },
+            HarnessEvent::MessageDelta {
+                text: text.clone(),
+                append: None,
+            },
             HarnessEvent::MessageCompleted,
         ],
         CliEntry::Reasoning { text, .. } => vec![
-            HarnessEvent::ReasoningDelta { text: text.clone() },
+            HarnessEvent::ReasoningDelta {
+                text: text.clone(),
+                append: None,
+            },
             HarnessEvent::ReasoningCompleted,
         ],
         CliEntry::Tool(tool) => tool_events(source, tool),

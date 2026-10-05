@@ -229,8 +229,8 @@ impl HarnessUpdateHost for GalleryHost {
             },
         ])
     }
-    fn update_cli(&self, _: HarnessId, _: &mut App) -> host::HostTask<()> {
-        Task::ready(Ok(()))
+    fn update_cli(&self, _: HarnessId, _: &mut App) -> host::HostTask<String> {
+        Task::ready(Ok(String::new()))
     }
     fn installed_version(&self, _: HarnessId, _: &mut App) -> host::HostTask<Option<String>> {
         Task::ready(Ok(Some("2.2.0".into())))

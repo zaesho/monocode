@@ -215,7 +215,7 @@ fn generates_a_commit_message_from_staged_changes() {
         );
         let message = h
             .adapter
-            .generate_commit_message("/repo".into(), None)
+            .generate_commit_message("/repo".into(), None, None)
             .await
             .unwrap();
         assert_eq!(message, "Fix login redirect\n\nStop the loop.");
@@ -244,7 +244,7 @@ fn reports_what_the_model_said_when_a_commit_message_does_not_parse() {
         );
         let error = h
             .adapter
-            .generate_commit_message("/repo".into(), None)
+            .generate_commit_message("/repo".into(), None, None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -268,7 +268,7 @@ fn falls_back_to_the_commit_summary_for_pull_request_text() {
         );
         let content = h
             .adapter
-            .generate_pr_content("/repo".into())
+            .generate_pr_content("/repo".into(), None)
             .await
             .unwrap()
             .unwrap();
@@ -287,7 +287,7 @@ fn fails_git_text_without_a_git_context() {
         let h = Harness::new();
         let error = h
             .adapter
-            .generate_commit_message("/repo".into(), None)
+            .generate_commit_message("/repo".into(), None, None)
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "Git context is not available");

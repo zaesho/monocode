@@ -20,6 +20,9 @@ pub struct RemoteSessionStatus {
     /// Why the host's model list did not load:
     /// `catalog.errors[harness] ?? catalogError`.
     pub catalog_problem: String,
+    /// A provider request may already have run and waits for the user to
+    /// inspect it. `Some(true)` when the host can record the confirmation.
+    pub inspection: Option<bool>,
 }
 
 /// A turn that failed before the host accepted it.
@@ -40,6 +43,9 @@ pub enum NoticeAction {
     Dismiss,
     /// Load the host's model list again.
     RetryCatalog,
+    /// Record that the user inspected a request that may have run. Sends
+    /// no provider input.
+    ConfirmInspection,
 }
 
 impl NoticeAction {
@@ -48,6 +54,7 @@ impl NoticeAction {
             Self::RetryPending | Self::RetryCatalog => "Retry",
             Self::TryAgain => "Try again",
             Self::Dismiss => "Dismiss",
+            Self::ConfirmInspection => "Confirm inspection",
         }
     }
 }
@@ -74,6 +81,27 @@ impl RemoteNotice {
 /// first turn, then any error, then a model list that did not load.
 pub fn remote_notice(status: &RemoteSessionStatus, machine_name: &str) -> Option<RemoteNotice> {
     let alert = !status.error.is_empty();
+    // A pending command here is the confirmation itself, so it waits below.
+    if let Some(confirmable) = status.inspection
+        && !status.pending
+    {
+        let text = "The provider request may already have run. Inspect its work before continuing.";
+        return Some(if confirmable {
+            RemoteNotice {
+                text: text.into(),
+                detail: status.error.clone(),
+                action: NoticeAction::ConfirmInspection,
+                alert,
+            }
+        } else {
+            RemoteNotice {
+                text: text.into(),
+                detail: "Update this host to confirm inspection.".into(),
+                action: NoticeAction::Dismiss,
+                alert,
+            }
+        });
+    }
     if status.pending && !status.sending {
         return Some(RemoteNotice {
             text: "Waiting for the host to confirm your request.".into(),
@@ -217,6 +245,34 @@ mod tests {
         assert_eq!(notice.detail, "codex is not installed");
         assert_eq!(notice.action, NoticeAction::RetryCatalog);
         assert!(!notice.alert);
+    }
+
+    #[test]
+    fn asks_to_confirm_inspection_of_a_request_that_may_have_run() {
+        let waiting = RemoteSessionStatus {
+            inspection: Some(true),
+            ..status()
+        };
+        let notice = remote_notice(&waiting, "Home server").unwrap();
+        assert_eq!(notice.action, NoticeAction::ConfirmInspection);
+        assert_eq!(notice.action.label(), "Confirm inspection");
+        assert!(notice.text.contains("may already have run"));
+        let old_host = RemoteSessionStatus {
+            inspection: Some(false),
+            ..status()
+        };
+        let notice = remote_notice(&old_host, "Home server").unwrap();
+        assert_eq!(notice.action, NoticeAction::Dismiss);
+        assert_eq!(notice.detail, "Update this host to confirm inspection.");
+        let confirming = RemoteSessionStatus {
+            inspection: Some(true),
+            pending: true,
+            ..status()
+        };
+        assert_eq!(
+            remote_notice(&confirming, "Home server").unwrap().action,
+            NoticeAction::RetryPending
+        );
     }
 
     #[test]

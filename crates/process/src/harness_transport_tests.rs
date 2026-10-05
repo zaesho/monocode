@@ -7,8 +7,8 @@ use super::*;
 struct Events(Mutex<mpsc::Sender<String>>);
 
 impl HarnessEvents for Events {
-    fn stdout(&self, _: &str, _: String) {}
-    fn stderr(&self, _: &str, _: String) {}
+    fn stdout(&self, _: &str, _: String, _: u32) {}
+    fn stderr(&self, _: &str, _: String, _: u32) {}
     fn exit(&self, _: &str, _: Option<i32>, _: u32) {}
     fn sse(&self, _: &str, data: String) {
         let _ = self.0.lock().unwrap().send(data);

@@ -10,6 +10,28 @@ use monocode_view_scm::{Scm, ScmHooks};
 use monocode_view_settings::settings::SlotContext;
 use std::{future::Future, rc::Rc, sync::Arc};
 
+/// The account selected for the helper harness in `cwd`, as the
+/// TypeScript registry chose it for Git text.
+fn helper_account(
+    services: &AppServices,
+    preferred: Option<monocode_core::HarnessId>,
+    cwd: &str,
+) -> Option<String> {
+    use monocode_harness::core::provider_accounts::{
+        selected_provider_account_id, supports_provider_accounts,
+    };
+    let availability = services.availability.clone();
+    let harness =
+        monocode_harness::pick_text_harness(preferred, |id| availability.is_harness_available(id));
+    supports_provider_accounts(harness).then(|| {
+        selected_provider_account_id(
+            &monocode_engine::attention::KvLocalStore(services.kv.clone()),
+            harness,
+            Some(cwd),
+        )
+    })
+}
+
 struct AppScm(Scm);
 impl Global for AppScm {}
 
@@ -44,6 +66,7 @@ fn app_hooks() -> ScmHooks {
             let Some(services) = AppServices::try_global(cx) else {
                 return Task::ready(Err("The provider services are unavailable.".into()));
             };
+            let account = helper_account(services, request.text_harness, &request.cwd);
             let registry = services.registry.clone();
             let availability = services.availability.clone();
             let spawner = registry.spawner().clone();
@@ -58,6 +81,7 @@ fn app_hooks() -> ScmHooks {
                         &request.cwd,
                         request.text_harness,
                         Some(provider_signal),
+                        account.as_deref(),
                         |id| availability.is_harness_available(id),
                     )
                     .await
@@ -70,6 +94,7 @@ fn app_hooks() -> ScmHooks {
             let Some(services) = AppServices::try_global(cx) else {
                 return Task::ready(Err("The provider services are unavailable.".into()));
             };
+            let account = helper_account(services, request.text_harness, &request.cwd);
             let registry = services.registry.clone();
             let availability = services.availability.clone();
             let spawner = registry.spawner().clone();
@@ -81,6 +106,7 @@ fn app_hooks() -> ScmHooks {
                         &registry,
                         &request.cwd,
                         request.text_harness,
+                        account.as_deref(),
                         |id| availability.is_harness_available(id),
                     )
                     .await

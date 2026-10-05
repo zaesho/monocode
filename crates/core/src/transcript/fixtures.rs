@@ -208,6 +208,7 @@ pub fn handoff(id: &str) -> Block {
         to: HarnessId::Claude,
         status: HandoffStatus::Ready,
         pending: None,
+        transfer: None,
         extra: Default::default(),
     });
     block

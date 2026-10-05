@@ -26,5 +26,8 @@ base64.workspace = true
 regex.workspace = true
 dunce = "1.0.5"
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3"

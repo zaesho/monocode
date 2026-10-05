@@ -273,7 +273,10 @@ impl GrokText {
                     if !delta.is_empty()
                         && let Some(sink) = sink
                     {
-                        sink(HarnessEvent::MessageDelta { text: delta });
+                        sink(HarnessEvent::MessageDelta {
+                            text: delta,
+                            append: None,
+                        });
                     }
                 }
             })

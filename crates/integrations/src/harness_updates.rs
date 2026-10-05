@@ -104,12 +104,13 @@ fn fetch_text(url: &str, accept: &str) -> Result<String, String> {
 
 /// Runs the harness's self-update against the binary MonoCode resolved for
 /// it. stdin is closed, so an updater that stops to ask fails instead of
-/// hanging.
+/// hanging. Returns what the updater printed: a CLI that a package manager
+/// installed says there how to update it instead.
 pub fn harness_update(
     command: String,
     binary_provider: String,
     binary_path: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let args: Vec<String> = update_args(&binary_provider)
         .ok_or_else(|| format!("No updater for harness: {binary_provider}"))?
         .iter()
@@ -120,7 +121,10 @@ pub fn harness_update(
     }
     let output = exec_output(&command, &args, None, UPDATE_TIMEOUT)?;
     if output.status.success() {
-        return Ok(());
+        let printed = [&output.stdout, &output.stderr]
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+            .join("\n");
+        return Ok(printed.trim().to_string());
     }
     Err(update_failure(&output.stdout, &output.stderr))
 }

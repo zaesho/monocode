@@ -88,20 +88,20 @@ pub fn resolve_context(
         if isolated {
             return None;
         }
-        let key = if provider == "claude" {
-            "CLAUDE_CONFIG_DIR"
+        // The default Claude account also honors CLAUDE_CONFIG_DIR from the
+        // login shell once that environment has loaded.
+        let configured = if provider == "claude" {
+            monocode_process::harness::configured_claude_dir_if_loaded().map(Into::into)
         } else {
-            "CODEX_HOME"
+            std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty())
         };
-        std::env::var_os(key)
-            .filter(|value| !value.is_empty())
-            .and_then(|value| {
-                monocode_process::harness::resolve_provider_home(
-                    Path::new(&value),
-                    Path::new(&context.cwd),
-                )
-                .ok()
-            })
+        configured.and_then(|value| {
+            monocode_process::harness::resolve_provider_home(
+                Path::new(&value),
+                Path::new(&context.cwd),
+            )
+            .ok()
+        })
     });
     let root = root.filter(|root| {
         !isolated

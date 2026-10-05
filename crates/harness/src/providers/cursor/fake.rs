@@ -302,8 +302,8 @@ impl ChildBackend for FakeBackend {
         async move { Err(format!("no file {path}")) }.boxed()
     }
 
-    fn update_cli(&self, _: String, _: HarnessId, _: Option<String>) -> ChildFuture<()> {
-        done(())
+    fn update_cli(&self, _: String, _: HarnessId, _: Option<String>) -> ChildFuture<String> {
+        done(String::new())
     }
 
     fn home_dir(&self) -> ChildFuture<String> {

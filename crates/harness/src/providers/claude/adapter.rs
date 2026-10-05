@@ -13,9 +13,10 @@ use monocode_core::harness_event::{
 use monocode_core::models::AgentModel;
 use monocode_core::user_question::UserQuestionReply;
 
+use crate::core::context_transfer::ContextTransferCapabilities;
 use crate::core::register::HarnessContext;
 use crate::core::registry::{
-    AcceptedHook, AdapterCapabilities, EventSink, GeneratedPrContent, HarnessAdapter,
+    AcceptedHook, AdapterCapabilities, CatalogScope, EventSink, GeneratedPrContent, HarnessAdapter,
     TextPromptInput, TitleInput,
 };
 use crate::core::session_title::GeneratedSessionTitle;
@@ -30,6 +31,14 @@ use super::io::{ChildrenIo, SharedChildIo};
 use super::session::{ClaudeSessionOptions, ClaudeSessions};
 use super::text::ClaudeText;
 use super::title::generate_claude_session_title;
+
+/// Claude takes shared history as text, resumes its own conversation, and
+/// confirms acceptance through the replay of each request.
+pub const CLAUDE_CONTEXT_TRANSFER: ContextTransferCapabilities = ContextTransferCapabilities {
+    native_messages: false,
+    resumed_append: true,
+    explicit_acceptance: true,
+};
 
 /// What the app supplies that [`HarnessContext`] does not carry: the
 /// `monocode.claudeHooks` setting and the git reads behind commit and pull
@@ -155,9 +164,13 @@ impl HarnessAdapter for ClaudeAdapter {
         &self,
         input: SendTurnInput,
         on_event: EventSink,
-        _on_accepted: Option<AcceptedHook>,
+        on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.sessions.send_turn(input, on_event))
+        Box::pin(self.sessions.send_turn(input, on_event, on_accepted))
+    }
+
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        Some(CLAUDE_CONTEXT_TRANSFER)
     }
 
     fn compact_context(
@@ -190,6 +203,10 @@ impl HarnessAdapter for ClaudeAdapter {
         Box::pin(async move { self.sessions.stop_session(&session_id).await })
     }
 
+    fn needs_process(&self, session_id: &str) -> bool {
+        self.sessions.needs_process(session_id)
+    }
+
     fn forget_session(&self, session_id: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move { self.sessions.forget_session(&session_id).await })
     }
@@ -216,6 +233,13 @@ impl HarnessAdapter for ClaudeAdapter {
         })
     }
 
+    fn refresh_catalog_in(&self, scope: CatalogScope) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.catalog.refresh_in(scope).await;
+            Ok(())
+        })
+    }
+
     fn generate_title(
         &self,
         input: TitleInput,
@@ -227,27 +251,51 @@ impl HarnessAdapter for ClaudeAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
-            generate_claude_commit_message(&self.text, self.git.as_ref(), &cwd, signal).await
+            generate_claude_commit_message(
+                &self.text,
+                self.git.as_ref(),
+                &cwd,
+                provider_account_id.as_deref(),
+                signal,
+            )
+            .await
         })
     }
 
     fn generate_pr_content(
         &self,
         cwd: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
-        Box::pin(
-            async move { generate_claude_pr_content(&self.text, self.git.as_ref(), &cwd).await },
-        )
+        Box::pin(async move {
+            generate_claude_pr_content(
+                &self.text,
+                self.git.as_ref(),
+                &cwd,
+                provider_account_id.as_deref(),
+            )
+            .await
+        })
     }
 
     fn generate_branch_name(
         &self,
         cwd: String,
         message: String,
+        provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
-        Box::pin(async move { Ok(generate_claude_branch_name(&self.text, &cwd, &message).await) })
+        Box::pin(async move {
+            Ok(generate_claude_branch_name(
+                &self.text,
+                &cwd,
+                &message,
+                provider_account_id.as_deref(),
+            )
+            .await)
+        })
     }
 
     fn warmup_text(&self, cwd: String) -> BoxFuture<'_, Result<()>> {

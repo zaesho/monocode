@@ -582,6 +582,7 @@ impl ProjectsHooks for TestHooks {
             to,
             status: HandoffStatus::Ready,
             pending: Some(true),
+            transfer: None,
             extra: Default::default(),
         });
         next.blocks.push(block);

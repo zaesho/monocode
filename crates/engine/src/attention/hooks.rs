@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use gpui::{App, WeakEntity};
 use monocode_core::HarnessId;
 use monocode_core::attachment::Attachment;
-use monocode_core::block::TurnIntent;
+use monocode_core::block::{ModelTarget, TurnIntent};
 use monocode_core::handoff::HandoffComposerCard;
 use monocode_core::harness_event::ApprovalDecision;
 use monocode_core::notes::NoteComposerCard;
@@ -36,6 +36,8 @@ pub struct SubmitRequest {
     pub handoff_card: Option<HandoffComposerCard>,
     pub intent: Option<TurnIntent>,
     pub app_request_id: Option<String>,
+    /// The provider and model the row was queued with.
+    pub build_target: Option<ModelTarget>,
 }
 
 impl SubmitRequest {
@@ -47,6 +49,7 @@ impl SubmitRequest {
             attachments: Vec::new(),
             follow_up_behavior: None,
             queued_message_id: None,
+            build_target: None,
             note_card: None,
             handoff_card: None,
             intent: None,

@@ -94,14 +94,18 @@ pub fn apply_harness_events_mut(
             continue;
         };
         let start = index;
-        while index + 1 < events.len() && delta_role(&events[index + 1]) == Some(role) {
+        let append = delta_appends(&events[index]);
+        while index + 1 < events.len()
+            && delta_role(&events[index + 1]) == Some(role)
+            && delta_appends(&events[index + 1]) == append
+        {
             index += 1;
         }
         let texts: Vec<&str> = events[start..=index]
             .iter()
             .filter_map(delta_text)
             .collect();
-        changed |= patch_streaming(env, session, role, &texts, true);
+        changed |= patch_streaming(env, session, role, &texts, true, append);
         index += 1;
     }
     changed
@@ -115,9 +119,25 @@ fn delta_role(event: &HarnessEvent) -> Option<BlockRole> {
     }
 }
 
+/// The delta carries plain incremental text (`append: true`).
+fn delta_appends(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::MessageDelta {
+            append: Some(true),
+            ..
+        } | HarnessEvent::ReasoningDelta {
+            append: Some(true),
+            ..
+        }
+    )
+}
+
 fn delta_text(event: &HarnessEvent) -> Option<&str> {
     match event {
-        HarnessEvent::MessageDelta { text } | HarnessEvent::ReasoningDelta { text } => Some(text),
+        HarnessEvent::MessageDelta { text, .. } | HarnessEvent::ReasoningDelta { text, .. } => {
+            Some(text)
+        }
         _ => None,
     }
 }
@@ -136,9 +156,14 @@ pub fn apply_harness_event_mut(
     event: &HarnessEvent,
 ) -> bool {
     match event {
-        HarnessEvent::MessageDelta { text } => {
-            patch_streaming(env, session, BlockRole::Assistant, &[text.as_str()], true)
-        }
+        HarnessEvent::MessageDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Assistant,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
         HarnessEvent::MessagePart {
             part_id,
             text,
@@ -206,9 +231,14 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::ImageGenerated(GeneratedImage::Inline { .. }) => false,
-        HarnessEvent::ReasoningDelta { text } => {
-            patch_streaming(env, session, BlockRole::Reasoning, &[text.as_str()], true)
-        }
+        HarnessEvent::ReasoningDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Reasoning,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
         HarnessEvent::ReasoningCompleted => {
             finish_role(session, BlockRole::Reasoning);
             true
@@ -350,7 +380,27 @@ pub fn apply_harness_event_mut(
             session.provider_session_id = Some(provider_session_id.clone());
             true
         }
-        HarnessEvent::TurnStarted { provider_turn_id } => {
+        // A turn the provider started on its own has no user block to stamp;
+        // it only shows the session working until it finishes.
+        HarnessEvent::TurnStarted {
+            native: Some(true), ..
+        } => {
+            let changed = session.busy != Some(true);
+            session.busy = Some(true);
+            changed
+        }
+        HarnessEvent::TurnFinished { native } => {
+            if *native != Some(true) {
+                return false;
+            }
+            finish_role(session, BlockRole::Assistant);
+            finish_role(session, BlockRole::Reasoning);
+            session.busy = Some(false);
+            true
+        }
+        HarnessEvent::TurnStarted {
+            provider_turn_id, ..
+        } => {
             let Some(index) = last_user_index(&session.blocks) else {
                 return false;
             };
@@ -1045,6 +1095,7 @@ fn patch_streaming(
     role: BlockRole,
     texts: &[&str],
     streaming: bool,
+    append: bool,
 ) -> bool {
     if role == BlockRole::Reasoning && texts.iter().all(|text| text.is_empty()) {
         return false;
@@ -1060,9 +1111,16 @@ fn patch_streaming(
             // tokens and full snapshots, so concatenating the incoming chunks
             // would duplicate text. The text only ever grows, so it changed
             // exactly when a join did something.
+            // An appending provider sends plain increments, so they are
+            // concatenated as is.
             let mut changed = false;
             for text in texts {
-                changed |= join_stream_text_into(&mut last.text, text);
+                if append {
+                    changed |= !text.is_empty();
+                    last.text.push_str(text);
+                } else {
+                    changed |= join_stream_text_into(&mut last.text, text);
+                }
             }
             if !changed && last.streaming == Some(streaming) {
                 return false;
@@ -1072,9 +1130,13 @@ fn patch_streaming(
         }
     }
     seal_last_stream(&mut session.blocks);
-    let text = texts
-        .iter()
-        .fold(String::new(), |acc, text| join_stream_text(&acc, text));
+    let text = if append {
+        texts.concat()
+    } else {
+        texts
+            .iter()
+            .fold(String::new(), |acc, text| join_stream_text(&acc, text))
+    };
     session.blocks.push(Block {
         streaming: Some(streaming),
         ..Block::new(env.new_id(), role, text)

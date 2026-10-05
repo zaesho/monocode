@@ -872,6 +872,7 @@ async fn worktree_changes_refuse_busy_queued_and_orchestrated_sessions(cx: &mut 
     setup.insert(cx, busy);
     let mut queued = chat("queued", "/repo");
     queued.queued_messages = Some(vec![QueuedMessage {
+        selection: None,
         app_request_id: None,
         id: "q".into(),
         text: "later".into(),

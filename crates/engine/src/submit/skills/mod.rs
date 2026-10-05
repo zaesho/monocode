@@ -172,6 +172,13 @@ impl SkillCatalogContext {
         self
     }
 
+    /// [`Self::with_account`] for a session's account, `None` being the
+    /// default one.
+    pub fn with_provider_account(mut self, account_id: Option<String>) -> Self {
+        self.account_id = account_id;
+        self
+    }
+
     pub fn with_home(mut self, home: impl Into<String>) -> Self {
         self.home = Some(home.into());
         self
@@ -485,8 +492,16 @@ impl SkillCatalog {
             key.push('\0');
             key.push_str(session_id);
         }
+        // Each named account has its own user skills and plugins. The
+        // default account and no account read the same profile.
         key.push('\0');
-        key.push_str(context.account_id.as_deref().unwrap_or_default());
+        key.push_str(
+            context
+                .account_id
+                .as_deref()
+                .filter(|account| *account != "default")
+                .unwrap_or_default(),
+        );
         key.push('\0');
         key.push_str(context.home.as_deref().unwrap_or_default());
         let mut homes: Vec<_> = context.provider_homes.iter().collect();

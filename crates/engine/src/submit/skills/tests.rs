@@ -949,6 +949,29 @@ fn isolates_omp_sessions_while_retaining_pis_shared_project_cache() {
 }
 
 #[test]
+fn keys_catalogs_by_provider_account() {
+    let fixture = fixture();
+    let key = |harness, account: Option<&str>| {
+        fixture.catalog.skill_catalog_key(
+            &ctx(harness, "/repo").with_provider_account(account.map(str::to_string)),
+        )
+    };
+    assert_ne!(
+        key(HarnessId::Claude, Some("work")),
+        key(HarnessId::Claude, None)
+    );
+    assert_eq!(
+        key(HarnessId::Claude, Some("default")),
+        key(HarnessId::Claude, None)
+    );
+    // Codex accounts have their own CODEX_HOME and skills too.
+    assert_ne!(
+        key(HarnessId::Codex, Some("work")),
+        key(HarnessId::Codex, None)
+    );
+}
+
+#[test]
 fn a_live_command_update_supersedes_an_older_probe_and_refreshes_subscribers() {
     let fixture = fixture();
     let context = ctx(HarnessId::Omp, "/repo").with_session("thread");

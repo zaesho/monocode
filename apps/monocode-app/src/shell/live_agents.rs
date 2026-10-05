@@ -22,11 +22,26 @@ struct Snapshot {
     mascots: JsRecord<String>,
 }
 
+/// The project appearance records the preview tints cards with.
+type Appearance = (
+    JsRecord<String>,
+    JsRecord<usize>,
+    JsRecord<String>,
+    JsRecord<String>,
+);
+
 pub(super) struct LiveAgentsArea {
     shell: WeakEntity<Shell>,
     preview: Entity<LiveAgentsPreview>,
     snapshot: Option<Snapshot>,
     visible: bool,
+    /// Set when sessions, notifications, or projects change. The window
+    /// renders this area on every frame, and `refresh` scans every open
+    /// session, so it runs only after a change.
+    stale: bool,
+    /// The appearance records and the [`crate::revisions::revision`] they
+    /// were read at. Each read parses four settings records.
+    appearance: Option<(u64, Appearance)>,
 }
 
 impl LiveAgentsArea {
@@ -40,22 +55,34 @@ impl LiveAgentsArea {
         })
         .detach();
         if let Some(sessions) = Engine::try_global(cx).map(|engine| engine.sessions.clone()) {
-            cx.observe(&sessions, |_, _, cx| cx.notify()).detach();
+            cx.observe(&sessions, Self::changed).detach();
         }
         if let Some(notifier) =
             Attention::try_global(cx).map(|attention| attention.notifier.clone())
         {
-            cx.observe(&notifier, |_, _, cx| cx.notify()).detach();
+            cx.observe(&notifier, Self::changed).detach();
         }
         if let Some(projects) = ProjectsGlobal::try_global(cx).map(|global| global.projects.clone())
         {
-            cx.observe(&projects, |_, _, cx| cx.notify()).detach();
+            cx.observe(&projects, Self::changed).detach();
         }
         Self {
             shell,
             preview,
             snapshot: None,
             visible: true,
+            stale: true,
+            appearance: None,
+        }
+    }
+
+    /// Rebuild the preview's agents now rather than redrawing the window:
+    /// the preview redraws itself when its agents change, and most session
+    /// changes (streamed text of a turn already shown) leave them alone.
+    fn changed<T>(&mut self, _: Entity<T>, cx: &mut Context<Self>) {
+        self.stale = true;
+        if self.visible {
+            self.refresh(cx);
         }
     }
 
@@ -82,11 +109,24 @@ impl LiveAgentsArea {
                 shell
                     .workspace
                     .as_ref()
-                    .and_then(|workspace| workspace.read(cx).active_session(cx))
-                    .map(|session| session.id),
+                    .and_then(|workspace| workspace.read(cx).active_session_ref(cx))
+                    .map(|session| session.id.clone()),
                 shell.layout.compact_rail_visible(),
             )
         };
+        let revision = crate::revisions::revision(cx);
+        let unchanged = !self.stale
+            && self
+                .appearance
+                .as_ref()
+                .is_some_and(|(read, _)| *read == revision)
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.active == active && snapshot.bottom_spacing == bottom_spacing
+            });
+        if unchanged {
+            return;
+        }
+        self.stale = false;
         let agents = monocode_engine::side_threads::live_agents(cx)
             .into_iter()
             .map(|agent| LiveAgent {
@@ -101,19 +141,27 @@ impl LiveAgentsArea {
                 done: agent.done,
             })
             .collect();
-        let (labels, colors, custom_colors, mascots) = ProjectsGlobal::try_global(cx)
-            .map(|global| global.projects.clone())
-            .map(|projects| {
-                projects.update(cx, |projects, _| {
-                    (
-                        projects.labels(),
-                        projects.colors(),
-                        projects.custom_colors(),
-                        projects.mascots(),
-                    )
-                })
-            })
-            .unwrap_or_default();
+        let appearance = match &self.appearance {
+            Some((read, appearance)) if *read == revision => appearance.clone(),
+            _ => {
+                let appearance: Appearance = ProjectsGlobal::try_global(cx)
+                    .map(|global| global.projects.clone())
+                    .map(|projects| {
+                        projects.update(cx, |projects, _| {
+                            (
+                                projects.labels(),
+                                projects.colors(),
+                                projects.custom_colors(),
+                                projects.mascots(),
+                            )
+                        })
+                    })
+                    .unwrap_or_default();
+                self.appearance = Some((revision, appearance.clone()));
+                appearance
+            }
+        };
+        let (labels, colors, custom_colors, mascots) = appearance;
         let snapshot = Snapshot {
             agents,
             active,

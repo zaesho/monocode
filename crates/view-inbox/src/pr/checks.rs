@@ -300,6 +300,7 @@ pub struct PrChecksView {
     scroll: Option<ScrollHandle>,
     animate: bool,
     repair_groups_snapshot: std::cell::RefCell<Vec<RepairGroup>>,
+    rows_cache: std::cell::RefCell<Option<Rc<Vec<Row>>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -330,6 +331,7 @@ impl PrChecksView {
             scroll: None,
             animate: true,
             repair_groups_snapshot: Default::default(),
+            rows_cache: Default::default(),
             _subscriptions: Vec::new(),
         };
         view.subscribe(cx);
@@ -444,7 +446,19 @@ impl PrChecksView {
                 .is_some_and(|error| !error.is_empty())
     }
 
-    fn sorted_rows(&self) -> Vec<Row> {
+    /// The rows in display order. Building them is quadratic in the checks
+    /// and serializes a key per row, and render and the row lookups each ask
+    /// for them, so [`Self::sync`] clears a cached copy instead.
+    fn sorted_rows(&self) -> Rc<Vec<Row>> {
+        if let Some(rows) = self.rows_cache.borrow().as_ref() {
+            return rows.clone();
+        }
+        let rows = Rc::new(self.build_rows());
+        *self.rows_cache.borrow_mut() = Some(rows.clone());
+        rows
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
         let Some(checks) = self.state.checks.as_ref() else {
             return Vec::new();
         };
@@ -501,6 +515,8 @@ impl PrChecksView {
             self.revision += 1;
         }
         self.state = next;
+        // The rows depend on the checks and the repair number.
+        self.rows_cache.take();
 
         // The selection closes when its checks stop failing or the PR moves.
         let scope = self.reveal_scope();
@@ -855,9 +871,9 @@ impl PrChecksView {
     pub fn fix_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let checks: Vec<GithubPrCheck> = self
             .sorted_rows()
-            .into_iter()
+            .iter()
             .filter(|row| row.check.state == GithubPrCheckState::Fail)
-            .map(|row| row.check)
+            .map(|row| row.check.clone())
             .collect();
         self.open_form(checks, SelectionAnchor::FixAll, window, cx);
     }

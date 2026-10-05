@@ -1426,6 +1426,38 @@ mod prose_summary {
             "Ran checks"
         );
     }
+
+    #[test]
+    fn collapses_whitespace_like_the_regex() {
+        let regex = Regex::new(r"\s+").unwrap();
+        let spaces = [
+            '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{85}', '\u{a0}', '\u{1680}', '\u{180e}',
+            '\u{2000}', '\u{200a}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}',
+            '\u{3000}', '\u{feff}',
+        ];
+        for space in spaces {
+            for text in [
+                format!("a{space}b"),
+                format!("{space}{space}a {space}b{space}"),
+                format!("x{space}\t\n y"),
+            ] {
+                assert_eq!(
+                    collapse_whitespace(&text),
+                    regex.replace_all(&text, " "),
+                    "{:?}",
+                    space
+                );
+            }
+        }
+        for c in '\0'..='\u{3100}' {
+            let text = format!("a{c}{c}b");
+            assert_eq!(
+                collapse_whitespace(&text),
+                regex.replace_all(&text, " "),
+                "{c:?}"
+            );
+        }
+    }
 }
 
 mod subagent_model_labels {

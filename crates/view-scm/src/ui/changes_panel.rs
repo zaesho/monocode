@@ -10,6 +10,7 @@
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -17,8 +18,8 @@ use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
     InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, canvas, div,
-    prelude::FluentBuilder as _,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window, canvas, div, prelude::FluentBuilder as _, uniform_list,
 };
 use gpui_component::input::{Enter, InputEvent, TextareaState};
 use monocode_core::HarnessId;
@@ -75,6 +76,123 @@ struct SashDrag {
     start_height: f32,
 }
 
+/// A folder row in tree view, flattened from [`ChangeDir`].
+#[derive(Clone, Debug)]
+struct DirRow {
+    name: String,
+    path: String,
+    status: Option<String>,
+    /// `<kind>:<path>`, the folder's key in `collapsed_dirs`.
+    key: String,
+}
+
+/// One 28 px row of the changes list.
+#[derive(Clone, Debug)]
+enum ListRow {
+    Section {
+        staged: bool,
+        count: usize,
+    },
+    Dir {
+        kind: GitFileDiffKind,
+        depth: usize,
+        dir: DirRow,
+        open: bool,
+    },
+    File {
+        kind: GitFileDiffKind,
+        /// Set in tree view.
+        depth: Option<usize>,
+        file: GitChangedFile,
+    },
+}
+
+/// The list's rows and what they were built from.
+struct ListCache {
+    index_rev: u64,
+    view: ChangesView,
+    staged_open: bool,
+    changes_open: bool,
+    collapsed: HashSet<String>,
+    rows: Rc<Vec<ListRow>>,
+}
+
+/// The staged section, then the unstaged one, each a header followed by
+/// its files (or its folder tree) while open.
+fn build_list_rows(files: &[GitChangedFile], cache: &ListCache) -> Vec<ListRow> {
+    let staged: Vec<GitChangedFile> = files.iter().filter(|f| f.staged).cloned().collect();
+    let unstaged: Vec<GitChangedFile> = files.iter().filter(|f| f.unstaged).cloned().collect();
+    let mut rows = Vec::new();
+    let sections = [
+        (true, staged, cache.staged_open, GitFileDiffKind::Staged),
+        (
+            false,
+            unstaged,
+            cache.changes_open,
+            GitFileDiffKind::Unstaged,
+        ),
+    ];
+    for (is_staged, list, open, kind) in sections {
+        if list.is_empty() {
+            continue;
+        }
+        rows.push(ListRow::Section {
+            staged: is_staged,
+            count: list.len(),
+        });
+        if !open {
+            continue;
+        }
+        if cache.view == ChangesView::Tree {
+            let tree = build_change_tree(&list);
+            push_dir_rows(&tree, 0, kind, &cache.collapsed, &mut rows);
+        } else {
+            rows.extend(list.into_iter().map(|file| ListRow::File {
+                kind,
+                depth: None,
+                file,
+            }));
+        }
+    }
+    rows
+}
+
+/// `ChangeDirChildren`: folders first, each followed by its open contents,
+/// then the files.
+fn push_dir_rows(
+    dir: &ChangeDir,
+    depth: usize,
+    kind: GitFileDiffKind,
+    collapsed: &HashSet<String>,
+    rows: &mut Vec<ListRow>,
+) {
+    for child in &dir.dirs {
+        let key = format!("{}:{}", kind.as_str(), child.path);
+        let open = !collapsed.contains(&key);
+        rows.push(ListRow::Dir {
+            kind,
+            depth,
+            dir: DirRow {
+                name: child.name.clone(),
+                path: child.path.clone(),
+                status: child.status.clone(),
+                key,
+            },
+            open,
+        });
+        if open {
+            push_dir_rows(child, depth + 1, kind, collapsed, rows);
+        }
+    }
+    for file in &dir.files {
+        rows.push(ListRow::File {
+            kind,
+            depth: Some(depth),
+            file: file.clone(),
+        });
+    }
+}
+
 pub struct GitChangesPanel {
     scm: Scm,
     cwd: String,
@@ -85,6 +203,10 @@ pub struct GitChangesPanel {
     status: Option<Entity<GitStatus>>,
     watch: Option<GitWatch>,
     index: Option<GitDiffIndex>,
+    /// Bumped each time `index` changes, so the list knows to rebuild.
+    index_rev: u64,
+    list_cache: Option<ListCache>,
+    list_scroll: UniformListScrollHandle,
     branch_menu_open: bool,
     busy: Option<Busy>,
     status_text: Option<SharedString>,
@@ -170,6 +292,9 @@ impl GitChangesPanel {
             status,
             watch: None,
             index: None,
+            index_rev: 0,
+            list_cache: None,
+            list_scroll: UniformListScrollHandle::new(),
             branch_menu_open: false,
             busy: None,
             status_text: None,
@@ -322,6 +447,7 @@ impl GitChangesPanel {
             return;
         }
         let prev = std::mem::replace(&mut self.index, next);
+        self.index_rev += 1;
         let branch_changed = prev.as_ref().and_then(|p| p.branch.clone())
             != self.index.as_ref().and_then(|i| i.branch.clone());
         if prev.is_some() && self.index.is_some() {
@@ -1486,12 +1612,12 @@ impl GitChangesPanel {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let index = self.index.clone()?;
+        let index = self.index.as_ref()?;
         let buttons = sync_buttons(flags)?;
         let c = theme.colors;
         let busy = self.busy.is_some();
         let syncing = self.busy == Some(Busy::Sync);
-        let title = sync_title(&index, syncing, flags.can_publish);
+        let title = sync_title(index, syncing, flags.can_publish);
         let secondary = |id: &'static str, title: String, disabled: bool| {
             let mut el = div()
                 .id(id)
@@ -1580,7 +1706,7 @@ impl GitChangesPanel {
                     .into_any_element()
             };
             column = column.child(
-                secondary("create-pr", create_pr_title(&index), disabled)
+                secondary("create-pr", create_pr_title(index), disabled)
                     .child(glyph)
                     .child("Create PR")
                     .when(!disabled, |el| {
@@ -1611,35 +1737,123 @@ impl GitChangesPanel {
         Some(column.into_any_element())
     }
 
-    fn render_list(&mut self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div()
-            .id("changes-list")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .py(u(4.));
-        let files = self.files().to_vec();
-        if files.is_empty() {
-            return list.child(
-                div()
-                    .px(u(12.))
-                    .py(u(8.))
-                    .text_px(12.)
-                    .text_color(theme.content(0.45))
-                    .child(empty_list_label(self.index.as_ref())),
-            );
+    /// The changes list. Every row is 28 px tall, so a `uniform_list` draws
+    /// only the rows in view; a large working tree no longer builds a row
+    /// per changed file on every frame.
+    fn render_list(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.files().is_empty() {
+            return div()
+                .id("changes-list")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .py(u(4.))
+                .child(
+                    div()
+                        .px(u(12.))
+                        .py(u(8.))
+                        .text_px(12.)
+                        .text_color(theme.content(0.45))
+                        .child(empty_list_label(self.index.as_ref())),
+                )
+                .into_any_element();
         }
+        let count = self.list_rows(cx).len();
+        uniform_list(
+            "changes-list",
+            count,
+            cx.processor(|this, range: Range<usize>, _, cx| this.render_list_rows(range, cx)),
+        )
+        .flex_1()
+        .min_h_0()
+        .py(u(4.))
+        .track_scroll(&self.list_scroll)
+        .into_any_element()
+    }
+
+    /// The list's rows, rebuilt only when the index, the view, an open
+    /// section, or a collapsed folder changed.
+    fn list_rows(&mut self, cx: &App) -> Rc<Vec<ListRow>> {
         let state = self.scm.state.read(cx);
-        let view = state.changes_view;
-        let staged_open = state.staged_open;
-        let changes_open = state.changes_open;
-        let collapsed = state.collapsed_dirs.clone();
-        let staged: Vec<GitChangedFile> = files.iter().filter(|f| f.staged).cloned().collect();
-        let unstaged: Vec<GitChangedFile> = files.iter().filter(|f| f.unstaged).cloned().collect();
-        if !staged.is_empty() {
-            let actions = vec![
+        let fresh = self.list_cache.as_ref().is_some_and(|cache| {
+            cache.index_rev == self.index_rev
+                && cache.view == state.changes_view
+                && cache.staged_open == state.staged_open
+                && cache.changes_open == state.changes_open
+                && cache.collapsed == state.collapsed_dirs
+        });
+        if !fresh {
+            let cache = ListCache {
+                index_rev: self.index_rev,
+                view: state.changes_view,
+                staged_open: state.staged_open,
+                changes_open: state.changes_open,
+                collapsed: state.collapsed_dirs.clone(),
+                rows: Rc::new(Vec::new()),
+            };
+            let rows = build_list_rows(self.files(), &cache);
+            self.list_cache = Some(ListCache {
+                rows: Rc::new(rows),
+                ..cache
+            });
+        }
+        self.list_cache
+            .as_ref()
+            .map(|cache| cache.rows.clone())
+            .unwrap_or_default()
+    }
+
+    fn render_list_rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let rows = self.list_rows(cx);
+        let view = self.scm.state.read(cx).changes_view;
+        let mut out = Vec::with_capacity(range.len());
+        for index in range {
+            let Some(row) = rows.get(index) else {
+                break;
+            };
+            out.push(match row {
+                ListRow::Section { staged, count } => self
+                    .render_section(*staged, *count, view, &theme, cx)
+                    .into_any_element(),
+                ListRow::Dir {
+                    kind,
+                    depth,
+                    dir,
+                    open,
+                } => self
+                    .render_dir_row(dir, *depth, *kind, *open, &theme, cx)
+                    .into_any_element(),
+                ListRow::File { kind, depth, file } => self
+                    .render_row(file, *kind, *depth, &theme, cx)
+                    .into_any_element(),
+            });
+        }
+        out
+    }
+
+    /// `FileSection`'s header, with the section's actions.
+    fn render_section(
+        &mut self,
+        staged: bool,
+        count: usize,
+        view: ChangesView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (id, title, open) = if staged {
+            (
+                "staged",
+                "STAGED CHANGES",
+                self.scm.state.read(cx).staged_open,
+            )
+        } else {
+            ("changes", "CHANGES", self.scm.state.read(cx).changes_open)
+        };
+        let actions = if staged {
+            vec![
                 section_action(
                     "staged-open-all",
                     IconName::FileDiff,
@@ -1658,30 +1872,9 @@ impl GitChangesPanel {
                         this.run_all(FileAction::Unstage, window, cx)
                     }),
                 ),
-            ];
-            list = list.child(self.render_section(
-                "staged",
-                "STAGED CHANGES",
-                staged.len(),
-                staged_open,
-                view,
-                actions,
-                theme,
-                cx,
-            ));
-            if staged_open {
-                list = list.children(self.render_files(
-                    &staged,
-                    view,
-                    GitFileDiffKind::Staged,
-                    &collapsed,
-                    theme,
-                    cx,
-                ));
-            }
-        }
-        if !unstaged.is_empty() {
-            let actions = vec![
+            ]
+        } else {
+            vec![
                 section_action(
                     "changes-open-all",
                     IconName::FileDiff,
@@ -1706,45 +1899,8 @@ impl GitChangesPanel {
                     "Stage All Changes",
                     cx.listener(|this, _, window, cx| this.run_all(FileAction::Stage, window, cx)),
                 ),
-            ];
-            list = list.child(self.render_section(
-                "changes",
-                "CHANGES",
-                unstaged.len(),
-                changes_open,
-                view,
-                actions,
-                theme,
-                cx,
-            ));
-            if changes_open {
-                list = list.children(self.render_files(
-                    &unstaged,
-                    view,
-                    GitFileDiffKind::Unstaged,
-                    &collapsed,
-                    theme,
-                    cx,
-                ));
-            }
-        }
-        list
-    }
-
-    /// `FileSection`'s header.
-    #[allow(clippy::too_many_arguments)]
-    fn render_section(
-        &mut self,
-        id: &'static str,
-        title: &'static str,
-        count: usize,
-        open: bool,
-        view: ChangesView,
-        actions: Vec<SectionAction>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let staged = id == "staged";
+            ]
+        };
         let toggle = div()
             .id((id, 0usize))
             .flex()
@@ -1805,6 +1961,7 @@ impl GitChangesPanel {
             .flex()
             .flex_none()
             .h(u(28.))
+            .w_full()
             .items_center()
             .gap(u(4.))
             .px(u(6.))
@@ -1819,73 +1976,18 @@ impl GitChangesPanel {
         header
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_files(
-        &mut self,
-        files: &[GitChangedFile],
-        view: ChangesView,
-        kind: GitFileDiffKind,
-        collapsed: &HashSet<String>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut rows = Vec::new();
-        if view == ChangesView::Tree {
-            let tree = build_change_tree(files);
-            self.render_dir_children(&tree, 0, kind, collapsed, theme, &mut rows, cx);
-        } else {
-            for file in files {
-                rows.push(
-                    self.render_row(file, kind, None, theme, cx)
-                        .into_any_element(),
-                );
-            }
-        }
-        rows
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_dir_children(
-        &mut self,
-        dir: &ChangeDir,
-        depth: usize,
-        kind: GitFileDiffKind,
-        collapsed: &HashSet<String>,
-        theme: &Theme,
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        for child in &dir.dirs {
-            let key = format!("{}:{}", kind.as_str(), child.path);
-            let open = !collapsed.contains(&key);
-            rows.push(
-                self.render_dir_row(child, depth, kind, key, open, theme, cx)
-                    .into_any_element(),
-            );
-            if open {
-                self.render_dir_children(child, depth + 1, kind, collapsed, theme, rows, cx);
-            }
-        }
-        for file in &dir.files {
-            rows.push(
-                self.render_row(file, kind, Some(depth), theme, cx)
-                    .into_any_element(),
-            );
-        }
-    }
-
     /// `ChangeDirRow`: the folder toggle, then its stage or unstage action.
     #[allow(clippy::too_many_arguments)]
     fn render_dir_row(
         &mut self,
-        dir: &ChangeDir,
+        dir: &DirRow,
         depth: usize,
         kind: GitFileDiffKind,
-        key: String,
         open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let key = dir.key.clone();
         let dot = match &dir.status {
             Some(status) => status_color(status_tone(status), theme),
             None => theme.content(0.40),

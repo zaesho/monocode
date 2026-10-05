@@ -3,12 +3,12 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, SharedString, Styled as _, Transformation, div, percentage,
+    AnyElement, App, Div, ElementId, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, Styled as _, Transformation, div, percentage,
 };
 use monocode_core::js;
 use monocode_ui::color::{hsl_to_rgb, parse_hex};
-use monocode_ui::{IconName, Theme, icon, u};
+use monocode_ui::{IconName, SteppedAnimationExt as _, Theme, icon, smooth_steps, u};
 
 use super::model::AccountStatusTone;
 
@@ -141,16 +141,35 @@ pub fn text(content: impl Into<SharedString>) -> Div {
         .child(content)
 }
 
-/// An icon that spins once a second (`animate-spin`).
-pub fn spin_icon(id: impl Into<ElementId>, name: IconName, size: f32, color: Hsla) -> AnyElement {
+/// An icon that spins once a second (`animate-spin`), redrawn at
+/// [`monocode_ui::ticker::SMOOTH_FPS`] instead of every display refresh. It
+/// keeps turning with reduced motion, as `animate-spin` did.
+pub fn spin_icon(_id: impl Into<ElementId>, name: IconName, size: f32, color: Hsla) -> AnyElement {
+    let period = Duration::from_secs(1);
     icon(name)
         .size(u(size))
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(1)).repeat(),
-            |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_loading_animation(period, smooth_steps(period), |svg, t| {
+            svg.with_transformation(Transformation::rotate(percentage(t)))
+        })
+        .into_any_element()
+}
+
+/// [`spin_icon`] for `motion-safe:animate-spin`: it holds still with reduced
+/// motion.
+pub fn motion_safe_spin_icon(
+    _id: impl Into<ElementId>,
+    name: IconName,
+    size: f32,
+    color: Hsla,
+) -> AnyElement {
+    let period = Duration::from_secs(1);
+    icon(name)
+        .size(u(size))
+        .text_color(color)
+        .with_stepped_animation(period, smooth_steps(period), |svg, t| {
+            svg.with_transformation(Transformation::rotate(percentage(t)))
+        })
         .into_any_element()
 }
 
@@ -171,17 +190,20 @@ pub fn hover_halo(group: &'static str, x: f32, y: f32, radius: f32, fill: Hsla) 
 }
 
 /// `animate-pulse`: opacity 1 to 0.5 and back over two seconds.
-pub fn pulse(id: impl Into<ElementId>, element: Div) -> AnyElement {
+///
+/// It redraws at [`monocode_ui::ticker::SMOOTH_FPS`] instead of on every
+/// display refresh. The usage chip pulses for as long as a provider's usage
+/// stays unloaded, and a repeating `with_animation` re-rendered the whole
+/// window each frame. Like `animate-pulse`, it keeps pulsing with reduced
+/// motion: every use marks loading.
+pub fn pulse(_id: impl Into<ElementId>, element: Div) -> AnyElement {
+    let period = Duration::from_secs(2);
     element
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(2)).repeat(),
-            |el, t| {
-                // `cubic-bezier(0.4, 0, 0.6, 1)` on 1 → 0.5 → 1.
-                let phase = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
-                el.opacity(1.0 - 0.5 * phase)
-            },
-        )
+        .with_loading_animation(period, smooth_steps(period), |el, t| {
+            // `cubic-bezier(0.4, 0, 0.6, 1)` on 1 → 0.5 → 1.
+            let phase = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
+            el.opacity(1.0 - 0.5 * phase)
+        })
         .into_any_element()
 }
 

@@ -19,6 +19,7 @@ mod pages;
 mod panes;
 mod quick;
 mod remote_pane;
+mod revisions;
 #[cfg(feature = "screenshot")]
 mod screenshot;
 mod session_cards;

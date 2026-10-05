@@ -1823,6 +1823,45 @@ fn add_untracked_map(root: &Path, files: &mut HashMap<String, FileAcc>) {
     }
 }
 
+/// What a cached line count was read from: the file's size, modification
+/// time, and on Unix its inode and status change time. A write that keeps
+/// the size and the modification time (`cp -p`, `touch -r`, a rewrite
+/// within one timestamp tick) still moves the change time, which no user
+/// call can set back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LineCountStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    inode: u64,
+    changed: (i64, i64),
+}
+
+impl LineCountStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let (inode, changed) = {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.ino(), (meta.ctime(), meta.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let (inode, changed) = (0, (0, 0));
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            inode,
+            changed,
+        }
+    }
+}
+
+/// Line counts of untracked files, keyed by path. The changes panel polls
+/// the diff index every 2 s, and each poll used to read every untracked file
+/// (up to 1 MiB each) again to count its lines.
+static LINE_COUNTS: Mutex<Option<HashMap<PathBuf, (LineCountStamp, i64)>>> = Mutex::new(None);
+/// Past this many entries the cache starts over, so paths that are gone do
+/// not pile up.
+const MAX_LINE_COUNTS: usize = 50_000;
+
 fn text_line_count(path: &Path) -> i64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
@@ -1830,6 +1869,28 @@ fn text_line_count(path: &Path) -> i64 {
     if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_UNTRACKED_BYTES {
         return 0;
     }
+    let stamp = LineCountStamp::of(&meta);
+    if stamp.modified.is_some()
+        && let Ok(guard) = LINE_COUNTS.lock()
+        && let Some((cached, lines)) = guard.as_ref().and_then(|cache| cache.get(path))
+        && *cached == stamp
+    {
+        return *lines;
+    }
+    let lines = read_text_line_count(path);
+    if stamp.modified.is_some()
+        && let Ok(mut guard) = LINE_COUNTS.lock()
+    {
+        let cache = guard.get_or_insert_with(HashMap::new);
+        if cache.len() >= MAX_LINE_COUNTS {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (stamp, lines));
+    }
+    lines
+}
+
+fn read_text_line_count(path: &Path) -> i64 {
     let Ok(bytes) = std::fs::read(path) else {
         return 0;
     };
@@ -5781,6 +5842,47 @@ mod tests {
         assert!(stats[0].mtime_ms.is_some());
         assert_eq!(stats[1].path, missing);
         assert!(stats[1].mtime_ms.is_none());
+    }
+
+    #[test]
+    fn untracked_line_counts_follow_file_changes() {
+        let dir = tmp("line-counts");
+        let path = dir.0.join("new.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        assert_eq!(text_line_count(&path), 2);
+        // A cached count is reused while the file is unchanged.
+        assert_eq!(text_line_count(&path), 2);
+        std::fs::write(&path, "a\nb\nc").unwrap();
+        assert_eq!(text_line_count(&path), 3);
+        std::fs::write(&path, [0u8, 1, 2]).unwrap();
+        assert_eq!(text_line_count(&path), 0);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(text_line_count(&path), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_line_counts_see_rewrites_that_keep_size_and_mtime() {
+        let dir = tmp("line-counts-mtime");
+        let path = dir.0.join("same.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(text_line_count(&path), 2);
+        // Same length, same modification time, one more line: only the
+        // status change time moves, as with `touch -r` after an edit.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "a\n\n\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(text_line_count(&path), 3);
     }
 
     #[test]

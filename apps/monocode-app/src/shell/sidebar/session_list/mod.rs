@@ -60,6 +60,8 @@ pub struct SessionCard {
 #[derive(Clone, Debug, Default)]
 pub struct ListData {
     pub sessions: Vec<SessionCard>,
+    /// Each card's index in `sessions`, by session id.
+    pub card_index: std::collections::HashMap<String, usize>,
     pub sessions_loading: bool,
     pub active_session_id: Option<String>,
     pub selected_ids: Vec<String>,
@@ -103,6 +105,14 @@ pub struct SessionList {
     insert_motion: insert_motion::SessionInsertMotion,
     /// A drawn card's height, which a new row grows to.
     card_height: Rc<Cell<Option<Pixels>>>,
+    /// Counts changes of the observed history, approvals, notifications,
+    /// and remote connections, for the list cache.
+    observed: u64,
+    /// The open sessions' [`crate::revisions::current_sessions_digest`]. Streamed
+    /// text leaves it alone, so the list does not redraw for it.
+    sessions_digest: Option<u64>,
+    /// The last list and what it was built from.
+    data_cache: Option<(model::ListKey, Rc<ListData>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -141,19 +151,38 @@ impl SessionList {
             }
         });
         let mut subscriptions = vec![search, rename];
+        let mut sessions_digest = None;
         if let Some(engine) = Engine::try_global(cx) {
             let sessions = engine.sessions.clone();
-            subscriptions.push(cx.observe(&sessions, |_, _, cx| cx.notify()));
+            sessions_digest = Some(crate::revisions::current_sessions_digest(cx));
+            subscriptions.push(cx.observe(&sessions, |this, _, cx| {
+                let digest = crate::revisions::current_sessions_digest(cx);
+                if this.sessions_digest != Some(digest) {
+                    this.sessions_digest = Some(digest);
+                    this.observed += 1;
+                    cx.notify();
+                }
+            }));
         }
         if let Some(attention) = Attention::try_global(cx) {
             let approvals = attention.approvals.clone();
             let notifier = attention.notifier.clone();
-            subscriptions.push(cx.observe(&approvals, |_, _, cx| cx.notify()));
-            subscriptions.push(cx.observe(&notifier, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&approvals, Self::observed_changed));
+            subscriptions.push(cx.observe(&notifier, Self::observed_changed));
         }
         if let Some(remote) = monocode_engine::remote::RemoteGlobal::try_global(cx) {
             let connections = remote.connections.clone();
-            subscriptions.push(cx.observe(&connections, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&connections, Self::observed_changed));
+        }
+        // The shell draws the sidebar cached, so the list also hears about
+        // the reminders and the orchestration runs it groups rows by.
+        if let Some(package) = monocode_engine::automations::AutomationsPackage::try_global(cx) {
+            let reminders = package.reminders.clone();
+            subscriptions.push(cx.observe(&reminders, Self::observed_changed));
+        }
+        if monocode_engine::orchestration::Orchestration::try_global(cx).is_some() {
+            let orchestrator = monocode_engine::orchestration::Orchestration::orchestrator(cx);
+            subscriptions.push(cx.observe(&orchestrator, Self::observed_changed));
         }
         Self {
             shell,
@@ -170,8 +199,16 @@ impl SessionList {
             remote_watch: None,
             insert_motion: Default::default(),
             card_height: Rc::default(),
+            observed: 0,
+            sessions_digest,
+            data_cache: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn observed_changed<T>(&mut self, _: Entity<T>, cx: &mut Context<Self>) {
+        self.observed += 1;
+        cx.notify();
     }
 
     fn with_shell(&self, cx: &mut App, f: impl FnOnce(&mut Shell, &mut Context<Shell>)) {
@@ -356,6 +393,8 @@ impl SessionList {
                     )
                     .child("Draft")
                     .into_any_element(),
+                // The history's sidebar clock redraws the list every 30
+                // seconds while it shows, so these labels keep moving.
                 SessionStatus::Idle => row
                     .text_color(theme.content(0.45))
                     .child(format_relative(session.updated_at, now))

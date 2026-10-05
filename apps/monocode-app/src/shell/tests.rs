@@ -213,3 +213,202 @@ fn window_menu_actions_work_before_child_focus_and_after_it_is_removed(cx: &mut 
     cx.run_until_parked();
     assert!(!shell.read_with(cx, |shell, _| shell.layout.project_rail_open));
 }
+
+/// A region drawn the way the shell draws its rails, sidebar, and title bar.
+struct CachedProbe {
+    shell: WeakEntity<Shell>,
+    region: CachedRegion,
+    renders: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Render for CachedProbe {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        self.region.sync(&self.shell, None, cx);
+        div().size_full()
+    }
+}
+
+struct Sibling;
+
+impl Render for Sibling {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full()
+    }
+}
+
+struct ProbeRoot {
+    shell: Entity<Shell>,
+    probe: Entity<CachedProbe>,
+    sibling: Entity<Sibling>,
+}
+
+impl Render for ProbeRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .size_full()
+            .child(
+                self.probe
+                    .clone()
+                    .cached(gpui::StyleRefinement::default().w(gpui::px(100.)).h_full()),
+            )
+            .child(self.sibling.clone())
+    }
+}
+
+#[gpui::test]
+fn a_cached_region_redraws_for_the_shell_and_session_metadata_only(cx: &mut TestAppContext) {
+    use monocode_core::{Block, BlockRole, HarnessId, Session};
+    init_test_engine(cx);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        monocode_ui::init(monocode_ui::AppearanceSettings::default(), cx);
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            let mut session = Session::blank("one", HarnessId::Codex, "model", "/repo");
+            session
+                .blocks
+                .push(Block::new("a", BlockRole::Assistant, "Hel"));
+            sessions.insert(session, cx);
+        });
+    });
+    let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+    let window = cx.open_window(gpui::size(gpui::px(400.), gpui::px(300.)), {
+        let renders = renders.clone();
+        move |window, cx| {
+            let shell = cx.new(|cx| Shell::new(ShellOptions::full(), window, cx));
+            let probe = cx.new(|_| CachedProbe {
+                shell: shell.downgrade(),
+                region: CachedRegion::default(),
+                renders,
+            });
+            ProbeRoot {
+                shell,
+                probe,
+                sibling: cx.new(|_| Sibling),
+            }
+        }
+    });
+    cx.run_until_parked();
+    let first = renders.get();
+    assert!(first >= 1);
+
+    // Another view's change redraws the window but not the cached region.
+    window
+        .update(cx, |root, _, cx| {
+            root.sibling.update(cx, |_, cx| cx.notify())
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(renders.get(), first);
+
+    // A streamed token changes no metadata the shell regions show.
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update("one", cx, |session| session.blocks[0].text.push_str("lo"));
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(renders.get(), first);
+
+    // The shell's own change and a busy session redraw it.
+    window
+        .update(cx, |root, _, cx| root.shell.update(cx, |_, cx| cx.notify()))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(renders.get(), first + 1);
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update("one", cx, |session| session.busy = Some(true));
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(renders.get(), first + 2);
+}
+
+struct Counted {
+    renders: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl Render for Counted {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.renders.set(self.renders.get() + 1);
+        div().size_full()
+    }
+}
+
+/// A session pane's shape: a cached transcript beside the composer.
+struct PaneProbe {
+    transcript: Entity<Counted>,
+    composer: Entity<Counted>,
+}
+
+impl Render for PaneProbe {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                self.transcript
+                    .clone()
+                    .cached(gpui::StyleRefinement::default().size_full()),
+            )
+            .child(self.composer.clone())
+    }
+}
+
+/// The shell must not draw the workspace area cached: a cached view that
+/// redraws redraws every cached view inside it, so the composer's caret
+/// would redraw the transcript.
+#[gpui::test]
+fn a_composer_redraw_leaves_the_cached_transcript_alone(cx: &mut TestAppContext) {
+    init_test_engine(cx);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        monocode_ui::init(monocode_ui::AppearanceSettings::default(), cx);
+    });
+    let transcript_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+    let composer_renders = std::rc::Rc::new(std::cell::Cell::new(0));
+    let pane = cx.update(|cx| {
+        let transcript = cx.new(|_| Counted {
+            renders: transcript_renders.clone(),
+        });
+        let composer = cx.new(|_| Counted {
+            renders: composer_renders.clone(),
+        });
+        let pane = cx.new(|_| PaneProbe {
+            transcript,
+            composer,
+        });
+        let view = pane.clone();
+        cx.set_global(AppSlots {
+            workspace: Some(std::rc::Rc::new(move |_, _| view.clone().into())),
+            ..Default::default()
+        });
+        pane
+    });
+    struct NoUsageHost;
+    impl monocode_view_settings::accounts::host::UsageHost for NoUsageHost {}
+    let _window = cx.open_window(gpui::size(gpui::px(800.), gpui::px(600.)), |window, cx| {
+        let mut shell = Shell::new(ShellOptions::full(), window, cx);
+        shell.usage_footer = Some(cx.new(|cx| {
+            monocode_view_settings::accounts::UsageFooter::new(
+                std::rc::Rc::new(NoUsageHost),
+                Default::default(),
+                Default::default(),
+                cx,
+            )
+        }));
+        shell
+    });
+    cx.run_until_parked();
+    let (transcript, composer) = (transcript_renders.get(), composer_renders.get());
+    assert!(transcript >= 1 && composer >= 1);
+    let composer_view = pane.read_with(cx, |pane, _| pane.composer.clone());
+    composer_view.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert_eq!(composer_renders.get(), composer + 1);
+    assert_eq!(transcript_renders.get(), transcript);
+    cx.update(|cx| cx.set_global(AppSlots::default()));
+}

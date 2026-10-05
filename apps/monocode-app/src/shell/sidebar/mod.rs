@@ -40,6 +40,9 @@ pub struct SessionSidebar {
     shell: WeakEntity<Shell>,
     session_list: Entity<SessionList>,
     worktree_switcher: Entity<WorktreeSwitcher>,
+    /// The shell draws the sidebar cached; this redraws it on the shell's,
+    /// the sessions', and the project's git changes.
+    region: super::CachedRegion,
 }
 
 impl SessionSidebar {
@@ -59,6 +62,7 @@ impl SessionSidebar {
             shell,
             session_list,
             worktree_switcher,
+            region: Default::default(),
         }
     }
 
@@ -85,6 +89,8 @@ impl Render for SessionSidebar {
             return div().into_any_element();
         };
         let layout = shell.read(cx).layout.clone();
+        let cwd = shell.read(cx).sidebar_cwd(cx);
+        self.region.sync(&self.shell, Some(&cwd), cx);
         let data = self.data(cx);
         self.render_sidebar(&layout, &data, window, cx)
             .into_any_element()

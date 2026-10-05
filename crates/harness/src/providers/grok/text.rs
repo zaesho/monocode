@@ -15,7 +15,7 @@ use monocode_core::block::ModelSettings;
 use monocode_core::harness::HarnessId;
 use monocode_core::harness_event::HarnessEvent;
 use monocode_core::js;
-use monocode_core::reducer::join_stream_text;
+use monocode_core::reducer::join_stream_text_into;
 
 use crate::core::abort_text_prompt::with_text_prompt_abort;
 use crate::core::acp::{AcpClient, AcpHandlers};
@@ -266,7 +266,7 @@ impl GrokText {
                             return;
                         }
                         let previous_len = state.output.len();
-                        state.output = join_stream_text(&state.output, &text_from_update(&params));
+                        join_stream_text_into(&mut state.output, &text_from_update(&params));
                         let delta = state.output.get(previous_len..).unwrap_or("").to_string();
                         (delta, state.on_event.clone())
                     };

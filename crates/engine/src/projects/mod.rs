@@ -807,6 +807,19 @@ pub fn notify_git_changed(cx: &mut App) {
     }
 }
 
+/// `notifyGitChanged` for edited files when no ref moved: the workspace hears
+/// it as before, and each folder's git status reloads only what the files can
+/// change there. Reloading every folder ran `git worktree list` with a status
+/// per working copy, and the branch list, for every project each time an
+/// agent's edit showed up in a poll.
+pub(crate) fn notify_files_changed(change: &git_status::FilesChange, cx: &mut App) {
+    Engine::hooks(cx).workspace.notify_git_changed(cx);
+    if let Some(global) = ProjectsGlobal::try_global(cx) {
+        let git = global.git.clone();
+        git.update(cx, |git, cx| git.files_changed(change, cx));
+    }
+}
+
 /// `notifyReviewChanged(sessionId)`.
 fn notify_review_changed(session_id: &str, cx: &mut App) {
     if Engine::try_global(cx).is_some() {

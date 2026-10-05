@@ -318,6 +318,11 @@ impl SettingsPage {
 
     /// The other props. A new notification request reveals the anchor again.
     pub fn set_props(&mut self, props: SettingsProps, cx: &mut Context<Self>) {
+        // The owner sends props after every workspace, project, and history
+        // change. Equal props would re-notify the page and every slot view.
+        if props == self.props {
+            return;
+        }
         let request_changed =
             props.notification_settings_request != self.props.notification_settings_request;
         let sessions_changed = props.sessions != self.props.sessions;

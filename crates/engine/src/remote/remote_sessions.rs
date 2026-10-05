@@ -360,8 +360,12 @@ impl RemoteSessions {
         let client = self.connections.read(cx).client().clone();
         for target in updates.finished {
             let known = self.last_snapshots.get(&target.shell_id).cloned();
-            let load =
-                client.load_remote_session(&target.machine_id, &target.host_session_id, known);
+            // Decoding and applying the sync run off the UI thread.
+            let load = cx.background_spawn(client.load_remote_session(
+                &target.machine_id,
+                &target.host_session_id,
+                known,
+            ));
             let shell_id = target.shell_id.clone();
             let task = cx.spawn(async move |this, cx| {
                 // On failure the tab reloads when it is shown.

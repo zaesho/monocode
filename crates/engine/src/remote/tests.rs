@@ -632,6 +632,29 @@ fn host_session(id: &str, revision: i64, busy: bool, blocks: Value) -> Value {
     })
 }
 
+#[test]
+fn an_unchanged_sync_hands_back_the_known_snapshot_itself() {
+    let transport = FakeTransport::new();
+    let client = client_with(&transport);
+    transport.respond(
+        "sessions.sync",
+        json!({
+            "kind": "snapshot",
+            "value": host_session("host-1", 3, false, json!([user_block("turn", "Fix it")])),
+        }),
+    );
+    let first = block_on(client.load_remote_session("machine", "host-1", None)).unwrap();
+    transport.respond(
+        "sessions.sync",
+        json!({ "kind": "unchanged", "revision": 3 }),
+    );
+    let again =
+        block_on(client.load_remote_session("machine", "host-1", Some(first.clone()))).unwrap();
+    // No copy of the transcript: the poll gets the same allocation back.
+    assert!(Arc::ptr_eq(&again, &first));
+    assert_eq!(transport.calls_for("sessions.sync").len(), 2);
+}
+
 /// A scripted host: one session per id, commands recorded, `changes.wait`
 /// held until the test releases it.
 #[derive(Default)]
@@ -1211,6 +1234,40 @@ fn older_hosts_without_pushed_changes_keep_polling(cx: &mut TestAppContext) {
     s.advance(cx, 3_000);
     assert_eq!(s.transport.calls_for("sessions.sync").len(), syncs + 2);
     assert_eq!(s.transport.calls_for("changes.wait").len(), 1);
+}
+
+#[gpui::test]
+fn an_unchanged_poll_does_not_redraw_the_tab(cx: &mut TestAppContext) {
+    let (s, host) = remote_setup(cx, Some("host-1"));
+    host.lock()
+        .sessions
+        .insert("host-1".into(), host_session("host-1", 3, false, json!([])));
+    s.transport.queue(
+        "changes.wait",
+        Reply::Error("Host rejected request: Unsupported host method".into()),
+    );
+    let tab = s.open(cx, "tab-1");
+    let notified = Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    let _observe = cx.update(|cx| cx.observe(&tab, move |_, _| count.set(count.get() + 1)));
+    let syncs = s.transport.calls_for("sessions.sync").len();
+    s.advance(cx, 3_000);
+    s.advance(cx, 3_000);
+    assert_eq!(s.transport.calls_for("sessions.sync").len(), syncs + 2);
+    assert_eq!(notified.get(), 0);
+    // A new revision still redraws.
+    host.lock().sessions.insert(
+        "host-1".into(),
+        host_session("host-1", 4, false, json!([user_block("turn", "Fix it")])),
+    );
+    s.advance(cx, 3_000);
+    assert!(notified.get() > 0);
+    assert_eq!(
+        tab.read_with(cx, |tab, _| tab
+            .snapshot()
+            .map(|snapshot| snapshot.revision)),
+        Some(4)
+    );
 }
 
 #[gpui::test]

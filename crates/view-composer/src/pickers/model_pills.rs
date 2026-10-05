@@ -107,8 +107,12 @@ impl ModelControlPills {
         values: ModelSettings,
         cx: &mut Context<Self>,
     ) {
+        let model = model.into();
+        if harness == self.harness && model == self.model && values == self.values {
+            return;
+        }
         self.harness = harness;
-        self.model = model.into();
+        self.model = model;
         self.values = values;
         cx.notify();
     }

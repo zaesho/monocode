@@ -144,7 +144,9 @@ pub fn resolve_available(
     ))
 }
 
-pub fn os_default(api: &Api) -> Result<CString, LocaleError> {
+/// The resolved default lives for the whole process, so callers borrow it.
+/// `compare` runs this per comparison inside sorts and must not allocate.
+pub fn os_default(api: &Api) -> Result<&'static CStr, LocaleError> {
     static DEFAULT: OnceLock<Result<CString, LocaleError>> = OnceLock::new();
     DEFAULT
         .get_or_init(|| {
@@ -178,7 +180,9 @@ pub fn os_default(api: &Api) -> Result<CString, LocaleError> {
                 Ok(locale.to_owned())
             }
         })
-        .clone()
+        .as_ref()
+        .map(CString::as_c_str)
+        .map_err(Clone::clone)
 }
 #[cfg(any(not(target_os = "linux"), test))]
 fn normalize_default(tag: &str) -> &str {

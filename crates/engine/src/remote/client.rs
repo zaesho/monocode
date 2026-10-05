@@ -12,7 +12,7 @@ use std::sync::Arc;
 use monocode_core::Attachment;
 use monocode_remote::host::protocol::{
     HostSession, RemoteAttachment, RemoteMachine, SessionSync, SessionSyncChunk,
-    SessionSyncResponse, SshSetup, apply_session_sync,
+    SessionSyncResponse, SshSetup, apply_session_sync, apply_shared_session_sync,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -266,6 +266,10 @@ impl RemoteClient {
     /// `loadRemoteSession`: fetch only what changed since `known`, falling
     /// back to a full snapshot. Returns `known` itself when nothing changed,
     /// so callers can tell an unchanged poll by pointer.
+    ///
+    /// Decoding the host's answer and applying it walk the whole transcript.
+    /// Entities run the returned future with `background_spawn` so that work
+    /// stays off the UI thread.
     pub fn load_remote_session(
         &self,
         machine_id: &str,
@@ -283,12 +287,11 @@ impl RemoteClient {
                     known.as_ref().map(|known| known.revision),
                 )
                 .await?;
-            let unchanged = matches!(update, SessionSync::Unchanged { .. });
-            let applied = apply_session_sync(known.as_deref(), update);
-            let snapshot = match (applied, &known) {
-                (Ok(_), Some(known)) if unchanged => known.clone(),
-                (Ok(snapshot), _) => Arc::new(snapshot),
-                (Err(_), _) => {
+            // An unchanged poll hands back `known` itself instead of a deep
+            // copy of the transcript that would be thrown away.
+            let snapshot = match apply_shared_session_sync(known.as_ref(), update) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
                     let full = client
                         .sync_remote_session(&machine_id, &session_id, None)
                         .await?;

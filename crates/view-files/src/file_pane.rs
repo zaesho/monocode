@@ -232,18 +232,32 @@ impl FilePane {
         self.show_tabs && self.tab_strip.is_some()
     }
 
+    // The owner pushes every prop again whenever the workspace or a session
+    // changes, which includes each streamed event. A prop that did not
+    // change returns early, so that push does not re-run `sync` over every
+    // tab and notify the pane each time.
+
     pub fn set_pane(&mut self, pane: EditorPane, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane == pane {
+            return;
+        }
         self.pane = pane;
         self.sync(window, cx);
     }
 
     pub fn set_focused(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focused == focused {
+            return;
+        }
         self.focused = focused;
         self.sync(window, cx);
     }
 
     /// `showTabs`: false when the title bar already names a standalone file.
     pub fn set_show_tabs(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_tabs == show {
+            return;
+        }
         self.show_tabs = show;
         cx.notify();
     }
@@ -260,6 +274,9 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.unified_diffs == unified {
+            return;
+        }
         self.unified_diffs = unified;
         self.sync(window, cx);
     }
@@ -270,6 +287,9 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.settings == settings {
+            return;
+        }
         self.settings = settings;
         for surface in self.surfaces.values() {
             if let Surface::Editor(editor) = surface {
@@ -285,6 +305,10 @@ impl FilePane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The owner keeps the same list while the plan sessions are unchanged.
+        if Rc::ptr_eq(&self.sessions, &sessions) {
+            return;
+        }
         self.sessions = sessions.clone();
         for surface in self.surfaces.values() {
             if let Surface::Plan(plan) = surface {

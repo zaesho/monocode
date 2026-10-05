@@ -8,7 +8,7 @@
 //! job leaves its cache so the next request retries, and only the three
 //! newest source revisions stay cached.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
 use futures::FutureExt as _;
@@ -29,6 +29,12 @@ pub type SourceReader = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Syn
 /// `MAX_CACHED_REVISIONS`.
 const MAX_CACHED_REVISIONS: usize = 3;
 
+/// How many Haze sizes stay cached. Haze is rendered per box size, so every
+/// size a window or pane resize passed through added a full-size image that
+/// the revision pruning never dropped. A Haze element keeps its own image,
+/// so an evicted size only renders again if a box returns to it.
+const MAX_CACHED_HAZE: usize = 12;
+
 /// The chat background caches, a GPUI global.
 pub struct BackgroundEffects {
     reader: SourceReader,
@@ -36,6 +42,8 @@ pub struct BackgroundEffects {
     sources: HashMap<String, EffectTask<Arc<Source>>>,
     /// `effectCache`, keyed by `source:effect:themeKey`.
     effects: HashMap<String, EffectTask<Arc<RenderImage>>>,
+    /// Haze keys in `effects`, oldest first.
+    haze_keys: VecDeque<String>,
 }
 
 impl Global for BackgroundEffects {}
@@ -48,6 +56,7 @@ impl Default for BackgroundEffects {
             }),
             sources: HashMap::new(),
             effects: HashMap::new(),
+            haze_keys: VecDeque::new(),
         }
     }
 }
@@ -104,6 +113,7 @@ impl BackgroundEffects {
         this.reader = reader;
         this.sources.clear();
         this.effects.clear();
+        this.haze_keys.clear();
     }
 
     /// How many sources and rendered effects are cached.
@@ -193,6 +203,22 @@ impl BackgroundEffects {
         let cache_key = format!(
             "{source_key}:gradient-blur:{variant:?}:{r:02x}{g:02x}{b:02x}:{width}x{height}"
         );
+        let Self {
+            effects, haze_keys, ..
+        } = Self::global_mut(cx);
+        // `forget_on_reject` and `prune_by_revision` drop entries on their
+        // own, so the order list first drops keys the cache no longer has.
+        // Each listed key then has one live entry, and eviction never counts
+        // a stale key against a live one.
+        haze_keys.retain(|key| effects.contains_key(key));
+        if !effects.contains_key(&cache_key) {
+            haze_keys.push_back(cache_key.clone());
+            while haze_keys.len() > MAX_CACHED_HAZE {
+                if let Some(oldest) = haze_keys.pop_front() {
+                    effects.remove(&oldest);
+                }
+            }
+        }
         let (source_key, path) = (source_key.to_string(), path.to_string());
         Self::cached_or_insert(cache_key, cx, move |cx| {
             let source = Self::ensure_source(&source_key, &path, cx);
@@ -242,6 +268,61 @@ mod tests {
         assert_eq!(revision_of("/a.png?v=101"), 101);
         assert_eq!(revision_of("/a.png?x=1&v=7:dither:false"), 7);
         assert_eq!(revision_of("/a.png"), 0);
+    }
+
+    #[gpui::test]
+    fn haze_keeps_a_bounded_number_of_sizes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            BackgroundEffects::set_reader(Arc::new(|_| Err("no file".into())), cx);
+            // A resize drag asks for one size per frame.
+            let jobs: Vec<_> = (0..40)
+                .map(|width| {
+                    BackgroundEffects::prepare_haze(
+                        "/a.png?v=1",
+                        "/a.png",
+                        HazeVariant::Empty,
+                        [0, 0, 0],
+                        (400.0 + width as f64, 300.0),
+                        cx,
+                    )
+                })
+                .collect();
+            assert_eq!(jobs.len(), 40);
+            let (_, effects) = BackgroundEffects::cached(cx);
+            assert_eq!(effects, MAX_CACHED_HAZE);
+        });
+    }
+
+    #[gpui::test]
+    fn haze_eviction_skips_entries_the_cache_already_dropped(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            BackgroundEffects::set_reader(Arc::new(|_| Err("no file".into())), cx);
+            let haze = |width: usize, height: f64, cx: &mut App| {
+                BackgroundEffects::prepare_haze(
+                    "/a.png?v=1",
+                    "/a.png",
+                    HazeVariant::Empty,
+                    [0, 0, 0],
+                    (400.0 + width as f64, height),
+                    cx,
+                )
+            };
+            let half = MAX_CACHED_HAZE / 2;
+            let mut jobs = Vec::new();
+            jobs.extend((0..half).map(|width| haze(width, 300.0, cx)));
+            jobs.extend((0..half).map(|width| haze(width, 301.0, cx)));
+            // A rejected job forgets its newer entries.
+            cx.global_mut::<BackgroundEffects>()
+                .effects
+                .retain(|key, _| !key.ends_with("x301"));
+            jobs.extend((0..half).map(|width| haze(width, 302.0, cx)));
+            assert_eq!(jobs.len(), 3 * half);
+            // The older sizes stay: only live entries count toward the limit.
+            let this = cx.global::<BackgroundEffects>();
+            assert_eq!(this.effects.len(), MAX_CACHED_HAZE);
+            assert_eq!(this.haze_keys.len(), MAX_CACHED_HAZE);
+            assert!(this.effects.keys().any(|key| key.ends_with("x300")));
+        });
     }
 
     #[test]

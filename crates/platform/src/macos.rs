@@ -104,6 +104,11 @@ pub fn paint_window_badge(label: &str, count: u32) {
     let mut map = window_badges()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
+    // The same count again leaves the tile as it is, so skip the AppKit
+    // label update and redraw.
+    if map.get(label).copied().unwrap_or(0) == count {
+        return;
+    }
     let previous: u32 = map.values().copied().sum();
     if count == 0 {
         map.remove(label);

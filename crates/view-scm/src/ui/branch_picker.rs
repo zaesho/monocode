@@ -207,11 +207,13 @@ impl BranchPicker {
         self.active
     }
 
-    fn branches_state(&self, cx: &gpui::App) -> (Option<GitBranches>, bool) {
+    /// The status's branch list, borrowed: the trigger reads it on every
+    /// render, and a repository can list thousands of remote branches.
+    fn branches_state<'a>(&self, cx: &'a gpui::App) -> (Option<&'a GitBranches>, bool) {
         match &self.status {
             Some(status) => {
                 let state = status.read(cx).branches_state();
-                (state.branches.clone(), state.settled)
+                (state.branches.as_ref(), state.settled)
             }
             None => (None, false),
         }
@@ -224,13 +226,13 @@ impl BranchPicker {
     /// The listed branches for the current query.
     pub fn rows(&self, cx: &gpui::App) -> Vec<GitBranchEntry> {
         let (branches, _) = self.branches_state(cx);
-        branch_rows(branches.as_ref(), self.branch.as_deref(), &self.query(cx))
+        branch_rows(branches, self.branch.as_deref(), &self.query(cx))
     }
 
     /// The fixed create action's name, or `None` when the name is taken.
     pub fn create_name(&self, cx: &gpui::App) -> Option<String> {
         let (branches, _) = self.branches_state(cx);
-        create_row(branches.as_ref(), &self.query(cx))
+        create_row(branches, &self.query(cx))
     }
 
     pub fn trigger(&self, cx: &gpui::App) -> BranchTrigger {
@@ -238,7 +240,7 @@ impl BranchPicker {
         branch_trigger(
             &self.cwd,
             self.branch.as_deref(),
-            branches.as_ref(),
+            branches,
             settled,
             self.enabled,
         )

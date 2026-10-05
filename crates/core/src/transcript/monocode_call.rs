@@ -174,6 +174,29 @@ fn strip_run_command(command: &str) -> &str {
     after.trim_start_matches(is_js_space)
 }
 
+/// Whether `command`, with quotes and backslashes dropped, contains
+/// `monocode` in any ASCII case. [`shell_words`] builds each word from the
+/// command's characters and drops only those, so a command whose first word
+/// names the binary always passes. Tool rows render often and most are not
+/// MonoCode calls, so this skips the tokenizer for them.
+fn may_name_monocode(command: &str) -> bool {
+    const NAME: &[u8] = b"monocode";
+    let bytes = command.as_bytes();
+    (0..bytes.len()).any(|start| {
+        let mut matched = 0;
+        let mut index = start;
+        while matched < NAME.len() {
+            match bytes.get(index) {
+                Some(byte) if byte.eq_ignore_ascii_case(&NAME[matched]) => matched += 1,
+                Some(b'\'' | b'"' | b'\\') if matched > 0 => {}
+                _ => return false,
+            }
+            index += 1;
+        }
+        true
+    })
+}
+
 /// `monoCodeToolCall`: the app CLI command a tool row runs, not a mention of
 /// it in prose or output.
 pub fn monocode_tool_call(block: &Block) -> Option<MonoCodeToolCall> {
@@ -190,7 +213,7 @@ pub fn monocode_tool_call(block: &Block) -> Option<MonoCodeToolCall> {
         .or_else(|| tool.and_then(|tool| tool.title.as_deref()))
         .unwrap_or(&block.text);
     let command = strip_run_command(crate::js::trim(candidate));
-    if command.is_empty() {
+    if command.is_empty() || !may_name_monocode(command) {
         return None;
     }
     let words = shell_words(command)?;
@@ -288,6 +311,22 @@ mod tests {
             "sessions.list"
         );
         assert!(monocode_tool_call(&shell("monocode.exe app models.list")).is_some());
+    }
+
+    #[test]
+    fn finds_the_binary_through_quotes_before_tokenizing() {
+        for command in [
+            r#"mono"code" app --help"#,
+            "'mono''code' app --help",
+            "MONOCODE app --help",
+            r#"C:\tools\MonoCode.exe app --help"#,
+        ] {
+            assert!(may_name_monocode(command), "{command}");
+            assert!(monocode_tool_call(&shell(command)).is_some(), "{command}");
+        }
+        for command in ["git status", "mono code app --help", "monocod app", ""] {
+            assert!(!may_name_monocode(command), "{command}");
+        }
     }
 
     #[test]

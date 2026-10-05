@@ -1392,8 +1392,11 @@ impl RemoteSession {
                 if outcome.is_ok()
                     && let Some(session_id) = &session_id
                 {
-                    outcome = client
-                        .load_remote_session(&machine.id, session_id, known)
+                    // Decoding and applying the sync run off the UI thread.
+                    let load = client.load_remote_session(&machine.id, session_id, known);
+                    outcome = cx
+                        .background_executor()
+                        .spawn(load)
                         .await
                         .and_then(|next| {
                             if next.project_id == project_id {
@@ -1408,8 +1411,18 @@ impl RemoteSession {
                         return None;
                     }
                     let mut active = false;
+                    // The host answered with the snapshot this tab already
+                    // shows, and the tab was already online: nothing a view
+                    // reads changed. React bailed out of the same `setState`.
+                    let mut unchanged = false;
                     match outcome {
                         Ok(next) => {
+                            unchanged = this.online
+                                && failed == 0
+                                && matches!(
+                                    (&this.snapshot, &next),
+                                    (Some(shown), Some(next)) if Arc::ptr_eq(shown, next)
+                                );
                             this.online = true;
                             let machine_id = this.machine.id.clone();
                             this.connections
@@ -1443,7 +1456,11 @@ impl RemoteSession {
                         }
                     }
                     this.in_flight = false;
-                    this.changed(cx);
+                    // A busy tab polls every 750 ms. Redraw only when the poll
+                    // changed something.
+                    if !unchanged {
+                        this.changed(cx);
+                    }
                     let again = std::mem::take(&mut this.again);
                     let live = this.connections.read(cx).remote_changes_live(&this.machine.id);
                     Some((again, live, active))

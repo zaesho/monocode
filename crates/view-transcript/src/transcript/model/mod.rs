@@ -20,5 +20,5 @@ pub use monocode_core::transcript::{
 };
 pub use plan::{
     BlockStore, FoldLine, FoldTitle, ItemView, Placement, PlanCache, PlanOptions, PlanState, Row,
-    RowKind, TurnFooter, build_plan, visible_blocks,
+    RowKind, RowRef, TurnFooter, build_plan, visible_blocks,
 };

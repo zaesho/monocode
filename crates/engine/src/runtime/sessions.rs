@@ -9,7 +9,9 @@
 //! Views observe the entity (`cx.observe`) for any change, or subscribe to
 //! `SessionsEvent` for specific ones.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -25,7 +27,7 @@ use super::in_flight::{in_flight_refs, in_flight_snapshot_key, should_write_in_f
 use super::reducer::{Reducer, apply_harness_events, last_user_block_id};
 use super::session_cache::SessionCache;
 use super::session_store::{
-    SessionSummary, backfill_claude_shell_commands, claude_shell_placeholder_ids,
+    PersistOutcome, SessionSummary, backfill_claude_shell_commands, claude_shell_placeholder_ids,
     persist_fingerprint, record_to_session, should_persist_session,
 };
 
@@ -86,6 +88,18 @@ pub struct Sessions {
     workspace_sync_key: Option<String>,
     workspace_timer: Option<Task<()>>,
     detach_timer: Option<Task<()>>,
+
+    /// The revision of each open session. Every change gives the changed
+    /// sessions a new value from `revision`, which never repeats, so a
+    /// reader can compare one number instead of a whole transcript.
+    revisions: HashMap<String, u64>,
+    /// Bumped by every change to the list or to any session.
+    revision: u64,
+    /// The revision the store is known to hold for each open session.
+    persisted_revisions: HashMap<String, u64>,
+    /// One shared copy per session, made on the first `snapshot` call after
+    /// a change, so views that show the same session share one clone.
+    snapshots: RefCell<HashMap<String, (u64, Arc<Session>)>>,
 }
 
 impl EventEmitter<SessionsEvent> for Sessions {}
@@ -129,6 +143,10 @@ impl Sessions {
             workspace_sync_key: None,
             workspace_timer: None,
             detach_timer: None,
+            revisions: HashMap::new(),
+            revision: 0,
+            persisted_revisions: HashMap::new(),
+            snapshots: RefCell::new(HashMap::new()),
         }
     }
 
@@ -159,6 +177,37 @@ impl Sessions {
     /// Busy sessions plus the leads of busy workers (`busySessionIds`).
     pub fn busy_session_ids(&self) -> &HashSet<String> {
         &self.busy_ids
+    }
+
+    /// A number that changes whenever the list or any open session changes.
+    /// Views that derive data from every session can cache it under this.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// A number that changes whenever this session changes, and `0` while
+    /// it is not open. Every `Sessions` change notifies every observer, so a
+    /// view that shows one session compares this with the value it saw last
+    /// and skips the work when they match. The value never repeats, even
+    /// when a session closes and opens again.
+    pub fn session_revision(&self, session_id: &str) -> u64 {
+        self.revisions.get(session_id).copied().unwrap_or(0)
+    }
+
+    /// The open session as a shared value. Views that show the same session
+    /// share one copy per revision instead of cloning it on every change.
+    pub fn snapshot(&self, session_id: &str) -> Option<Arc<Session>> {
+        let revision = self.session_revision(session_id);
+        if let Some((cached, snapshot)) = self.snapshots.borrow().get(session_id)
+            && *cached == revision
+        {
+            return Some(snapshot.clone());
+        }
+        let snapshot = Arc::new(self.get(session_id)?.clone());
+        self.snapshots
+            .borrow_mut()
+            .insert(session_id.to_string(), (revision, snapshot.clone()));
+        Some(snapshot)
     }
 
     /// Events waiting for the next flush.
@@ -311,6 +360,12 @@ impl Sessions {
             .entry(session_id.to_string())
             .or_default()
             .push(event);
+        // The next frame applies this event, and nothing below can schedule
+        // an earlier flush. Tokens arrive many times per frame, so skip the
+        // window and tab lookups.
+        if self.scheduled_flush() == Some(FlushKind::Frame) {
+            return;
+        }
         let hooks = Engine::hooks(cx);
         let hidden = hooks.workspace.window_hidden(cx);
         let foreground = !hidden && hooks.workspace.is_foreground(session_id, cx);
@@ -471,51 +526,89 @@ impl Sessions {
     /// `persistSession`: save one open session now unless it is unchanged
     /// since its last save.
     pub fn persist(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        let revision = self.session_revision(session_id);
+        // No change since the store last held this session, so the
+        // fingerprint would match. Skip the copy and the hash.
+        if revision != 0 && self.persisted_revisions.get(session_id) == Some(&revision) {
+            return;
+        }
         if let Some(session) = self.get(session_id).cloned() {
-            self.persist_session(session, cx);
+            self.persist_value(session, Some(revision), cx);
         }
     }
 
     /// `persistSession` for a session value, which may already be leaving
     /// memory.
     pub fn persist_session(&mut self, session: Session, cx: &mut Context<Self>) {
+        self.persist_value(session, None, cx);
+    }
+
+    /// The save behind `persist` and `persist_session`. `revision` is the
+    /// live session's revision when `session` is a copy of it.
+    fn persist_value(&mut self, session: Session, revision: Option<u64>, cx: &mut Context<Self>) {
         if !should_persist_session(&session)
             || self.removing.contains(&session.id)
             || self.switching_worktrees.contains_key(&session.id)
         {
             return;
         }
-        let fingerprint = persist_fingerprint(&session);
-        // Leaving a session flushes it. An unchanged one would still rewrite
-        // and re-diff its whole transcript under the store lock.
-        if self.last_persisted.get(&session.id) == Some(&fingerprint) {
-            return;
-        }
-        let upsert = Engine::writer(cx).upsert_session(&session);
-        let id = session.id;
+        // The writer compares fingerprints and sanitizes off the UI thread,
+        // in order with the session's other writes.
+        let id = session.id.clone();
+        let last = self.last_persisted.get(&id).cloned();
+        let write = Engine::writer(cx).upsert_session_if_changed(session, last);
         cx.spawn(async move |this, cx| {
-            let Ok(Some(summary)) = upsert.await else {
+            let Ok(outcome) = write.await else {
                 return;
             };
-            this.update(cx, |this, cx| {
-                this.last_persisted.insert(id, fingerprint);
-                cx.emit(SessionsEvent::Persisted(Box::new(summary)));
+            this.update(cx, |this, cx| match outcome {
+                PersistOutcome::Saved {
+                    summary,
+                    fingerprint,
+                } => {
+                    if let Some(fingerprint) = fingerprint {
+                        this.last_persisted.insert(id.clone(), fingerprint);
+                    }
+                    this.mark_persisted_revision(&id, revision);
+                    cx.emit(SessionsEvent::Persisted(summary));
+                }
+                PersistOutcome::Unchanged { .. } => this.mark_persisted_revision(&id, revision),
+                PersistOutcome::Skipped => {}
             })
             .ok();
         })
         .detach();
     }
 
+    /// Record that the store holds the open session as it was at `revision`.
+    fn mark_persisted_revision(&mut self, session_id: &str, revision: Option<u64>) {
+        let Some(revision) = revision.filter(|revision| *revision != 0) else {
+            return;
+        };
+        // Only for a session that is still open. A closed session's next
+        // revision is new, so an entry for it could never match anyway.
+        if !self.revisions.contains_key(session_id) {
+            return;
+        }
+        let entry = self
+            .persisted_revisions
+            .entry(session_id.to_string())
+            .or_insert(revision);
+        *entry = (*entry).max(revision);
+    }
+
     /// Forget the saved fingerprint, so the next save writes even when
     /// nothing changed (`lastPersisted.delete`).
     pub fn forget_persisted(&mut self, session_id: &str) {
         self.last_persisted.remove(session_id);
+        self.persisted_revisions.remove(session_id);
     }
 
     /// Clear the queued save and saved-turn bookkeeping for a discarded chat.
     pub fn clear_save_state(&mut self, session_id: &str) {
         self.pending_persist.retain(|pending| pending != session_id);
         self.last_persisted.remove(session_id);
+        self.persisted_revisions.remove(session_id);
         self.last_persisted_user_block.remove(session_id);
     }
 
@@ -575,6 +668,23 @@ impl Sessions {
     /// The bookkeeping every change runs: the effects App.tsx ran on each
     /// `sessions` render.
     fn changed(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        self.bump_revisions(ids);
+        self.change_effects(ids, cx);
+    }
+
+    /// Give the changed sessions a new revision and return it.
+    fn bump_revisions(&mut self, ids: &[String]) -> u64 {
+        self.revision += 1;
+        let mut snapshots = self.snapshots.borrow_mut();
+        for id in ids {
+            self.revisions.insert(id.clone(), self.revision);
+            snapshots.remove(id);
+        }
+        self.revision
+    }
+
+    /// `changed` after the revisions moved.
+    fn change_effects(&mut self, ids: &[String], cx: &mut Context<Self>) {
         cx.notify();
         self.observe_for_persist(ids, cx);
         self.sync_in_flight_snapshot(cx);
@@ -587,9 +697,17 @@ impl Sessions {
         if ids.is_empty() {
             return;
         }
-        for id in ids {
-            self.pending_persist.retain(|pending| pending != id);
-            self.queued.remove(id);
+        {
+            let mut snapshots = self.snapshots.borrow_mut();
+            for id in ids {
+                self.pending_persist.retain(|pending| pending != id);
+                self.queued.remove(id);
+                // A closed id that opens again gets a new revision, so
+                // dropping its entries cannot make a stale value match.
+                self.revisions.remove(id);
+                self.persisted_revisions.remove(id);
+                snapshots.remove(id);
+            }
         }
         let live: HashSet<String> = self.ids().into_iter().collect();
         Engine::hooks(cx).side_threads.sessions_closed(&live, cx);
@@ -708,14 +826,37 @@ impl Sessions {
 
     /// The workspace snapshot effect: save the layout 250 ms after it
     /// changes. The workspace package calls this when tabs change too.
+    ///
+    /// Every session change runs this, which is once per frame while an
+    /// agent streams. Collecting the snapshot serializes every tab, so it
+    /// happens once when the timer fires, from the state at that moment,
+    /// and writes only when the key changed.
     pub fn schedule_workspace_snapshot(&mut self, cx: &mut Context<Self>) {
-        // TODO(port): the effect cleanup cleared the pending save on every
-        // re-run, and a re-run with an unchanged key returned without
-        // scheduling again, so a save could be dropped. Ported as written.
-        self.workspace_timer = None;
+        // TODO(port): the TypeScript cleared the pending save on every
+        // re-run and could drop a save when a later change had the same
+        // key. Collecting when the timer fires saves the latest layout
+        // instead.
         if !self.workspace_autosave {
+            self.workspace_timer = None;
             return;
         }
+        if self.workspace_timer.is_some() {
+            return;
+        }
+        let timer = cx.background_executor().timer(WORKSPACE_SNAPSHOT_DEBOUNCE);
+        self.workspace_timer = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| this.save_workspace_snapshot(cx))
+                .ok();
+        }));
+    }
+
+    /// The timer half of `schedule_workspace_snapshot`.
+    fn save_workspace_snapshot(&mut self, cx: &mut Context<Self>) {
+        // This runs inside the timer's own task. Dropping the handle lets
+        // the next change schedule again; the write below is detached so it
+        // finishes on its own.
+        self.workspace_timer = None;
         let hooks = Engine::hooks(cx);
         let Some(snapshot) = hooks.workspace.collect_snapshot(&self.list, cx) else {
             return;
@@ -725,12 +866,9 @@ impl Sessions {
             return;
         }
         self.workspace_sync_key = Some(key);
-        let timer = cx.background_executor().timer(WORKSPACE_SNAPSHOT_DEBOUNCE);
-        self.workspace_timer = Some(cx.spawn(async move |_, cx| {
-            timer.await;
-            let save = cx.update(|cx| Engine::writer(cx).save_workspace_snapshot(snapshot));
-            let _ = save.await;
-        }));
+        Engine::writer(cx)
+            .save_workspace_snapshot(snapshot)
+            .detach();
     }
 
     /// Start the idle detach timer unless one is pending. The workspace
@@ -786,38 +924,42 @@ impl Sessions {
                 || this.opening.contains(&session.id)
                 || (keep_unseen && unseen.contains(&session.id))
         };
-        let idle: Vec<Session> = self
+        // Sessions in `skip_forget` stay open and are not saved here.
+        let idle: Vec<String> = self
             .list
             .iter()
-            .filter(|session| !stays(self, session))
-            .cloned()
+            .filter(|session| !stays(self, session) && !self.skip_forget.contains(&session.id))
+            .map(|session| session.id.clone())
             .collect();
         if idle.is_empty() {
             return;
         }
-        for session in &idle {
-            if self.skip_forget.contains(&session.id) {
-                continue;
-            }
-            if should_persist_session(session) {
-                self.loaded_cache.remember(session.clone());
-            }
-            self.persist_session(session.clone(), cx);
-            for harness in hooks.harness.session_child_harnesses(session) {
-                hooks
-                    .harness
-                    .forget_session(harness, &session.id, cx)
-                    .detach();
+        for id in &idle {
+            // `persist` skips a session the store already holds without
+            // copying or hashing its transcript.
+            self.persist(id, cx);
+            let harnesses = self
+                .list
+                .iter()
+                .find(|session| session.id == *id)
+                .map(|session| hooks.harness.session_child_harnesses(session))
+                .unwrap_or_default();
+            for harness in harnesses {
+                hooks.harness.forget_session(harness, id, cx).detach();
             }
         }
-        let skip = self.skip_forget.clone();
+        let idle: HashSet<String> = idle.into_iter().collect();
         let mut closed = Vec::new();
         let mut kept = Vec::with_capacity(self.list.len());
         for session in std::mem::take(&mut self.list) {
-            if stays(self, &session) || skip.contains(&session.id) {
+            if !idle.contains(&session.id) {
                 kept.push(session);
-            } else {
-                closed.push(session.id);
+                continue;
+            }
+            closed.push(session.id.clone());
+            // The session leaves the list, so the cache takes it as is.
+            if should_persist_session(&session) {
+                self.loaded_cache.remember(session);
             }
         }
         self.list = kept;
@@ -937,10 +1079,18 @@ impl Sessions {
         }
         let hooks = Engine::hooks(cx);
         bind_resumed_sessions(std::slice::from_ref(&restored), &hooks, cx);
-        self.last_persisted
-            .insert(restored.id.clone(), persist_fingerprint(&restored));
+        // The restored session is what the store holds. Record that by
+        // revision instead of hashing the whole transcript here, and drop a
+        // fingerprint left from before the session closed.
+        self.last_persisted.remove(&restored.id);
         self.list.push(restored.clone());
-        self.changed(std::slice::from_ref(&restored.id), cx);
+        let ids = std::slice::from_ref(&restored.id);
+        // Before the effects run: a provider thread seen for the first time
+        // saves at once, and that save must find the session unchanged.
+        let revision = self.bump_revisions(ids);
+        self.persisted_revisions
+            .insert(restored.id.clone(), revision);
+        self.change_effects(ids, cx);
         Some(restored)
     }
 
@@ -1099,9 +1249,18 @@ pub fn bind_resumed_sessions(
 pub fn get_stored_session(session_id: &str, cx: &App) -> Task<Option<Session>> {
     let writer = Engine::writer(cx);
     let record = writer.get_record(session_id);
+    let executor = cx.background_executor().clone();
     cx.spawn(async move |cx| {
         let record = record.await.ok().flatten()?;
-        let mut session = record_to_session(record);
+        // Hydrating sanitizes and parses every block, and the Codex repair
+        // walks them all, so both run off the UI thread.
+        let (mut session, codex_repaired) = executor
+            .spawn(async move {
+                let mut session = record_to_session(record);
+                let repaired = backfill_codex_session(&mut session);
+                (session, repaired)
+            })
+            .await;
         if session.harness == HarnessId::Claude
             && let Some(provider) = session
                 .provider_session_id
@@ -1126,19 +1285,10 @@ pub fn get_stored_session(session_id: &str, cx: &App) -> Task<Option<Session>> {
                 }
             }
         }
-        // The Codex protocol mapping lives in the harness crate, which the
-        // runtime-only build leaves out.
-        #[cfg(feature = "package-deps")]
-        {
-            use monocode_harness::providers::codex::protocol::backfill_codex_shell_commands;
-            if session.harness == HarnessId::Codex
-                && let Some(blocks) = backfill_codex_shell_commands(&session.blocks)
-            {
-                session.blocks = blocks;
-                // A failed write must not cost the reader the session. The
-                // repair stays in memory and the next load retries it.
-                let _ = writer.upsert_session(&session).await;
-            }
+        if codex_repaired {
+            // A failed write must not cost the reader the session. The
+            // repair stays in memory and the next load retries it.
+            let _ = writer.upsert_session(&session).await;
         }
         let recover = cx.update(|cx| {
             Engine::hooks(cx)
@@ -1152,4 +1302,24 @@ pub fn get_stored_session(session_id: &str, cx: &App) -> Task<Option<Session>> {
         }
         Some(recovered.session)
     })
+}
+
+/// Relabel an old Codex row from the command saved on it. `true` when the
+/// transcript changed and should be saved.
+fn backfill_codex_session(session: &mut Session) -> bool {
+    // The Codex protocol mapping lives in the harness crate, which the
+    // runtime-only build leaves out.
+    #[cfg(feature = "package-deps")]
+    {
+        use monocode_harness::providers::codex::protocol::backfill_codex_shell_commands;
+        if session.harness == HarnessId::Codex
+            && let Some(blocks) = backfill_codex_shell_commands(&session.blocks)
+        {
+            session.blocks = blocks;
+            return true;
+        }
+    }
+    #[cfg(not(feature = "package-deps"))]
+    let _ = session;
+    false
 }

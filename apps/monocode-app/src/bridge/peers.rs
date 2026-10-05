@@ -829,12 +829,20 @@ impl InboxHooks for AppInboxHooks {
     }
 
     fn new_default_session(&self, cwd: &str, inherit_runtime_mode: bool, cx: &mut App) -> Session {
+        // `session_defaults` without its copy of the session.
         let runtime_mode = inherit_runtime_mode
             .then(|| {
                 workspace(cx).and_then(|workspace| {
                     workspace
                         .read(cx)
-                        .session_defaults(cx)
+                        .active_session_ref(cx)
+                        .or_else(|| {
+                            monocode_engine::runtime::Engine::try_global(cx)?
+                                .sessions
+                                .read(cx)
+                                .all()
+                                .first()
+                        })
                         .map(|session| session.runtime_mode)
                 })
             })
@@ -881,16 +889,19 @@ impl InboxHooks for AppInboxHooks {
             return "~".into();
         };
         let workspace = workspace.read(cx);
+        // The active chat's folder, else the first open chat's
+        // (`session_defaults`), read in place.
         workspace
-            .active_session(cx)
-            .map(|session| session.cwd)
-            .filter(|cwd| !cwd.is_empty())
+            .active_session_ref(cx)
             .or_else(|| {
-                workspace
-                    .session_defaults(cx)
-                    .map(|session| session.cwd)
-                    .filter(|cwd| !cwd.is_empty())
+                monocode_engine::runtime::Engine::try_global(cx)?
+                    .sessions
+                    .read(cx)
+                    .all()
+                    .first()
             })
+            .map(|session| session.cwd.clone())
+            .filter(|cwd| !cwd.is_empty())
             .unwrap_or_else(|| workspace.project_cwd().to_string())
     }
 

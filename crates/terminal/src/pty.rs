@@ -224,8 +224,9 @@ pub struct PtyStatus {
     foreground: Option<String>,
 }
 
-/// Off the main thread: this forks `ps`, and the title poll calls it once a
-/// second for every open terminal.
+/// Off the main thread: the title poll calls it once a second for every open
+/// terminal. An idle shell costs one ioctl. A running program costs a kernel
+/// read of its command line, or a `ps` fork if that read fails.
 pub fn pty_status(host: &PtyHost, id: String) -> Result<PtyStatus, String> {
     let live = host
         .get(&id)
@@ -715,11 +716,13 @@ fn foreground_label(master_fd: i32, shell_pid: u32) -> Option<String> {
         return None;
     }
     let pid = pgrp;
-    if pid <= 0 {
+    // The title poll runs once a second per terminal. An idle shell owns the
+    // foreground group, so check that before reading any command line.
+    if pid <= 0 || pid == shell_pid as i32 {
         return None;
     }
     let label = process_label(pid)?;
-    if pid == shell_pid as i32 || is_shell_name(&label) {
+    if is_shell_name(&label) {
         return None;
     }
     Some(label)
@@ -727,6 +730,100 @@ fn foreground_label(master_fd: i32, shell_pid: u32) -> Option<String> {
 
 #[cfg(unix)]
 fn process_label(pid: i32) -> Option<String> {
+    let args = match process_args(pid) {
+        Some(args) => args,
+        None => ps_args(pid)?,
+    };
+    let args = args.trim();
+    if args.is_empty() {
+        return None;
+    }
+    command_label(args)
+}
+
+/// A process's command line the way `ps -o args=` prints it: argv joined by
+/// spaces. The title poll asks once a second per busy terminal, so read it
+/// from the kernel instead of forking `ps`.
+#[cfg(target_os = "macos")]
+fn process_args(pid: i32) -> Option<String> {
+    let mut size = {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let mut max: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let ok = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut max as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } == 0;
+        if !ok || max <= 0 {
+            return None;
+        }
+        max as usize
+    };
+    let mut buf = vec![0u8; size];
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let ok = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } == 0;
+    if !ok {
+        return None;
+    }
+    buf.truncate(size);
+    parse_procargs2(&buf)
+}
+
+/// `KERN_PROCARGS2`: argc as a C int, the executable path, NUL padding, then
+/// argc NUL-terminated arguments (and the environment after them).
+#[cfg(any(target_os = "macos", test))]
+fn parse_procargs2(buf: &[u8]) -> Option<String> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let rest = &buf[4..];
+    let mut pos = rest.iter().position(|&byte| byte == 0)?;
+    while rest.get(pos) == Some(&0) {
+        pos += 1;
+    }
+    let mut args = Vec::new();
+    for _ in 0..argc.max(0) {
+        if pos >= rest.len() {
+            break;
+        }
+        let end = rest[pos..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map_or(rest.len(), |offset| pos + offset);
+        args.push(String::from_utf8_lossy(&rest[pos..end]).into_owned());
+        pos = end + 1;
+    }
+    (!args.is_empty()).then(|| args.join(" "))
+}
+
+/// `/proc/<pid>/cmdline`: the arguments, each ending in a NUL.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn process_args(pid: i32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw
+        .split(|&byte| byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    (!args.is_empty()).then(|| args.join(" "))
+}
+
+/// The fallback when the kernel read fails.
+#[cfg(unix)]
+fn ps_args(pid: i32) -> Option<String> {
     use std::process::Command;
     let output = Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "args="])
@@ -735,12 +832,7 @@ fn process_label(pid: i32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let args = raw.trim();
-    if args.is_empty() {
-        return None;
-    }
-    command_label(args)
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(unix)]
@@ -788,6 +880,41 @@ fn is_shell_name(name: &str) -> bool {
 #[cfg(all(test, unix))]
 mod label_tests {
     use super::*;
+
+    #[test]
+    fn reads_the_same_command_line_ps_prints() {
+        // This test binary, then a child with spaces and flags in its argv.
+        let own = std::process::id() as i32;
+        assert_eq!(
+            process_args(own).map(|args| args.trim().to_string()),
+            ps_args(own).map(|args| args.trim().to_string())
+        );
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        let read = process_args(pid);
+        let printed = ps_args(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(read.as_deref(), Some("sleep 30"));
+        assert_eq!(
+            read.map(|args| args.trim().to_string()),
+            printed.map(|args| args.trim().to_string())
+        );
+    }
+
+    #[test]
+    fn parses_procargs2() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/node\0\0\0node\0/usr/local/bin/npm\0run\0HOME=/x\0");
+        assert_eq!(
+            parse_procargs2(&buf).as_deref(),
+            Some("node /usr/local/bin/npm run")
+        );
+        assert_eq!(parse_procargs2(&[1, 0]), None);
+    }
 
     #[test]
     fn command_label_prefers_cli_over_interpreter() {

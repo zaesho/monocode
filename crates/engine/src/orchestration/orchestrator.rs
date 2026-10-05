@@ -166,6 +166,19 @@ impl Orchestrator {
         self.host.as_ref()?.session(id, cx)
     }
 
+    /// Read a session through the host without copying it.
+    fn read_session<R>(&self, id: &str, cx: &App, read: impl FnOnce(&Session) -> R) -> Option<R> {
+        let host = self.host.as_ref()?;
+        let mut read = Some(read);
+        let mut out = None;
+        host.read_session(id, cx, &mut |session| {
+            if let Some(read) = read.take() {
+                out = Some(read(session));
+            }
+        });
+        out
+    }
+
     /// `resumeBlocker`: another busy session in the checkout a run would use.
     pub fn resume_blocker(
         &self,
@@ -174,18 +187,21 @@ impl Orchestrator {
         cx: &App,
     ) -> Option<Session> {
         let host = self.host.as_ref()?;
-        let lead = host.session(lead_id, cx)?;
+        // The paused panel asks while it draws, so read in place and copy
+        // only the blocker.
+        let lead_cwd = self.read_session(lead_id, cx, |lead| {
+            lead.worktree_cwd
+                .clone()
+                .unwrap_or_else(|| lead.cwd.clone())
+        })?;
         let cwd = match checkout_cwd {
             Some(cwd) => cwd.to_string(),
             None => match self.run(lead_id) {
                 Some(run) => orchestration_checkout_cwd(&run),
-                None => lead
-                    .worktree_cwd
-                    .clone()
-                    .unwrap_or_else(|| lead.cwd.clone()),
+                None => lead_cwd,
             },
         };
-        host.sessions(cx).into_iter().find(|session| {
+        host.find_session(cx, &mut |session| {
             session.id != lead_id
                 && session.is_busy()
                 && same_checkout(
@@ -197,7 +213,8 @@ impl Orchestrator {
 
     /// `resumeLeadBusy`.
     pub fn resume_lead_busy(&self, lead_id: &str, cx: &App) -> bool {
-        self.session(lead_id, cx).is_some_and(|lead| lead.is_busy())
+        self.read_session(lead_id, cx, |lead| lead.is_busy())
+            .unwrap_or(false)
     }
 
     fn emit(&mut self, cx: &mut Context<Self>) {
@@ -297,27 +314,31 @@ impl Orchestrator {
     /// user-facing prompt: the lead answers for them, and escalates to the
     /// user in its own conversation when it does not want to decide alone.
     pub fn pending_input(&self, task: &OrchestrationTask, cx: &App) -> Option<PendingInput> {
-        let worker = self.session(&task.session_id, cx)?;
-        let pending = pending_approval_for_session(&worker)?;
-        let detail = match pending.kind {
-            InputKind::Approval => pending.block.as_ref().map(|block| {
-                match block.tool.as_ref().and_then(|tool| tool.detail.as_deref()) {
-                    Some(detail) => monocode_core::js::trim(detail).to_string(),
-                    None => block.text.clone(),
-                }
-            }),
-            InputKind::Question => None,
-        };
-        Some(PendingInput {
-            kind: pending.kind,
-            request_id: pending.request_id,
-            label: pending.label,
-            detail,
-            questions: worker
-                .pending_question
-                .as_ref()
-                .map(|question| question.questions.clone()),
+        // `sync` asks for every worker on every `Sessions` change, so read
+        // the worker in place instead of copying its transcript.
+        self.read_session(&task.session_id, cx, |worker| {
+            let pending = pending_approval_for_session(worker)?;
+            let detail = match pending.kind {
+                InputKind::Approval => pending.block.as_ref().map(|block| {
+                    match block.tool.as_ref().and_then(|tool| tool.detail.as_deref()) {
+                        Some(detail) => monocode_core::js::trim(detail).to_string(),
+                        None => block.text.clone(),
+                    }
+                }),
+                InputKind::Question => None,
+            };
+            Some(PendingInput {
+                kind: pending.kind,
+                request_id: pending.request_id,
+                label: pending.label,
+                detail,
+                questions: worker
+                    .pending_question
+                    .as_ref()
+                    .map(|question| question.questions.clone()),
+            })
         })
+        .flatten()
     }
 
     /// `waitingFor`.
@@ -502,15 +523,16 @@ impl Orchestrator {
             if run.status != RunStatus::Active || self.waking.contains(&run.lead_id) {
                 continue;
             }
-            let Some(lead) = self.session(&run.lead_id, cx) else {
+            let Some(lead_waits) = self.read_session(&run.lead_id, cx, |lead| {
+                lead.is_busy()
+                    || lead
+                        .queued_messages
+                        .as_ref()
+                        .is_some_and(|queue| !queue.is_empty())
+            }) else {
                 continue;
             };
-            if lead.is_busy()
-                || lead
-                    .queued_messages
-                    .as_ref()
-                    .is_some_and(|queue| !queue.is_empty())
-            {
+            if lead_waits {
                 continue;
             }
             let announced = self

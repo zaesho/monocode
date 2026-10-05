@@ -15,7 +15,11 @@ impl SessionList {
                          cx: &mut Context<Self>| {
             let mut body = div().flex().flex_col().gap(u(2.0));
             for row in rows {
-                if let Some(card) = data.sessions.iter().find(|card| card.id == row.id) {
+                if let Some(card) = data
+                    .card_index
+                    .get(&row.id)
+                    .and_then(|index| data.sessions.get(*index))
+                {
                     let selected = data.active_session_id.as_deref() == Some(&card.id)
                         || data.selected_ids.contains(&card.id);
                     let element = self

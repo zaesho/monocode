@@ -1117,3 +1117,40 @@ fn recovery_preserves_external_destination_created_during_install() {
     assert!(destination.join("SKILL.md").exists());
     assert!(stage.exists());
 }
+
+#[test]
+fn reconcile_statuses_match_a_fresh_snapshot_for_exported_conflicting_and_disabled_copies() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    fs::create_dir_all(fixture.source.join("references")).unwrap();
+    fs::write(fixture.source.join("references/info.txt"), "info").unwrap();
+    let imported = manager.import(&fixture.source).unwrap();
+    manager.set_shared(&imported.entry.id, true).unwrap();
+    // An edit outside MonoCode turns one export into a conflict.
+    let claude = fixture.home.join(".claude/skills/example-skill/SKILL.md");
+    fs::write(&claude, instructions("Edited by hand.")).unwrap();
+    let states = |statuses: Vec<ExportStatus>| {
+        let mut states: Vec<_> = statuses
+            .into_iter()
+            .map(|status| (status.target_key, status.path, status.state, status.detail))
+            .collect();
+        states.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        states
+    };
+    for shared in [true, false] {
+        manager.set_shared(&imported.entry.id, shared).unwrap();
+        let report = manager.reconcile(&[]).unwrap();
+        let reported = states(
+            report
+                .statuses
+                .into_iter()
+                .map(|status| status.export)
+                .collect(),
+        );
+        let snapshot = states(manager.snapshot().unwrap().entries.remove(0).statuses);
+        assert_eq!(reported, snapshot, "shared {shared}");
+        assert!(reported
+            .iter()
+            .any(|(_, _, state, _)| *state == ExportState::Conflict));
+    }
+}

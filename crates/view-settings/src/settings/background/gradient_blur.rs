@@ -10,6 +10,7 @@
 //! background.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{
     App, Context, ElementId, Hsla, ImageSource, InteractiveElement as _, IntoElement,
@@ -28,12 +29,18 @@ pub fn background_rgb(color: Hsla) -> [u8; 3] {
     [byte(rgb.r), byte(rgb.g), byte(rgb.b)]
 }
 
+/// How long a resized box keeps its old image before Haze renders at the
+/// new size. A window or pane drag changes the size every frame.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+
 /// One Haze element's measured box, its request, and its image.
 #[derive(Default)]
 pub struct HazeState {
     /// The box in CSS px, from the last frame.
     size: Option<(f64, f64)>,
     key: Option<String>,
+    /// The request without its size, to tell a resize from a new look.
+    look: Option<String>,
     image: Option<Arc<RenderImage>>,
     task: Option<Task<()>>,
 }
@@ -53,20 +60,48 @@ impl HazeState {
     ) -> Option<Arc<RenderImage>> {
         let (width, height) = self.size?;
         let source_key = format!("{path}?v={revision}");
-        let key = format!("{source_key}:{variant:?}:{background:?}:{width}x{height}");
+        let look = format!("{source_key}:{variant:?}:{background:?}");
+        let key = format!("{look}:{width}x{height}");
         if self.key.as_deref() == Some(key.as_str()) {
             return self.image.clone();
         }
         self.key = Some(key);
-        let prepared = BackgroundEffects::prepare_haze(
-            &source_key,
-            path,
-            variant,
-            background,
-            (width, height),
-            cx,
-        );
+        // A resize keeps the old image until the size settles, so a drag
+        // renders one Haze at the end instead of one per frame. Replacing
+        // the task cancels a wait that has not finished.
+        let resizing = self.image.is_some() && self.look.as_deref() == Some(look.as_str());
+        self.look = Some(look);
+        let prepared = (!resizing).then(|| {
+            BackgroundEffects::prepare_haze(
+                &source_key,
+                path,
+                variant,
+                background,
+                (width, height),
+                cx,
+            )
+        });
+        let path = path.to_string();
         self.task = Some(cx.spawn(async move |this, cx| {
+            let prepared = match prepared {
+                Some(prepared) => prepared,
+                None => {
+                    cx.background_executor().timer(RESIZE_SETTLE).await;
+                    let Ok(prepared) = this.update(cx, |_, cx| {
+                        BackgroundEffects::prepare_haze(
+                            &source_key,
+                            &path,
+                            variant,
+                            background,
+                            (width, height),
+                            cx,
+                        )
+                    }) else {
+                        return;
+                    };
+                    prepared
+                }
+            };
             let image = prepared.await.ok();
             this.update(cx, |this, cx| {
                 this.image = image;
@@ -130,6 +165,10 @@ impl RenderOnce for GradientBlurBackground {
                         state.size = Some(size);
                         cx.notify();
                     });
+                    // A notify during the draw schedules no frame, and the
+                    // state is not a view. Redraw the view that holds the
+                    // haze so it builds the image at the new size.
+                    window.request_animation_frame();
                 }
             },
             |_, _, _, _| {},

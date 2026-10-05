@@ -39,6 +39,33 @@ impl AssetSource for Assets {
     }
 }
 
+/// `img(path)` that also redraws the current view when the image finishes
+/// loading. GPUI redraws only the first view that asked for an image, so a
+/// cached view that drew the same image in the same frame kept an empty box
+/// until something else redrew it.
+pub fn shared_img(
+    path: impl Into<gpui::SharedString>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> gpui::Img {
+    use futures::FutureExt as _;
+
+    let source = gpui::ImageSource::from(path.into());
+    if let gpui::ImageSource::Resource(resource) = &source {
+        let (task, _) = cx.fetch_asset::<gpui::ImgResourceLoader>(resource);
+        if task.clone().now_or_never().is_none() {
+            let view = window.current_view();
+            window
+                .spawn(cx, async move |cx| {
+                    let _ = task.await;
+                    cx.on_next_frame(move |_, cx| cx.notify(view));
+                })
+                .detach();
+        }
+    }
+    gpui::img(source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

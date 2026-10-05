@@ -4,11 +4,13 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, ElementId, Hsla, IntoElement, ParentElement as _,
-    RenderOnce, Styled as _, Window, div,
+    App, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce,
+    Styled as _, Window, div,
 };
 use monocode_ui::styled::UiStyled as _;
 use monocode_ui::{Theme, u};
+
+use crate::motion::spinner_loop;
 
 /// `FRAMES`.
 pub const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -55,6 +57,7 @@ impl RenderOnce for TerminalSpinner {
         let theme = Theme::of(cx);
         let cycle = Duration::from_millis(FRAME_MS * FRAMES.len() as u64);
         div()
+            .id(self.id)
             .w(u(14.))
             .flex_none()
             .flex()
@@ -62,10 +65,10 @@ impl RenderOnce for TerminalSpinner {
             .text_px(self.size)
             .line_height(u(self.size))
             .text_color(self.color.unwrap_or(theme.content(0.45)))
-            .with_animation(self.id, Animation::new(cycle).repeat(), |el, delta| {
-                let frame = ((delta * FRAMES.len() as f32) as usize).min(FRAMES.len() - 1);
-                el.child(FRAMES[frame])
-            })
+            // One redraw per frame of the spinner, not per display refresh.
+            .child(spinner_loop(cycle, FRAMES.len() as u32, |frame| {
+                FRAMES[frame as usize % FRAMES.len()]
+            }))
     }
 }
 

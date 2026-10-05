@@ -1282,7 +1282,7 @@ fn find_path_in_record(rec: &Record, depth: usize) -> Option<String> {
 
 fn looks_like_tool_path(value: &str) -> bool {
     let text = js::trim(value);
-    if text.is_empty() || js::len(text) > 400 || text.contains(['\n', '\r']) {
+    if text.is_empty() || !js::len_at_most(text, 400) || text.contains(['\n', '\r']) {
         return false;
     }
     if is_weak_tool_title(text) {
@@ -1328,7 +1328,7 @@ fn looks_like_abs_path(value: &str) -> bool {
                 .next()
                 .is_some_and(|next| next != '/' && !js::is_space(next))
         });
-        return has_segment && js::len(text) < 512;
+        return has_segment && js::len_at_most(text, 511);
     }
     let bytes = text.as_bytes();
     bytes.len() >= 3
@@ -1338,7 +1338,7 @@ fn looks_like_abs_path(value: &str) -> bool {
 }
 
 fn cap_line(text: &str) -> String {
-    if js::len(text) <= MAX_LINE_CHARS {
+    if js::len_at_most(text, MAX_LINE_CHARS) {
         return text.to_string();
     }
     format!("{}…", js::slice_prefix(text, MAX_LINE_CHARS - 1))
@@ -1522,7 +1522,7 @@ fn skill_name_field(value: Option<&Value>) -> Option<String> {
     let text = js::trim(text).trim_start_matches('/');
     if text.is_empty()
         || is_weak_tool_title(text)
-        || js::len(text) > 80
+        || !js::len_at_most(text, 80)
         || text.contains(['\n', '\r'])
     {
         return None;

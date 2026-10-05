@@ -296,3 +296,49 @@ fn a_second_press_closes_permissions_and_the_model_picker_replaces_them(cx: &mut
         assert!(view.selector().is_some());
     });
 }
+
+#[gpui::test]
+fn inline_previews_decode_once_and_drop_with_their_attachment(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use monocode_core::AttachmentKind;
+
+    let host = Rc::new(Host::default());
+    let (view, cx) = mount(cx, host);
+    let file = Attachment {
+        id: "pasted-image".into(),
+        name: "screenshot.png".into(),
+        mime_type: "image/png".into(),
+        kind: AttachmentKind::Image,
+        data: Some(base64::engine::general_purpose::STANDARD.encode([0u8; 64])),
+        ..Attachment::default()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.attachments.files.push(file.clone());
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    let first = view.read_with(cx, |view, _| view.previews.get("pasted-image"));
+    let first = first.expect("the chip decoded its preview");
+
+    // Another render reuses the decoded image instead of decoding again.
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        let again = view.previews.get("pasted-image").expect("still cached");
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(view.previews.len(), 1);
+    });
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.attachments.files.clear();
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| assert_eq!(view.previews.len(), 0));
+}

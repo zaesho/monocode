@@ -127,6 +127,7 @@ pub struct QuickComposer {
     pub(crate) error: Option<String>,
     pub(crate) busy: bool,
     pub(crate) attachments: QuickAttachments,
+    pub(crate) previews: render::PreviewCache,
     pub(crate) selector: Option<(Entity<QuickModelSelector>, Subscription)>,
     pub(crate) permissions: Option<(Entity<QuickPermissions>, Subscription)>,
 
@@ -212,6 +213,7 @@ impl QuickComposer {
             error: None,
             busy: false,
             attachments: QuickAttachments::default(),
+            previews: Default::default(),
             selector: None,
             permissions: None,
             motion: PickerMotion::default(),

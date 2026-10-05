@@ -39,6 +39,9 @@ impl IntoElement for PromptTextElement {
 /// window freely.
 #[derive(Clone)]
 struct Snapshot {
+    /// The input's `version`: bumps with the text, the IME range, and the
+    /// decorations.
+    version: u64,
     text: SharedString,
     placeholder: SharedString,
     selection: Range<usize>,
@@ -67,11 +70,13 @@ pub struct PrepaintState {
 }
 
 fn snapshot(input: &Entity<PromptInput>, window: &mut Window, cx: &mut App) -> Snapshot {
-    let decorations = input.update(cx, |input, cx| input.decorations(cx));
+    let (decorations, text) =
+        input.update(cx, |input, cx| (input.decorations(cx), input.shared_text()));
     let input = input.read(cx);
     let focused = input.focus_handle.is_focused(window);
     Snapshot {
-        text: input.buffer.text().to_string().into(),
+        version: input.version(),
+        text,
         placeholder: input.placeholder.clone(),
         selection: input.buffer.selection(),
         caret: input.caret(),
@@ -187,6 +192,52 @@ fn metrics(snapshot: &Snapshot, window: &Window) -> Metrics {
     }
 }
 
+/// What a [`TextLayout`] depends on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LayoutKey {
+    version: u64,
+    width: Pixels,
+    padding: [Pixels; 4],
+    font: gpui::Font,
+    font_size: Pixels,
+    line_height: Pixels,
+    indent: Pixels,
+    color: Hsla,
+}
+
+/// The layout for this snapshot at `width`, reused from the last frame when
+/// nothing it depends on changed. Measuring and prepainting both ask for
+/// it, so without the cache every frame wrapped and shaped the text twice.
+fn cached_layout(
+    input: &Entity<PromptInput>,
+    snapshot: &Snapshot,
+    metrics: &Metrics,
+    width: Pixels,
+    window: &mut Window,
+    cx: &mut App,
+) -> Rc<TextLayout> {
+    let key = LayoutKey {
+        version: snapshot.version,
+        width,
+        padding: metrics.padding,
+        font: metrics.font.clone(),
+        font_size: metrics.font_size,
+        line_height: metrics.line_height,
+        indent: metrics.indent,
+        color: metrics.color,
+    };
+    if let Some((cached, layout)) = &input.read(cx).layout_cache
+        && *cached == key
+    {
+        return layout.clone();
+    }
+    let layout = Rc::new(layout_text(snapshot, metrics, width, window, cx));
+    input.update(cx, |input, _| {
+        input.layout_cache = Some((key, layout.clone()));
+    });
+    layout
+}
+
 fn layout_text(
     snapshot: &Snapshot,
     metrics: &Metrics,
@@ -256,13 +307,14 @@ impl Element for PromptTextElement {
         let metrics = metrics(&snapshot, window);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
+        let input = self.input.clone();
         let layout_id =
             window.request_measured_layout(style, move |known, available, window, cx| {
                 let width = known.width.unwrap_or(match available.width {
                     AvailableSpace::Definite(width) => width,
                     _ => px(10_000.),
                 });
-                let layout = layout_text(&snapshot, &metrics, width, window, cx);
+                let layout = cached_layout(&input, &snapshot, &metrics, width, window, cx);
                 size(width, element_height(&snapshot, &metrics, &layout))
             });
         (layout_id, ())
@@ -279,13 +331,14 @@ impl Element for PromptTextElement {
     ) -> Self::PrepaintState {
         let snapshot = snapshot(&self.input, window, cx);
         let metrics = metrics(&snapshot, window);
-        let layout = Rc::new(layout_text(
+        let layout = cached_layout(
+            &self.input,
             &snapshot,
             &metrics,
             bounds.size.width,
             window,
             cx,
-        ));
+        );
         let [top, _right, bottom, left] = metrics.padding;
         let viewport = (bounds.size.height - top - bottom).max(px(0.));
         let max_scroll = (layout.height() - viewport).max(px(0.));

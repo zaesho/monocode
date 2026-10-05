@@ -87,6 +87,9 @@ impl AccessPicker {
     }
 
     pub fn set_value(&mut self, value: RuntimeMode, cx: &mut Context<Self>) {
+        if value == self.value {
+            return;
+        }
         self.value = value;
         if self.open {
             self.active = index_of(value);
@@ -96,8 +99,10 @@ impl AccessPicker {
 
     /// A turn is running, so a change applies to the next one.
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
-        self.busy = busy;
-        cx.notify();
+        if busy != self.busy {
+            self.busy = busy;
+            cx.notify();
+        }
     }
 
     pub fn is_open(&self) -> bool {

@@ -131,7 +131,7 @@ pub struct FrameCursor {
 }
 
 /// Everything needed to paint the viewport once.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
     pub cols: usize,
     pub rows: usize,
@@ -205,6 +205,9 @@ pub struct Emulator {
     bell: bool,
     cell_width: f32,
     cell_height: f32,
+    /// Bumped by every call that can change what [`Emulator::frame`]
+    /// returns, so the view can reuse the last frame while it stays put.
+    revision: u64,
 }
 
 impl Emulator {
@@ -234,7 +237,27 @@ impl Emulator {
             bell: false,
             cell_width: 8.0,
             cell_height: 16.0,
+            revision: 0,
         }
+    }
+
+    /// Changes whenever the next [`Emulator::frame`] may differ from the
+    /// last one: output, resize, scroll, selection, focus, or theme.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Whether a blinking cursor is on screen: the program shows the cursor,
+    /// has not asked for a steady one (DECSCUSR), and the viewport is not
+    /// scrolled away from it. Blink ticks change nothing on screen otherwise.
+    pub fn cursor_blinks(&self) -> bool {
+        self.mode().contains(TermMode::SHOW_CURSOR)
+            && self.term.cursor_style().blinking
+            && self.cursor_cell().is_some()
     }
 
     pub fn theme(&self) -> &TerminalTheme {
@@ -245,6 +268,7 @@ impl Emulator {
     /// dark (`SCHEME_CHANGE_EVENT` in TerminalView.tsx).
     pub fn set_theme(&mut self, theme: TerminalTheme) {
         self.theme = theme;
+        self.touch();
     }
 
     /// Cell size in pixels, used to answer CSI 14 t.
@@ -256,6 +280,7 @@ impl Emulator {
     /// Parse PTY output. Returns the bytes the terminal wants written back to
     /// the PTY: replies to DSR, DA, and color queries (OSC 10, 11, 12, 4).
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.touch();
         self.parser.advance(&mut self.term, bytes);
         let events: Vec<Event> = self.listener.0.borrow_mut().drain(..).collect();
         let mut replies = Vec::new();
@@ -305,6 +330,7 @@ impl Emulator {
     }
 
     pub fn resize(&mut self, size: GridSize) {
+        self.touch();
         self.term.resize(size);
     }
 
@@ -380,23 +406,28 @@ impl Emulator {
     /// Scroll the viewport. Positive moves up into history.
     pub fn scroll(&mut self, lines: i32) {
         if lines != 0 {
+            self.touch();
             self.term.scroll_display(Scroll::Delta(lines));
         }
     }
 
     pub fn scroll_page_up(&mut self) {
+        self.touch();
         self.term.scroll_display(Scroll::PageUp);
     }
 
     pub fn scroll_page_down(&mut self) {
+        self.touch();
         self.term.scroll_display(Scroll::PageDown);
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.touch();
         self.term.scroll_display(Scroll::Bottom);
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.touch();
         self.term.scroll_display(Scroll::Top);
     }
 
@@ -404,6 +435,7 @@ impl Emulator {
     /// Cmd+K on macOS: the cursor's line becomes the first line and the
     /// scrollback is dropped.
     pub fn clear(&mut self) {
+        self.touch();
         let cursor = self.term.grid().cursor.point;
         if cursor.line.0 > 0 {
             self.term.scroll_up(cursor.line.0 as usize);
@@ -430,6 +462,7 @@ impl Emulator {
 
     /// Tell the terminal whether it has focus.
     pub fn set_focused(&mut self, focused: bool) {
+        self.touch();
         self.term.is_focused = focused;
     }
 
@@ -453,21 +486,27 @@ impl Emulator {
     /// Start a selection. `Simple` for a drag, `Semantic` for a word
     /// (double click), `Lines` for a line (triple click).
     pub fn start_selection(&mut self, ty: SelectionType, point: GridPoint, side: Side) {
+        self.touch();
         self.term.selection = Some(Selection::new(ty, point, side));
     }
 
     /// Move the moving end of the selection.
     pub fn update_selection(&mut self, point: GridPoint, side: Side) {
+        self.touch();
         if let Some(selection) = self.term.selection.as_mut() {
             selection.update(point, side);
         }
     }
 
     pub fn clear_selection(&mut self) {
+        if self.term.selection.is_some() {
+            self.touch();
+        }
         self.term.selection = None;
     }
 
     pub fn select_all(&mut self) {
+        self.touch();
         let grid = self.term.grid();
         let start = Point::new(grid.topmost_line(), Column(0));
         let end = Point::new(grid.bottommost_line(), grid.last_column());
@@ -780,6 +819,56 @@ mod tests {
 
     fn cursor(e: &Emulator) -> Option<(usize, usize)> {
         e.frame().cursor.map(|c| (c.row, c.col))
+    }
+
+    #[test]
+    fn revision_moves_with_every_change_the_frame_can_show() {
+        let mut e = emu(10, 3);
+        let mut last = e.revision();
+        let mut changed = |e: &Emulator| {
+            let moved = e.revision() != last;
+            last = e.revision();
+            moved
+        };
+        // Reads and the cell size leave it alone.
+        let _ = e.frame();
+        e.set_cell_size(9.0, 18.0);
+        let _ = e.take_title_changed();
+        assert!(!changed(&e));
+        e.feed(b"hi");
+        assert!(changed(&e));
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
+        assert!(changed(&e));
+        e.update_selection(e.grid_point(0, 1), Side::Right);
+        assert!(changed(&e));
+        e.clear_selection();
+        assert!(changed(&e));
+        // Clearing no selection changes nothing.
+        e.clear_selection();
+        assert!(!changed(&e));
+        e.set_focused(false);
+        assert!(changed(&e));
+        e.resize(GridSize::new(12, 4));
+        assert!(changed(&e));
+        e.scroll_to_top();
+        assert!(changed(&e));
+        e.set_theme(TerminalTheme::light());
+        assert!(changed(&e));
+    }
+
+    #[test]
+    fn cursor_blinks_only_when_shown_and_not_steady() {
+        let mut e = emu(10, 3);
+        assert!(e.cursor_blinks());
+        // DECSCUSR 2: steady block.
+        e.feed(b"\x1b[2 q");
+        assert!(!e.cursor_blinks());
+        // DECSCUSR 1: blinking block.
+        e.feed(b"\x1b[1 q");
+        assert!(e.cursor_blinks());
+        // DECTCEM off hides the cursor.
+        e.feed(b"\x1b[?25l");
+        assert!(!e.cursor_blinks());
     }
 
     #[test]

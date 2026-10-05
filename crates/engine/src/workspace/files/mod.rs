@@ -22,7 +22,7 @@ use std::sync::Arc;
 use gpui::{App, AppContext, Entity, EventEmitter, Global};
 
 pub use backend::{FileMtime, FsBackend, FsEntry, LocalFs, ProjectFile};
-pub use file_index::{FileIndex, FilesLoad, FilesResult, RankedFile};
+pub use file_index::{FileIndex, FilesLoad, FilesResult, ProjectFilesChanged, RankedFile};
 pub use file_tree::{DirsChanged, FileTree};
 pub use file_watch::FileWatch;
 

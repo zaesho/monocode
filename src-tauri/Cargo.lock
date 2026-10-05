@@ -2569,6 +2569,7 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2652,11 +2653,13 @@ dependencies = [
 name = "monocode-store"
 version = "0.7.0"
 dependencies = [
+ "base64 0.22.1",
  "monocode-git",
  "monocode-platform",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 

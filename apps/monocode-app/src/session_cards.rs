@@ -39,6 +39,9 @@ pub struct ComposerCards {
     /// Linked sessions as (id, title).
     peers: Vec<(String, String)>,
     _links: Subscription,
+    /// The note card shows its source project's mark, which the projects
+    /// package and the `monocode:tab-group:*` settings hold.
+    _marks: Subscription,
     _titles: Option<gpui::Task<()>>,
 }
 impl ComposerCards {
@@ -49,6 +52,11 @@ impl ComposerCards {
             cards: ContextCards::default(),
             peers: Vec::new(),
             _links: cx.observe(&links, |this, _, cx| this.refresh_peers(cx)),
+            _marks: crate::revisions::observe(cx, |this, cx| {
+                if this.cards.note.is_some() {
+                    cx.notify();
+                }
+            }),
             _titles: None,
         };
         this.refresh_peers(cx);

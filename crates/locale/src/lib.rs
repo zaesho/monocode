@@ -5,6 +5,7 @@ mod api;
 mod locale;
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     cmp::Ordering,
     ffi::{c_void, CStr, CString},
@@ -68,6 +69,10 @@ fn try_compare(a: &str, b: &str, locale: Option<&str>) -> Result<Ordering, Local
         let entry = cache.entry(locale);
         if entry.collator.is_none() {
             entry.collator = Some(Collator::new(&entry.locale)?);
+        }
+        // Identical bytes always collate equal. Sort tie-breaks hit this often.
+        if a == b {
+            return Ok(Ordering::Equal);
         }
         let collator = entry.collator.as_ref().unwrap();
         let mut status = 0;
@@ -248,42 +253,54 @@ impl Cache {
             _apartment: api::Apartment::new(api)?,
         })
     }
+    // The OS default comes back borrowed, so the common no-locale path does
+    // not allocate a CString per comparison.
     fn resolve(
         &self,
         locale: Option<&str>,
         service: locale::Service,
-    ) -> Result<CString, LocaleError> {
+    ) -> Result<Cow<'static, CStr>, LocaleError> {
         match locale {
             Some(locale) => {
                 let requested = locale::from_language_tag(self.api, locale)?;
                 match locale::resolve_available(self.api, &requested, service)? {
-                    Some(locale) => Ok(locale),
+                    Some(locale) => Ok(Cow::Owned(locale)),
                     None => self.resolve(None, service),
                 }
             }
             None => {
                 #[cfg(any(test, feature = "test-support"))]
                 if let Some(locale) = LOCALE_SCOPE.with(|scope| scope.borrow().last().cloned()) {
-                    return Ok(locale);
+                    return Ok(Cow::Owned(locale));
                 }
-                locale::os_default(self.api)
+                locale::os_default(self.api).map(Cow::Borrowed)
             }
         }
     }
-    fn entry(&mut self, locale: CString) -> &mut Entry {
-        if let Some(index) = self.entries.iter().position(|entry| entry.locale == locale) {
-            let entry = self.entries.remove(index);
-            self.entries.push(entry);
-        } else {
-            // Explicit locale inputs must not grow an unbounded process cache.
-            if self.entries.len() == 16 {
-                self.entries.remove(0);
+    fn entry(&mut self, locale: Cow<'_, CStr>) -> &mut Entry {
+        let last = self.entries.len().wrapping_sub(1);
+        match self
+            .entries
+            .iter()
+            .position(|entry| entry.locale.as_c_str() == &*locale)
+        {
+            // Repeated calls for one locale, as in a sort, skip the reorder.
+            Some(index) if index == last => {}
+            Some(index) => {
+                let entry = self.entries.remove(index);
+                self.entries.push(entry);
             }
-            self.entries.push(Entry {
-                locale,
-                collator: None,
-                relative: None,
-            });
+            None => {
+                // Explicit locale inputs must not grow an unbounded process cache.
+                if self.entries.len() == 16 {
+                    self.entries.remove(0);
+                }
+                self.entries.push(Entry {
+                    locale: locale.into_owned(),
+                    collator: None,
+                    relative: None,
+                });
+            }
         }
         self.entries.last_mut().unwrap()
     }
@@ -306,7 +323,11 @@ thread_local! { static LOCALE_SCOPE: RefCell<Vec<CString>> = const { RefCell::ne
 /// Run a controlled fixture with a locale on this thread only. Restore on unwind.
 #[cfg(any(test, feature = "test-support"))]
 pub fn with_locale<T>(locale: &str, operation: impl FnOnce() -> T) -> Result<T, LocaleError> {
-    let locale = with_cache(|cache| cache.resolve(Some(locale), locale::Service::Relative))?;
+    let locale = with_cache(|cache| {
+        cache
+            .resolve(Some(locale), locale::Service::Relative)
+            .map(Cow::into_owned)
+    })?;
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {

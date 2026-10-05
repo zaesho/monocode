@@ -175,14 +175,24 @@ fn walk(
                 relative.display()
             )));
         }
-        let resolved = fs::canonicalize(&path).map_err(|e| io("Resolve resource", &path, e))?;
-        if !resolved.starts_with(root) {
-            return Err(Error::InvalidBundle(format!(
-                "Symbolic link leaves the skill directory: {}",
-                relative.display()
-            )));
-        }
-        let metadata = fs::metadata(&resolved).map_err(|e| io("Read resource", &resolved, e))?;
+        // `canonical` is already resolved and `read_dir` gives on-disk names,
+        // so a child that is not a link resolves to `path` itself, inside
+        // `root`. Only links need `canonicalize` and a second `metadata`,
+        // which cost several system calls per file on every fingerprint.
+        let (resolved, metadata) = if metadata.file_type().is_symlink() {
+            let resolved = fs::canonicalize(&path).map_err(|e| io("Resolve resource", &path, e))?;
+            if !resolved.starts_with(root) {
+                return Err(Error::InvalidBundle(format!(
+                    "Symbolic link leaves the skill directory: {}",
+                    relative.display()
+                )));
+            }
+            let metadata =
+                fs::metadata(&resolved).map_err(|e| io("Read resource", &resolved, e))?;
+            (resolved, metadata)
+        } else {
+            (path, metadata)
+        };
         if metadata.is_dir() {
             items.push(Item {
                 path: relative.clone(),

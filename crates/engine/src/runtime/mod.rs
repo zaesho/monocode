@@ -41,5 +41,5 @@ pub use hooks::{
 pub use in_flight::ResumedWorkspace;
 pub use lifecycle::{BootWorkspace, Lifecycle, LifecycleEvent, QuitMode};
 pub use session_links::{LINK_MESSAGE_BUDGET, SessionLinks};
-pub use session_store::{InFlightRef, SessionSummary, SessionWriter};
+pub use session_store::{InFlightRef, PersistOutcome, SessionSummary, SessionWriter};
 pub use sessions::{Sessions, SessionsEvent};

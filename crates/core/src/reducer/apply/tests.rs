@@ -1511,6 +1511,68 @@ fn settles_a_step_in_place_instead_of_repeating_it() {
 }
 
 #[test]
+fn reports_a_repeated_step_as_no_change_and_keeps_the_run() {
+    let mut t = T::new();
+    let step = json!({
+        "type": "agent.step", "callId": "agent-1", "stepId": "t1", "kind": "tool",
+        "text": "Read src/App.tsx", "status": "in_progress",
+    });
+    let spawned = spawn(&mut t);
+    let mut session = t.apply(&spawned, step.clone());
+    session.blocks[0]
+        .agent_run
+        .as_mut()
+        .unwrap()
+        .extra
+        .insert("kept".into(), json!(true));
+    let before = session.clone();
+    assert!(!apply_harness_event_mut(
+        &mut t.env,
+        &mut session,
+        &ev(step)
+    ));
+    assert_eq!(session, before);
+
+    // A real change rebuilds the run header, as the TypeScript's new object did.
+    let changed = apply_harness_event_mut(
+        &mut t.env,
+        &mut session,
+        &ev(json!({
+            "type": "agent.step", "callId": "agent-1", "stepId": "t1", "kind": "tool",
+            "text": "", "status": "completed",
+        })),
+    );
+    assert!(changed);
+    let agent = run(&session.blocks[0]);
+    assert_eq!(agent.steps[0].status.as_deref(), Some("completed"));
+    assert!(agent.extra.is_empty());
+}
+
+#[test]
+fn keeps_the_newest_steps_of_a_long_run() {
+    let mut t = T::new();
+    let mut session = spawn(&mut t);
+    for index in 0..MAX_AGENT_STEPS + 5 {
+        let changed = apply_harness_event_mut(
+            &mut t.env,
+            &mut session,
+            &ev(json!({
+                "type": "agent.step", "callId": "agent-1", "stepId": format!("s{index}"),
+                "kind": "tool", "text": format!("Read {index}.rs"),
+            })),
+        );
+        assert!(changed);
+    }
+    let steps = &run(&session.blocks[0]).steps;
+    assert_eq!(steps.len(), MAX_AGENT_STEPS);
+    assert_eq!(steps[0].id, "s5");
+    assert_eq!(
+        steps[MAX_AGENT_STEPS - 1].id,
+        format!("s{}", MAX_AGENT_STEPS + 4)
+    );
+}
+
+#[test]
 fn drops_a_step_with_no_parent_call_to_hang_it_on() {
     let mut t = T::new();
     let session = spawn(&mut t);

@@ -843,3 +843,120 @@ fn lists_the_folders_a_create_or_move_touches() {
         vec!["/p".to_string(), "/q".into()]
     );
 }
+
+// Keyboard reveal and scroll anchoring over the virtualized list.
+
+impl Harness<'_> {
+    /// The row's drawn bounds, if it lies inside the list's viewport.
+    fn row_in_view(&mut self, path: &str) -> bool {
+        let viewport = self
+            .tree
+            .read_with(self.cx, |tree, _| tree.list.viewport_bounds());
+        let selector: &'static str = Box::leak(format!("tree-row:{path}").into_boxed_str());
+        self.cx.debug_bounds(selector).is_some_and(|row| {
+            row.top() >= viewport.top() - px(0.5) && row.bottom() <= viewport.bottom() + px(0.5)
+        })
+    }
+
+    /// The path of the first row the list shows.
+    fn first_visible(&mut self) -> Option<(String, Pixels)> {
+        self.tree.read_with(self.cx, |tree, _| {
+            let top = tree.list.logical_scroll_top();
+            match tree.list_rows.get(top.item_ix) {
+                Some(ListRow::Tree(TreeRow::Entry { entry, .. })) => {
+                    Some((entry.path.clone(), top.offset_in_item))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    fn scroll_to_row(&mut self, index: usize) {
+        self.tree.update(self.cx, |tree, cx| {
+            tree.list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        });
+        self.cx.run_until_parked();
+    }
+}
+
+fn numbered(prefix: &str, count: usize) -> Vec<FsEntry> {
+    (0..count)
+        .map(|index| {
+            FsEntry::file(
+                format!("f{index:04}.ts"),
+                format!("{prefix}/f{index:04}.ts"),
+            )
+        })
+        .collect()
+}
+
+#[gpui::test]
+fn up_with_nothing_selected_reveals_the_last_row(cx: &mut TestAppContext) {
+    let mut h = mount(setup(numbered(CWD, 300)), cx);
+    let last = format!("{CWD}/f0299.ts");
+    assert!(!h.row_in_view(&last), "the tree is taller than the view");
+    h.keys("up");
+    assert_eq!(
+        h.tree
+            .read_with(h.cx, |tree, _| tree.selected_path().map(str::to_string)),
+        Some(last.clone())
+    );
+    assert!(h.row_in_view(&last));
+}
+
+#[gpui::test]
+fn down_after_a_large_folder_opens_above_keeps_the_selection_in_view(cx: &mut TestAppContext) {
+    let fs = setup(vec![folder("big"), file("a.ts"), file("b.ts")]);
+    fs.set_dir(&format!("{CWD}/big"), numbered(&format!("{CWD}/big"), 1000));
+    let mut h = mount(fs, cx);
+    let a = format!("{CWD}/a.ts");
+    h.select(&a);
+    h.cx.run_until_parked();
+    assert!(h.row_in_view(&a));
+    let big = format!("{CWD}/big");
+    h.tree.update(h.cx, |tree, cx| tree.toggle(&big, cx));
+    h.cx.run_until_parked();
+    h.keys("down");
+    let b = format!("{CWD}/b.ts");
+    assert_eq!(
+        h.tree
+            .read_with(h.cx, |tree, _| tree.selected_path().map(str::to_string)),
+        Some(b.clone())
+    );
+    assert!(h.row_in_view(&b));
+    // And back up past the 1000 rows to the top.
+    h.select(&big);
+    h.tree.update(h.cx, |tree, _| tree.reveal_row(&big));
+    h.cx.update(|window, _| window.refresh());
+    h.cx.run_until_parked();
+    assert!(h.row_in_view(&big));
+}
+
+#[gpui::test]
+fn a_listing_that_changes_around_the_view_keeps_it_in_place(cx: &mut TestAppContext) {
+    let src = format!("{CWD}/src");
+    let fs = setup(vec![folder("src")]);
+    fs.set_dir(&src, numbered(&src, 300));
+    let mut h = mount(fs, cx);
+    h.tree.update(h.cx, |tree, cx| tree.toggle(&src, cx));
+    h.cx.run_until_parked();
+    h.scroll_to_row(150);
+    let before = h.first_visible().expect("an entry is at the top");
+
+    // A checkout adds a file at each end of the folder.
+    let mut entries = vec![FsEntry::file("aaa.rs", format!("{src}/aaa.rs"))];
+    entries.extend(numbered(&src, 300));
+    entries.push(FsEntry::file("zzz.rs", format!("{src}/zzz.rs")));
+    h.fs.set_dir(&src, entries);
+    h.cx.update(|_, cx| h.fs.explorer.notify_dirs_changed(cx));
+    h.cx.executor()
+        .advance_clock(DIRS_REFRESH_DELAY + Duration::from_millis(50));
+    h.cx.run_until_parked();
+    assert!(h.has_row("src/zzz.rs"));
+    assert_eq!(h.first_visible(), Some(before.clone()));
+    assert!(h.row_in_view(&before.0));
+}

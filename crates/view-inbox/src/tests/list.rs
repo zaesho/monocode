@@ -257,3 +257,22 @@ fn applies_filter_menu_rows_to_the_list(cx: &mut TestAppContext) {
             .read_with(h.cx, |view, _| view.state().filters_active)
     );
 }
+
+#[gpui::test]
+fn redrawing_reuses_the_visible_items_until_the_list_changes(cx: &mut TestAppContext) {
+    let list = FakeList::new(sample_list_state(), sample_items());
+    let h = mount(cx, list);
+    let reads = h.list.visible_reads.get();
+
+    // A redraw for an unrelated reason does not map the items again.
+    h.view.update(h.cx, |_, cx| cx.notify());
+    draw(h.cx);
+    draw(h.cx);
+    assert_eq!(h.list.visible_reads.get(), reads);
+
+    // A list change reads them once more.
+    let list = h.list.clone();
+    h.cx.update(|_, cx| list.listeners.notify(cx));
+    draw(h.cx);
+    assert_eq!(h.list.visible_reads.get(), reads + 1);
+}

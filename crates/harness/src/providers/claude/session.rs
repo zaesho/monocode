@@ -37,6 +37,7 @@ use parking_lot::{Mutex, MutexGuard, ReentrantMutex};
 use regex::Regex;
 use serde_json::{Value, json};
 
+use crate::core::partial_json::PartialJson;
 use crate::core::provider_accounts::same_provider_account_id;
 use crate::core::registry::{AcceptedHook, EventSink};
 use crate::core::task::{SharedSpawner, sleep, timeout};
@@ -127,7 +128,7 @@ struct InFlightTool {
     id: String,
     name: String,
     input: Record,
-    partial_json: String,
+    partial_json: PartialJson,
     title: String,
 }
 
@@ -766,7 +767,7 @@ impl Live {
                 id: started.id,
                 name: started.name,
                 input: started.input,
-                partial_json: String::new(),
+                partial_json: PartialJson::default(),
             };
             if started.index >= 0 {
                 self.tools_by_index.insert(started.index, tool.id.clone());
@@ -804,7 +805,7 @@ impl Live {
                 return;
             };
             tool.partial_json.push_str(&json_delta.partial);
-            let Some(parsed) = try_parse_json_record(&tool.partial_json) else {
+            let Some(parsed) = tool.partial_json.complete().and_then(try_parse_json_record) else {
                 return;
             };
             tool.input = parsed.clone();
@@ -913,7 +914,7 @@ impl Live {
                 id: tool_use.id.clone(),
                 name: tool_use.name.clone(),
                 input: tool_use.input.clone(),
-                partial_json: String::new(),
+                partial_json: PartialJson::default(),
                 title: tool_title(&tool_use.name, &tool_use.input),
             };
             self.tools_by_id.set(tool_use.id.clone(), tool.clone());
@@ -1742,7 +1743,7 @@ impl Live {
                     id: id.clone(),
                     name: "Agent".into(),
                     input: Record::new(),
-                    partial_json: String::new(),
+                    partial_json: PartialJson::default(),
                     title: title.into(),
                 },
             );

@@ -285,7 +285,6 @@ static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| re(r"`([^`]*)`"));
 static LINK: LazyLock<Regex> = LazyLock::new(|| re(r"!?\[([^\]]*)\]\([^)]*\)"));
 static STRONG: LazyLock<Regex> = LazyLock::new(|| re(r"\*\*(.+?)\*\*|__(.+?)__"));
 static EMPHASIS: LazyLock<Regex> = LazyLock::new(|| re(r"\*(.+?)\*|_(.+?)_"));
-static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| re(r"\s+"));
 
 /// Either alternative's capture, the `$2` of `(\*\*|__)(.+?)\1`.
 fn either_capture(caps: &regex::Captures<'_>) -> String {
@@ -308,8 +307,29 @@ pub fn prose_summary(text: &str) -> String {
     let value = LINK.replace_all(&value, "$1");
     let value = STRONG.replace_all(&value, either_capture);
     let value = EMPHASIS.replace_all(&value, either_capture);
-    let value = WHITESPACE.replace_all(&value, " ");
+    let value = collapse_whitespace(&value);
     js::trim(&value).to_string()
+}
+
+/// `value.replace(/\s+/g, " ")` with the Rust `\s`, which is the Unicode
+/// `White_Space` property, as `char::is_whitespace` is. The regex made one
+/// match per gap between words, about 0.5 ms on a 20 KB paragraph, and the
+/// transcript summarizes every thinking row each time it renders.
+fn collapse_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
 }
 
 /// `editVerb`: the canonical verb for a write-preview row.

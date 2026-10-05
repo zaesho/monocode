@@ -182,6 +182,9 @@ pub struct FileEditorSurface {
     metadata: Option<String>,
     metadata_open: bool,
     draft: String,
+    /// The SVG preview of `draft`, built on first draw after the draft
+    /// changes rather than copied and hashed on every frame.
+    svg_image: Option<Arc<Image>>,
     navigation_token: Option<u64>,
     source_navigation_token: Option<u64>,
     pending_navigation: Option<EditorNavigation>,
@@ -256,6 +259,7 @@ impl FileEditorSurface {
             metadata: None,
             metadata_open: false,
             draft: String::new(),
+            svg_image: None,
             navigation_token: None,
             source_navigation_token: None,
             pending_navigation: None,
@@ -576,6 +580,7 @@ impl FileEditorSurface {
         self.editor = Some(editor);
         self.apply_git_base(cx);
         self.draft = normalize_line_breaks(&text);
+        self.svg_image = None;
         if self.markdown() && self.preview.is_none() {
             self.build_preview(window, cx);
         } else {
@@ -625,6 +630,7 @@ impl FileEditorSurface {
             return;
         }
         self.draft = draft;
+        self.svg_image = None;
         self.update_preview(cx);
     }
 
@@ -796,25 +802,32 @@ impl FileEditorSurface {
                 if diff.binary || diff.too_large {
                     return Ok(None);
                 }
-                let original = normalize_line_breaks(&diff.original);
                 let changed = file
                     .as_ref()
                     .is_some_and(|file| file.staged || file.unstaged);
-                let eol_only = changed
-                    && diff.original != diff.current
-                    && original == normalize_line_breaks(&diff.current);
-                let source = if diff.original.is_empty() {
-                    &diff.current
-                } else {
-                    &diff.original
-                };
-                Ok(Some(GitBase {
-                    path,
-                    line_ending: detect_line_ending(source),
-                    original,
-                    kind,
-                    eol_only,
-                }))
+                // Whole-file passes over up to 8 MiB of text: keep them off
+                // the UI thread.
+                let base = cx
+                    .background_spawn(async move {
+                        let original = normalize_line_breaks(&diff.original);
+                        let eol_only = changed
+                            && diff.original != diff.current
+                            && original == normalize_line_breaks(&diff.current);
+                        let source = if diff.original.is_empty() {
+                            &diff.current
+                        } else {
+                            &diff.original
+                        };
+                        GitBase {
+                            path,
+                            line_ending: detect_line_ending(source),
+                            original,
+                            kind,
+                            eol_only,
+                        }
+                    })
+                    .await;
+                Ok(Some(base))
             }
             .await;
             this.update(cx, |this, cx| {
@@ -1040,11 +1053,16 @@ impl FileEditorSurface {
         }
     }
 
-    fn render_svg(&self) -> gpui::AnyElement {
-        let image = Arc::new(Image::from_bytes(
-            ImageFormat::Svg,
-            self.draft.clone().into_bytes(),
-        ));
+    fn render_svg(&mut self) -> gpui::AnyElement {
+        let image = self
+            .svg_image
+            .get_or_insert_with(|| {
+                Arc::new(Image::from_bytes(
+                    ImageFormat::Svg,
+                    self.draft.clone().into_bytes(),
+                ))
+            })
+            .clone();
         div()
             .id("svg-preview")
             .flex()

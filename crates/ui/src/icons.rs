@@ -5,7 +5,7 @@
 //! src/features/sessions/ui/HarnessIcon.tsx.
 
 use gpui::{
-    AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, Styled, Svg, Window, div, img,
+    AnyElement, App, Hsla, IntoElement, ParentElement, RenderOnce, Styled, Svg, Window, div,
     relative, svg,
 };
 
@@ -699,7 +699,7 @@ impl Provider {
 }
 
 impl RenderOnce for Provider {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let frame = div()
             .flex_none()
             .size(u(self.size))
@@ -716,7 +716,9 @@ impl RenderOnce for Provider {
                 .text_color(color)
                 .into_any_element()
         } else {
-            img(self.logo.path()).size_full().into_any_element()
+            crate::assets::shared_img(self.logo.path(), window, cx)
+                .size_full()
+                .into_any_element()
         };
         frame.child(mark)
     }

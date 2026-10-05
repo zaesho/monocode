@@ -139,7 +139,9 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let messages = self.props.queued_messages.clone();
+        // Queued messages carry their attachments' bytes, so rows borrow
+        // them and the Edit button looks its message up when clicked.
+        let messages = &self.props.queued_messages;
         if messages.is_empty() {
             return None;
         }
@@ -263,7 +265,7 @@ impl Composer {
                     );
             } else {
                 let steer = id.clone();
-                let edit = message.clone();
+                let edit = id.clone();
                 let delete = id.clone();
                 row = row
                     .child(
@@ -295,7 +297,15 @@ impl Composer {
                         .tooltip(monocode_ui::widgets::tooltip("Edit queued message"))
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
-                                this.start_queue_edit(&edit, window, cx);
+                                let message = this
+                                    .props
+                                    .queued_messages
+                                    .iter()
+                                    .find(|message| message.id == edit)
+                                    .cloned();
+                                if let Some(message) = message {
+                                    this.start_queue_edit(&message, window, cx);
+                                }
                             },
                         )),
                     )

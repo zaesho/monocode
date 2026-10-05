@@ -654,6 +654,8 @@ pub struct TestWorkspace {
     pub hidden: RefCell<bool>,
     /// What `collect_snapshot` returns; `None` skips snapshot writes.
     pub snapshot: RefCell<Option<Value>>,
+    /// How many times `collect_snapshot` ran.
+    pub collects: std::cell::Cell<usize>,
     /// Answer to every confirmation dialog.
     pub confirm_answer: RefCell<bool>,
     pub confirms: RefCell<Vec<String>>,
@@ -686,6 +688,7 @@ impl WorkspaceHooks for TestWorkspace {
     }
 
     fn collect_snapshot(&self, sessions: &[Session], _cx: &App) -> Option<Value> {
+        self.collects.set(self.collects.get() + 1);
         let base = self.snapshot.borrow().clone()?;
         let mut snapshot = base;
         if let Some(object) = snapshot.as_object_mut() {

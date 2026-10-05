@@ -40,6 +40,23 @@ pub fn len(s: &str) -> usize {
     s.encode_utf16().count()
 }
 
+/// `len(s) <= max`, without counting past `max`. A string never has more
+/// UTF-16 units than UTF-8 bytes, so most short strings return without a
+/// scan, and a long tool output costs O(max) instead of O(len).
+pub fn len_at_most(s: &str, max: usize) -> bool {
+    if s.len() <= max {
+        return true;
+    }
+    let mut used = 0;
+    for c in s.chars() {
+        used += c.len_utf16();
+        if used > max {
+            return false;
+        }
+    }
+    true
+}
+
 /// `s.slice(0, units)` measured in UTF-16 code units. A surrogate pair that
 /// would be cut in half is dropped instead, since Rust strings cannot hold one
 /// half of a pair.
@@ -156,6 +173,26 @@ pub fn clamp(value: f64, min: f64, max: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn len_at_most_matches_len() {
+        for text in [
+            "",
+            "a",
+            "abc",
+            "é",
+            "éé",
+            "日本",
+            "😀",
+            "a😀",
+            "😀😀",
+            "x\u{feff}y",
+        ] {
+            for max in 0..6 {
+                assert_eq!(len_at_most(text, max), len(text) <= max, "{text:?} {max}");
+            }
+        }
+    }
 
     #[test]
     fn rounds_like_math_round() {

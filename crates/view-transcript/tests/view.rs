@@ -388,3 +388,137 @@ fn remeasures_prompt_corners_when_a_pooled_tab_is_shown_at_a_new_width() {
     show_at(&mut cx, 800.);
     assert_eq!(single_line(&mut cx), Some(true));
 }
+
+/// Timing probe for the streaming path on a long session: what one streamed
+/// event costs in `set_session` and in the frame after it. Run with
+/// `cargo test -p monocode-view-transcript --test view -- --ignored --nocapture streaming_cost`.
+#[test]
+#[ignore]
+fn streaming_cost_on_a_long_session() {
+    use std::time::{Duration, Instant};
+    let _guard = serial();
+    let mut cx = app();
+    let mut live = long_session(2_000);
+    // Long finished answers make the copy text of every turn sizable.
+    for block in live.blocks.iter_mut() {
+        if block.id.starts_with('a') {
+            block.text = format!("{}\n\n{}", block.text, "Some more words. ".repeat(200));
+        }
+    }
+    live.blocks.push(user("u-live", "Keep going"));
+    live.blocks.push(shell("t-live"));
+    let mut streaming = note("a-live", "Partial");
+    streaming.streaming = Some(true);
+    live.blocks.push(streaming);
+    live.busy = Some(true);
+    let (window, transcript, _) = open(&mut cx, live.clone());
+    let last = live.blocks.len() - 1;
+    let mut update = Duration::ZERO;
+    let mut frame = Duration::ZERO;
+    let rounds = 100;
+    for round in 0..rounds {
+        live.blocks[last].text.push_str(&format!(" word{round}"));
+        let session = Arc::new(live.clone());
+        let start = Instant::now();
+        cx.update(|cx| transcript.update(cx, |view, cx| view.set_session(session, cx)));
+        update += start.elapsed();
+        let start = Instant::now();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+        })
+        .expect("draw");
+        frame += start.elapsed();
+        cx.run_until_parked();
+    }
+    eprintln!(
+        "set_session {:?} per event, frame {:?} per event ({} blocks)",
+        update / rounds,
+        frame / rounds,
+        live.blocks.len()
+    );
+}
+
+/// The model half of [`streaming_cost_on_a_long_session`]: the block store
+/// and the plan alone.
+#[test]
+#[ignore]
+fn streaming_cost_of_the_model() {
+    use monocode_view_transcript::transcript::model::plan::{
+        BlockStore, PlanCache, PlanOptions, PlanState, build_plan, visible_blocks,
+    };
+    use std::time::{Duration, Instant};
+    let mut live = long_session(2_000);
+    for block in live.blocks.iter_mut() {
+        if block.id.starts_with('a') {
+            block.text = format!("{}\n\n{}", block.text, "Some more words. ".repeat(200));
+        }
+    }
+    live.blocks.push(user("u-live", "Keep going"));
+    let mut streaming = note("a-live", "Partial");
+    streaming.streaming = Some(true);
+    live.blocks.push(streaming);
+    let last = live.blocks.len() - 1;
+    let mut store = BlockStore::default();
+    let mut cache = PlanCache::default();
+    let options = PlanOptions {
+        busy: true,
+        visible: true,
+        harness: Some(HarnessId::Claude),
+        ..Default::default()
+    };
+    store.update(&live.blocks);
+    build_plan(
+        store.blocks(),
+        &options,
+        &PlanState::default(),
+        Some(&mut cache),
+    );
+    let (mut update, mut visible, mut plan) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let rounds = 50;
+    for round in 0..rounds {
+        live.blocks[last].text.push_str(&format!(" word{round}"));
+        let start = Instant::now();
+        store.update(&live.blocks);
+        update += start.elapsed();
+        let start = Instant::now();
+        let blocks = visible_blocks(store.blocks(), options.harness);
+        visible += start.elapsed();
+        let start = Instant::now();
+        build_plan(&blocks, &options, &PlanState::default(), Some(&mut cache));
+        plan += start.elapsed();
+    }
+    eprintln!(
+        "store {:?}, visible {:?}, plan {:?} per event",
+        update / rounds,
+        visible / rounds,
+        plan / rounds
+    );
+}
+
+/// What one frame costs while a live turn's work window holds many calls.
+#[test]
+#[ignore]
+fn frame_cost_of_a_long_live_phase() {
+    use std::time::{Duration, Instant};
+    let _guard = serial();
+    let mut cx = app();
+    let mut blocks = vec![user("u", "Go")];
+    for call in 0..300 {
+        blocks.push(shell(&format!("t{call}")));
+    }
+    let mut live = session(blocks);
+    live.busy = Some(true);
+    let (window, _transcript, _) = open(&mut cx, live);
+    let rounds = 50;
+    let mut frame = Duration::ZERO;
+    for _ in 0..rounds {
+        let start = Instant::now();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        })
+        .expect("draw");
+        frame += start.elapsed();
+    }
+    eprintln!("frame {:?} with a 300-call live phase", frame / rounds);
+}

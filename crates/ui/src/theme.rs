@@ -589,8 +589,11 @@ impl Theme {
             body_glass,
             sidebar_pane,
             popover_backdrop: if dark { ink(0.02) } else { base },
-            modal_backdrop: with_alpha(base, 0.55),
-            modal_overlay: with_alpha(black, 0.4),
+            // The panel blurs whatever sits behind it, overlay included, so a
+            // heavy black scrim turns a light panel grey. Light mode gets a
+            // faint scrim and a near-opaque panel instead.
+            modal_backdrop: with_alpha(base, if dark { 0.55 } else { 0.88 }),
+            modal_overlay: with_alpha(black, if dark { 0.4 } else { 0.12 }),
             popover_border: ink(0.10),
             modal_border: ink(0.07),
             primary,

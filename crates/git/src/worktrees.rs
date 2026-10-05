@@ -2,7 +2,6 @@
 //! Moved from src-tauri/src/worktrees.rs.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use std::ops::Deref;
 
@@ -35,8 +34,7 @@ pub struct Worktrees {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    monocode_platform::hide_window_console(&mut command);
+    let mut command = crate::fs::git_cmd_for_args(args);
     let output = command
         .arg("-C")
         .arg(root)

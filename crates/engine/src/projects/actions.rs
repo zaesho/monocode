@@ -623,26 +623,8 @@ fn rebind_kept_sessions(forgotten: &HashSet<String>, cx: &mut App) {
         .filter(|session| forgotten.contains(&session.id) && session.worktree_removed != Some(true))
         .collect();
     let engine_hooks = Engine::hooks(cx);
+    // This also rebinds the thread a pending switch leaves.
     bind_resumed_sessions(&kept, &engine_hooks, cx);
-    for session in &kept {
-        let Some(pending) = session.pending_switch.as_ref() else {
-            continue;
-        };
-        let Some(provider) = pending
-            .from_provider_session_id
-            .clone()
-            .filter(|provider| !provider.is_empty())
-        else {
-            continue;
-        };
-        // `bindHarnessSession(pending.from, ...)`: the thread the pending
-        // switch leaves, in the same working copy.
-        let mut from = session.clone();
-        from.harness = pending.from;
-        from.provider_session_id = Some(provider);
-        from.provider_account_id = pending.from_provider_account_id.clone();
-        engine_hooks.harness.bind_session(&from, cx);
-    }
 }
 
 async fn remove_worktree_flow(

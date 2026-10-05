@@ -81,7 +81,12 @@ pub fn can_dispatch_queued_head(session: &Session) -> bool {
     if is_preparing_handoff(session) {
         return false;
     }
-    true
+    // A provider request may have run without acknowledgment.
+    !session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .is_some_and(|delivery| delivery.needs_inspection())
 }
 
 /// `queuedMessageForSubmit`: resolve a queued row for auto-dispatch (the

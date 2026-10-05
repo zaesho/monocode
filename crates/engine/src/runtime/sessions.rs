@@ -935,15 +935,7 @@ impl Sessions {
             return Some(appeared.clone());
         }
         let hooks = Engine::hooks(cx);
-        if restored.worktree_removed != Some(true)
-            && restored
-                .provider_session_id
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-            && hooks.harness.is_live_harness(restored.harness)
-        {
-            hooks.harness.bind_session(&restored, cx);
-        }
+        bind_resumed_sessions(std::slice::from_ref(&restored), &hooks, cx);
         self.last_persisted
             .insert(restored.id.clone(), persist_fingerprint(&restored));
         self.list.push(restored.clone());
@@ -1049,12 +1041,37 @@ pub fn bind_resumed_sessions(
     cx: &mut App,
 ) {
     for session in sessions {
-        if session.worktree_removed == Some(true)
-            || session
-                .provider_session_id
+        if session.worktree_removed == Some(true) {
+            continue;
+        }
+        let cwd = monocode_core::session::session_work_cwd(session);
+        // The source of a pending switch keeps its conversation, so a
+        // switch back can resume it.
+        if let Some(source) = &session.pending_switch
+            && source
+                .from_provider_session_id
                 .as_ref()
-                .is_none_or(|id| id.is_empty())
+                .is_some_and(|id| !id.is_empty())
+            && source.from != session.harness
+            && hooks.harness.is_live_harness(source.from)
+        {
+            let mut from = session.clone();
+            from.harness = source.from;
+            from.provider_session_id = source.from_provider_session_id.clone();
+            from.provider_account_id = source.from_provider_account_id.clone();
+            hooks.harness.bind_session(&from, cx);
+        }
+        if session
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|id| id.is_empty())
             || !hooks.harness.is_live_harness(session.harness)
+            || monocode_core::provider_context::requires_fresh_provider_binding(
+                session,
+                session.harness,
+                cwd,
+                session.provider_account_id.as_deref(),
+            )
         {
             continue;
         }

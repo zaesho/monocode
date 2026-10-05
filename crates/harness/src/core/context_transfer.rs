@@ -118,21 +118,25 @@ pub struct PreparedTurn {
 
 const DELIVERY_SAVE_FAILED: &str = "MonoCode could not save the shared-history delivery receipt.";
 
-/// `reportInlineContextDelivery`: hand the receipt to the caller without
-/// waiting. A failed save is reported as a session error.
+/// `reportInlineContextDelivery`: hand the receipt to the caller before
+/// acceptance is reported, without waiting for its save. A failed save is
+/// reported as a session error.
 pub fn report_inline_context_delivery(
     transfer: &ContextTransferInput,
     receipt: ContextTransferReceipt,
     on_event: &EventSink,
     spawner: &SharedSpawner,
 ) {
-    let Some(on_delivered) = transfer.on_delivered.clone() else {
+    let Some(on_delivered) = transfer.on_delivered.as_ref() else {
         return;
     };
+    // The hook runs now, so the caller records the receipt before the
+    // acceptance that follows. Only its save runs later.
+    let saved = on_delivered(receipt);
     let on_event = on_event.clone();
     spawner.spawn(
         async move {
-            if let Err(error) = on_delivered(receipt).await {
+            if let Err(error) = saved.await {
                 on_event(HarnessEvent::SessionError {
                     message: format!("{DELIVERY_SAVE_FAILED} {error}"),
                 });

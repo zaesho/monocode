@@ -32,6 +32,7 @@ pub mod pipeline;
 pub use monocode_core::portable_context;
 pub mod prefs;
 pub mod prompt;
+pub mod provider_switch;
 pub mod quote_draft;
 pub mod second_opinion;
 pub mod session_context;

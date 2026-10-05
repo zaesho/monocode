@@ -1560,6 +1560,62 @@ impl SessionWriter {
 
     /// `discardDraftSessionRecord`: delete a draft-only record while its
     /// still-open blank session id may be saved later.
+    /// `saveProviderContextSnapshot`: the immutable shared history of one
+    /// provider switch, for the target's file tools to read.
+    pub fn save_switch_snapshot(
+        &self,
+        session_id: &str,
+        switch_id: &str,
+        content: String,
+    ) -> Task<Result<String, String>> {
+        let future = self.backend.write_switch_snapshot(
+            session_id.to_string(),
+            switch_id.to_string(),
+            content,
+        );
+        self.executor.spawn(future)
+    }
+
+    /// `snapshotContextAssets`: durable copies of historical attachments.
+    /// Only the original path or bytes travel to the store.
+    pub fn snapshot_context_assets(
+        &self,
+        session_id: &str,
+        attachments: &[monocode_core::Attachment],
+    ) -> Task<Result<Vec<monocode_core::portable_context::ContextAssetSnapshot>, String>> {
+        if attachments.is_empty() {
+            return Task::ready(Ok(Vec::new()));
+        }
+        let sources = attachments
+            .iter()
+            .map(
+                |attachment| monocode_store::context_history::ContextAssetSource {
+                    id: attachment.id.clone(),
+                    name: attachment.name.clone(),
+                    path: attachment.path.clone().filter(|path| !path.is_empty()),
+                    data: attachment.data.clone().filter(|data| !data.is_empty()),
+                },
+            )
+            .collect();
+        let future = self
+            .backend
+            .snapshot_context_assets(session_id.to_string(), sources);
+        self.executor.spawn(async move {
+            Ok(future
+                .await?
+                .into_iter()
+                .map(
+                    |saved| monocode_core::portable_context::ContextAssetSnapshot {
+                        id: saved.id,
+                        path: saved.path,
+                        sha256: saved.sha256,
+                        unavailable_reason: saved.unavailable_reason,
+                    },
+                )
+                .collect())
+        })
+    }
+
     pub fn discard_draft_session_record(&self, session_id: &str) -> Task<Result<(), String>> {
         let backend = self.backend.clone();
         let id = session_id.to_string();

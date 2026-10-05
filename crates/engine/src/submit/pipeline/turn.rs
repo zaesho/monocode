@@ -11,9 +11,11 @@
 use std::rc::Rc;
 
 use futures::FutureExt;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use gpui::{AsyncApp, WeakEntity};
-use monocode_core::block::{Block, PlanStatus, TurnIntent};
+use monocode_core::block::TransferMode;
+use monocode_core::block::{Block, ModelTarget, PlanStatus, TurnIntent};
 use monocode_core::handoff::HandoffComposerCard;
 use monocode_core::harness_event::{HarnessSessionInput, RewindLastTurnInput, SendTurnInput};
 use monocode_core::orchestration::{
@@ -23,9 +25,18 @@ use monocode_core::paths::path_key;
 use monocode_core::plan::{
     build_plan_prompt, is_provider_failure_text, plan_turn_key, plan_turn_prompt,
 };
+use monocode_core::provider_context::{
+    DeliveryCoverage, accept_provider_delivery, can_apply_running_configuration,
+    fail_provider_delivery, mark_provider_context_delivered, mark_provider_request_submitted,
+    record_provider_bound, record_provider_context_usage, recover_submitted_provider_delivery,
+    settle_provider_binding,
+};
 use monocode_core::reducer::{now_ms, promote_last_assistant_to_plan_mut, stop_streaming_mut};
 use monocode_core::session::{PendingHarnessSwitch, session_work_cwd};
 use monocode_core::{Attachment, HarnessEvent, HarnessId, Session, js};
+use monocode_harness::core::context_transfer::{
+    ContextTransferInput, ContextTransferReceipt, DeliveredHook, DeliveryMode,
+};
 use monocode_harness::core::registry::{AcceptedHook, EventSink, TitleInput};
 use monocode_harness::core::text_harness::pick_text_harness;
 
@@ -44,12 +55,14 @@ use crate::submit::app_access::TurnAppAccess;
 use crate::submit::attachments::prepare_attachments;
 use crate::submit::edit_last_turn::EditedResendAttempt;
 use crate::submit::handoff::{
-    choose_handoff_brief, complete_handoff, consume_handoff, is_preparing_handoff,
-    should_ask_outgoing_agent, user_messages_after_handoff, wrap_handoff_prompt,
+    complete_handoff, consume_handoff, is_preparing_handoff, user_messages_after_handoff,
+    wrap_handoff_prompt,
 };
-use crate::submit::handoff_turn::{OutgoingHandoffInput, request_outgoing_handoff};
 use crate::submit::hooks::SubmitPeers;
 use crate::submit::prompt::prepare_prompt;
+use crate::submit::provider_switch::{
+    ACCEPTANCE_SAVE_FAILED, TRANSFER_FAILED, save_provider_context_session,
+};
 use crate::submit::session_context::expand_dropped_sessions;
 use crate::submit::skills::{SkillCatalog, SkillCatalogContext};
 
@@ -58,19 +71,45 @@ pub(crate) enum TurnSignal {
     Event(Box<HarnessEvent>),
     /// `onAccepted`: the provider took the user turn.
     Accepted,
+    /// `onDelivered`: shared history reached the target. The reply says
+    /// whether its receipt was saved.
+    Delivered(ContextTransferReceipt, oneshot::Sender<Result<(), String>>),
 }
 
 /// An event sink and accepted hook that feed one channel.
 pub(crate) fn signal_channel() -> (EventSink, AcceptedHook, async_channel::Receiver<TurnSignal>) {
+    let (sink, accepted, _, receiver) = signal_channel_with_delivery();
+    (sink, accepted, receiver)
+}
+
+/// [`signal_channel`] with the delivery hook a shared-history transfer
+/// reports through.
+pub(crate) fn signal_channel_with_delivery() -> (
+    EventSink,
+    AcceptedHook,
+    DeliveredHook,
+    async_channel::Receiver<TurnSignal>,
+) {
     let (sender, receiver) = async_channel::unbounded();
     let events = sender.clone();
     let sink: EventSink = std::sync::Arc::new(move |event| {
         let _ = events.try_send(TurnSignal::Event(Box::new(event)));
     });
+    let accepts = sender.clone();
     let accepted: AcceptedHook = std::sync::Arc::new(move || {
-        let _ = sender.try_send(TurnSignal::Accepted);
+        let _ = accepts.try_send(TurnSignal::Accepted);
     });
-    (sink, accepted, receiver)
+    let delivered: DeliveredHook = std::sync::Arc::new(move |receipt| {
+        let (reply, saved) = oneshot::channel();
+        let _ = sender.try_send(TurnSignal::Delivered(receipt, reply));
+        async move {
+            saved
+                .await
+                .unwrap_or_else(|_| Err("The turn ended before the receipt was saved.".into()))
+        }
+        .boxed()
+    });
+    (sink, accepted, delivered, receiver)
 }
 
 /// Run a harness call and hand each signal to `on_signal` as it arrives.
@@ -137,7 +176,6 @@ pub(crate) struct TurnRun {
     pub session_id: String,
     pub generation: u64,
     pub current: Session,
-    pub text: String,
     pub attachments: Vec<Attachment>,
     pub options: SubmitOptions,
     pub intent: TurnIntent,
@@ -169,10 +207,14 @@ pub(crate) struct TurnRun {
     pub config: SubmitConfig,
     pub peers: SubmitPeers,
     pub skills: SkillCatalog,
+    /// The picker revision when the turn started.
+    pub selection_revision: u64,
+    /// The `Submit` entity, set when the turn task starts.
+    pub submit: Option<WeakEntity<Submit>>,
 }
 
 /// The turn's mutable state (the `let` bindings in the TypeScript closure).
-struct TurnState {
+pub(super) struct TurnState {
     control_text: String,
     control_error: Option<String>,
     proposal: Option<OrchestrationProposal>,
@@ -183,9 +225,21 @@ struct TurnState {
     native_plan_seen: bool,
     build_succeeded: bool,
     pending_edited_events: Vec<HarnessEvent>,
-    work_cwd: String,
-    wrap: Option<Wrap>,
+    pub(super) work_cwd: String,
+    pub(super) wrap: Option<Wrap>,
     plan_event_key: String,
+    /// The prepared attachments and the exact first request, composed
+    /// before any history is exported.
+    pub(super) prepared: Vec<Attachment>,
+    pub(super) send_text: String,
+    /// Shared history for a provider switch, until the target accepts.
+    pub(super) transfer: Option<ContextTransferInput>,
+    pub(super) transfer_switch_id: Option<String>,
+    provider_accepted: bool,
+    /// The request went to the provider, so it may have run.
+    provider_dispatched: bool,
+    provider_turn_completed: bool,
+    acceptance_persistence_failed: bool,
 }
 
 impl TurnState {
@@ -199,7 +253,8 @@ impl TurnState {
 }
 
 /// Run the turn and report the outcome to a managed caller.
-pub(crate) async fn run_turn(this: WeakEntity<Submit>, run: TurnRun, cx: &mut AsyncApp) {
+pub(crate) async fn run_turn(this: WeakEntity<Submit>, mut run: TurnRun, cx: &mut AsyncApp) {
+    run.submit = Some(this.clone());
     let cx: &AsyncApp = cx;
     let mut state = TurnState {
         control_text: String::new(),
@@ -215,6 +270,14 @@ pub(crate) async fn run_turn(this: WeakEntity<Submit>, run: TurnRun, cx: &mut As
         work_cwd: run.initial_work_cwd.clone(),
         wrap: None,
         plan_event_key: String::new(),
+        prepared: Vec::new(),
+        send_text: String::new(),
+        transfer: None,
+        transfer_switch_id: None,
+        provider_accepted: false,
+        provider_dispatched: false,
+        provider_turn_completed: false,
+        acceptance_persistence_failed: false,
     };
     let mut outcome = ControlOutcome::failed("Turn did not complete");
     match run.outer(&mut state, cx).await {
@@ -241,6 +304,12 @@ pub(crate) async fn run_turn(this: WeakEntity<Submit>, run: TurnRun, cx: &mut As
         }
     }
     let cancelled = !run.gen_current(cx);
+    if !cancelled {
+        let id = run.session_id.clone();
+        let _ = this.update(&mut cx.clone(), |this, _| {
+            this.running_selections.remove(&id)
+        });
+    }
     cx.update(|cx| {
         reject_edited(run.edited.as_deref(), &run.options, cx);
         let outcome = if cancelled {
@@ -265,7 +334,7 @@ impl TurnRun {
         self.current.harness
     }
 
-    fn gen_current(&self, cx: &AsyncApp) -> bool {
+    pub(super) fn gen_current(&self, cx: &AsyncApp) -> bool {
         cx.update(|cx| Engine::sessions(cx).read(cx).turn_gen(&self.session_id)) == self.generation
     }
 
@@ -277,11 +346,11 @@ impl TurnRun {
         });
     }
 
-    fn flush(&self, cx: &AsyncApp) {
+    pub(super) fn flush(&self, cx: &AsyncApp) {
         cx.update(|cx| Engine::sessions(cx).update(cx, |sessions, cx| sessions.flush(cx)));
     }
 
-    fn update_session(&self, cx: &AsyncApp, update: impl FnOnce(&mut Session)) {
+    pub(super) fn update_session(&self, cx: &AsyncApp, update: impl FnOnce(&mut Session)) {
         cx.update(|cx| {
             Engine::sessions(cx).update(cx, |sessions, cx| {
                 sessions.update(&self.session_id, cx, update);
@@ -289,22 +358,56 @@ impl TurnRun {
         });
     }
 
-    fn latest(&self, cx: &AsyncApp) -> Option<Session> {
+    pub(super) fn latest(&self, cx: &AsyncApp) -> Option<Session> {
         cx.update(|cx| Engine::sessions(cx).read(cx).get(&self.session_id).cloned())
     }
 
-    /// The outer `catch`: end the turn with the error on the transcript.
+    /// The outer `catch`: end the turn with the error on the transcript. A
+    /// provider switch that did not reach the target goes back to a draft,
+    /// and one that was dispatched waits for inspection.
     fn fail_session(&self, state: &TurnState, message: &str, cx: &AsyncApp) {
         let proposal = self.proposal_id.clone().zip(state.proposal.clone());
         let peers = self.peers.clone();
+        let switching = self.pending_switch.is_some() && !state.provider_accepted;
+        let switch_id = state.transfer_switch_id.clone();
+        let dispatched = state.provider_dispatched;
+        let unbuilt_plan = self
+            .approved_plan
+            .as_ref()
+            .filter(|_| self.intent == TurnIntent::Build && !state.provider_accepted)
+            .map(|plan| plan.id.clone());
         self.update_session(cx, |session| {
             stop_streaming_mut(session, now_ms());
+            if switching {
+                if is_preparing_handoff(session) {
+                    *session = complete_handoff(session, TRANSFER_FAILED);
+                }
+                if let Some(switch_id) = &switch_id {
+                    if dispatched {
+                        recover_submitted_provider_delivery(session, switch_id);
+                    } else {
+                        fail_provider_delivery(session, switch_id, true);
+                    }
+                }
+                if !dispatched
+                    && let Some(user) = session
+                        .blocks
+                        .iter_mut()
+                        .rev()
+                        .find(|block| block.role == monocode_core::BlockRole::User)
+                {
+                    user.draft = Some(true);
+                }
+            }
             session.worktree_preparing = None;
             if let Some((id, draft)) = proposal {
                 let failed = peers
                     .orchestration
                     .complete_proposal(&draft, "", Some(message));
                 *session = with_orchestration_proposal(session, &id, &failed);
+            }
+            if let Some(plan_id) = &unbuilt_plan {
+                with_plan_status(session, plan_id, PlanStatus::Ready);
             }
         });
     }
@@ -317,7 +420,6 @@ impl TurnRun {
         cx: &AsyncApp,
     ) -> Result<Option<ControlOutcome>, String> {
         let id = self.session_id.as_str();
-        let registry = self.config.registry.clone();
         if self.create_draft_worktree {
             let branch = temporary_worktree_branch_name(&uuid::Uuid::new_v4().to_string());
             let base = self
@@ -377,39 +479,15 @@ impl TurnRun {
                 text: card.brief.clone(),
             })
             .or_else(|| self.queued_handoff.clone());
-        if let Some(pending) = &self.pending_switch {
-            let mut agent_text = String::new();
-            if should_ask_outgoing_agent(&self.current) && registry.is_live_harness(pending.from) {
-                agent_text = request_outgoing_handoff(
-                    &registry,
-                    OutgoingHandoffInput {
-                        harness: pending.from,
-                        session_id: id.to_string(),
-                        cwd: state.work_cwd.clone(),
-                        model: pending.from_model.clone(),
-                        model_settings: Some(pending.from_settings.clone()),
-                        provider_account_id: pending.from_provider_account_id.clone(),
-                        user_request: self.text.clone(),
-                    },
-                )
-                .await;
-            }
-            if !self.gen_current(cx) {
+        self.prepare_request(state, cx).await?;
+        if !self.gen_current(cx) {
+            return Ok(None);
+        }
+        if self.pending_switch.is_some() && !self.raw_command {
+            if self.prepare_transfer(state, cx).await?.is_none() {
                 return Ok(None);
             }
-            let latest = self.latest(cx).unwrap_or_else(|| self.current.clone());
-            let brief = choose_handoff_brief(&agent_text, &latest, Some(&self.text));
-            registry
-                .forget_harness_session(pending.from, id)
-                .await
-                .map_err(|error| error.to_string())?;
-            if !self.gen_current(cx) {
-                return Ok(None);
-            }
-            state.wrap = Some(Wrap {
-                from: pending.from,
-                text: brief,
-            });
+            state.wrap = None;
         }
 
         state.plan_event_key =
@@ -431,6 +509,14 @@ impl TurnRun {
             if !self.gen_current(cx) {
                 return Ok(None);
             }
+            if state.acceptance_persistence_failed {
+                // The error is already on the transcript, and the provider
+                // finished its turn.
+                state.control_error = Some(message);
+                state.build_succeeded =
+                    state.provider_turn_completed && !state.provider_failure_seen;
+                return Ok(Some(self.finish(state, cx).await));
+            }
             if let Some(wrap) = state.wrap.clone() {
                 self.reveal_handoff(&wrap.text, cx);
             }
@@ -451,12 +537,13 @@ impl TurnRun {
         Ok(Some(self.finish(state, cx).await))
     }
 
-    /// The inner `try`. `Err` carries the message the `catch` reports.
-    async fn attempt(&self, state: &mut TurnState, cx: &AsyncApp) -> Result<(), String> {
+    /// `firstProviderRequest`: compose the exact first request before any
+    /// history is exported or a provider process changes, so the capacity
+    /// check sees the whole request.
+    async fn prepare_request(&self, state: &mut TurnState, cx: &AsyncApp) -> Result<(), String> {
         let id = self.session_id.as_str();
-        let registry = self.config.registry.clone();
         let harness = self.harness();
-        let prepared =
+        state.prepared =
             prepare_attachments(self.config.attachment_io.as_ref(), &self.attachments).await;
         let prompt = match (&self.approved_plan, self.intent) {
             (Some(plan), TurnIntent::Build) => build_plan_prompt(&plan.text),
@@ -504,6 +591,49 @@ impl TurnRun {
         } else {
             Vec::new()
         };
+        let inbox_ask = (!self.raw_command)
+            .then(|| self.current.inbox_ask.clone())
+            .flatten();
+        // A provider switch carries shared history instead of a recap.
+        let wrap = state.wrap.clone().filter(|_| self.pending_switch.is_none());
+        let body = match &wrap {
+            Some(wrap) if !self.raw_command => {
+                let request = js::trim(&turn_prompt);
+                wrap_handoff_prompt(
+                    &wrap.text,
+                    wrap.from,
+                    if request.is_empty() {
+                        CONTINUE_PROMPT
+                    } else {
+                        request
+                    },
+                    &earlier,
+                )
+            }
+            _ => turn_prompt,
+        };
+        let body = self.peers.inbox.ask_prompt(inbox_ask.as_ref(), body);
+        let mut send_text = cx.update(|cx| self.peers.orchestration.prompt(id, body, cx));
+        if self.operator_matched {
+            let cli = format!("{} app", shell_path(&(self.config.app_cli_path)()?));
+            send_text.push_str(&format!(
+                "\n\n<monocode_app>\nThe user's Operator command enables app access in this thread, including later turns without the command. You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read and continue other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run `{cli} --help` for exact commands and JSON fields, then use it as needed for the user's request. When reading another session, start with its latest two or three user/assistant exchanges. Request older exchanges with nextBefore or a larger excerpt only if needed. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>"
+            ));
+        }
+        if let Some(note) = &self.app_note {
+            let cli = format!("{} app", shell_path(&(self.config.app_cli_path)()?));
+            send_text.push_str("\n\n");
+            send_text.push_str(&note.replace("{cli}", &cli));
+        }
+        state.send_text = send_text;
+        Ok(())
+    }
+
+    /// The inner `try`. `Err` carries the message the `catch` reports.
+    async fn attempt(&self, state: &mut TurnState, cx: &AsyncApp) -> Result<(), String> {
+        let id = self.session_id.as_str();
+        let registry = self.config.registry.clone();
+        let harness = self.harness();
         if let Some(edited) = &self.edited
             && registry.can_rewind_harness_last_turn(harness)
         {
@@ -555,39 +685,54 @@ impl TurnRun {
             }
         }
 
-        let inbox_ask = (!self.raw_command)
-            .then(|| self.current.inbox_ask.clone())
-            .flatten();
-        let body = match &state.wrap {
-            Some(wrap) if !self.raw_command => {
-                let request = js::trim(&turn_prompt);
-                wrap_handoff_prompt(
-                    &wrap.text,
-                    wrap.from,
-                    if request.is_empty() {
-                        CONTINUE_PROMPT
-                    } else {
-                        request
-                    },
-                    &earlier,
-                )
+        let send_text = state.send_text.clone();
+        let prepared = std::mem::take(&mut state.prepared);
+        let sent = match state.transfer_switch_id.clone() {
+            Some(switch_id) => {
+                // `dispatchAfterContextSave`: the submission marker is saved
+                // before the request goes out, so a restart knows it may
+                // have run.
+                self.update_session(cx, |session| {
+                    mark_provider_request_submitted(session, &switch_id)
+                });
+                let latest = self.latest(cx);
+                let save = cx.update(|cx| {
+                    save_provider_context_session(
+                        latest,
+                        "The provider submission marker could not be saved. The request was not sent.",
+                        cx,
+                    )
+                });
+                match save.await {
+                    Err(error) => Err(error),
+                    Ok(()) if !self.gen_current(cx) => Ok(()),
+                    Ok(()) => {
+                        state.provider_dispatched = true;
+                        self.send_turn(send_text, prepared, state, cx).await
+                    }
+                }
             }
-            _ => turn_prompt,
+            None => self.send_turn(send_text, prepared, state, cx).await,
         };
-        let body = self.peers.inbox.ask_prompt(inbox_ask.as_ref(), body);
-        let mut send_text = cx.update(|cx| self.peers.orchestration.prompt(id, body, cx));
-        if self.operator_matched {
-            let cli = format!("{} app", shell_path(&(self.config.app_cli_path)()?));
-            send_text.push_str(&format!(
-                "\n\n<monocode_app>\nThe user's Operator command enables app access in this thread, including later turns without the command. You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read and continue other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run `{cli} --help` for exact commands and JSON fields, then use it as needed for the user's request. When reading another session, start with its latest two or three user/assistant exchanges. Request older exchanges with nextBefore or a larger excerpt only if needed. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>"
-            ));
+        if sent.is_ok() {
+            state.provider_turn_completed = true;
         }
-        if let Some(note) = &self.app_note {
-            let cli = format!("{} app", shell_path(&(self.config.app_cli_path)()?));
-            send_text.push_str("\n\n");
-            send_text.push_str(&note.replace("{cli}", &cli));
+        let acceptance = match state.transfer_switch_id.as_deref() {
+            Some(switch_id) => self.acceptance_save(switch_id, cx),
+            None => None,
+        };
+        let acceptance = match acceptance {
+            Some(save) => save.await,
+            None => Ok(()),
+        };
+        sent?;
+        if acceptance.is_err() {
+            state.acceptance_persistence_failed = true;
+            return Err(ACCEPTANCE_SAVE_FAILED.into());
         }
-        self.send_turn(send_text, prepared, state, cx).await?;
+        if !self.gen_current(cx) {
+            return Ok(());
+        }
         self.accept_edited_resend(state, cx);
         if let Some(draft) = state.proposal.clone()
             && !state.provider_failure_seen
@@ -687,19 +832,128 @@ impl TurnRun {
             text,
             attachments: Some(attachments),
         };
-        let (sink, accepted, signals) = signal_channel();
-        let send = self.config.registry.send_harness_turn(
+        let (sink, accepted, delivered, signals) = signal_channel_with_delivery();
+        let transfer = state.transfer.clone().map(|transfer| ContextTransferInput {
+            on_delivered: Some(delivered),
+            ..transfer
+        });
+        let send = self.config.registry.send_harness_turn_with_context(
             self.harness(),
             input,
+            transfer,
             sink,
-            self.edited.is_some().then_some(accepted),
+            Some(accepted),
         );
         drive(send, &signals, |signal| match signal {
-            TurnSignal::Accepted => self.accept_edited_resend(state, cx),
+            TurnSignal::Accepted => self.on_provider_accepted(state, cx),
             TurnSignal::Event(event) => self.route_turn_event(*event, state, cx),
+            TurnSignal::Delivered(receipt, reply) => {
+                self.on_context_delivered(receipt, reply, state, cx)
+            }
         })
         .await
         .map_err(|error| error.to_string())
+    }
+
+    /// `onAccepted`: the provider took the request. A provider switch is
+    /// complete, and its acceptance is saved at once.
+    fn on_provider_accepted(&self, state: &mut TurnState, cx: &AsyncApp) {
+        if !self.gen_current(cx) || state.provider_accepted {
+            return;
+        }
+        state.provider_accepted = true;
+        self.accept_edited_resend(state, cx);
+        let Some(switch_id) = state.transfer_switch_id.clone() else {
+            return;
+        };
+        self.update_session(cx, |session| {
+            accept_provider_delivery(session, &switch_id);
+            *session = consume_handoff(session);
+        });
+        if let Some(submit) = &self.submit {
+            let id = self.session_id.clone();
+            let _ = submit.update(&mut cx.clone(), |submit, cx| {
+                submit.start_acceptance_save(&id, &switch_id, cx)
+            });
+        }
+        // Later repair prompts belong to this accepted native turn.
+        state.transfer = None;
+    }
+
+    /// `onDelivered`: record which history reached the target. A native
+    /// import is saved before the current request starts.
+    fn on_context_delivered(
+        &self,
+        receipt: ContextTransferReceipt,
+        reply: oneshot::Sender<Result<(), String>>,
+        state: &mut TurnState,
+        cx: &AsyncApp,
+    ) {
+        let Some(switch_id) = state.transfer_switch_id.clone() else {
+            let _ = reply.send(Ok(()));
+            return;
+        };
+        if !self.gen_current(cx) {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        self.flush(cx);
+        let prefix = format!("{}:", self.session_id);
+        let mode = match receipt.mode {
+            DeliveryMode::Native => TransferMode::Native,
+            DeliveryMode::Inline => TransferMode::Inline,
+        };
+        let coverage = DeliveryCoverage {
+            included_block_ids: receipt.included_ids.map(|ids| {
+                ids.into_iter()
+                    .map(|id| id.strip_prefix(&prefix).map(str::to_string).unwrap_or(id))
+                    .collect()
+            }),
+            omitted_block_ids: receipt.omitted_ids,
+            source_through_block_id: receipt.through_block_id,
+        };
+        let bound = receipt.provider_session_id;
+        self.update_session(cx, |session| {
+            mark_provider_context_delivered(session, &switch_id, mode, bound.as_deref(), coverage)
+        });
+        if mode != TransferMode::Native {
+            let _ = reply.send(Ok(()));
+            return;
+        }
+        let latest = self.latest(cx);
+        let save = cx.update(|cx| {
+            save_provider_context_session(
+                latest,
+                "The native context import could not be saved.",
+                cx,
+            )
+        });
+        cx.spawn(async move |_| {
+            let _ = reply.send(save.await);
+        })
+        .detach();
+    }
+
+    /// `acceptancePersistence.wait`: the open acceptance save for this
+    /// switch.
+    fn acceptance_save(
+        &self,
+        switch_id: &str,
+        cx: &AsyncApp,
+    ) -> Option<crate::submit::provider_switch::SharedSave> {
+        let submit = self.submit.as_ref()?.upgrade()?;
+        let id = self.session_id.clone();
+        cx.update(|cx| submit.read(cx).acceptance.wait(&id, Some(switch_id)))
+    }
+
+    /// The picker revision now, to compare with the turn's.
+    fn current_selection_revision(&self, cx: &AsyncApp) -> u64 {
+        let id = self.session_id.clone();
+        self.submit
+            .as_ref()
+            .and_then(|submit| submit.upgrade())
+            .map(|submit| cx.update(|cx| submit.read(cx).selection_revision(&id)))
+            .unwrap_or(self.selection_revision)
     }
 
     /// `routeTurnEvent`: drop events from a superseded turn, and hold an
@@ -719,6 +973,81 @@ impl TurnRun {
 
     /// `applyTurnEvent`.
     fn apply_turn_event(&self, event: HarnessEvent, state: &mut TurnState, cx: &AsyncApp) {
+        let harness = self.harness();
+        let account = self.provider_account_id.clone();
+        match &event {
+            HarnessEvent::SessionProviderBound {
+                provider_session_id,
+            } => {
+                // A startup identity is not proof that the target accepted.
+                self.flush(cx);
+                let work_cwd = state.work_cwd.clone();
+                self.update_session(cx, |session| {
+                    record_provider_bound(
+                        session,
+                        harness,
+                        &work_cwd,
+                        provider_session_id,
+                        account.as_deref(),
+                    )
+                });
+                return;
+            }
+            HarnessEvent::Context { used, window } => {
+                self.flush(cx);
+                let work_cwd = state.work_cwd.clone();
+                self.update_session(cx, |session| {
+                    record_provider_context_usage(
+                        session,
+                        harness,
+                        &work_cwd,
+                        *used,
+                        *window,
+                        account.as_deref(),
+                    )
+                });
+            }
+            _ => {}
+        }
+        if matches!(
+            event,
+            HarnessEvent::SessionConfigChanged { .. } | HarnessEvent::Context { .. }
+        ) {
+            // A picker change while the turn runs owns the selection now.
+            let running = ModelTarget {
+                harness,
+                model: self.current.model.clone(),
+                model_settings: self.current.model_settings.clone(),
+            };
+            let revisions = (self.selection_revision, self.current_selection_revision(cx));
+            let applies = self.latest(cx).is_some_and(|selected| {
+                can_apply_running_configuration(&selected, &running, Some(revisions))
+            });
+            if !applies {
+                return;
+            }
+        }
+        if let HarnessEvent::SessionConfigChanged {
+            model,
+            model_settings,
+        } = &event
+            && let Some(submit) = self.submit.as_ref().and_then(|submit| submit.upgrade())
+        {
+            let id = self.session_id.clone();
+            let (model, model_settings) = (model.clone(), model_settings.clone());
+            cx.update(|cx| {
+                submit.update(cx, |submit, _| {
+                    if let Some(running) = submit.running_selections.get_mut(&id) {
+                        if let Some(model) = model {
+                            running.model = model;
+                        }
+                        running
+                            .model_settings
+                            .extend(model_settings.unwrap_or_default());
+                    }
+                })
+            });
+        }
         cx.update(|cx| {
             self.peers
                 .orchestration
@@ -738,10 +1067,7 @@ impl TurnRun {
             state.control_error = Some(message.clone());
         }
         if let Some(wrap) = state.wrap.clone()
-            && matches!(
-                event,
-                HarnessEvent::SessionStarted | HarnessEvent::SessionProviderBound { .. }
-            )
+            && matches!(event, HarnessEvent::SessionStarted)
         {
             self.reveal_handoff(&wrap.text, cx);
         }
@@ -857,6 +1183,7 @@ impl TurnRun {
         let id = self.session_id.as_str();
         self.flush(cx);
         let failed = state.provider_failure_seen
+            || state.acceptance_persistence_failed
             || is_provider_failure_text(&state.control_text)
             || !state.build_succeeded;
         let outcome = ControlOutcome {
@@ -866,7 +1193,7 @@ impl TurnRun {
                 ControlStatus::Completed
             },
             text: js::trim(&state.control_text).to_string(),
-            error: if state.provider_failure_seen {
+            error: if state.provider_failure_seen || state.acceptance_persistence_failed {
                 state.control_error.clone()
             } else {
                 None
@@ -876,17 +1203,30 @@ impl TurnRun {
         // stream or poisoned turn state. Park it now; the next prompt will
         // reconnect and resume through a fresh transport.
         if state.provider_failure_seen {
-            let _ = self
-                .config
-                .registry
-                .stop_harness_session(self.harness(), id)
-                .await;
+            // A switch that never reached the target leaves no conversation
+            // worth resuming.
+            let unsent = state.transfer_switch_id.is_some()
+                && !state.provider_accepted
+                && !state.provider_dispatched;
+            let registry = &self.config.registry;
+            let _ = if unsent {
+                registry.forget_harness_session(self.harness(), id).await
+            } else {
+                registry.stop_harness_session(self.harness(), id).await
+            };
         }
         let flush = cx.update(|cx| Engine::checkpoints(cx).flush_session_checkpoint(id));
         flush.await;
 
         let provider_failure_seen = state.provider_failure_seen;
+        let acceptance_failed = state.acceptance_persistence_failed;
         let build_succeeded = state.build_succeeded;
+        let transfer = state.transfer_switch_id.clone();
+        let accepted = state.provider_accepted;
+        let dispatched = state.provider_dispatched;
+        let harness = self.harness();
+        let account = self.provider_account_id.clone();
+        let settle_cwd = state.work_cwd.clone();
         let response = state.proposal_response().to_string();
         let proposal = self.proposal_id.clone().zip(state.proposal.clone());
         let completed = state.completed_proposal.clone();
@@ -898,6 +1238,19 @@ impl TurnRun {
         let peers = self.peers.clone();
         self.update_session(cx, |session| {
             stop_streaming_mut(session, now_ms());
+            match &transfer {
+                Some(switch_id) if !accepted => {
+                    if dispatched {
+                        recover_submitted_provider_delivery(session, switch_id);
+                    } else {
+                        fail_provider_delivery(session, switch_id, true);
+                    }
+                }
+                _ if accepted => {
+                    settle_provider_binding(session, harness, &settle_cwd, account.as_deref())
+                }
+                _ => {}
+            }
             let provider_failed = provider_failure_seen
                 || is_provider_failure_text(&super::session_edits::last_assistant_text_in_turn(
                     session,
@@ -906,9 +1259,11 @@ impl TurnRun {
                 let finalized = match completed {
                     Some(completed) if !provider_failed && build_succeeded => completed,
                     _ => {
-                        let error = (provider_failed || !build_succeeded).then(|| {
-                            error.unwrap_or_else(|| "The lead could not finish planning.".into())
-                        });
+                        let error = (provider_failed || !build_succeeded || acceptance_failed)
+                            .then(|| {
+                                error
+                                    .unwrap_or_else(|| "The lead could not finish planning.".into())
+                            });
                         peers
                             .orchestration
                             .complete_proposal(&draft, &response, error.as_deref())

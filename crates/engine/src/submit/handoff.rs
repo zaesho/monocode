@@ -62,7 +62,24 @@ pub fn plan_composer_switch(session: &Session, next: HarnessId) -> ComposerSwitc
     if session.harness == next {
         return ComposerSwitchPlan::Model;
     }
-    if let Some(pending) = &session.pending_switch
+    // History may include a target request that ran. Returning to its source
+    // then needs a new transfer, before or after the user confirms
+    // inspection.
+    let last = last_handoff_block(&session.blocks).and_then(|block| block.handoff.as_ref());
+    let unknown_request_intent = session.pending_switch.as_ref().is_some_and(|pending| {
+        last.is_some_and(|last| {
+            last.from == pending.from
+                && last.transfer.as_ref().is_some_and(|transfer| {
+                    transfer.needs_inspection == Some(true)
+                        || transfer.inspection_confirmed == Some(true)
+                })
+        })
+    });
+    let pending_switch = session
+        .pending_switch
+        .as_ref()
+        .filter(|_| !unknown_request_intent);
+    if let Some(pending) = pending_switch
         && next == pending.from
     {
         return ComposerSwitchPlan::Revert {
@@ -87,9 +104,8 @@ pub fn plan_composer_switch(session: &Session, next: HarnessId) -> ComposerSwitc
         };
     }
     ComposerSwitchPlan::Arm {
-        pending: session
-            .pending_switch
-            .clone()
+        pending: pending_switch
+            .cloned()
             .unwrap_or_else(|| PendingHarnessSwitch {
                 from: session.harness,
                 from_model: session.model.clone(),
@@ -154,6 +170,10 @@ pub fn pending_handoff(session: &Session) -> Option<PendingHandoff> {
     let last = last_handoff_block(&session.blocks)?;
     let handoff = last.handoff.as_ref()?;
     if handoff.pending != Some(true) || handoff.status != HandoffStatus::Ready {
+        return None;
+    }
+    // A shared-history transfer belongs to its target provider only.
+    if handoff.transfer.is_some() && handoff.to != session.harness {
         return None;
     }
     let trimmed = js::trim(&last.text);

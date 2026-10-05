@@ -10,6 +10,7 @@
 mod activity;
 mod blocks;
 mod changes;
+mod entrance;
 mod fold;
 mod footer;
 pub(crate) mod mascot;
@@ -281,6 +282,16 @@ pub struct TranscriptView {
     /// and whether the window has laid out every step since. See
     /// `render_phase`.
     live_scroll_carry: HashMap<String, (Pixels, bool)>,
+    /// Live steps arriving on their phase's rail. See `entrance`.
+    entrances: entrance::StepEntrances,
+    /// Step row heights the entrances grow to, by step key.
+    step_heights: entrance::StepHeights,
+    /// The prompt just sent and when, while it rises into place
+    /// (`riseIntoAnchor`). See `entrance::prompt_rise`.
+    prompt_rise: Option<(String, Instant)>,
+    /// The transcript's height on the last frame, for where a sent prompt
+    /// rises from.
+    height: Rc<Cell<Pixels>>,
     /// When a copy or save button last succeeded, by key.
     feedback: HashMap<String, Instant>,
     markdown: HashMap<MarkdownKey, MarkdownEntry>,
@@ -380,6 +391,10 @@ impl TranscriptView {
             search_query: String::new(),
             toggles: HashMap::new(),
             live_scroll_carry: HashMap::new(),
+            entrances: entrance::StepEntrances::default(),
+            step_heights: Rc::default(),
+            prompt_rise: None,
+            height: Rc::new(Cell::new(px(0.))),
             feedback: HashMap::new(),
             markdown: HashMap::new(),
             styles: HashMap::new(),
@@ -430,6 +445,9 @@ impl TranscriptView {
             self.store = BlockStore::default();
             self.plan_cache = PlanCache::default();
             self.toggles.clear();
+            self.entrances.clear();
+            self.step_heights.borrow_mut().clear();
+            self.prompt_rise = None;
             self.state = PlanState::default();
             self.clocks.clear();
             self.markdown.clear();
@@ -776,8 +794,13 @@ impl TranscriptView {
             self.last_user_id = last_user_id;
         } else if last_user_id != self.last_user_id {
             self.last_user_id = last_user_id.clone();
-            if last_user_id.is_some() {
+            if let Some(id) = last_user_id {
                 self.anchor_turn = true;
+                // In the chat layout the prompt rises from the upper screen
+                // into its anchored spot at the top.
+                if self.config.anchor_prompts && self.config.layout == TranscriptLayout::Chat {
+                    self.prompt_rise = Some((id, Instant::now()));
+                }
             }
             self.list.set_follow_mode(FollowMode::Tail);
         }
@@ -1167,6 +1190,7 @@ impl TranscriptView {
             RowKind::Accessory => self.render_changes(&row, cx),
             RowKind::Footer(footer) => self.render_footer(&row, footer, cx),
         };
+        let content = self.rise_row(&row, content, cx);
         div()
             .id(ElementId::Name(SharedString::from(row.key.clone())))
             .w_full()
@@ -1181,6 +1205,28 @@ impl TranscriptView {
                     .child(content),
             )
             .into_any_element()
+    }
+
+    /// A row of the turn whose prompt is rising into place, with its part
+    /// of the motion. Other rows, and every row once the rise is over, are
+    /// unchanged.
+    fn rise_row(&mut self, row: &Row, content: AnyElement, cx: &App) -> AnyElement {
+        let Some((id, started)) = &self.prompt_rise else {
+            return content;
+        };
+        let rise = (!cx.reduce_motion() && self.config.visible)
+            .then(|| entrance::prompt_rise(started.elapsed()))
+            .flatten();
+        let Some(rise) = rise else {
+            self.prompt_rise = None;
+            return content;
+        };
+        if !row.last_turn {
+            return content;
+        }
+        let prompt = row.first_block().is_some_and(|block| &block.id == id);
+        let from = self.height.get() * entrance::PROMPT_RISE_FROM;
+        entrance::rising_row(prompt, rise, from, content)
     }
 
     /// The width the transcript column lays text out in, for measuring.
@@ -1199,6 +1245,8 @@ impl TranscriptView {
 
 impl Render for TranscriptView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The list draws its rows after this, in the same pass.
+        self.entrances.next_pass();
         let theme = Theme::of(cx);
         div()
             .id("agent-transcript")
@@ -1220,8 +1268,12 @@ impl Render for TranscriptView {
             // hidden at.
             .child({
                 let width = self.width.clone();
+                let height = self.height.clone();
                 canvas(
-                    move |bounds, _, _| width.set(bounds.size.width),
+                    move |bounds, _, _| {
+                        width.set(bounds.size.width);
+                        height.set(bounds.size.height);
+                    },
                     |_, _, _, _| {},
                 )
                 .absolute()

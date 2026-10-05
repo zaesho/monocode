@@ -77,6 +77,7 @@ impl SubmitConfig {
         Self {
             skill_sources: Arc::new(ProcessSkillSources {
                 registry: registry.clone(),
+                data_dir: None,
             }),
             registry,
             catalog,

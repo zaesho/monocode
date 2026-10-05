@@ -90,8 +90,10 @@ fn server_from_json(provider: &str, name: &str, config: &str) -> Result<(String,
     Ok((name, server))
 }
 
+/// `profile` is the Claude profile a Claude server is added to.
 pub fn mcp_add(
     host: &HarnessHost,
+    profile: Option<&crate::harness::ClaudeMcpProfile>,
     cwd: String,
     provider: String,
     scope: String,
@@ -135,6 +137,7 @@ pub fn mcp_add(
             &name,
             &server,
             binary_path.as_deref(),
+            profile.filter(|_| provider == "claude"),
         ),
         _ => Err("Unsupported MCP provider".into()),
     }
@@ -423,21 +426,28 @@ pub struct McpConnection {
     enabled: bool,
 }
 
-pub fn mcp_discover(cwd: String) -> Result<Vec<McpConnection>, String> {
+/// `mcp_discover`. Claude's servers come from `claude_dir`, the selected
+/// profile's config directory, or the home directory when it is `None`.
+pub fn mcp_discover(
+    cwd: String,
+    claude_dir: Option<PathBuf>,
+) -> Result<Vec<McpConnection>, String> {
     let home = dirs_home().ok_or("Home directory not found")?;
     let project = expand_home(&cwd);
     let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
     let desktop_config = claude_desktop_config(Path::new(&home));
     let opencode_config = std::env::var_os("OPENCODE_CONFIG").map(PathBuf::from);
-    Ok(discover(
+    Ok(discover_with_claude_config(
         Path::new(&home),
         &project,
         codex_home.as_deref(),
         &desktop_config,
         opencode_config.as_deref(),
+        claude_dir.as_deref(),
     ))
 }
 
+#[cfg(test)]
 fn discover(
     home: &Path,
     project: &Path,
@@ -445,8 +455,28 @@ fn discover(
     desktop_config: &Path,
     opencode_config: Option<&Path>,
 ) -> Vec<McpConnection> {
+    discover_with_claude_config(
+        home,
+        project,
+        codex_home_override,
+        desktop_config,
+        opencode_config,
+        None,
+    )
+}
+
+fn discover_with_claude_config(
+    home: &Path,
+    project: &Path,
+    codex_home_override: Option<&Path>,
+    desktop_config: &Path,
+    opencode_config: Option<&Path>,
+    claude_dir: Option<&Path>,
+) -> Vec<McpConnection> {
     let mut connections = Vec::new();
-    let claude = home.join(".claude.json");
+    let claude = claude_dir
+        .map(|dir| dir.join(".claude.json"))
+        .unwrap_or_else(|| home.join(".claude.json"));
     if let Some(config) = read_json(&claude) {
         add_json_servers(
             &mut connections,
@@ -1046,6 +1076,43 @@ mod tests {
             value["mcp"]["servers"]["docs"]["url"],
             "https://example.com/mcp"
         );
+    }
+
+    #[test]
+    fn discovers_claude_servers_from_the_selected_profile() {
+        let root =
+            std::env::temp_dir().join(format!("monocode-mcp-profile-{}", uuid::Uuid::new_v4()));
+        let home = root.join("home");
+        let profile = root.join("profile");
+        let project = root.join("project");
+        for dir in [&home, &profile, &project] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"mcpServers":{"default-only":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            profile.join(".claude.json"),
+            r#"{"mcpServers":{"named-only":{"command":"node"}}}"#,
+        )
+        .unwrap();
+        let servers = discover_with_claude_config(
+            &home,
+            &project,
+            None,
+            &root.join("desktop.json"),
+            None,
+            Some(&profile),
+        );
+        let names: Vec<_> = servers
+            .iter()
+            .filter(|server| server.provider == "claude")
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["named-only"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

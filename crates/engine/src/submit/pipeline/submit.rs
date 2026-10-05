@@ -784,12 +784,15 @@ impl Submit {
         let io = self.config.attachment_io.clone();
         let skills = self.skills.clone();
         let peers = self.peers.clone();
+        let account = current.provider_account_id.clone();
         cx.spawn(async move |_, cx| {
             let prepared =
                 crate::submit::attachments::prepare_attachments(io.as_ref(), &attachments).await;
-            let prompt =
-                super::turn::prepare(&harness_text, harness, &id, &work_cwd, &skills, &peers, cx)
-                    .await;
+            let context =
+                crate::submit::skills::SkillCatalogContext::new(harness, work_cwd.clone())
+                    .with_session(id.clone())
+                    .with_account(account);
+            let prompt = super::turn::prepare(&harness_text, &context, &skills, &peers, cx).await;
             let text = peers.inbox.ask_prompt(inbox_ask.as_ref(), prompt);
             let steer = registry.steer_harness_turn(
                 harness,

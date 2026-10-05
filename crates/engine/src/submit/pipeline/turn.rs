@@ -102,20 +102,19 @@ pub(crate) async fn drive<T>(
     }
 }
 
-/// `preparePrompt` with the prompt hooks.
+/// `preparePrompt` with the prompt hooks. `context` names the session, its
+/// working directory, and its account.
 pub(crate) async fn prepare(
     text: &str,
-    harness: HarnessId,
-    session_id: &str,
-    cwd: &str,
+    context: &SkillCatalogContext,
     skills: &SkillCatalog,
     peers: &SubmitPeers,
     cx: &AsyncApp,
 ) -> String {
-    let context = SkillCatalogContext::new(harness, cwd).with_session(session_id);
+    let cwd = context.cwd.as_str();
     let prompt = prepare_prompt(
         text,
-        &context,
+        context,
         skills,
         |text| cx.update(|cx| peers.prompt.apply_file_mentions(text, cwd, cx)),
         |text| cx.update(|cx| peers.prompt.apply_notes(text, cx)),
@@ -464,9 +463,9 @@ impl TurnRun {
             _ => {
                 prepare(
                     &self.harness_text,
-                    harness,
-                    id,
-                    &state.work_cwd,
+                    &SkillCatalogContext::new(harness, state.work_cwd.clone())
+                        .with_session(id)
+                        .with_account(self.provider_account_id.clone()),
                     &self.skills,
                     &self.peers,
                     cx,

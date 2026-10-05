@@ -143,6 +143,9 @@ pub struct SkillCatalogContext {
     pub harness: HarnessId,
     pub cwd: String,
     pub session_id: Option<String>,
+    /// The provider account whose profile holds Claude's user skills and
+    /// plugins. `None` is the default account.
+    pub provider_account_id: Option<String>,
 }
 
 impl SkillCatalogContext {
@@ -151,11 +154,17 @@ impl SkillCatalogContext {
             harness,
             cwd: cwd.into(),
             session_id: None,
+            provider_account_id: None,
         }
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_account(mut self, provider_account_id: Option<String>) -> Self {
+        self.provider_account_id = provider_account_id;
         self
     }
 }
@@ -172,6 +181,18 @@ pub trait SkillSources: Send + Sync {
         cwd: String,
         disabled: Vec<String>,
     ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>>;
+
+    /// [`SkillSources::list_skills`] for a harness and provider account, so
+    /// Claude's user skills come from the selected profile.
+    fn list_skills_as(
+        &self,
+        cwd: String,
+        disabled: Vec<String>,
+        _harness: HarnessId,
+        _provider_account_id: Option<String>,
+    ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+        self.list_skills(cwd, disabled)
+    }
 
     fn read_text_file(&self, path: String) -> BoxFuture<'static, Result<String, String>>;
 
@@ -202,6 +223,9 @@ pub trait SkillSources: Send + Sync {
 /// smol's blocking pool, and native commands from the harness registry.
 pub struct ProcessSkillSources {
     pub registry: monocode_harness::core::HarnessRegistry,
+    /// Where named provider profiles live. Without it every catalog reads
+    /// the default Claude profile.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl SkillSources for ProcessSkillSources {
@@ -214,7 +238,32 @@ impl SkillSources for ProcessSkillSources {
         cwd: String,
         disabled: Vec<String>,
     ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
-        smol::unblock(move || monocode_process::skills::list_skills(cwd, Some(disabled))).boxed()
+        smol::unblock(move || monocode_process::skills::list_skills(cwd, Some(disabled), None))
+            .boxed()
+    }
+
+    fn list_skills_as(
+        &self,
+        cwd: String,
+        disabled: Vec<String>,
+        harness: HarnessId,
+        provider_account_id: Option<String>,
+    ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+        let data_dir = self.data_dir.clone();
+        smol::unblock(move || {
+            let claude_dir = match (&data_dir, harness) {
+                (Some(data_dir), HarnessId::Claude) => {
+                    monocode_process::harness::provider_account_dir(
+                        data_dir,
+                        "claude",
+                        provider_account_id.as_deref(),
+                    )?
+                }
+                _ => None,
+            };
+            monocode_process::skills::list_skills(cwd, Some(disabled), claude_dir)
+        })
+        .boxed()
     }
 
     fn read_text_file(&self, path: String) -> BoxFuture<'static, Result<String, String>> {
@@ -404,6 +453,16 @@ impl SkillCatalog {
             context.harness,
             normalize_project_path(&context.cwd)
         );
+        // Each Claude profile has its own user skills and plugins.
+        if context.harness == HarnessId::Claude
+            && let Some(account) = context
+                .provider_account_id
+                .as_deref()
+                .filter(|account| *account != "default")
+        {
+            key.push_str("\0account:");
+            key.push_str(account);
+        }
         if session_scoped
             && let Some(session_id) = context.session_id.as_deref().filter(|id| !id.is_empty())
         {
@@ -502,6 +561,7 @@ impl SkillCatalog {
             harness: context.harness,
             cwd: normalize_project_path(&context.cwd),
             session_id: context.session_id.clone().filter(|id| !id.is_empty()),
+            provider_account_id: context.provider_account_id.clone(),
         };
         let key = self.skill_catalog_key(&normalized);
         let native = self.has_native_commands(normalized.harness);
@@ -642,7 +702,12 @@ impl SkillCatalog {
         let discovered = self
             .inner
             .sources
-            .list_skills(context.cwd.clone(), disabled_paths)
+            .list_skills_as(
+                context.cwd.clone(),
+                disabled_paths,
+                context.harness,
+                context.provider_account_id.clone(),
+            )
             .await?;
         let disabled: HashSet<String> = self.load_disabled_skill_paths().into_iter().collect();
         let enabled: Vec<DiscoveredSkill> = discovered

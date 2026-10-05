@@ -393,14 +393,43 @@ fn resolve_mcp_binary(provider: &str, binary_path: Option<&str>) -> Result<PathB
     }
 }
 
+/// The Claude profile an MCP command runs under: the account's config
+/// directory, or the effective default one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeMcpProfile {
+    config_dir: Option<PathBuf>,
+    /// A named profile, which keeps its own credentials. The default
+    /// account's environment tokens must not leak into it.
+    named: bool,
+}
+
+impl ClaudeMcpProfile {
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
+    }
+}
+
+/// `claudeMcpProfile`: the profile of `account_id`, `None` meaning the
+/// default account.
+pub fn claude_mcp_profile(
+    data_dir: &Path,
+    account_id: Option<&str>,
+) -> Result<ClaudeMcpProfile, String> {
+    Ok(ClaudeMcpProfile {
+        config_dir: provider_account_dir(data_dir, "claude", account_id)?,
+        named: account_id.is_some_and(|id| id != DEFAULT_PROVIDER_ACCOUNT_ID),
+    })
+}
+
 fn claude_mcp_command(
     args: Vec<String>,
     cwd: String,
     timeout: Duration,
     binary_path: Option<&str>,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<String, String> {
     let binary = resolve_mcp_binary("claude", binary_path)?;
-    mcp_command(binary, args, cwd, timeout)
+    mcp_command(binary, args, cwd, timeout, profile)
 }
 
 fn mcp_command(
@@ -408,12 +437,19 @@ fn mcp_command(
     args: Vec<String>,
     cwd: String,
     timeout: Duration,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<String, String> {
     let workdir = expand_home(&cwd);
     if !workdir.is_dir() {
         return Err("Project directory does not exist".into());
     }
-    let output = exec_output(&binary.to_string_lossy(), &args, Some(&cwd), timeout)?;
+    let output = exec_output_with_profile(
+        &binary.to_string_lossy(),
+        &args,
+        Some(&cwd),
+        timeout,
+        profile,
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if output.status.success() {
         return Ok(stdout);
@@ -422,15 +458,24 @@ fn mcp_command(
     Err(format!("{} {}", stderr.trim(), stdout).trim().to_string())
 }
 
-pub fn claude_mcp_list(host: &HarnessHost, cwd: String) -> Result<String, String> {
+/// `claude_mcp_list` under the selected profile (`None` for the default
+/// account).
+pub fn claude_mcp_list(
+    host: &HarnessHost,
+    data_dir: &Path,
+    cwd: String,
+    account_id: Option<&str>,
+) -> Result<String, String> {
+    let profile = claude_mcp_profile(data_dir, account_id)?;
     let binary_path = host.runtime_binary_path("claude");
     let mut output = claude_mcp_command(
         vec!["mcp".into(), "list".into()],
         cwd.clone(),
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(&profile),
     )?;
-    for name in configured_ws_mcp_servers(&expand_home(&cwd)) {
+    for name in configured_ws_mcp_servers(&expand_home(&cwd), profile.config_dir()) {
         if !output
             .lines()
             .any(|line| line.starts_with(&format!("{name}:")))
@@ -443,7 +488,7 @@ pub fn claude_mcp_list(host: &HarnessHost, cwd: String) -> Result<String, String
     Ok(output)
 }
 
-fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
+fn configured_ws_mcp_servers(cwd: &Path, config_dir: Option<&Path>) -> Vec<String> {
     let mut names = Vec::new();
     let read = |path: &Path| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
@@ -460,8 +505,8 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
             }
         }
     };
-    if let Some(home) = dirs_home()
-        && let Some(settings) = read(&Path::new(&home).join(".claude.json"))
+    if let Some(path) = claude_config_path(config_dir)
+        && let Some(settings) = read(&path)
     {
         collect(settings.get("mcpServers"), &mut names);
         collect(
@@ -485,6 +530,7 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
 
 pub fn claude_mcp_add(
     host: &HarnessHost,
+    profile: &ClaudeMcpProfile,
     cwd: String,
     name: String,
     config: String,
@@ -513,6 +559,7 @@ pub fn claude_mcp_add(
         cwd,
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(profile),
     )?;
     Ok(())
 }
@@ -524,9 +571,16 @@ pub fn add_mcp_via_cli(
     name: &str,
     config: &serde_json::Value,
     binary_path: Option<&str>,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<(), String> {
     let (binary, args) = mcp_add_args(provider, scope, name, config, binary_path)?;
-    mcp_command(binary, args, cwd.to_owned(), Duration::from_secs(30))?;
+    mcp_command(
+        binary,
+        args,
+        cwd.to_owned(),
+        Duration::from_secs(30),
+        profile,
+    )?;
     Ok(())
 }
 
@@ -537,6 +591,7 @@ pub fn opencode_major_version(cwd: &str, binary_path: Option<&str>) -> Result<u3
         vec!["--version".into()],
         cwd.to_owned(),
         Duration::from_secs(10),
+        None,
     )?;
     version
         .split_whitespace()
@@ -665,6 +720,7 @@ fn mcp_key_values(
 
 pub fn claude_mcp_remove(
     host: &HarnessHost,
+    profile: &ClaudeMcpProfile,
     cwd: String,
     name: String,
     scope: String,
@@ -681,12 +737,15 @@ pub fn claude_mcp_remove(
         cwd,
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(profile),
     )?;
     Ok(())
 }
 
+/// `profile` applies to Claude only.
 pub fn mcp_provider_login(
     host: &HarnessHost,
+    profile: Option<&ClaudeMcpProfile>,
     cwd: String,
     provider: String,
     name: String,
@@ -711,6 +770,7 @@ pub fn mcp_provider_login(
         args.into_iter().map(String::from).chain([name]).collect(),
         cwd,
         Duration::from_secs(180),
+        profile.filter(|_| provider == "claude"),
     )?;
     Ok(())
 }
@@ -904,6 +964,10 @@ pub fn harness_spawn_with_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
+    // A configured Claude binary may have another name.
+    if binary_provider.as_deref() == Some("claude") && command_basename(&command) != "claude" {
+        apply_claude_env(&mut cmd);
+    }
     apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
     cmd.envs(environment);
 
@@ -991,7 +1055,12 @@ pub fn provider_account_dir(
     account_id: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
     let Some(account_id) = account_id.filter(|id| *id != DEFAULT_PROVIDER_ACCOUNT_ID) else {
-        return Ok(None);
+        // The default Claude account lives wherever CLAUDE_CONFIG_DIR says.
+        return Ok(if provider == "claude" {
+            configured_claude_dir()
+        } else {
+            None
+        });
     };
     let dir = provider_account_path(data_dir, provider, account_id)?;
     std::fs::create_dir_all(&dir).map_err(|error| {
@@ -1001,6 +1070,31 @@ pub fn provider_account_dir(
         )
     })?;
     Ok(Some(dir))
+}
+
+/// `CLAUDE_CONFIG_DIR` from this process or the login shell: where the
+/// default Claude account keeps its config.
+pub fn configured_claude_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| login_shell_env("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+}
+
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`: which macOS Keychain entry the default
+/// Claude account uses, when it differs from its config directory.
+pub fn configured_claude_secure_storage_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| login_shell_env("CLAUDE_SECURESTORAGE_CONFIG_DIR").map(PathBuf::from))
+}
+
+/// `.claude.json` in a Claude config directory, or in the home directory
+/// when there is none.
+pub fn claude_config_path(dir: Option<&Path>) -> Option<PathBuf> {
+    dir.map(|dir| dir.join(".claude.json"))
+        .or_else(|| dirs_home().map(|home| PathBuf::from(home).join(".claude.json")))
 }
 
 pub fn provider_account_path(
@@ -1073,6 +1167,10 @@ fn apply_provider_account(
     let Some(account) = account else {
         return Ok(());
     };
+    // The default account keeps the user's own environment.
+    if account.id == DEFAULT_PROVIDER_ACCOUNT_ID {
+        return Ok(());
+    }
     let Some(dir) = provider_account_dir(data_dir, &account.provider, Some(&account.id))? else {
         return Ok(());
     };
@@ -1345,12 +1443,44 @@ pub fn exec_output(
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    exec_output_with_profile(command, args, cwd, timeout, None)
+}
+
+/// [`exec_output`] for a Claude command run under `profile`.
+fn exec_output_with_profile(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    timeout: Duration,
+    profile: Option<&ClaudeMcpProfile>,
+) -> Result<std::process::Output, String> {
     let mut cmd = Command::new(command);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
+    if let Some(profile) = profile {
+        // A configured binary may not be named claude.
+        if command_basename(command) != "claude" {
+            apply_claude_env(&mut cmd);
+        }
+        if let Some(dir) = &profile.config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+            if profile.named {
+                cmd.env("CLAUDE_SECURESTORAGE_CONFIG_DIR", dir);
+            }
+        }
+        if profile.named {
+            for key in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ] {
+                cmd.env_remove(key);
+            }
+        }
+    }
     if let Some(dir) = cwd {
         let workdir = expand_home(dir);
         if workdir.is_dir() {
@@ -2847,6 +2977,7 @@ fn prepare_child(cmd: &mut Command, command: &str) {
         apply_grok_env(cmd);
     }
     if command_basename(command) == "claude" {
+        apply_claude_env(cmd);
         cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_CODE_ENTRYPOINT);
     }
     isolate_child(cmd);
@@ -2890,6 +3021,66 @@ fn apply_grok_env(cmd: &mut Command) {
     }
 }
 
+/// What Claude reads from the environment to authenticate, route to a
+/// gateway or cloud, reach a proxy, and trust certificates. A Finder-launched
+/// app inherits none of what the user set in their shell profile.
+const CLAUDE_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// Give Claude the login shell's values for [`CLAUDE_ENV_KEYS`] this
+/// process does not have. A named profile removes the tokens afterwards.
+fn apply_claude_env(cmd: &mut Command) {
+    for key in CLAUDE_ENV_KEYS {
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        if let Some(value) = login_shell_env(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
 static LOGIN_SHELL_ENV: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 
 /// Keys worth keeping out of `printenv`. PATH is the important one: a
@@ -2923,6 +3114,7 @@ fn load_login_shell_env() -> HashMap<String, String> {
     {
         LOGIN_SHELL_KEYS
             .into_iter()
+            .chain(CLAUDE_ENV_KEYS.iter().copied())
             .filter_map(|key| {
                 let value = std::env::var(key).ok()?;
                 (!value.is_empty()).then(|| (key.to_string(), value))
@@ -2969,12 +3161,20 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
             return HashMap::new();
         }
     };
+    parse_login_shell_env(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The `printenv` lines worth keeping: PATH, the provider keys, and Claude's
+/// variables. Empty values are dropped.
+#[cfg(not(windows))]
+fn parse_login_shell_env(output: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in output.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if LOGIN_SHELL_KEYS.contains(&key) && !value.is_empty() {
+        if (LOGIN_SHELL_KEYS.contains(&key) || CLAUDE_ENV_KEYS.contains(&key)) && !value.is_empty()
+        {
             map.insert(key.to_string(), value.to_string());
         }
     }
@@ -2993,6 +3193,58 @@ fn command_basename(command: &str) -> &str {
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn login_shell_env_keeps_claude_routing_and_auth_without_unrelated_variables() {
+        let env = parse_login_shell_env(
+            "PATH=/bin\nANTHROPIC_API_KEY=dummy\nANTHROPIC_BASE_URL=http://localhost\nCLAUDE_CONFIG_DIR=/tmp/profile\nAWS_PROFILE=testing\nGOOGLE_APPLICATION_CREDENTIALS=/tmp/fixture\nHTTPS_PROXY=http://localhost:8000\nNODE_EXTRA_CA_CERTS=/tmp/certs\nUNRELATED_SECRET=excluded\nANTHROPIC_AUTH_TOKEN=\n",
+        );
+        assert_eq!(env.len(), 8);
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("dummy")
+        );
+        assert!(!env.contains_key("UNRELATED_SECRET"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_mcp_commands_select_named_storage_and_remove_default_tokens() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("monocode-mcp-profile-{}", uuid::Uuid::new_v4()));
+        let profile_dir = root.join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let binary = root.join("claude");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo '2.1.287 (Claude Code)'; exit 0; fi
+printf '%s\n' "$CLAUDE_CONFIG_DIR" "$CLAUDE_SECURESTORAGE_CONFIG_DIR"
+if [ -n "${ANTHROPIC_API_KEY-}${ANTHROPIC_AUTH_TOKEN-}${CLAUDE_CODE_OAUTH_TOKEN-}" ]; then echo default-token-present; fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = ClaudeMcpProfile {
+            config_dir: Some(profile_dir.clone()),
+            named: true,
+        };
+        let output = claude_mcp_command(
+            vec!["mcp".into(), "list".into()],
+            root.to_string_lossy().into_owned(),
+            Duration::from_secs(5),
+            Some(&binary.to_string_lossy()),
+            Some(&profile),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            format!("{}\n{}", profile_dir.display(), profile_dir.display())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn spawn_group(script: &str) -> std::process::Child {
         Command::new("sh")
@@ -3432,6 +3684,7 @@ mod tests {
                     vec!["mcp".into(), "login".into(), "docs".into()],
                     cwd.clone(),
                     Duration::from_secs(5),
+                    None,
                 )
                 .unwrap(),
                 "mcp\nlogin\ndocs"
@@ -3443,6 +3696,7 @@ mod tests {
                 cwd.clone(),
                 Duration::from_secs(5),
                 paths.get("claude").map(String::as_str),
+                None,
             )
             .unwrap(),
             "mcp\nlist"
@@ -3477,6 +3731,7 @@ mod tests {
                 "docs",
                 &config,
                 paths.get(provider).map(String::as_str),
+                None,
             )
             .unwrap();
         }

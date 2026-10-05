@@ -346,11 +346,17 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
 
     // Submit.
     let mut submit = SubmitConfig::new(registry.clone(), catalog.clone(), kv.clone(), spawner);
+    // Claude skills come from the session's profile.
+    submit.skill_sources = Arc::new(monocode_engine::submit::skills::ProcessSkillSources {
+        registry: registry.clone(),
+        data_dir: Some(data_dir.clone()),
+    });
     submit.mcp_settings = Some(
         monocode_engine::submit::mcp_settings_cache::McpSettingsCache::new(
             Arc::new(
                 monocode_engine::submit::mcp_settings_cache::ProcessMcpSources {
                     host: host.clone(),
+                    data_dir: data_dir.clone(),
                 },
             ),
             registry.spawner().clone(),

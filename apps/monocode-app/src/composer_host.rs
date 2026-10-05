@@ -91,11 +91,14 @@ impl ModelSource for CatalogModelSource {
     }
 }
 
-/// `SkillCatalogContext` from the composer's key.
-fn catalog_context(context: &SkillContext) -> SkillCatalogContext {
+/// `SkillCatalogContext` from the composer's key, with the session's
+/// provider account so Claude reads that profile's skills.
+fn catalog_context(context: &SkillContext, cx: &App) -> SkillCatalogContext {
     let mut catalog = SkillCatalogContext::new(context.harness, context.cwd.clone());
     if let Some(id) = &context.session_id {
-        catalog = catalog.with_session(id.clone());
+        catalog = catalog
+            .with_session(id.clone())
+            .with_account(session_account(id, cx));
     }
     catalog
 }
@@ -181,6 +184,16 @@ fn mcp_connection(server: &monocode_engine::submit::mcp::McpConnection) -> McpCo
         transport: server.transport.clone(),
         enabled: server.enabled,
     }
+}
+
+/// The provider account a session runs under.
+fn session_account(session_id: &str, cx: &App) -> Option<String> {
+    monocode_engine::runtime::Engine::try_global(cx)?;
+    monocode_engine::runtime::Engine::sessions(cx)
+        .read(cx)
+        .get(session_id)?
+        .provider_account_id
+        .clone()
 }
 
 fn engine_mcp_connection(
@@ -527,7 +540,7 @@ impl ComposerHost for SessionComposerHost {
         let Some(catalog) = &self.skills else {
             return Vec::new();
         };
-        let context = catalog_context(context);
+        let context = catalog_context(context, cx);
         if let Some(skills) = catalog.peek_skills(&context) {
             return skills.iter().map(picker_skill).collect();
         }
@@ -543,7 +556,7 @@ impl ComposerHost for SessionComposerHost {
         let Some(catalog) = &self.skills else {
             return;
         };
-        let load = catalog.load_skills(&catalog_context(context), refresh);
+        let load = catalog.load_skills(&catalog_context(context, cx), refresh);
         let task = cx.background_spawn(async move {
             load.await;
         });
@@ -640,6 +653,11 @@ impl ComposerHost for SessionComposerHost {
         let Some(cache) = &self.mcp_cache else {
             return McpServers::default();
         };
+        // Claude's servers depend on the session's profile.
+        let account = session_account(&self.session_id, cx);
+        let key =
+            monocode_engine::submit::mcp_settings_cache::mcp_scope_key(cwd, account.as_deref());
+        let cwd = key.as_str();
         if !self.mcp_watches.borrow().contains_key(cwd)
             && let Some(composer) = self.composer.borrow().clone()
         {

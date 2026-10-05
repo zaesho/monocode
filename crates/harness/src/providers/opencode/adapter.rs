@@ -54,20 +54,26 @@ use super::git::{
     SharedGitSource, generate_open_code_branch_name, generate_open_code_commit_message,
     generate_open_code_pr_content,
 };
+use super::policy::{
+    build_open_code_permission_rules, managed_open_code_config, parse_open_code_tool_output_glob,
+    verify_managed_open_code_policy,
+};
 use super::protocol::{
-    MINIMUM_OPENCODE_VERSION, OpenCodePart, ParsedOpenCodeModelSlug, PartStore, PartTime, Record,
-    append_open_code_assistant_text_delta, build_open_code_permission_rules, compare_semver,
-    context_used_from_message_info, detail_from_tool_part, event_session_id, field,
-    is_known_hidden_agent, is_truthy, merge_open_code_assistant_text, open_code_child_session_id,
-    parse_open_code_model_slug, parse_open_code_version, parse_server_url_from_output,
-    permission_title, preview_from_tool_part, record_field, session_error_message, string_field,
-    text_delta_event, to_open_code_permission_reply, to_open_code_prompt_parts,
-    tool_kind_from_name, turn_metrics_from_message_info,
+    OpenCodePart, ParsedOpenCodeModelSlug, PartStore, PartTime, Record,
+    append_open_code_assistant_text_delta, context_used_from_message_info, detail_from_tool_part,
+    event_session_id, field, is_known_hidden_agent, is_supported_open_code_version, is_truthy,
+    merge_open_code_assistant_text, open_code_child_session_id, parse_open_code_model_slug,
+    parse_open_code_version, parse_server_url_from_output, permission_title,
+    preview_from_tool_part, record_field, session_error_message, string_field, text_delta_event,
+    to_open_code_permission_reply, to_open_code_prompt_parts, tool_kind_from_name,
+    turn_metrics_from_message_info, unsupported_open_code_version_message,
 };
 use super::text::OpenCodeText;
 use super::title::generate_open_code_session_title;
 use crate::core::catalog::SharedCatalog;
-use crate::core::child::{BinaryPathChoice, ChildEvent, Children, SseEvent, SseEvents};
+use crate::core::child::{
+    BinaryPathChoice, ChildEvent, Children, SpawnRequest, SseEvent, SseEvents,
+};
 use crate::core::registry::{
     AcceptedHook, AdapterCapabilities, EventSink, GeneratedPrContent, HarnessAdapter,
     TextPromptInput, TitleInput,
@@ -608,33 +614,25 @@ impl OpenCodeAdapter {
         on_event: &EventSink,
     ) -> Result<Arc<Live>> {
         let session_id = &input.session_id;
+        let planning = input.intent == Some(TurnIntent::Plan);
         let existing = self.live(session_id);
-        if let Some(existing) = existing.as_ref().filter(|live| live.cwd == input.cwd) {
-            let mode_changed = existing.with(|s| {
-                s.on_event = on_event.clone();
-                s.runtime_mode != input.runtime_mode
-            });
-            if mode_changed {
-                let permission = build_open_code_permission_rules(input.runtime_mode);
-                existing
-                    .client
-                    .update_session(
-                        &existing.open_code_session_id,
-                        &PermissionUpdate {
-                            permission: &permission,
-                        },
-                    )
-                    .await?;
-            }
-            existing.with(|s| s.runtime_mode = input.runtime_mode);
+        // The access mode is part of the server's configuration, so a new
+        // mode or a Plan turn starts a new server instead of patching rules.
+        if let Some(existing) = existing.as_ref().filter(|live| {
+            live.cwd == input.cwd
+                && live.with(|s| s.runtime_mode == input.runtime_mode && s.planning == planning)
+        }) {
+            existing.with(|s| s.on_event = on_event.clone());
             return Ok(existing.clone());
         }
-        if existing.is_some() {
-            self.inner
-                .threads
-                .lock()
-                .resume_by_thread
-                .remove(session_id);
+        if let Some(existing) = &existing {
+            if existing.cwd != input.cwd {
+                self.inner
+                    .threads
+                    .lock()
+                    .resume_by_thread
+                    .remove(session_id);
+            }
             self.stop_open_code_session(session_id).await;
         }
 
@@ -654,6 +652,30 @@ impl OpenCodeAdapter {
         let binary = children.resolve_open_code_binary().await?;
         self.assert_open_code_version(&binary.path, &input.cwd)
             .await?;
+        let exec = |args: &[&str]| {
+            children.exec_child(
+                &binary.path,
+                args.iter().map(|arg| arg.to_string()).collect(),
+                Some(&input.cwd),
+                Some(HarnessId::Opencode),
+                BinaryPathChoice::Runtime,
+            )
+        };
+        let agents = exec(&["agent", "list"]).await?;
+        let restricted = planning || input.runtime_mode != RuntimeMode::FullAccess;
+        let tool_output_glob = if restricted {
+            Some(parse_open_code_tool_output_glob(
+                &exec(&["debug", "paths"]).await?,
+            )?)
+        } else {
+            None
+        };
+        let policy = managed_open_code_config(
+            &agents,
+            input.runtime_mode,
+            planning,
+            tool_output_glob.as_deref(),
+        )?;
 
         let start = Arc::new(Mutex::new(ServerStart::default()));
         let live_ref: Arc<Mutex<Option<Arc<Live>>>> = Arc::default();
@@ -661,22 +683,30 @@ impl OpenCodeAdapter {
 
         let port = children.free_harness_port().await?;
         children
-            .spawn_child(
-                session_id,
-                &binary.path,
-                vec![
+            .spawn_request(SpawnRequest {
+                session_id: session_id.clone(),
+                command: binary.path.clone(),
+                args: vec![
                     "serve".into(),
                     "--hostname=127.0.0.1".into(),
                     format!("--port={port}"),
                 ],
-                &input.cwd,
-                None,
-                Some(HarnessId::Opencode),
-            )
+                cwd: input.cwd.clone(),
+                binary_provider: Some(HarnessId::Opencode),
+                environment: HashMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), policy)]),
+                ..Default::default()
+            })
             .await?;
 
         match self
-            .connect(input, on_event, &start, &live_ref, resume)
+            .connect(
+                input,
+                on_event,
+                &start,
+                &live_ref,
+                resume,
+                tool_output_glob.as_deref(),
+            )
             .await
         {
             Ok(live) => Ok(live),
@@ -746,12 +776,34 @@ impl OpenCodeAdapter {
         start: &Arc<Mutex<ServerStart>>,
         live_ref: &Arc<Mutex<Option<Arc<Live>>>>,
         resume: Option<Resume>,
+        tool_output_glob: Option<&str>,
     ) -> Result<Arc<Live>> {
         let url = wait_for_server_url(start, SERVER_TIMEOUT_MS).await?;
         let client = OpenCodeClient::new(&url, &input.cwd, self.inner.children.clone());
+        let planning = input.intent == Some(TurnIntent::Plan);
+        if planning || input.runtime_mode != RuntimeMode::FullAccess {
+            // Project config can outrank the managed policy. Check what the
+            // server actually applied before any prompt can use it.
+            let agents = client.get_agents().await?;
+            let config = client.get_config().await?;
+            verify_managed_open_code_policy(
+                &agents,
+                &config,
+                input.runtime_mode,
+                planning,
+                tool_output_glob,
+            )?;
+        }
         let can_resume = resume.is_some();
-        let session =
-            resolve_session(&client, resume.as_ref(), input.runtime_mode, &input.cwd).await?;
+        let session = resolve_session(
+            &client,
+            resume.as_ref(),
+            input.runtime_mode,
+            planning,
+            &input.cwd,
+            tool_output_glob,
+        )
+        .await?;
         if can_resume && let Err(error) = repair_unsupported_file_turn(&client, &session.id).await {
             log::debug!("[monocode] opencode attachment recovery {error:#}");
         }
@@ -926,22 +978,11 @@ impl OpenCodeAdapter {
             )
             .await
             .unwrap_or_default();
-        let Some(version) = parse_open_code_version(&output) else {
-            bail!(
-                "Unable to determine OpenCode version. MonoCode requires v{MINIMUM_OPENCODE_VERSION} or newer."
-            );
-        };
-        if compare_semver(&version, MINIMUM_OPENCODE_VERSION) < 0 {
-            bail!(
-                "OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer."
-            );
+        let version = parse_open_code_version(&output);
+        match version.as_deref() {
+            Some(version) if is_supported_open_code_version(version) => Ok(()),
+            version => bail!(unsupported_open_code_version_message(version)),
         }
-        // TODO(port): there is no upper bound. OpenCode 2 passes this gate but
-        // serves its API under `/api` behind basic auth, answers
-        // `POST /session` with 405, and serves its web app at `/event`, so a
-        // turn fails with "OpenCode HTTP 405". `opencode_major_version` in
-        // monocode-process tells the two apart.
-        Ok(())
     }
 }
 
@@ -1055,7 +1096,12 @@ fn handle_event(live: &Arc<Live>, event: &Record) -> Option<Continuation> {
                         if live.with(|s| s.mute_updates || s.turn_token() != turn) {
                             return Ok(());
                         }
-                        match handle_request(&live, &event_type, &properties) {
+                        match handle_request(
+                            &live,
+                            &event_type,
+                            &properties,
+                            Some(&payload_session_id),
+                        ) {
                             Some(next) => next.await,
                             None => Ok(()),
                         }
@@ -1066,8 +1112,14 @@ fn handle_event(live: &Arc<Live>, event: &Record) -> Option<Continuation> {
         }
     }
 
+    let payload_session_id = event_session_id(event);
     match event_type.as_str() {
-        "permission.asked" | "question.asked" => handle_request(live, &event_type, &properties),
+        "permission.asked" | "question.asked" => handle_request(
+            live,
+            &event_type,
+            &properties,
+            payload_session_id.as_deref(),
+        ),
         _ => {
             live.with(|s| handle_transcript_event(s, live, &event_type, &properties));
             None
@@ -1075,9 +1127,14 @@ fn handle_event(live: &Arc<Live>, event: &Record) -> Option<Continuation> {
     }
 }
 
-fn handle_request(live: &Arc<Live>, event_type: &str, properties: &Record) -> Option<Continuation> {
+fn handle_request(
+    live: &Arc<Live>,
+    event_type: &str,
+    properties: &Record,
+    payload_session_id: Option<&str>,
+) -> Option<Continuation> {
     if event_type == "permission.asked" {
-        handle_permission(live, properties)
+        handle_permission(live, properties, payload_session_id)
     } else {
         handle_question(live, properties)
     }
@@ -1088,8 +1145,13 @@ enum PermissionNext {
     Wait(i64, oneshot::Receiver<ApprovalDecision>),
 }
 
-/// The `permission.asked` branch of `handleEvent`.
-fn handle_permission(live: &Arc<Live>, properties: &Record) -> Option<Continuation> {
+/// The `permission.asked` branch of `handleEvent`. `payload_session_id` is
+/// the session that asked.
+fn handle_permission(
+    live: &Arc<Live>,
+    properties: &Record,
+    payload_session_id: Option<&str>,
+) -> Option<Continuation> {
     let props = Some(properties);
     let id = string_field(props, "id")
         .or_else(|| string_field(props, "requestID"))?
@@ -1168,7 +1230,19 @@ fn handle_permission(live: &Arc<Live>, properties: &Record) -> Option<Continuati
         };
 
         if s.planning {
-            let decision = if kind == "read" || kind == "search" {
+            // An Explore task from the primary session is read-only. Every
+            // pattern must name it, and a child cannot delegate further.
+            let explore_task = permission == "task"
+                && payload_session_id == Some(live.open_code_session_id.as_str())
+                && field(props, "patterns")
+                    .and_then(Value::as_array)
+                    .is_some_and(|patterns| {
+                        !patterns.is_empty()
+                            && patterns
+                                .iter()
+                                .all(|pattern| pattern.as_str() == Some("explore"))
+                    });
+            let decision = if kind == "read" || kind == "search" || explore_task {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
@@ -2014,9 +2088,11 @@ async fn resolve_session(
     client: &OpenCodeClient,
     resume: Option<&Resume>,
     runtime_mode: RuntimeMode,
+    planning: bool,
     cwd: &str,
+    tool_output_glob: Option<&str>,
 ) -> Result<OpenCodeSession> {
-    let permission = build_open_code_permission_rules(runtime_mode);
+    let permission = build_open_code_permission_rules(runtime_mode, planning, tool_output_glob);
     let update = PermissionUpdate {
         permission: &permission,
     };
@@ -2028,12 +2104,14 @@ async fn resolve_session(
                 .as_deref()
                 .filter(|directory| !directory.is_empty())
                 .is_none_or(|directory| same_directory(directory, cwd));
+            // A resumed session keeps the rules it was created with until
+            // this patch lands, so a failed patch must not reach a prompt.
             if same {
-                let _ = client.update_session(&adopted.id, &update).await;
+                client.update_session(&adopted.id, &update).await?;
                 return Ok(adopted);
             }
             let forked = client.fork_session(&adopted.id, cwd).await?;
-            let _ = client.update_session(&forked.id, &update).await;
+            client.update_session(&forked.id, &update).await?;
             Ok(forked)
         }
         .await;

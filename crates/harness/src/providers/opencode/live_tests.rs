@@ -692,7 +692,7 @@ fn uses_response_order_when_a_user_timestamp_is_missing() {
 // describe("OpenCode access modes")
 
 #[test]
-fn updates_a_live_session_when_access_changes_and_auto_allows_residual_full_access_prompts() {
+fn restarts_a_live_session_when_access_changes_and_auto_allows_residual_full_access_prompts() {
     smol::block_on(async {
         let mut h = Harness::new();
         let first = h.start_turn().await;
@@ -714,6 +714,8 @@ fn updates_a_live_session_when_access_changes_and_auto_allows_residual_full_acce
             Some(r#"{"permission":[{"permission":"*","pattern":"*","action":"allow"}]}"#)
         );
         wait_for("second prompt", || h.prompts() == 2).await;
+        // The access mode is server configuration, so the change restarts it.
+        assert_eq!(h.host.spawns().len(), 2);
 
         h.ask_permission(ROOT, "permission_residual");
         let reply = h
@@ -1378,5 +1380,249 @@ fn still_kills_the_child_when_closing_an_ended_stream_fails() {
         h.adapter.stop_session(THREAD.into()).await.unwrap();
         assert_eq!(h.host.sse_closes(), [THREAD]);
         assert_eq!(h.host.kills(), [THREAD]);
+    });
+}
+
+// describe("OpenCode review regressions")
+
+fn plan_input(runtime_mode: RuntimeMode) -> SendTurnInput {
+    let mut input = turn_input(runtime_mode);
+    input.session.intent = Some(TurnIntent::Plan);
+    input
+}
+
+#[test]
+fn rejects_opencode_2_before_spawning_a_v1_server() {
+    smol::block_on(async {
+        let h = Harness::new();
+        h.host.exec_once("opencode v2.0.20");
+        let error = h.turn().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("OpenCode 2 uses a different API")
+        );
+        assert!(h.host.spawns().is_empty());
+    });
+}
+
+#[test]
+fn rejects_effective_higher_priority_permissions_before_creating_a_prompt() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let handler = live_test_handler(json!([]));
+        h.host.respond_with(move |request| {
+            if path_of(&request.url) == "/agent" {
+                return (
+                    200,
+                    json!([{
+                        "name": "injected",
+                        "permission": [
+                            { "permission": "*", "pattern": "*", "action": "ask" },
+                            { "permission": "bash", "pattern": "*", "action": "allow" },
+                        ],
+                    }])
+                    .to_string(),
+                );
+            }
+            handler(request)
+        });
+        let error = h.turn().await.unwrap_err();
+        assert!(error.to_string().contains("grants tools beyond"));
+        assert_eq!(h.prompts(), 0);
+        assert!(h.host.kills().contains(&THREAD.to_string()));
+    });
+}
+
+#[test]
+fn rejects_a_higher_priority_primary_child_tool_grant() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let handler = live_test_handler(json!([]));
+        h.host.respond_with(move |request| {
+            if path_of(&request.url) == "/config" {
+                return (
+                    200,
+                    json!({ "experimental": { "primary_tools": ["bash"] } }).to_string(),
+                );
+            }
+            handler(request)
+        });
+        let error = h.turn().await.unwrap_err();
+        assert!(error.to_string().contains("grants tools beyond"));
+        assert_eq!(h.prompts(), 0);
+    });
+}
+
+#[test]
+fn rejects_an_effective_subagent_explore_grant_before_creating_a_prompt() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let handler = live_test_handler(json!([]));
+        h.host.respond_with(move |request| {
+            if path_of(&request.url) == "/agent" {
+                return (
+                    200,
+                    json!([{
+                        "name": "explore",
+                        "mode": "subagent",
+                        "permission": [
+                            { "permission": "*", "pattern": "*", "action": "deny" },
+                            { "permission": "task", "pattern": "*", "action": "deny" },
+                            { "permission": "task", "pattern": "explore", "action": "allow" },
+                        ],
+                    }])
+                    .to_string(),
+                );
+            }
+            handler(request)
+        });
+        let error = h
+            .send(plan_input(RuntimeMode::Supervised), &h.events)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("grants tools beyond"));
+        assert_eq!(h.prompts(), 0);
+        assert!(h.host.kills().contains(&THREAD.to_string()));
+    });
+}
+
+#[test]
+fn starts_plan_and_its_subagents_with_the_managed_permission_policy() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.send(plan_input(RuntimeMode::FullAccess), &h.events);
+        wait_for("Plan prompt", || h.prompts() == 1).await;
+        let config = h.host.spawned_config().unwrap();
+        assert_eq!(config["permission"]["*"], "deny");
+        assert_eq!(config["permission"]["task"], "deny");
+        assert_eq!(
+            config["agent"]["plan"]["permission"]["task"],
+            json!({ "*": "deny", "explore": "allow" })
+        );
+        assert_eq!(config["agent"]["general"]["permission"]["task"], "deny");
+        assert_eq!(config["agent"]["explore"]["permission"]["task"], "deny");
+        assert_eq!(config["agent"]["general"]["permission"]["*"], "deny");
+        assert_eq!(
+            config["permission"]["external_directory"],
+            json!({ "*": "deny", "/isolated/data/opencode/tool-output/*": "allow" })
+        );
+        assert_eq!(config["experimental"]["primary_tools"], json!([]));
+        let session = h
+            .host
+            .http_calls()
+            .into_iter()
+            .find(|call| call.method == "POST" && path_of(&call.url) == "/session")
+            .unwrap();
+        assert!(
+            body(&session)["permission"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({
+                    "permission": "external_directory",
+                    "pattern": "/isolated/data/opencode/tool-output/*",
+                    "action": "allow",
+                }))
+        );
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn rejects_an_unsafe_tool_output_directory_before_starting_the_server() {
+    smol::block_on(async {
+        let h = Harness::new();
+        h.host.set_debug_paths("data       /other/*");
+        let error = h.turn().await.unwrap_err();
+        assert!(error.to_string().contains("safe data directory"));
+        assert!(h.host.spawns().is_empty());
+    });
+}
+
+#[test]
+fn replies_to_a_plan_task_by_its_scope_and_session() {
+    let scopes: [(Option<Value>, &str); 14] = [
+        (None, "reject"),
+        (Some(Value::Null), "reject"),
+        (Some(json!([])), "reject"),
+        (Some(json!("explore")), "reject"),
+        (Some(json!({ "agent": "explore" })), "reject"),
+        (Some(json!([42])), "reject"),
+        (Some(json!([""])), "reject"),
+        (Some(json!([" explore "])), "reject"),
+        (Some(json!(["explore", 42])), "reject"),
+        (Some(json!(["explore", null])), "reject"),
+        (Some(json!(["general"])), "reject"),
+        (Some(json!(["explore", "general"])), "reject"),
+        (Some(json!(["explore"])), "once"),
+        (Some(json!(["explore", "explore"])), "once"),
+    ];
+    for (patterns, root_reply) in scopes {
+        for session_id in [ROOT, "session_child", "session_grandchild"] {
+            smol::block_on(async {
+                let mut h = Harness::new();
+                let done = h.send(plan_input(RuntimeMode::FullAccess), &h.events);
+                wait_for("Plan prompt", || h.prompts() == 1).await;
+                if session_id != ROOT {
+                    h.session_created("session_child", Some(ROOT));
+                }
+                if session_id == "session_grandchild" {
+                    h.session_created(session_id, Some("session_child"));
+                }
+                let mut properties = json!({
+                    "id": "plan_task_request",
+                    "sessionID": session_id,
+                    "permission": "task",
+                    "metadata": { "subagent_type": "explore" },
+                });
+                if let Some(patterns) = &patterns {
+                    properties["patterns"] = patterns.clone();
+                }
+                h.sse(json!({ "type": "permission.asked", "properties": properties }));
+                let request = h
+                    .wait_for_call("Plan task reply", |call| {
+                        call.url.contains("/permission/plan_task_request/reply")
+                    })
+                    .await;
+                assert_eq!(request.method, "POST");
+                assert_eq!(
+                    request.url,
+                    "http://127.0.0.1:4096/permission/plan_task_request/reply?directory=%2Frepo"
+                );
+                let reply = if session_id == ROOT {
+                    root_reply
+                } else {
+                    "reject"
+                };
+                assert_eq!(
+                    body(&request),
+                    json!({ "reply": reply }),
+                    "{patterns:?} {session_id}"
+                );
+                assert!(!h.events().iter().any(is_approval));
+                h.idle(ROOT);
+                done.await.unwrap();
+            });
+        }
+    }
+}
+
+#[test]
+fn does_not_submit_a_resumed_prompt_after_its_permission_patch_fails() {
+    smol::block_on(async {
+        let h = Harness::new();
+        h.adapter.bind_session(THREAD, ROOT, "/repo", None);
+        let handler = live_test_handler(json!([]));
+        h.host.respond_with(move |request| {
+            if request.method == "PATCH" {
+                return (500, "Permission update failed".into());
+            }
+            handler(request)
+        });
+        let error = h.turn().await.unwrap_err();
+        assert!(error.to_string().contains("Permission update failed"));
+        assert_eq!(h.prompts(), 0);
+        assert!(!h.host.kills().is_empty());
     });
 }

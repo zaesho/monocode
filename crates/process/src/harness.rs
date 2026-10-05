@@ -1281,6 +1281,7 @@ const EXEC_ALLOWED_ARGS: &[&[&str]] = &[
     &["models"],
     &["status", "--json"],
     &["agent", "list"],
+    &["debug", "paths"],
 ];
 
 fn exec_args_allowed(args: &[String]) -> bool {
@@ -1315,7 +1316,10 @@ pub fn harness_exec(
     binary_provider: Option<String>,
     binary_path: Option<String>,
 ) -> Result<String, String> {
-    if !exec_args_allowed(&args) {
+    // `debug paths` reveals OpenCode's data directory and nothing else needs it.
+    if !exec_args_allowed(&args)
+        || (args == ["debug", "paths"] && binary_provider.as_deref() != Some("opencode"))
+    {
         return Err("harness_exec: unsupported arguments".into());
     }
     if !is_resolved_harness_binary(&command, binary_provider.as_deref(), binary_path.as_deref()) {
@@ -3910,6 +3914,20 @@ mod exec_allowlist_tests {
         assert!(exec_args_allowed(&args(&["models"])));
         assert!(exec_args_allowed(&args(&["status", "--json"])));
         assert!(exec_args_allowed(&args(&["agent", "list"])));
+        assert!(exec_args_allowed(&args(&["debug", "paths"])));
+    }
+
+    #[test]
+    fn limits_debug_paths_to_opencode() {
+        let error = harness_exec(
+            "unused".into(),
+            args(&["debug", "paths"]),
+            None,
+            Some("codex".into()),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "harness_exec: unsupported arguments");
     }
 
     #[test]

@@ -24,6 +24,15 @@ use crate::core::task::{SharedSpawner, SmolSpawner};
 
 type Handler = Arc<dyn Fn(&HttpRequest) -> (u16, String) + Send + Sync>;
 
+/// An exec reply a test queued.
+enum ExecOnce {
+    Output(String),
+}
+
+/// The agents `opencode agent list` prints by default.
+pub const DEFAULT_AGENT_LIST: &str =
+    "build (primary)\n[]\nplan (primary)\n[]\ngeneral (subagent)\n[]\nexplore (subagent)\n[]";
+
 /// A reply a test sends later: status and body.
 type LaterReply = oneshot::Receiver<(u16, String)>;
 
@@ -45,6 +54,12 @@ struct State {
     /// Fail the next `sse_close` with this error.
     sse_close_error: Option<String>,
     exec_output: String,
+    /// What `opencode agent list` prints.
+    agent_list: String,
+    /// What `opencode debug paths` prints.
+    debug_paths: String,
+    /// Exec replies queued ahead of the argument defaults, oldest first.
+    exec_once: VecDeque<ExecOnce>,
     exec_calls: Vec<ExecRequest>,
     logs: VecDeque<Result<Vec<Value>, String>>,
     runtime_path: Option<String>,
@@ -119,6 +134,9 @@ impl FakeHost {
                     "opencode 1.14.19"
                 }
                 .into(),
+                agent_list: DEFAULT_AGENT_LIST.into(),
+                debug_paths: "data       /isolated/data/opencode".into(),
+                exec_once: VecDeque::new(),
                 exec_calls: Vec::new(),
                 logs: VecDeque::new(),
                 runtime_path: None,
@@ -187,6 +205,30 @@ impl FakeHost {
 
     pub fn set_exec_output(&self, output: &str) {
         self.inner.state.lock().exec_output = output.into();
+    }
+
+    pub fn set_debug_paths(&self, output: &str) {
+        self.inner.state.lock().debug_paths = output.into();
+    }
+
+    /// The next exec call, whatever its arguments, prints `output`.
+    pub fn exec_once(&self, output: &str) {
+        self.inner
+            .state
+            .lock()
+            .exec_once
+            .push_back(ExecOnce::Output(output.into()));
+    }
+
+    /// The managed config the last server started with.
+    pub fn spawned_config(&self) -> Option<Value> {
+        let state = self.inner.state.lock();
+        let config = state
+            .spawns
+            .last()?
+            .environment
+            .get("OPENCODE_CONFIG_CONTENT")?;
+        serde_json::from_str(config).ok()
     }
 
     pub fn http_calls(&self) -> Vec<HttpRequest> {
@@ -271,6 +313,45 @@ impl FakeHost {
     }
 }
 
+/// What the server answers at `/agent` or `/config` after starting with
+/// `config`: the config itself, or each configured agent with its rules
+/// flattened in key order.
+pub fn policy_reply(path: &str, config: &Value) -> (u16, String) {
+    if path == "/config" {
+        return (200, config.to_string());
+    }
+    let agents: Vec<Value> = config["agent"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| {
+            let rules: Vec<Value> = value["permission"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .flat_map(|(permission, action)| match action {
+                    Value::Object(patterns) => patterns
+                        .iter()
+                        .map(|(pattern, action)| {
+                            serde_json::json!({ "permission": permission, "pattern": pattern, "action": action })
+                        })
+                        .collect::<Vec<_>>(),
+                    action => vec![
+                        serde_json::json!({ "permission": permission, "pattern": "*", "action": action }),
+                    ],
+                })
+                .collect();
+            let mode = if name == "build" || name == "plan" {
+                "primary"
+            } else {
+                "subagent"
+            };
+            serde_json::json!({ "name": name, "mode": mode, "permission": rules })
+        })
+        .collect();
+    (200, Value::Array(agents).to_string())
+}
+
 /// `waitFor`: poll `predicate` every 5 ms for up to 2 s.
 pub async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
     for _ in 0..400 {
@@ -338,8 +419,16 @@ impl ChildBackend for FakeBackend {
 
     fn exec(&self, request: ExecRequest) -> ChildFuture<String> {
         let mut state = self.inner.state.lock();
+        let output = match request.args.join(" ").as_str() {
+            "agent list" => state.agent_list.clone(),
+            "debug paths" => state.debug_paths.clone(),
+            _ => state.exec_output.clone(),
+        };
         state.exec_calls.push(request);
-        ready(Ok(state.exec_output.clone()))
+        match state.exec_once.pop_front() {
+            Some(ExecOnce::Output(output)) => ready(Ok(output)),
+            None => ready(Ok(output)),
+        }
     }
 
     fn free_port(&self) -> ChildFuture<u16> {
@@ -347,7 +436,7 @@ impl ChildBackend for FakeBackend {
     }
 
     fn http(&self, request: HttpRequest) -> ChildFuture<HttpResponse> {
-        let (once, deferred, handler) = {
+        let (once, deferred, handler, policy) = {
             let mut state = self.inner.state.lock();
             state.http_calls.push(request.clone());
             let path = path_of(&request.url);
@@ -360,7 +449,12 @@ impl ChildBackend for FakeBackend {
                 Some(_) => None,
                 None => state.once.pop_front(),
             };
-            (once, deferred, state.handler.clone())
+            let policy = state
+                .spawns
+                .last()
+                .and_then(|spawn| spawn.environment.get("OPENCODE_CONFIG_CONTENT"))
+                .and_then(|config| serde_json::from_str::<Value>(config).ok());
+            (once, deferred, state.handler.clone(), policy)
         };
         async move {
             let (status, body) = match (deferred, once) {
@@ -370,6 +464,15 @@ impl ChildBackend for FakeBackend {
                     reply.await.map_err(|_| "dropped".to_string())?
                 }
                 (None, None) => handler(&request),
+            };
+            // `GET /agent` and `GET /config` report the managed policy the
+            // server started with, unless the handler answered them itself.
+            let (status, body) = match path_of(&request.url).as_str() {
+                "/agent" | "/config" if status == 204 => policy
+                    .as_ref()
+                    .map(|config| policy_reply(&path_of(&request.url), config))
+                    .unwrap_or((status, body)),
+                _ => (status, body),
             };
             Ok(HttpResponse { status, body })
         }

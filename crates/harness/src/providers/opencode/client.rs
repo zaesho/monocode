@@ -214,6 +214,22 @@ impl OpenCodeClient {
         session_from(value)
     }
 
+    /// `getAgents`: the effective agents and their ordered permission rules.
+    pub async fn get_agents(&self) -> Result<Value> {
+        let value = self
+            .request("GET", "/agent", RequestOptions::default())
+            .await?;
+        Ok(value.unwrap_or(Value::Null))
+    }
+
+    /// `getConfig`: the server's merged configuration.
+    pub async fn get_config(&self) -> Result<Value> {
+        let value = self
+            .request("GET", "/config", RequestOptions::default())
+            .await?;
+        Ok(value.unwrap_or(Value::Null))
+    }
+
     /// `getMessages`. `None` when the server did not return a list.
     pub async fn get_messages(&self, session_id: &str) -> Result<Option<Vec<OpenCodeMessage>>> {
         let value = self

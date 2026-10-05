@@ -147,19 +147,21 @@ fn env_var(name: &str) -> Option<String> {
 
 /// The Go key lives at `auth.json -> "opencode-go" -> "key"` inside the
 /// OpenCode data directory. Resolution mirrors OpenCode's own precedence:
-/// the `OPENCODE_AUTH_CONTENT` blob, then an explicit provider key in
-/// opencode config, then stored credentials on disk.
+/// an explicit provider key in config, then the `OPENCODE_AUTH_CONTENT`
+/// blob, then stored credentials on disk.
 fn read_opencode_go_api_key() -> Option<String> {
-    // Env-injected auth blob is authoritative when it parses: a valid blob
-    // without opencode-go means "no key", not "look elsewhere".
+    // Provider options override credentials from either the auth blob or disk.
+    if let Some(key) = read_opencode_config_api_key() {
+        return Some(key);
+    }
+    // The auth blob replaces auth.json, but does not replace provider
+    // options. A valid blob without opencode-go means "no key", not "look
+    // elsewhere".
     if let Some(blob) = env_var("OPENCODE_AUTH_CONTENT")
         && let Ok(value) = serde_json::from_str::<Value>(&blob)
         && value.is_object()
     {
         return extract_opencode_go_key(&value);
-    }
-    if let Some(key) = read_opencode_config_api_key() {
-        return Some(key);
     }
     let primary = opencode_data_dir()?.join("auth.json");
     let raw = std::fs::read_to_string(&primary)
@@ -1160,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_content_blob_without_key_stays_authoritative() {
+    fn auth_content_blob_without_key_stays_authoritative_below_config_keys() {
         // A valid blob without opencode-go means "no key", even when disk
         // credentials exist: no fallback to auth.json.
         // SAFETY: edition 2024 marks environment writes unsafe. Only this test
@@ -1172,7 +1174,21 @@ mod tests {
             )
         };
         assert_eq!(read_opencode_go_api_key(), None);
-        unsafe { std::env::remove_var("OPENCODE_AUTH_CONTENT") };
+        // A key in config provider options still wins over the blob.
+        unsafe {
+            std::env::set_var(
+                "OPENCODE_CONFIG_CONTENT",
+                r#"{"provider":{"opencode-go":{"options":{"apiKey":"configured-go-key"}}}}"#,
+            )
+        };
+        assert_eq!(
+            read_opencode_go_api_key().as_deref(),
+            Some("configured-go-key")
+        );
+        unsafe {
+            std::env::remove_var("OPENCODE_AUTH_CONTENT");
+            std::env::remove_var("OPENCODE_CONFIG_CONTENT");
+        };
     }
 
     fn encrypt_droid_blob(plain: &str, key: &[u8], iv: &[u8; 16]) -> String {

@@ -9,7 +9,7 @@ use gpui::{
 };
 use gpui_component::input::{Enter, Escape, InputEvent, TextareaState};
 use monocode_ui::styled::glass_backdrop;
-use monocode_ui::widgets::tooltip;
+use monocode_ui::widgets::{tooltip, window_layer};
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 
 use crate::hooks::CommitMessageRequest;
@@ -171,7 +171,7 @@ impl SwitchBranchDialog {
 }
 
 impl Render for SwitchBranchDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let c = theme.colors;
         let generating = self.generate.is_some();
@@ -271,6 +271,7 @@ impl Render for SwitchBranchDialog {
         let can_commit = self.can_commit(cx);
         let mut panel = div()
             .id("switch-branch-dialog")
+            .debug_selector(|| "switch-branch-dialog".into())
             .relative()
             .flex()
             .flex_col()
@@ -363,14 +364,10 @@ impl Render for SwitchBranchDialog {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.cancel(cx)),
             );
-        deferred(
+        deferred(window_layer(
             div()
                 .id("switch-branch-layer")
                 .occlude()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
                 .child(backdrop)
                 .child(
                     div()
@@ -385,7 +382,8 @@ impl Render for SwitchBranchDialog {
                         .child(div().flex_none().h(relative(0.22)))
                         .child(panel),
                 ),
-        )
+            window,
+        ))
         .with_priority(theme.layer.dialog)
     }
 }

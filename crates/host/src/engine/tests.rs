@@ -13,7 +13,10 @@ use futures::channel::oneshot;
 use monocode_core::harness_event::ApprovalDecision as CoreDecision;
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{Attachment, HarnessId};
-use monocode_harness::core::registry::EventSink;
+use monocode_harness::core::context_transfer::{
+    ContextTransferCapabilities, ContextTransferInput, PreparedTurn,
+};
+use monocode_harness::core::registry::{AcceptedHook, EventSink};
 use monocode_harness::core::session_title::GeneratedSessionTitle;
 use monocode_remote::host::attachments::{read_attachment_chunk, write_attachment_chunk};
 use monocode_remote::host::protocol::HostSession;
@@ -27,8 +30,13 @@ use crate::runtime::HostRuntime;
 struct Turn {
     input: SendTurnInput,
     on_event: EventSink,
-    finish: Option<oneshot::Sender<()>>,
+    on_accepted: Option<AcceptedHook>,
+    transfer: Option<ContextTransferInput>,
+    /// The next result, when the test scripts a failure.
+    finish: Option<oneshot::Sender<Result<(), String>>>,
 }
+
+type Script = Box<dyn FnOnce(&Turn) -> String + Send>;
 
 #[derive(Default)]
 struct Fake {
@@ -46,35 +54,92 @@ struct Fake {
     branch: Mutex<Option<async_channel::Receiver<String>>>,
     persistent: AtomicBool,
     needs_process: AtomicBool,
+    capabilities: Mutex<Option<ContextTransferCapabilities>>,
+    /// Counts `forget` calls. `None` makes `forget` fall back to `stop`,
+    /// as a provider without its own forget does.
+    forgets: Mutex<Option<usize>>,
+    /// Scripted behavior for the next send: it may emit events or report a
+    /// delivery, then fails with the returned message. The send is not
+    /// recorded as a turn, like `mockRejectedValueOnce`.
+    next_send: Mutex<Option<Script>>,
 }
 
 impl Fake {
-    fn push(&self, input: SendTurnInput, on_event: EventSink) -> ProviderFuture<()> {
+    fn push(
+        &self,
+        input: SendTurnInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+        transfer: Option<ContextTransferInput>,
+    ) -> ProviderFuture<()> {
         let (finish, finished) = oneshot::channel();
-        self.turns.lock().push(Turn {
+        let turn = Turn {
             input,
             on_event,
+            on_accepted,
+            transfer,
             finish: Some(finish),
-        });
-        async move {
-            let _ = finished.await;
-            Ok(())
+        };
+        let script = self.next_send.lock().take();
+        if let Some(script) = script {
+            let failure = script(&turn);
+            return async move { Err(failure) }.boxed();
         }
-        .boxed()
+        self.turns.lock().push(turn);
+        async move { finished.await.unwrap_or(Ok(())) }.boxed()
     }
 
     fn finish_last(&self) {
         if let Some(turn) = self.turns.lock().last_mut()
             && let Some(finish) = turn.finish.take()
         {
-            let _ = finish.send(());
+            let _ = finish.send(Ok(()));
         }
     }
 
     fn finish(&self, index: usize) {
         if let Some(finish) = self.turns.lock()[index].finish.take() {
-            let _ = finish.send(());
+            let _ = finish.send(Ok(()));
         }
+    }
+
+    fn script(&self, script: impl FnOnce(&Turn) -> String + Send + 'static) {
+        *self.next_send.lock() = Some(Box::new(script));
+    }
+
+    fn accept(&self, index: usize) {
+        let accepted = self.turns.lock()[index].on_accepted.clone();
+        if let Some(accepted) = accepted {
+            accepted();
+        }
+    }
+
+    /// `onDelivered` with a native receipt for `provider_session_id`.
+    fn deliver(&self, index: usize, provider_session_id: &str) -> Result<(), String> {
+        let delivered = self.turns.lock()[index]
+            .transfer
+            .as_ref()
+            .and_then(|transfer| transfer.on_delivered.clone());
+        match delivered {
+            Some(delivered) => smol::block_on(delivered(native_receipt(provider_session_id))),
+            None => Ok(()),
+        }
+    }
+
+    fn transfer(&self, index: usize) -> Option<ContextTransferInput> {
+        self.turns.lock()[index].transfer.clone()
+    }
+
+    fn set_capabilities(&self, capabilities: Option<ContextTransferCapabilities>) {
+        *self.capabilities.lock() = capabilities;
+    }
+
+    fn count_forgets(&self) {
+        *self.forgets.lock() = Some(0);
+    }
+
+    fn forget_count(&self) -> usize {
+        self.forgets.lock().unwrap_or_default()
     }
 
     fn emit(&self, index: usize, event: Value) {
@@ -92,9 +157,27 @@ impl Fake {
 }
 
 impl HostProvider for Fake {
-    fn send(&self, input: SendTurnInput, on_event: EventSink) -> ProviderFuture<()> {
+    fn send(&self, turn: PreparedTurn) -> ProviderFuture<()> {
         self.sends.fetch_add(1, Ordering::SeqCst);
-        self.push(input, on_event)
+        self.push(turn.input, turn.on_event, turn.on_accepted, turn.transfer)
+    }
+
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        *self.capabilities.lock()
+    }
+
+    fn forget(&self, id: &str) -> ProviderFuture<()> {
+        let mut forgets = self.forgets.lock();
+        match forgets.as_mut() {
+            Some(count) => {
+                *count += 1;
+                async { Ok(()) }.boxed()
+            }
+            None => {
+                drop(forgets);
+                self.stop(id)
+            }
+        }
     }
 
     fn can_compact(&self) -> bool {
@@ -114,6 +197,8 @@ impl HostProvider for Fake {
                 attachments: None,
             },
             on_event,
+            None,
+            None,
         )
     }
 
@@ -182,6 +267,17 @@ impl HostProvider for Fake {
             }
         }
         .boxed()
+    }
+}
+
+/// A native history import into `provider_session_id`.
+fn native_receipt(provider_session_id: &str) -> ContextTransferReceipt {
+    ContextTransferReceipt {
+        mode: DeliveryMode::Native,
+        provider_session_id: Some(provider_session_id.to_string()),
+        included_ids: None,
+        omitted_ids: None,
+        through_block_id: None,
     }
 }
 
@@ -1431,3 +1527,5 @@ fn interrupts_a_native_claude_wakeup_when_the_host_closes() {
     assert_eq!(value.status, HostSessionStatus::Interrupted);
     assert_ne!(value.session.busy, Some(true));
 }
+
+mod switching;

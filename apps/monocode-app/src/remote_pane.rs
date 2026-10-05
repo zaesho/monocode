@@ -445,6 +445,7 @@ impl RemotePane {
                 failed_turn: status.failed_draft.map(|draft| FailedTurn { draft }),
                 error: status.error,
                 catalog_problem: status.catalog_problem,
+                inspection: status.inspection,
             };
             props.session = Some(Arc::new(remote.session(cx)));
         } else {
@@ -761,6 +762,9 @@ impl RemotePane {
                         NoticeAction::Dismiss => monocode_engine::remote::NoticeAction::Dismiss,
                         NoticeAction::RetryCatalog => {
                             monocode_engine::remote::NoticeAction::RetryCatalog
+                        }
+                        NoticeAction::ConfirmInspection => {
+                            monocode_engine::remote::NoticeAction::ConfirmInspection
                         }
                     };
                     remote.update(cx, |remote, cx| remote.run_notice_action(action, cx));

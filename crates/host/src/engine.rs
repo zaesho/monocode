@@ -18,14 +18,35 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use monocode_core::attachment::is_vision_image;
 use monocode_core::block::{
-    ApprovalDecided, Block, BlockRole, PlanBlockMeta, PlanStatus, TurnIntent, TurnModel,
+    ApprovalDecided, Block, BlockNotice, BlockRole, HandoffMeta, HandoffStatus, PlanBlockMeta,
+    PlanStatus, TransferMode, TransferStatus, TurnIntent, TurnModel,
 };
+use monocode_core::handoff::ComposerSwitchPlan;
 use monocode_core::harness_event::{HarnessEvent, HarnessSessionInput, SendTurnInput};
+use monocode_core::portable_context::{
+    ContextAssetSnapshot, OmissionReason, PortableContext, PortableContextOptions,
+    build_portable_context, build_portable_context_snapshot, current_attachment_tokens,
+    historical_context_attachments,
+};
+use monocode_core::provider_context::{
+    DeliveryCoverage, DeliveryStart, ProviderBinding, accept_provider_delivery,
+    begin_provider_delivery, can_resume_provider_binding, confirm_provider_delivery_inspection,
+    fail_provider_delivery, mark_provider_context_delivered, mark_provider_request_submitted,
+    provider_binding, record_provider_bound, record_provider_context_usage,
+    recover_submitted_provider_delivery, remember_provider_binding,
+    requires_fresh_provider_binding, settle_provider_binding, update_provider_handoff,
+};
 use monocode_core::reducer::{SystemEnv, apply_harness_event_mut, now_ms, stop_streaming};
-use monocode_core::session::{can_replace_session_title, format_session_title, title_from_prompt};
-use monocode_core::{Attachment, Session};
+use monocode_core::session::{
+    PendingHarnessSwitch, can_replace_session_title, format_session_title, title_from_prompt,
+};
+use monocode_core::{Attachment, HarnessId, Session};
 use monocode_harness::core::SharedCatalog;
-use monocode_harness::core::registry::{EventSink, TitleInput};
+use monocode_harness::core::context_transfer::{
+    ContextTransferInput, ContextTransferReceipt, DeliveredHook, DeliveryMode,
+    prepare_context_transfer_input,
+};
+use monocode_harness::core::registry::{AcceptedHook, EventSink, TitleInput};
 use monocode_harness::core::task::SharedSpawner;
 use monocode_remote::host::HostStore;
 use monocode_remote::host::attachments::resolve_attachments;
@@ -40,6 +61,7 @@ use sha2::{Digest, Sha256};
 
 use crate::backend::{HostEngineOptions, HostHarness};
 use crate::commands::parse_command;
+use crate::context_assets::{ContextAssetLimits, snapshot_host_context_assets};
 use crate::git_worktrees::{
     named_worktree_branch, rename_host_worktree_branch, resolve_host_worktree,
 };
@@ -105,6 +127,173 @@ struct Active {
     done: Done,
     cancelled: bool,
     persistence_failed: bool,
+    /// The provider acknowledged the request, even if saving that failed.
+    accepted: bool,
+}
+
+/// The shared history a turn delivers after a provider switch, or after a
+/// delivery that left the target's conversation uncertain.
+#[derive(Clone)]
+struct Transfer {
+    context: PortableContext,
+    /// The full eligible history, for a target whose resume fails.
+    fallback_context: PortableContext,
+    switch_id: String,
+    /// The target starts a new conversation instead of resuming its own.
+    fresh: bool,
+}
+
+/// What the handoff row says about a delivery (`contextStatus`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextStatus {
+    Imported,
+    Accepted,
+    Uncertain,
+}
+
+/// `contextStatus`: word the handoff row for `switch_id` after the
+/// delivery's state changed.
+fn context_status(session: &mut Session, switch_id: &str, status: ContextStatus) {
+    let Some(delivery) = session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .filter(|delivery| delivery.switch_id == switch_id)
+    else {
+        return;
+    };
+    let mode = if delivery.mode == TransferMode::Native {
+        "native messages"
+    } else {
+        "attributed history"
+    };
+    let detail = format!(
+        "Delivered {} transcript items as {mode}. Omitted {}. Historical attachments remain file references.",
+        delivery.included_block_ids.len(),
+        delivery.omitted_block_ids.len()
+    );
+    let text = match status {
+        ContextStatus::Accepted => format!("Continued with shared history. {detail}"),
+        ContextStatus::Imported => format!("{detail} The current request awaits acceptance."),
+        ContextStatus::Uncertain if delivery.needs_inspection() => "The provider request may already have run. Inspect its work, then confirm inspection before continuing.".to_string(),
+        ContextStatus::Uncertain => "The provider did not acknowledge this transfer. The next turn will use a fresh conversation with shared history. You can also return to the source provider.".to_string(),
+    };
+    let row = format!("{switch_id}-context");
+    for block in &mut session.blocks {
+        if block.id != row {
+            continue;
+        }
+        block.text = text.clone();
+        if let Some(handoff) = &mut block.handoff {
+            let accepted = status == ContextStatus::Accepted;
+            handoff.status = if accepted {
+                HandoffStatus::Ready
+            } else {
+                HandoffStatus::Preparing
+            };
+            handoff.pending = Some(!accepted);
+        }
+    }
+}
+
+/// Ends an unaccepted delivery after its turn stopped. A submitted request
+/// may have run, so it waits for inspection. Otherwise the request goes
+/// back to a draft. Returns whether the target's conversation should be
+/// forgotten.
+fn end_unaccepted_delivery(session: &mut Session, switch_id: &str) -> bool {
+    let submitted = session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .is_some_and(|delivery| delivery.is_submitted());
+    if submitted {
+        recover_submitted_provider_delivery(session, switch_id);
+    } else {
+        fail_provider_delivery(session, switch_id, false);
+    }
+    context_status(session, switch_id, ContextStatus::Uncertain);
+    !session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .is_some_and(|delivery| delivery.needs_inspection())
+}
+
+/// The session's provider conversation may be rebound: it is not a target
+/// that may hold partial history.
+fn can_rebind(session: &Session) -> Option<&str> {
+    session
+        .provider_session_id
+        .as_deref()
+        .filter(|_| !requires_fresh_provider_binding(session, session.harness, &session.cwd, None))
+}
+
+/// `planComposerSwitch` from src/features/sessions/model/handoff.ts. The
+/// desktop's copy lives in monocode-engine, which this crate cannot use.
+fn plan_composer_switch(session: &Session, next: HarnessId) -> ComposerSwitchPlan {
+    if session.harness == next {
+        return ComposerSwitchPlan::Model;
+    }
+    // History may include a target request that ran. Returning to its source
+    // then needs a new transfer, before or after inspection is confirmed.
+    let last = session
+        .blocks
+        .iter()
+        .rev()
+        .find(|block| block.role == BlockRole::Handoff)
+        .and_then(|block| block.handoff.as_ref());
+    let unknown_request_intent = session.pending_switch.as_ref().is_some_and(|pending| {
+        last.is_some_and(|last| {
+            last.from == pending.from
+                && last.transfer.as_ref().is_some_and(|transfer| {
+                    transfer.needs_inspection == Some(true)
+                        || transfer.inspection_confirmed == Some(true)
+                })
+        })
+    });
+    let pending = session
+        .pending_switch
+        .as_ref()
+        .filter(|_| !unknown_request_intent);
+    if let Some(pending) = pending
+        && next == pending.from
+    {
+        return ComposerSwitchPlan::Revert {
+            restore_provider_session_id: pending
+                .from_provider_session_id
+                .clone()
+                .filter(|id| !id.is_empty()),
+            restore_provider_account_id: pending
+                .from_provider_account_id
+                .clone()
+                .filter(|id| !id.is_empty()),
+        };
+    }
+    if !session
+        .blocks
+        .iter()
+        .any(|block| block.role == BlockRole::User)
+        && session.pending_switch.is_none()
+    {
+        return ComposerSwitchPlan::Empty {
+            forget: session.harness,
+        };
+    }
+    ComposerSwitchPlan::Arm {
+        pending: pending.cloned().unwrap_or_else(|| PendingHarnessSwitch {
+            from: session.harness,
+            from_model: session.model.clone(),
+            from_settings: session.model_settings.clone(),
+            from_provider_session_id: session
+                .provider_session_id
+                .clone()
+                .filter(|id| !id.is_empty()),
+            from_provider_account_id: session
+                .provider_account_id
+                .clone()
+                .filter(|id| !id.is_empty()),
+        }),
+    }
 }
 
 /// A running session, including streamed events not yet written to disk.
@@ -135,6 +324,36 @@ impl State {
     }
 }
 
+/// The provider half of a `switchProvider` command: remember the binding
+/// the session leaves, then arm, revert, or drop the pending switch.
+/// `resumable` means the target can append to its own saved conversation.
+fn switch_provider(session: &mut Session, harness: HarnessId, resumable: bool) {
+    let cwd = session.cwd.clone();
+    if let Some(source) = provider_binding(session, session.harness, &cwd, None) {
+        remember_provider_binding(session, source);
+    }
+    let plan = plan_composer_switch(session, harness);
+    let target = provider_binding(session, harness, &cwd, None);
+    session.harness = harness;
+    session.context = None;
+    session.provider_session_id = target
+        .filter(|_| resumable)
+        .map(|target| target.provider_session_id);
+    session.provider_account_id = None;
+    match plan {
+        ComposerSwitchPlan::Arm { pending } => session.pending_switch = Some(pending),
+        ComposerSwitchPlan::Revert {
+            restore_provider_session_id,
+            ..
+        } => {
+            session.pending_switch = None;
+            session.provider_session_id = restore_provider_session_id;
+        }
+        ComposerSwitchPlan::Empty { .. } => session.pending_switch = None,
+        ComposerSwitchPlan::Model => {}
+    }
+}
+
 /// A test seam: return true to fail the next matching save.
 #[cfg(test)]
 pub(crate) type SaveFault = Box<dyn FnMut(&Value) -> bool + Send>;
@@ -162,6 +381,7 @@ enum Effect {
         intent: Option<SendIntent>,
         attachments: Vec<Attachment>,
         first_turn: Option<(String, bool)>,
+        transfer: Option<Box<Transfer>>,
     },
     Cancel,
     Approve {
@@ -284,6 +504,13 @@ impl Inner {
         if let Some(message) = message {
             let mut block =
                 Block::new(uuid::Uuid::new_v4().to_string(), BlockRole::System, message);
+            block.notice = Some(
+                if status == HostSessionStatus::Interrupted || message == "Stopped by you." {
+                    BlockNotice::Interrupt
+                } else {
+                    BlockNotice::Error
+                },
+            );
             block.streaming = Some(false);
             session.blocks.push(block);
         }
@@ -320,7 +547,33 @@ impl Inner {
             self.settle_native_turn(state, id, run_id);
             return;
         }
-        if !apply_harness_event_mut(&mut SystemEnv, &mut live.value.session, &event) {
+        let mut changed = apply_harness_event_mut(&mut SystemEnv, &mut live.value.session, &event);
+        let session = &mut live.value.session;
+        let identity = |session: &Session| {
+            (
+                session.provider_context.clone(),
+                session.pending_switch.clone(),
+                session.provider_session_id.clone(),
+            )
+        };
+        match &event {
+            HarnessEvent::SessionProviderBound {
+                provider_session_id,
+            } => {
+                let before = identity(session);
+                let (harness, cwd) = (session.harness, session.cwd.clone());
+                record_provider_bound(session, harness, &cwd, provider_session_id, None);
+                changed |= identity(session) != before;
+            }
+            HarnessEvent::Context { used, window } => {
+                let before = session.provider_context.clone();
+                let (harness, cwd) = (session.harness, session.cwd.clone());
+                record_provider_context_usage(session, harness, &cwd, *used, *window, None);
+                changed |= session.provider_context != before;
+            }
+            _ => {}
+        }
+        if !changed {
             return;
         }
         let batch = batched(&event);
@@ -487,6 +740,187 @@ impl Inner {
         );
     }
 
+    /// `updateProviderState`: apply `update` to the running session and save
+    /// it with `event`. The change stays in memory even when saving fails,
+    /// so settlement can still use it; the failure stops the provider.
+    /// Returns false when `run_id` no longer runs.
+    fn update_provider_state(
+        self: &Arc<Self>,
+        id: &str,
+        run_id: &str,
+        update: impl FnOnce(&mut Session),
+        event: &Value,
+    ) -> Result<bool, String> {
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let Some(live) = state.live.get_mut(id).filter(|live| {
+            live.value.run_id.as_deref() == Some(run_id)
+                && live.value.status == HostSessionStatus::Running
+        }) else {
+            return Ok(false);
+        };
+        let before = live.value.session.clone();
+        update(&mut live.value.session);
+        let changed = live.value.session != before;
+        let harness = live.value.session.harness;
+        let saved = self.flush(state, id).and_then(|()| {
+            if changed && let Some(live) = state.live.get_mut(id) {
+                live.value = (*self.save(live.value.clone(), event)?).clone();
+            }
+            Ok(())
+        });
+        if let Err(error) = saved {
+            if let Some(active) = state.running.get_mut(id) {
+                active.persistence_failed = true;
+            }
+            if let Ok(provider) = self.provider(harness) {
+                let id = id.to_string();
+                self.spawner.spawn(
+                    async move {
+                        let _ = provider.stop(&id).await;
+                    }
+                    .boxed(),
+                );
+            }
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Whether `run_id` is still the session's live run.
+    fn live_run(&self, id: &str, run_id: &str) -> bool {
+        self.state
+            .lock()
+            .live
+            .get(id)
+            .is_some_and(|live| live.value.run_id.as_deref() == Some(run_id))
+    }
+
+    fn mark_accepted(&self, id: &str) {
+        if let Some(active) = self.state.lock().running.get_mut(id) {
+            active.accepted = true;
+        }
+    }
+
+    /// `onAccepted`: the provider took the request. A failed save must not
+    /// reach the provider's reader; settlement saves the retained
+    /// acknowledgment again.
+    fn accepted_hook(
+        self: &Arc<Self>,
+        id: &str,
+        run_id: &str,
+        switch_id: Option<String>,
+    ) -> AcceptedHook {
+        let engine = Arc::downgrade(self);
+        let (id, run_id) = (id.to_string(), run_id.to_string());
+        Arc::new(move || {
+            let Some(engine) = engine.upgrade() else {
+                return;
+            };
+            if !engine.live_run(&id, &run_id) {
+                return;
+            }
+            engine.mark_accepted(&id);
+            let mut event = json!({ "type": "providerContext.accepted" });
+            if let Some(switch_id) = &switch_id {
+                event["switchId"] = json!(switch_id);
+            }
+            let accepted = engine.update_provider_state(
+                &id,
+                &run_id,
+                |session| {
+                    if let Some(switch_id) = &switch_id {
+                        accept_provider_delivery(session, switch_id);
+                        context_status(session, switch_id, ContextStatus::Accepted);
+                    }
+                },
+                &event,
+            );
+            if let Err(error) = accepted {
+                log::error!("Could not save provider acceptance: {error}");
+            }
+        })
+    }
+
+    /// `onDelivered`: the history reached the target. Inline history travels
+    /// in the acknowledged request itself, so it also counts as acceptance.
+    fn delivered_hook(
+        self: &Arc<Self>,
+        id: &str,
+        run_id: &str,
+        transfer: &Transfer,
+    ) -> DeliveredHook {
+        let engine = Arc::downgrade(self);
+        let (id, run_id) = (id.to_string(), run_id.to_string());
+        let switch_id = transfer.switch_id.clone();
+        let known: Vec<(String, String)> = transfer
+            .context
+            .items
+            .iter()
+            .chain(&transfer.fallback_context.items)
+            .map(|item| (item.id.clone(), item.source_block_id.clone()))
+            .collect();
+        Arc::new(move |receipt: ContextTransferReceipt| {
+            let result = (|| {
+                let Some(engine) = engine.upgrade() else {
+                    return Ok(());
+                };
+                if !engine.live_run(&id, &run_id) {
+                    return Ok(());
+                }
+                let inline = receipt.mode == DeliveryMode::Inline;
+                if inline {
+                    engine.mark_accepted(&id);
+                }
+                let mode = if inline {
+                    TransferMode::Inline
+                } else {
+                    TransferMode::Native
+                };
+                let included = receipt.included_ids.as_ref().map(|ids| {
+                    ids.iter()
+                        .map(|id| {
+                            known
+                                .iter()
+                                .find(|(item, _)| item == id)
+                                .map_or_else(|| id.clone(), |(_, block)| block.clone())
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let coverage = DeliveryCoverage {
+                    omitted_block_ids: included.as_ref().and_then(|_| receipt.omitted_ids.clone()),
+                    included_block_ids: included,
+                    source_through_block_id: receipt.through_block_id.clone(),
+                };
+                let event = json!({
+                    "type": "providerContext.delivered",
+                    "switchId": switch_id,
+                    "mode": if inline { "inline" } else { "native" },
+                });
+                let saved = engine.update_provider_state(
+                    &id,
+                    &run_id,
+                    |session| {
+                        mark_provider_context_delivered(
+                            session,
+                            &switch_id,
+                            mode,
+                            receipt.provider_session_id.as_deref(),
+                            coverage,
+                        );
+                        context_status(session, &switch_id, ContextStatus::Imported);
+                    },
+                    &event,
+                );
+                match saved {
+                    Err(error) if !inline => Err(error),
+                    _ => Ok(()),
+                }
+            })();
+            async move { result }.boxed()
+        })
+    }
+
     fn sink(self: &Arc<Self>, id: &str, run_id: &str) -> EventSink {
         let engine: Weak<Self> = Arc::downgrade(self);
         let id = id.to_string();
@@ -518,6 +952,7 @@ impl Inner {
         prompt: Option<String>,
         intent: Option<SendIntent>,
         attachments: Vec<Attachment>,
+        transfer: Option<Transfer>,
     ) {
         let session = value.session.clone();
         let run_id = value.run_id.clone().unwrap_or_default();
@@ -532,6 +967,7 @@ impl Inner {
                 done: finished.map(|_| ()).boxed().shared(),
                 cancelled: false,
                 persistence_failed: false,
+                accepted: false,
             },
         );
         state.live.insert(
@@ -546,7 +982,15 @@ impl Inner {
         self.spawner.spawn(
             async move {
                 let outcome = engine
-                    .turn(&session, &run_id, &provider, prompt, intent, attachments)
+                    .turn(
+                        &session,
+                        &run_id,
+                        &provider,
+                        prompt,
+                        intent,
+                        attachments,
+                        transfer,
+                    )
                     .await;
                 if let Err(error) = outcome {
                     if let Some(live) = engine.state.lock().live.get_mut(&session.id) {
@@ -570,6 +1014,7 @@ impl Inner {
     }
 
     /// The body of `run`: the provider call, then settlement.
+    #[allow(clippy::too_many_arguments)]
     async fn turn(
         self: &Arc<Self>,
         session: &Session,
@@ -578,6 +1023,7 @@ impl Inner {
         prompt: Option<String>,
         intent: Option<SendIntent>,
         attachments: Vec<Attachment>,
+        transfer: Option<Transfer>,
     ) -> Result<(), String> {
         let id = session.id.as_str();
         let mut error: Option<String> = None;
@@ -613,24 +1059,52 @@ impl Inner {
                 app_access: None,
             };
             let on_event = self.sink(id, run_id);
-            let result = match prompt {
-                None => provider.compact(input, on_event).await,
-                Some(text) => match with_image_data(attachments) {
-                    Ok(attachments) => {
+            let result = async {
+                // The target takes over from the provider the switch left.
+                if let Some(pending) = &session.pending_switch
+                    && pending.from != session.harness
+                {
+                    self.provider(pending.from)?.stop(id).await?;
+                }
+                if let Some(transfer) = &transfer {
+                    if transfer.fresh {
+                        provider.forget(id).await?;
+                    } else if let Some(provider_session_id) = &session.provider_session_id {
+                        provider.bind(id, provider_session_id, &session.cwd);
+                    }
+                }
+                match prompt {
+                    None => provider.compact(input, on_event).await,
+                    Some(text) => {
+                        let input = SendTurnInput {
+                            session: input,
+                            text,
+                            attachments: Some(with_image_data(attachments)?),
+                        };
+                        let on_accepted = self.accepted_hook(
+                            id,
+                            run_id,
+                            transfer.as_ref().map(|transfer| transfer.switch_id.clone()),
+                        );
+                        let transfer = transfer.as_ref().map(|transfer| ContextTransferInput {
+                            context: transfer.context.clone(),
+                            fallback_context: Some(transfer.fallback_context.clone()),
+                            on_delivered: Some(self.delivered_hook(id, run_id, transfer)),
+                        });
                         provider
-                            .send(
-                                SendTurnInput {
-                                    session: input,
-                                    text,
-                                    attachments: Some(attachments),
-                                },
+                            .send(prepare_context_transfer_input(
+                                input,
+                                transfer,
+                                provider.context_transfer_capabilities(),
                                 on_event,
-                            )
+                                Some(on_accepted),
+                                self.spawner.clone(),
+                            ))
                             .await
                     }
-                    Err(error) => Err(error),
-                },
-            };
+                }
+            }
+            .await;
             error = result.err();
         }
         // A persistent provider keeps its child for later wakeups unless the
@@ -652,26 +1126,38 @@ impl Inner {
         if stop {
             provider.stop(id).await?;
         }
-        let persisted = {
+        let (persisted, forget) = {
             let mut state = self.state.lock();
             let state = &mut *state;
             self.flush(state, id)?;
-            // A native turn may already own the session.
-            if state
-                .live
-                .get(id)
-                .is_some_and(|live| live.value.run_id.as_deref() == Some(run_id))
+            let mut forget = false;
+            if let Some(mut latest) =
+                Self::running_value(state, &*self.store.session(id)?, id, run_id)
             {
-                state.live.remove(id);
-            }
-            let latest = self.store.session(id)?;
-            if latest.run_id.as_deref() == Some(run_id) {
                 let closing = self.closing.load(Ordering::SeqCst);
-                let (cancelled, failed) = state
+                let (cancelled, failed, accepted) = state
                     .running
                     .get(id)
-                    .map(|active| (active.cancelled, active.persistence_failed))
+                    .map(|active| (active.cancelled, active.persistence_failed, active.accepted))
                     .unwrap_or_default();
+                if accepted {
+                    if let Some(transfer) = &transfer {
+                        accept_provider_delivery(&mut latest.session, &transfer.switch_id);
+                        context_status(
+                            &mut latest.session,
+                            &transfer.switch_id,
+                            ContextStatus::Accepted,
+                        );
+                    }
+                    settle_provider_binding(
+                        &mut latest.session,
+                        session.harness,
+                        &session.cwd,
+                        None,
+                    );
+                } else if let Some(transfer) = &transfer {
+                    forget = end_unaccepted_delivery(&mut latest.session, &transfer.switch_id);
+                }
                 let message = if closing {
                     Some("Host stopped. This turn was interrupted.")
                 } else if failed {
@@ -692,18 +1178,51 @@ impl Inner {
                 }
                 self.save(Self::settled(&latest, status, message, now_ms()), &event)?;
             }
+            // A native turn may already own the session.
+            if state
+                .live
+                .get(id)
+                .is_some_and(|live| live.value.run_id.as_deref() == Some(run_id))
+            {
+                state.live.remove(id);
+            }
             state.running.remove(id);
             if provider.persistent() {
                 self.park_idle_provider(state, id, provider.clone());
             }
-            self.store.session(id)?.session.clone()
+            (self.store.session(id)?.session.clone(), forget)
         };
+        if forget {
+            provider.forget(id).await?;
+        }
         // Stopping released the provider's callbacks; binding keeps only its
-        // conversation for an explicit follow-up.
-        if let Some(provider_session_id) = &persisted.provider_session_id {
+        // conversation for an explicit follow-up. A target that may hold
+        // partial history is not rebound.
+        if let Some(provider_session_id) = can_rebind(&persisted) {
             provider.bind(id, provider_session_id, &persisted.cwd);
         }
         Ok(())
+    }
+
+    /// The value to settle for `run_id`: the live copy, which keeps
+    /// provider evidence whose save failed, while the saved session still
+    /// runs that turn. `None` once another run or a settlement replaced it.
+    fn running_value(
+        state: &State,
+        stored: &HostSession,
+        id: &str,
+        run_id: &str,
+    ) -> Option<HostSession> {
+        if stored.run_id.as_deref() != Some(run_id) || stored.status != HostSessionStatus::Running {
+            return None;
+        }
+        Some(
+            state
+                .live
+                .get(id)
+                .filter(|live| live.value.run_id.as_deref() == Some(run_id))
+                .map_or_else(|| stored.clone(), |live| live.value.clone()),
+        )
     }
 
     /// `retrySettlement`: settles a turn whose final write failed, every
@@ -750,29 +1269,55 @@ impl Inner {
         provider: &Arc<dyn HostProvider>,
     ) -> Result<(), String> {
         provider.stop(id).await?;
-        let latest = {
+        let (latest, forget) = {
             let mut state = self.state.lock();
             let state = &mut *state;
             self.flush(state, id)?;
-            let latest = self.store.session(id)?;
-            if latest.run_id.as_deref() == Some(run_id)
-                && latest.status == HostSessionStatus::Running
-            {
-                self.save(
-                    Self::settled(
-                        &latest,
-                        HostSessionStatus::Interrupted,
-                        Some(STORAGE_FAILED),
-                        latest.updated_at,
-                    ),
-                    &json!({ "type": "interrupted", "reason": "persistence failure" }),
-                )?;
-            }
+            let stored = self.store.session(id)?;
+            let mut forget = false;
+            let latest = match Self::running_value(state, &stored, id, run_id) {
+                Some(mut latest) => {
+                    let accepted = state.running.get(id).is_some_and(|active| active.accepted);
+                    let delivery = latest
+                        .session
+                        .provider_context
+                        .as_ref()
+                        .and_then(|context| context.delivery.as_ref())
+                        .map(|delivery| (delivery.switch_id.clone(), delivery.status));
+                    if accepted {
+                        if let Some((switch_id, _)) = &delivery {
+                            accept_provider_delivery(&mut latest.session, switch_id);
+                            context_status(&mut latest.session, switch_id, ContextStatus::Accepted);
+                        }
+                        let (harness, cwd) = (latest.session.harness, latest.session.cwd.clone());
+                        settle_provider_binding(&mut latest.session, harness, &cwd, None);
+                    } else if let Some((switch_id, status)) = &delivery
+                        && *status != TransferStatus::Accepted
+                    {
+                        forget = end_unaccepted_delivery(&mut latest.session, switch_id);
+                    }
+                    let updated_at = latest.updated_at;
+                    (*self.save(
+                        Self::settled(
+                            &latest,
+                            HostSessionStatus::Interrupted,
+                            Some(STORAGE_FAILED),
+                            updated_at,
+                        ),
+                        &json!({ "type": "interrupted", "reason": "persistence failure" }),
+                    )?)
+                    .clone()
+                }
+                None => (*stored).clone(),
+            };
             state.live.remove(id);
             state.running.remove(id);
-            latest
+            (latest, forget)
         };
-        if let Some(provider_session_id) = &latest.session.provider_session_id {
+        if forget {
+            provider.forget(id).await?;
+        }
+        if let Some(provider_session_id) = can_rebind(&latest.session) {
             provider.bind(id, provider_session_id, &latest.session.cwd);
         }
         Ok(())
@@ -904,6 +1449,38 @@ impl Inner {
     }
 }
 
+fn create_private_dir(directory: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(directory).map_err(|error| error.to_string())
+    }
+}
+
+/// `writeFileSync(path, data, { mode: 0o600 })`.
+fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(data))
+        .map_err(|error| error.to_string())
+}
+
 /// Adds base64 data to vision images, as the provider sends them inline.
 fn with_image_data(attachments: Vec<Attachment>) -> Result<Vec<Attachment>, String> {
     attachments
@@ -985,22 +1562,47 @@ impl HostEngine {
         };
         let inner = &engine.inner;
         for value in inner.store.sessions(None)? {
-            if value.status == HostSessionStatus::Running {
-                inner.save(
+            let mut recovered = value;
+            if recovered.status == HostSessionStatus::Running {
+                recovered = (*inner.save(
                     Inner::settled(
-                        &value,
+                        &recovered,
                         HostSessionStatus::Interrupted,
                         Some("Host restarted. This turn was interrupted; inspect its work before continuing."),
-                        value.updated_at,
+                        recovered.updated_at,
                     ),
                     &json!({ "type": "interrupted" }),
-                )?;
+                )?)
+                .clone();
             }
-            if let Some(provider_session_id) = &value.session.provider_session_id {
-                inner.provider(value.session.harness)?.bind(
-                    &value.session.id,
+            // A delivery the previous host left open cannot be completed. A
+            // submitted request waits for inspection; any other goes back to
+            // a draft.
+            let open = recovered
+                .session
+                .provider_context
+                .as_ref()
+                .and_then(|context| context.delivery.as_ref())
+                .filter(|delivery| {
+                    !matches!(
+                        delivery.status,
+                        TransferStatus::Accepted | TransferStatus::Uncertain
+                    )
+                })
+                .map(|delivery| delivery.switch_id.clone());
+            if let Some(switch_id) = open {
+                end_unaccepted_delivery(&mut recovered.session, &switch_id);
+                recovered = (*inner.save(
+                    recovered,
+                    &json!({ "type": "providerContext.recovered", "switchId": switch_id }),
+                )?)
+                .clone();
+            }
+            if let Some(provider_session_id) = can_rebind(&recovered.session) {
+                inner.provider(recovered.session.harness)?.bind(
+                    &recovered.session.id,
                     provider_session_id,
-                    &value.session.cwd,
+                    &recovered.session.cwd,
                 );
             }
         }
@@ -1155,8 +1757,16 @@ impl HostEngine {
                 intent,
                 attachments,
                 first_turn,
+                transfer,
             }) => {
-                inner.run(state, &saved, prompt.clone(), intent, attachments);
+                inner.run(
+                    state,
+                    &saved,
+                    prompt.clone(),
+                    intent,
+                    attachments,
+                    transfer.map(|transfer| *transfer),
+                );
                 drop(guard);
                 if let Some((message, placeholder_title)) = first_turn {
                     inner.generate_first_turn_names(&saved, &message, placeholder_title);
@@ -1272,8 +1882,74 @@ impl HostEngine {
         }
         let provider = inner.provider(value.session.harness)?;
         let running = value.status == HostSessionStatus::Running;
+        let needs_inspection = value
+            .session
+            .provider_context
+            .as_ref()
+            .and_then(|context| context.delivery.as_ref())
+            .is_some_and(|delivery| delivery.needs_inspection());
+        if needs_inspection
+            && matches!(
+                command,
+                HostCommand::Send { .. }
+                    | HostCommand::Compact { .. }
+                    | HostCommand::SwitchProvider { .. }
+            )
+        {
+            return Err(
+                "Inspect the interrupted provider request and confirm inspection before continuing"
+                    .into(),
+            );
+        }
         match command {
             HostCommand::Create { .. } => unreachable!("handled above"),
+            HostCommand::ConfirmProviderInspection {
+                expected_revision, ..
+            } => {
+                if running {
+                    return Err(
+                        "Wait for host storage to reconcile before confirming inspection".into(),
+                    );
+                }
+                if value.revision != *expected_revision {
+                    return Err(
+                        "Session changed on the host. Reload it before confirming inspection"
+                            .into(),
+                    );
+                }
+                if !needs_inspection {
+                    return Err("This session does not need inspection confirmation".into());
+                }
+                confirm_provider_delivery_inspection(&mut value.session);
+            }
+            HostCommand::SwitchProvider {
+                expected_revision,
+                harness,
+                model,
+                model_settings,
+                runtime_mode,
+                ..
+            } => {
+                if running {
+                    return Err("Wait for the current turn before changing providers".into());
+                }
+                if value.revision != *expected_revision {
+                    return Err(
+                        "Session changed on the host. Reload it before changing providers".into(),
+                    );
+                }
+                let target_provider = inner.provider(*harness)?;
+                switch_provider(
+                    &mut value.session,
+                    *harness,
+                    target_provider
+                        .context_transfer_capabilities()
+                        .is_some_and(|capabilities| capabilities.resumed_append),
+                );
+                value.session.model = model.clone();
+                value.session.model_settings = model_settings.clone();
+                value.session.runtime_mode = *runtime_mode;
+            }
             HostCommand::Configure {
                 model,
                 model_settings,
@@ -1423,6 +2099,17 @@ impl HostEngine {
         if !send && !provider.can_compact() {
             return Err("Context compaction is unavailable for this provider".into());
         }
+        if !send
+            && (value.session.pending_switch.is_some()
+                || requires_fresh_provider_binding(
+                    &value.session,
+                    value.session.harness,
+                    &value.session.cwd,
+                    None,
+                ))
+        {
+            return Err("Send a turn with shared history before compacting this provider".into());
+        }
         let blocks = &value.session.blocks;
         let draft = draft_block_id.and_then(|id| {
             blocks
@@ -1457,6 +2144,12 @@ impl HostEngine {
         } else {
             Vec::new()
         };
+        let transfer = if send {
+            self.prepare_transfer(value, command_id, text, &attachments, provider)?
+        } else {
+            None
+        };
+        let blocks = &value.session.blocks;
         let run_id = uuid::Uuid::new_v4().to_string();
         let first_turn = send && !blocks.iter().any(|block| !block.is_draft());
         let harness = value.session.harness;
@@ -1514,13 +2207,210 @@ impl HostEngine {
             value.session.title = title_from_prompt(text, harness, &attachments);
         }
         value.session.blocks = next_blocks;
+        // Saved before dispatch: after a crash the request may have run.
+        if let Some(transfer) = &transfer {
+            mark_provider_request_submitted(&mut value.session, &transfer.switch_id);
+        }
         *effect = Some(Effect::Run {
             prompt: send.then(|| text.to_string()),
             intent: if send { intent } else { None },
             attachments,
             first_turn: (first_turn && send).then(|| (text.to_string(), placeholder_title)),
+            transfer: transfer.map(Box::new),
         });
         Ok(())
+    }
+
+    /// The shared history a send delivers after a provider switch, or after
+    /// a delivery left the target's conversation uncertain. Adds the
+    /// handoff row and starts the delivery receipt. An error, such as a
+    /// request too large for the target's context, leaves the session
+    /// unchanged.
+    fn prepare_transfer(
+        &self,
+        value: &mut HostSession,
+        command_id: &str,
+        text: &str,
+        attachments: &[Attachment],
+        provider: &Arc<dyn HostProvider>,
+    ) -> Result<Option<Transfer>, String> {
+        let session = &value.session;
+        let (harness, cwd) = (session.harness, session.cwd.clone());
+        let uncertain = requires_fresh_provider_binding(session, harness, &cwd, None);
+        let switching = session
+            .pending_switch
+            .as_ref()
+            .is_some_and(|pending| pending.from != harness);
+        if !switching && !uncertain {
+            return Ok(None);
+        }
+        let switch_id = command_id.to_string();
+        let binding = provider_binding(session, harness, &cwd, None);
+        let resumable = !uncertain
+            && provider
+                .context_transfer_capabilities()
+                .is_some_and(|capabilities| capabilities.resumed_append)
+            && can_resume_provider_binding(session, binding.as_ref());
+        let resumed = binding.filter(|_| resumable);
+        let directory = self.context_directory(&session.id)?;
+        let assets = snapshot_host_context_assets(
+            &directory.join("assets"),
+            &historical_context_attachments(session, None),
+            ContextAssetLimits::default(),
+        )?;
+        let attachment_tokens = current_attachment_tokens(attachments);
+        let context = self.portable_history(
+            session,
+            &switch_id,
+            text,
+            resumed.as_ref(),
+            &assets,
+            attachment_tokens,
+        )?;
+        let fallback_context = match &resumed {
+            Some(_) => self.portable_history(
+                session,
+                &format!("{switch_id}-fallback"),
+                text,
+                None,
+                &assets,
+                attachment_tokens,
+            )?,
+            None => context.clone(),
+        };
+        let from = session
+            .pending_switch
+            .as_ref()
+            .map(|pending| pending.from)
+            .or_else(|| {
+                session
+                    .provider_context
+                    .as_ref()
+                    .and_then(|context| context.delivery.as_ref())
+                    .map(|delivery| delivery.from)
+            })
+            .unwrap_or(harness);
+        let session = &mut value.session;
+        session.provider_session_id = resumed
+            .as_ref()
+            .map(|binding| binding.provider_session_id.clone());
+        let mut row = Block::new(
+            format!("{command_id}-context"),
+            BlockRole::Handoff,
+            format!(
+                "Preparing shared history. Selected {} transcript items and omitted {}. Historical attachments remain file references.",
+                context.items.len(),
+                context.omitted.len()
+            ),
+        );
+        row.handoff = Some(HandoffMeta {
+            from,
+            to: harness,
+            status: HandoffStatus::Preparing,
+            pending: Some(true),
+            transfer: None,
+            extra: Default::default(),
+        });
+        session.blocks.push(row);
+        begin_provider_delivery(
+            session,
+            DeliveryStart {
+                switch_id: switch_id.clone(),
+                from: Some(from),
+                to: Some(harness),
+                cwd,
+                provider_account_id: None,
+                current_user_block_id: command_id.to_string(),
+                source_through_block_id: context.through_block_id.clone(),
+                included_block_ids: context
+                    .items
+                    .iter()
+                    .map(|item| item.source_block_id.clone())
+                    .collect(),
+                omitted_block_ids: context.omitted.iter().map(|item| item.id.clone()).collect(),
+                target_provider_session_id: resumed
+                    .as_ref()
+                    .map(|binding| binding.provider_session_id.clone()),
+            },
+        );
+        let historical: u64 = context
+            .items
+            .iter()
+            .map(|item| item.attachments.as_ref().map_or(0, Vec::len) as u64)
+            .sum();
+        let retrieval_path = context.retrieval_path.clone();
+        update_provider_handoff(session, &switch_id, |transfer| {
+            transfer.historical_attachments = historical;
+            transfer.retrieval_path = retrieval_path.clone();
+        });
+        Ok(Some(Transfer {
+            context,
+            fallback_context,
+            switch_id,
+            fresh: !resumable,
+        }))
+    }
+
+    /// `contextDirectory`: where this host keeps a session's shared
+    /// history. Fails once the session was deleted.
+    fn context_directory(&self, id: &str) -> Result<std::path::PathBuf, String> {
+        let store = &self.inner.store;
+        store.assert_context_writable(id)?;
+        store.context_directory(id)
+    }
+
+    /// `portableHistory`: the history `binding` lacks, or all of it. When
+    /// the budget leaves items out, the full history is saved as a file the
+    /// target can read.
+    fn portable_history(
+        &self,
+        session: &Session,
+        switch_id: &str,
+        current_request: &str,
+        binding: Option<&ProviderBinding>,
+        assets: &[ContextAssetSnapshot],
+        attachment_tokens: usize,
+    ) -> Result<PortableContext, String> {
+        let window = self
+            .inner
+            .catalog
+            .read()
+            .model_context_window(&session.model)
+            .or_else(|| binding.and_then(|binding| binding.context_window))
+            .map(|window| window.max(0) as usize);
+        let mut context = build_portable_context(
+            session,
+            &PortableContextOptions {
+                after_block_id: binding
+                    .and_then(|binding| binding.delivered_through_block_id.as_deref()),
+                current_request: Some(current_request),
+                window_tokens: window,
+                occupied_tokens: binding
+                    .and_then(|binding| binding.context_used)
+                    .map(|used| used.max(0) as usize),
+                attachment_tokens: Some(attachment_tokens),
+                asset_snapshots: assets,
+                ..Default::default()
+            },
+        )?;
+        if context
+            .omitted
+            .iter()
+            .any(|item| item.reason == OmissionReason::Budget)
+        {
+            let directory = self.context_directory(&session.id)?;
+            create_private_dir(&directory)?;
+            let name = format!("{:x}.md", Sha256::digest(switch_id.as_bytes()));
+            let path = directory.join(name);
+            let snapshot = build_portable_context_snapshot(
+                session,
+                context.through_block_id.as_deref(),
+                assets,
+            )?;
+            write_private_file(&path, snapshot.as_bytes())?;
+            context.retrieval_path = Some(path.to_string_lossy().into_owned());
+        }
+        Ok(context)
     }
 
     /// `close`: stops running providers and waits for their turns to
@@ -1638,6 +2528,8 @@ fn command_id(command: &HostCommand) -> &str {
     match command {
         HostCommand::Create { command_id, .. }
         | HostCommand::Configure { command_id, .. }
+        | HostCommand::SwitchProvider { command_id, .. }
+        | HostCommand::ConfirmProviderInspection { command_id, .. }
         | HostCommand::Compact { command_id, .. }
         | HostCommand::Send { command_id, .. }
         | HostCommand::Draft { command_id, .. }
@@ -1652,6 +2544,8 @@ fn session_id(command: &HostCommand) -> Option<&str> {
     match command {
         HostCommand::Create { .. } => None,
         HostCommand::Configure { session_id, .. }
+        | HostCommand::SwitchProvider { session_id, .. }
+        | HostCommand::ConfirmProviderInspection { session_id, .. }
         | HostCommand::Compact { session_id, .. }
         | HostCommand::Send { session_id, .. }
         | HostCommand::Draft { session_id, .. }

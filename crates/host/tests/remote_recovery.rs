@@ -9,6 +9,7 @@ use futures::{FutureExt as _, channel::oneshot};
 use monocode_core::harness_event::{ApprovalDecision, HarnessEvent, SendTurnInput};
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{BlockRole, HarnessId};
+use monocode_harness::core::context_transfer::PreparedTurn;
 use monocode_harness::core::{SharedCatalog, registry::EventSink};
 use monocode_host::providers::ProviderFuture;
 use monocode_host::runtime::HostRuntime;
@@ -64,11 +65,11 @@ impl ControlledProvider {
 }
 
 impl HostProvider for ControlledProvider {
-    fn send(&self, input: SendTurnInput, on_event: EventSink) -> ProviderFuture<()> {
+    fn send(&self, turn: PreparedTurn) -> ProviderFuture<()> {
         let (finish, finished) = oneshot::channel();
         self.turns.lock().push(Turn {
-            input,
-            on_event,
+            input: turn.input,
+            on_event: turn.on_event,
             finish: Some(finish),
         });
         async move {

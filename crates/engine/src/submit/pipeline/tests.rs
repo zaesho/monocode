@@ -933,6 +933,108 @@ async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut 
     assert_eq!(fixture.codex.calls.lock().steers.len(), 1);
 }
 
+/// An `EngineHost` over a projects backend that records worktree calls.
+fn worker_host(
+    cx: &mut TestAppContext,
+) -> (
+    Rc<crate::orchestration::engine_host::EngineHost>,
+    Arc<crate::projects::testing::FakeBackend>,
+) {
+    use crate::projects::{ProjectsConfig, ProjectsGlobal};
+    let projects = crate::projects::testing::FakeBackend::new();
+    let backend = projects.clone();
+    cx.update(|cx| {
+        ProjectsGlobal::init(
+            ProjectsConfig {
+                kv: Kv::in_memory(),
+                backend,
+                clock: crate::projects::system_clock(),
+            },
+            cx,
+        )
+    });
+    insert(chat("lead", HarnessId::Codex), cx);
+    let host = Rc::new(crate::orchestration::engine_host::EngineHost {
+        control: None,
+        harness_host: None,
+        owner: String::new(),
+        peers: Rc::new(crate::orchestration::peers::NoPeers),
+    });
+    (host, projects)
+}
+
+#[gpui::test]
+async fn creates_a_worker_checkpoint_before_its_first_turn(cx: &mut TestAppContext) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::tests::{run, task};
+    use crate::orchestration::state::{OrchestrationTask, WorkspacePolicy};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, _projects) = worker_host(cx);
+    let isolated = OrchestrationTask {
+        harness: HarnessId::Codex,
+        model: "codex:default".into(),
+        ..task("a")
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &isolated, cx));
+    cx.run_until_parked();
+    let created = created.now_or_never().unwrap().unwrap();
+    let path = created.workspace.checkout_cwd;
+    assert_eq!(
+        fixture.backend.calls("session_checkpoint_ensure"),
+        [json!({ "sessionId": "a", "cwd": path, "isolated": true })]
+    );
+
+    let shared = OrchestrationTask {
+        id: "b".into(),
+        session_id: "b".into(),
+        workspace_policy: Some(WorkspacePolicy::Shared),
+        ..isolated
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &shared, cx));
+    cx.run_until_parked();
+    assert!(created.now_or_never().unwrap().is_ok());
+    assert_eq!(
+        fixture.backend.calls("session_checkpoint_ensure")[1],
+        json!({ "sessionId": "b", "cwd": CWD })
+    );
+}
+
+#[gpui::test]
+async fn removes_a_new_worktree_when_its_checkpoint_fails(cx: &mut TestAppContext) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::OrchestrationTask;
+    use crate::orchestration::state::tests::{run, task};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, projects) = worker_host(cx);
+    fixture
+        .backend
+        .set_failing("session_checkpoint_ensure", true);
+    let worker = OrchestrationTask {
+        harness: HarnessId::Codex,
+        model: "codex:default".into(),
+        ..task("a")
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &worker, cx));
+    cx.run_until_parked();
+    assert!(created.now_or_never().unwrap().is_err());
+    let worktree = &projects.calls("git_orchestration_worktree_create")[0];
+    assert_eq!(
+        projects.calls("git_orchestration_worktree_remove"),
+        [
+            json!({ "cwd": CWD, "path": format!("{CWD}-worktrees/{}", worktree["branch"].as_str().unwrap()) })
+        ]
+    );
+    assert_eq!(
+        projects.calls("git_orchestration_branch_remove"),
+        [json!({ "cwd": CWD, "branch": worktree["branch"] })]
+    );
+    assert!(cx.update(|cx| Engine::sessions(cx).read(cx).get("a").is_none()));
+}
+
 #[gpui::test]
 async fn says_so_when_a_harness_cannot_take_a_follow_up(cx: &mut TestAppContext) {
     let fixture = setup(cx);
@@ -1699,6 +1801,85 @@ async fn reports_orchestration_refusals_and_managed_unavailability(cx: &mut Test
             "Session is unavailable or already running"
         )]
     );
+}
+
+/// A run led by `lead` with `worker` as one of its agents.
+struct WorkerRun;
+
+impl SubmitOrchestrationHooks for WorkerRun {
+    fn led_run_status(&self, session_id: &str, _cx: &App) -> Option<String> {
+        (session_id == "lead").then(|| "active".to_string())
+    }
+
+    fn run_status_for_session(&self, session_id: &str, _cx: &App) -> Option<String> {
+        matches!(session_id, "lead" | "worker").then(|| "active".to_string())
+    }
+}
+
+fn edit_script() -> Script {
+    let paths = Some(vec!["src/a.rs".to_string()]);
+    Script {
+        events: vec![
+            HarnessEvent::ToolStarted {
+                agent_model: None,
+                call_id: "c".into(),
+                title: "Edit".into(),
+                kind: Some("edit".into()),
+                status: None,
+                background: None,
+                preview: None,
+                paths: paths.clone(),
+            },
+            HarnessEvent::ToolUpdated {
+                agent_model: None,
+                call_id: "c".into(),
+                title: Some("Edit".into()),
+                kind: Some("edit".into()),
+                status: Some("completed".into()),
+                detail: None,
+                preview: None,
+                paths,
+            },
+            HarnessEvent::MessageCompleted,
+        ],
+        result: Ok(()),
+        hold: false,
+    }
+}
+
+#[gpui::test]
+async fn records_worker_edits_but_not_the_leads_or_a_worker_turn_checkpoint(
+    cx: &mut TestAppContext,
+) {
+    let fixture = setup(cx);
+    cx.update(|cx| {
+        fixture.submit.update(cx, |submit, _| {
+            submit.set_peers(|peers| peers.orchestration = Rc::new(WorkerRun))
+        })
+    });
+    insert(chat("worker", HarnessId::Codex), cx);
+    insert(chat("lead", HarnessId::Codex), cx);
+    let checkpoint_calls = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .backend
+            .commands()
+            .into_iter()
+            .filter(|command| command.starts_with("session_checkpoint_"))
+            .collect()
+    };
+
+    fixture.codex.push(edit_script());
+    submit(&fixture, "worker", "edit", SubmitOptions::default(), cx);
+    // The worker got its checkpoint before its first turn, so the turn
+    // creates none. Its edits are still recorded.
+    assert_eq!(
+        checkpoint_calls(&fixture),
+        ["session_checkpoint_prepare", "session_checkpoint_capture"]
+    );
+
+    fixture.codex.push(edit_script());
+    submit(&fixture, "lead", "edit", SubmitOptions::default(), cx);
+    assert_eq!(checkpoint_calls(&fixture).len(), 2);
 }
 
 #[derive(Default)]

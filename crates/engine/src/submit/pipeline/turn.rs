@@ -422,6 +422,9 @@ impl TurnRun {
 
         state.plan_event_key =
             plan_turn_key(self.generation as i64, &uuid::Uuid::new_v4().to_string());
+        // Workers get their checkpoint in `create_worker`, before any turn. A
+        // turn must not create one later: it would count earlier worker edits
+        // as the baseline and drop them from the accepted result.
         let in_orchestration = cx
             .update(|cx| self.peers.orchestration.run_status_for_session(id, cx))
             .is_some();
@@ -758,10 +761,12 @@ impl TurnRun {
         let work_cwd = state.work_cwd.clone();
         cx.update(|cx| {
             nudge_open_editors(&event, &work_cwd, cx);
+            // Workers need their edits recorded so an accepted task can be
+            // applied to the lead checkout. Only the lead is excluded.
             if self
                 .peers
                 .orchestration
-                .run_status_for_session(&self.session_id, cx)
+                .led_run_status(&self.session_id, cx)
                 .is_none()
             {
                 track_session_edits(&self.session_id, &work_cwd, &event, cx);

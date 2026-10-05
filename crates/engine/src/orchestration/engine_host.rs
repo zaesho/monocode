@@ -176,6 +176,31 @@ async fn create_worker(
         workspace_identity(&project_cwd, &tree.path, tree.branch.as_deref())
     };
     let checkout = workspace.checkout_cwd.clone();
+    // Record the worker's starting state before its first turn so
+    // `integrate_worker` can apply exactly what it changed. A retained
+    // worktree already has worker edits and keeps its existing checkpoint.
+    let checkpoints = cx.update(|cx| Engine::checkpoints(cx));
+    if task.workspace_policy == Some(WorkspacePolicy::Shared) {
+        checkpoints
+            .ensure(&task.session_id, &checkout, false)
+            .await?;
+    } else if task.workspace.is_none()
+        && let Err(error) = checkpoints.ensure(&task.session_id, &checkout, true).await
+    {
+        // Nothing records this worktree yet, so no later cleanup would find
+        // it. Remove it before reporting the failure.
+        let removed = cx
+            .update(|cx| remove_orchestration_worktree(&lead_checkout, &checkout, cx))
+            .await;
+        if removed.is_ok()
+            && let Some(branch) = &workspace.branch
+        {
+            let _ = cx
+                .update(|cx| remove_orchestration_branch(&lead_checkout, branch, cx))
+                .await;
+        }
+        return Err(error);
+    }
     let scratch_dir = match &host.control {
         Some(control) => {
             let (control, owner, lead_id, session_id) = (

@@ -157,13 +157,17 @@ impl From<InFlightSession> for InFlightRef {
 /// `shouldPersistSession`: only real chats belong in project history. Blank
 /// tabs stay ephemeral.
 pub fn should_persist_session(session: &Session) -> bool {
-    session.inbox_ask.is_none()
-        && !is_remote_project_path(&session.cwd)
-        && session.cwd != "~"
+    is_storable_session(session)
         && session
             .blocks
             .iter()
             .any(|block| block.role == BlockRole::User)
+}
+
+/// `isStorableSession`: a local conversation the store can hold, with or
+/// without a message. Reminders save blank conversations this way.
+pub fn is_storable_session(session: &Session) -> bool {
+    session.inbox_ask.is_none() && !is_remote_project_path(&session.cwd) && session.cwd != "~"
 }
 
 /// `isPersistableId`: matches Rust `validate_id`. A path here fails the whole
@@ -1240,7 +1244,26 @@ impl SessionWriter {
         &self,
         session: &Session,
     ) -> Task<Result<Option<SessionSummary>, String>> {
-        if !should_persist_session(session) || self.is_deleted(&session.id) {
+        if !should_persist_session(session) {
+            return Task::ready(Ok(None));
+        }
+        self.write_session(session)
+    }
+
+    /// `upsertSession(session, { allowEmpty: true })`: also saves a blank
+    /// local conversation, so a reminder can point at it.
+    pub fn upsert_session_allow_empty(
+        &self,
+        session: &Session,
+    ) -> Task<Result<Option<SessionSummary>, String>> {
+        if !is_storable_session(session) {
+            return Task::ready(Ok(None));
+        }
+        self.write_session(session)
+    }
+
+    fn write_session(&self, session: &Session) -> Task<Result<Option<SessionSummary>, String>> {
+        if self.is_deleted(&session.id) {
             return Task::ready(Ok(None));
         }
         let payload = sanitize_session_for_persist(session);

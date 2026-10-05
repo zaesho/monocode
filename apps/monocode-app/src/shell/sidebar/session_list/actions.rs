@@ -297,7 +297,7 @@ impl SessionList {
             let due = monocode_engine::automations::reminders::reminder_time(id, now_ms());
             let mut item = MenuItem::new(id, label).disabled(remote_project || due.is_none());
             if remote_project {
-                item = item.description("Reminders require a saved local conversation.");
+                item = item.description("Reminders need a conversation in a local project.");
             } else if let Some(due) = due {
                 item = item.description(
                     monocode_engine::automations::reminders::format_reminder_time(due),

@@ -758,7 +758,10 @@ mod tests {
     }
 
     fn delta(text: &str) -> HarnessEvent {
-        HarnessEvent::MessageDelta { text: text.into() }
+        HarnessEvent::MessageDelta {
+            text: text.into(),
+            append: None,
+        }
     }
 
     async fn prompt_started(harness: &Harness) {

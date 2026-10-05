@@ -140,7 +140,10 @@ fn maps_agent_message_and_tool_updates_to_harness_events() {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "Hi" },
         })),
-        vec![HarnessEvent::MessageDelta { text: "Hi".into() }]
+        vec![HarnessEvent::MessageDelta {
+            text: "Hi".into(),
+            append: None
+        }]
     );
     let tools = events_from_acp_update(&json!({
         "sessionUpdate": "tool_call",

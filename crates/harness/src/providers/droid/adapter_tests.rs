@@ -152,7 +152,8 @@ fn spawns_droid_acp_switches_model_then_effort_sets_autonomy_and_prompts() {
             provider_session_id: "droid-session-1".into()
         }));
         assert!(all.contains(&HarnessEvent::MessageDelta {
-            text: "done".into()
+            text: "done".into(),
+            append: None,
         }));
         // The first live session kicks off the effort probe.
         peer.wait_for("catalog probe", |peer| probe_spawns(peer) == 1)

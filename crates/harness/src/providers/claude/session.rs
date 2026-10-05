@@ -43,7 +43,7 @@ use crate::core::task::{SharedSpawner, sleep, timeout};
 
 use super::io::{SharedChildIo, claude_account};
 use super::protocol::*;
-use super::shared::{OrderedMap, is_agent_tool_name, join_stream_text, snapshot_remainder};
+use super::shared::{OrderedMap, is_agent_tool_name, snapshot_remainder};
 
 /// Task-list block key for TaskCreate and TaskUpdate items.
 pub const CLAUDE_TASKS_KEY: &str = "claude-tasks";
@@ -140,6 +140,9 @@ struct AdvisorCall {
     body: Option<String>,
     status: InterjectionStatus,
 }
+
+/// The most of a subagent tool's output its trail keeps, in characters.
+const SUBAGENT_OUTPUT_LIMIT: usize = 32_000;
 
 const ADVISOR_FORWARDED: &str = "Claude Code sent the full conversation to the advisor.";
 
@@ -266,6 +269,9 @@ struct Live {
     /// Results Claude still owes this MonoCode turn: one for the prompt and
     /// one for each steer message it accepted.
     outstanding_results: u32,
+    /// Subagent prose so far, by `{parent}:{message}:text`. Claude can send
+    /// one message's text in several records.
+    narration: HashMap<String, String>,
     /// Token totals across every result of this MonoCode turn.
     metrics: TurnMetrics,
     /// The main model, from Claude's assistant messages. A turn's result
@@ -548,13 +554,21 @@ impl Live {
             }
             match delta.kind {
                 ClaudeDeltaKind::Assistant => {
+                    // Claude's deltas are plain increments. Guessing at an
+                    // overlap would drop a chunk that repeats earlier text.
                     self.close_pending_assistant_message();
-                    self.emitted_assistant = join_stream_text(&self.emitted_assistant, &delta.text);
-                    self.emit(HarnessEvent::MessageDelta { text: delta.text });
+                    self.emitted_assistant.push_str(&delta.text);
+                    self.emit(HarnessEvent::MessageDelta {
+                        text: delta.text,
+                        append: Some(true),
+                    });
                 }
                 ClaudeDeltaKind::Reasoning => {
-                    self.emitted_reasoning = join_stream_text(&self.emitted_reasoning, &delta.text);
-                    self.emit(HarnessEvent::ReasoningDelta { text: delta.text });
+                    self.emitted_reasoning.push_str(&delta.text);
+                    self.emit(HarnessEvent::ReasoningDelta {
+                        text: delta.text,
+                        append: Some(true),
+                    });
                 }
             }
             return;
@@ -681,8 +695,11 @@ impl Live {
         }
         let extra = snapshot_remainder(&self.emitted_assistant, &snapshot).to_string();
         if !extra.is_empty() {
-            self.emitted_assistant = join_stream_text(&self.emitted_assistant, &extra);
-            self.emit(HarnessEvent::MessageDelta { text: extra });
+            self.emitted_assistant.push_str(&extra);
+            self.emit(HarnessEvent::MessageDelta {
+                text: extra,
+                append: Some(true),
+            });
         }
 
         for tool_use in assistant_tool_uses(rec) {
@@ -1424,7 +1441,7 @@ impl Live {
     /// through the work. Its prose never joins the parent transcript, since
     /// that would read as the main agent talking, but it is the most legible
     /// thing in the panel for its own row.
-    fn note_subagent_narration(&self, rec: &Record) {
+    fn note_subagent_narration(&mut self, rec: &Record) {
         let Some(parent) = self.subagent_parent(rec) else {
             return;
         };
@@ -1451,15 +1468,27 @@ impl Live {
                 thinking,
             ));
         }
-        let text = assistant_text_blocks(rec).join("");
-        let text = monocode_core::js::trim(&text);
+        // A later record of the same message adds to its text rather than
+        // replacing it.
+        let chunk = assistant_text_blocks(rec).join("");
+        let chunk = monocode_core::js::trim(&chunk);
+        let key = format!("{}:{message_id}:text", parent.id);
+        let prior = self.narration.get(&key).cloned().unwrap_or_default();
+        let text = if chunk == prior || chunk.is_empty() {
+            prior
+        } else if prior.is_empty() {
+            chunk.to_string()
+        } else {
+            format!("{prior}\n{chunk}")
+        };
         if !text.is_empty() {
             self.emit(agent_step(
                 &parent.id,
                 &format!("{message_id}:text"),
                 AgentStepKind::Message,
-                text,
+                &text,
             ));
+            self.narration.insert(key, text);
         }
     }
 
@@ -1480,8 +1509,9 @@ impl Live {
                     }
                     .into(),
                 );
-                if result.is_error && !result.text.is_empty() {
-                    *detail = Some(result.text.clone());
+                // The output stays in the subagent's trail, up to a bound.
+                if !result.text.is_empty() {
+                    *detail = Some(result.text.chars().take(SUBAGENT_OUTPUT_LIMIT).collect());
                 }
             }
             self.emit(step);
@@ -2098,8 +2128,9 @@ impl ClaudeSessions {
         };
         let effort_raw = get("effort");
         let mut settings = ClaudeCliSettings::default();
-        if get("thinking") == Some("true") {
-            settings.always_thinking_enabled = Some(true);
+        // An explicit Off overrides thinking the user's settings turn on.
+        if let Some(thinking) = get("thinking") {
+            settings.always_thinking_enabled = Some(thinking == "true");
         }
         if get("fast") == Some("true") {
             settings.fast_mode = Some(true);
@@ -2662,6 +2693,7 @@ impl ClaudeSessions {
                 started: false,
                 outstanding_results: 0,
                 metrics: TurnMetrics::default(),
+                narration: HashMap::new(),
                 model: launch.model.clone().unwrap_or_default(),
                 emitted_assistant: String::new(),
                 emitted_reasoning: String::new(),
@@ -2876,6 +2908,7 @@ async fn run_turn(
         live.resume_expected = false;
         live.background_key.clear();
         live.task_notes.clear();
+        live.narration.clear();
         live.turn_result_seen = false;
         live.turn_end_pending = false;
         live.outstanding_results = 1;

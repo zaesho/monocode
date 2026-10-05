@@ -809,9 +809,15 @@ pub fn text_delta_event(part: &OpenCodePart, text: &str) -> Option<HarnessEvent>
         return None;
     }
     if part.part_type == "reasoning" {
-        return Some(HarnessEvent::ReasoningDelta { text: text.into() });
+        return Some(HarnessEvent::ReasoningDelta {
+            text: text.into(),
+            append: None,
+        });
     }
-    Some(HarnessEvent::MessageDelta { text: text.into() })
+    Some(HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: None,
+    })
 }
 
 /// `Map<string, OpenCodePart>`: parts by id, iterated in insertion order. A
@@ -1324,12 +1330,18 @@ mod tests {
         assert_eq!(text_delta_event(&part, ""), None);
         assert_eq!(
             text_delta_event(&part, "hi"),
-            Some(HarnessEvent::MessageDelta { text: "hi".into() })
+            Some(HarnessEvent::MessageDelta {
+                text: "hi".into(),
+                append: None
+            })
         );
         part.part_type = "reasoning".into();
         assert_eq!(
             text_delta_event(&part, "hm"),
-            Some(HarnessEvent::ReasoningDelta { text: "hm".into() })
+            Some(HarnessEvent::ReasoningDelta {
+                text: "hm".into(),
+                append: None
+            })
         );
     }
 

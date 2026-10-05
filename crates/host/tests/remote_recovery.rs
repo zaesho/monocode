@@ -44,7 +44,10 @@ impl ControlledProvider {
         (turn.on_event)(HarnessEvent::SessionProviderBound {
             provider_session_id: "recovery-provider-thread".into(),
         });
-        (turn.on_event)(HarnessEvent::MessageDelta { text: text.into() });
+        (turn.on_event)(HarnessEvent::MessageDelta {
+            text: text.into(),
+            append: None,
+        });
         (turn.on_event)(HarnessEvent::MessageCompleted);
         turn.finish.take().unwrap().send(()).unwrap();
     }

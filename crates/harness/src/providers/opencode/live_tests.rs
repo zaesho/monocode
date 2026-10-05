@@ -1221,8 +1221,14 @@ fn reports_streamed_text_tools_retries_usage_and_session_errors() {
         assert_eq!(
             deltas,
             [
-                &HarnessEvent::MessageDelta { text: "Hel".into() },
-                &HarnessEvent::MessageDelta { text: "lo".into() },
+                &HarnessEvent::MessageDelta {
+                    text: "Hel".into(),
+                    append: None
+                },
+                &HarnessEvent::MessageDelta {
+                    text: "lo".into(),
+                    append: None
+                },
             ]
         );
         assert!(events.iter().any(|event| matches!(

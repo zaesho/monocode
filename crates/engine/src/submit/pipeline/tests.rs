@@ -61,7 +61,10 @@ impl Script {
     fn reply(text: &str) -> Self {
         Self {
             events: vec![
-                HarnessEvent::MessageDelta { text: text.into() },
+                HarnessEvent::MessageDelta {
+                    text: text.into(),
+                    append: None,
+                },
                 HarnessEvent::MessageCompleted,
             ],
             result: Ok(()),
@@ -580,7 +583,14 @@ async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
 /// Queue output from the running turn without letting its flush run.
 fn queue_output(id: &str, text: &str, cx: &mut App) {
     Engine::sessions(cx).update(cx, |sessions, cx| {
-        sessions.enqueue_event(id, HarnessEvent::MessageDelta { text: text.into() }, cx);
+        sessions.enqueue_event(
+            id,
+            HarnessEvent::MessageDelta {
+                text: text.into(),
+                append: None,
+            },
+            cx,
+        );
     });
 }
 
@@ -918,6 +928,7 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
     fixture.codex.push(Script {
         events: vec![HarnessEvent::MessageDelta {
             text: "working".into(),
+            append: None,
         }],
         result: Ok(()),
         hold: true,

@@ -43,7 +43,10 @@ fn busy(id: &str) -> Session {
 }
 
 fn delta(text: &str) -> HarnessEvent {
-    HarnessEvent::MessageDelta { text: text.into() }
+    HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: None,
+    }
 }
 
 /// Records harness registry calls.

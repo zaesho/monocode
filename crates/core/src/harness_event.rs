@@ -67,14 +67,26 @@ pub enum HarnessEvent {
         status: Option<InterjectionStatus>,
     },
     #[serde(rename = "message.delta")]
-    MessageDelta { text: String },
+    MessageDelta {
+        text: String,
+        /// `Some(true)`: plain incremental text to append as is. Without it
+        /// the reducer folds the text in, which tolerates providers that
+        /// resend snapshots but can drop a chunk that repeats earlier text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        append: Option<bool>,
+    },
     #[serde(rename = "message.completed")]
     MessageCompleted,
     /// `image.generated` has two shapes: inline base64 data, or a file on disk.
     #[serde(rename = "image.generated")]
     ImageGenerated(GeneratedImage),
     #[serde(rename = "reasoning.delta")]
-    ReasoningDelta { text: String },
+    ReasoningDelta {
+        text: String,
+        /// As on [`HarnessEvent::MessageDelta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        append: Option<bool>,
+    },
     #[serde(rename = "reasoning.completed")]
     ReasoningCompleted,
     #[serde(rename = "tool.started", rename_all = "camelCase")]
@@ -417,6 +429,8 @@ mod tests {
             json!({ "type": "usage.limited", "resetsAt": 1000 }),
             json!({ "type": "background.updated", "tasks": ["build"] }),
             json!({ "type": "message.delta", "text": "hi" }),
+            json!({ "type": "message.delta", "text": "hi", "append": true }),
+            json!({ "type": "reasoning.delta", "text": "hm", "append": true }),
             json!({ "type": "message.completed" }),
             json!({ "type": "reasoning.delta", "text": "hm" }),
             json!({ "type": "reasoning.completed" }),

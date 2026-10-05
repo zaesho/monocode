@@ -727,7 +727,7 @@ impl TurnRun {
         });
         if self.options.on_settled.is_some() {
             match &event {
-                HarnessEvent::MessageDelta { text } => {
+                HarnessEvent::MessageDelta { text, .. } => {
                     state.control_text.push_str(text);
                     keep_tail(&mut state.control_text, 20_000);
                 }
@@ -771,7 +771,7 @@ impl TurnRun {
         }
         if state.proposal.is_some() {
             match &event {
-                HarnessEvent::MessageDelta { text } => {
+                HarnessEvent::MessageDelta { text, .. } => {
                     state.proposal_text.push_str(text);
                     keep_tail(&mut state.proposal_text, 200_000);
                     return None;

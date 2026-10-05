@@ -530,9 +530,15 @@ fn handle_stream_event(live: &mut LiveText, rec: &Record) -> Option<HarnessEvent
         return Some(match delta.kind {
             ClaudeDeltaKind::Assistant => {
                 live.output = join_stream_text(&live.output, &delta.text);
-                HarnessEvent::MessageDelta { text: delta.text }
+                HarnessEvent::MessageDelta {
+                    text: delta.text,
+                    append: None,
+                }
             }
-            ClaudeDeltaKind::Reasoning => HarnessEvent::ReasoningDelta { text: delta.text },
+            ClaudeDeltaKind::Reasoning => HarnessEvent::ReasoningDelta {
+                text: delta.text,
+                append: None,
+            },
         });
     }
 

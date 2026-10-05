@@ -335,6 +335,23 @@ fn does_not_double_an_assistant_block_when_a_completed_snapshot_repeats_it() {
 }
 
 #[test]
+fn appends_marked_deltas_without_folding_repeated_chunks() {
+    let mut t = T::new();
+    let append = |text: &str| json!({ "type": "message.delta", "text": text, "append": true });
+    let session = t.apply_all(
+        &t.session(HarnessId::Claude, "/tmp"),
+        &[append("ha"), append("ha"), append("!")],
+    );
+    assert_eq!(texts(&session), ["haha!"]);
+    // One at a time takes the same path as a batch.
+    let mut session = t.session(HarnessId::Claude, "/tmp");
+    for text in ["ha", "ha", "!"] {
+        session = t.apply(&session, append(text));
+    }
+    assert_eq!(texts(&session), ["haha!"]);
+}
+
+#[test]
 fn continues_open_prose_through_status_rows_then_completes_it() {
     let mut t = T::new();
     let mut session = t.apply(&t.session(HarnessId::Omp, "/tmp"), delta("contributor（"));

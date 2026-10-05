@@ -1747,10 +1747,10 @@ fn handle_notification(
         }
         track_agent_row(live, &event);
         match event {
-            HarnessEvent::MessageDelta { text } => {
+            HarnessEvent::MessageDelta { text, .. } => {
                 publish_codex_text(live, TextRole::Assistant, &text, snapshot, item_id)
             }
-            HarnessEvent::ReasoningDelta { text } => {
+            HarnessEvent::ReasoningDelta { text, .. } => {
                 publish_codex_text(live, TextRole::Reasoning, &text, snapshot, item_id)
             }
             other => live.emit(other),
@@ -2225,8 +2225,14 @@ fn publish_codex_text(
         emit.to_string()
     };
     live.emit(match role {
-        TextRole::Assistant => HarnessEvent::MessageDelta { text: emit },
-        TextRole::Reasoning => HarnessEvent::ReasoningDelta { text: emit },
+        TextRole::Assistant => HarnessEvent::MessageDelta {
+            text: emit,
+            append: None,
+        },
+        TextRole::Reasoning => HarnessEvent::ReasoningDelta {
+            text: emit,
+            append: None,
+        },
     });
 }
 

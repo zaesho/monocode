@@ -106,7 +106,7 @@ fn live_turn(harness: HarnessId) {
         let reply: String = events
             .iter()
             .filter_map(|event| match event {
-                HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+                HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

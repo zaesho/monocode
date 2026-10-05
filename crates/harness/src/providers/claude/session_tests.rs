@@ -1108,10 +1108,12 @@ fn keeps_a_follow_up_paragraph_separate_and_does_not_replay_its_snapshot() {
         deltas,
         [
             HarnessEvent::MessageDelta {
-                text: progress.into()
+                text: progress.into(),
+                append: Some(true),
             },
             HarnessEvent::MessageDelta {
-                text: update.into()
+                text: update.into(),
+                append: Some(true),
             },
         ]
     );
@@ -1799,7 +1801,7 @@ fn does_not_dump_subagent_assistant_text_into_the_parent_transcript() {
     finish(turn).unwrap();
     assert!(!events.any(|event| matches!(
         event,
-        HarnessEvent::MessageDelta { text } if text.contains("I will grep for tokens")
+        HarnessEvent::MessageDelta { text, .. } if text.contains("I will grep for tokens")
     )));
 }
 
@@ -2808,4 +2810,222 @@ fn does_not_silently_succeed_when_an_interrupt_cannot_reach_claude() {
         message: "Write failed".into(),
     }));
     assert_eq!(h.io.state.lock().kills, 1);
+}
+
+// describe("review probes for the official v0.7.0 transcript")
+
+fn delta(h: &Harness, text: &str) {
+    h.emit(json!({
+        "type": "stream_event",
+        "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } },
+    }));
+}
+
+fn start_agent(h: &Harness) {
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "id": "parent-message", "content": [{
+            "type": "tool_use", "id": "agent-call", "name": "Agent", "input": { "description": "Review" },
+        }] },
+    }));
+}
+
+fn agent_steps(events: &Events) -> Vec<monocode_core::block::AgentStep> {
+    events
+        .reduce()
+        .blocks
+        .into_iter()
+        .find(|block| {
+            block.tool.as_ref().and_then(|tool| tool.call_id.as_deref()) == Some("agent-call")
+        })
+        .and_then(|block| block.agent_run)
+        .map(|run| run.steps)
+        .unwrap_or_default()
+}
+
+#[test]
+fn preserves_repeated_incremental_text_chunks() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    for text in ["ha", "ha", "!"] {
+        delta(&h, text);
+    }
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "id": "answer", "content": [{ "type": "text", "text": "haha!" }] },
+    }));
+    h.result("sess_1");
+    finish(turn).unwrap();
+    let text: String = events
+        .reduce()
+        .blocks
+        .iter()
+        .filter(|block| block.role == BlockRole::Assistant)
+        .map(|block| block.text.as_str())
+        .collect();
+    assert_eq!(text, "haha!");
+}
+
+#[test]
+fn does_not_replace_the_final_requests_context_with_aggregate_turn_usage() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "assistant",
+        "message": {
+            "id": "last-request",
+            "content": [{ "type": "text", "text": "Done" }],
+            "usage": { "input_tokens": 5, "cache_read_input_tokens": 40_000, "output_tokens": 1 },
+        },
+    }));
+    h.emit(json!({
+        "type": "result",
+        "subtype": "success",
+        "usage": { "input_tokens": 20, "cache_read_input_tokens": 100_000, "output_tokens": 500 },
+        "modelUsage": { "claude-sonnet-5": { "contextWindow": 200_000 } },
+    }));
+    finish(turn).unwrap();
+    let context = events.reduce().context.unwrap();
+    assert!(context.used < 50_000);
+    assert_eq!(context.window, Some(200_000));
+}
+
+#[test]
+fn does_not_use_a_subagents_larger_context_window_for_the_main_model() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "result",
+        "subtype": "success",
+        "usage": { "input_tokens": 10, "output_tokens": 5 },
+        "modelUsage": {
+            "claude-sonnet-5": { "contextWindow": 200_000 },
+            "claude-opus-5[1m]": { "contextWindow": 1_000_000 },
+        },
+    }));
+    finish(turn).unwrap();
+    assert_eq!(events.reduce().context.unwrap().window, Some(200_000));
+}
+
+#[test]
+fn keeps_successful_subagent_tool_output_available_for_inspection() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    start_agent(&h);
+    h.emit(json!({
+        "type": "assistant",
+        "parent_tool_use_id": "agent-call",
+        "message": { "id": "sub-message", "content": [{
+            "type": "tool_use", "id": "shell-call", "name": "Bash", "input": { "command": "npm test" },
+        }] },
+    }));
+    h.emit(json!({
+        "type": "user",
+        "parent_tool_use_id": "agent-call",
+        "message": { "content": [{ "type": "tool_result", "tool_use_id": "shell-call", "content": "42 tests passed" }] },
+    }));
+    h.result("sess_1");
+    finish(turn).unwrap();
+    let step = agent_steps(&events)
+        .into_iter()
+        .find(|step| step.id == "shell-call")
+        .unwrap();
+    assert_eq!(step.detail.as_deref(), Some("42 tests passed"));
+}
+
+#[test]
+fn keeps_all_subagent_text_blocks_that_share_one_api_message_id() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    start_agent(&h);
+    for text in ["First observation.", "Second observation."] {
+        h.emit(json!({
+            "type": "assistant",
+            "parent_tool_use_id": "agent-call",
+            "message": { "id": "sub-message", "content": [{ "type": "text", "text": text }] },
+        }));
+    }
+    h.result("sess_1");
+    finish(turn).unwrap();
+    let text: Vec<String> = agent_steps(&events)
+        .into_iter()
+        .map(|step| step.text)
+        .collect();
+    assert_eq!(text, ["First observation.\nSecond observation."]);
+}
+
+#[test]
+fn counts_the_task_follow_up_work_in_the_same_monocode_user_turn() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "system", "subtype": "task_started", "task_id": "background-shell",
+        "task_type": "local_bash", "description": "Run tests",
+    }));
+    h.emit(json!({
+        "type": "result", "subtype": "success",
+        "usage": { "input_tokens": 50, "cache_read_input_tokens": 5000, "output_tokens": 1000 },
+    }));
+    h.emit(json!({
+        "type": "system", "subtype": "task_notification", "task_id": "background-shell",
+        "status": "completed", "summary": "Tests passed",
+    }));
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+    delta(&h, "The tests passed.");
+    h.emit(json!({
+        "type": "assistant",
+        "message": { "content": [{ "type": "text", "text": "The tests passed." }] },
+    }));
+    h.emit(json!({
+        "type": "result", "subtype": "success",
+        "usage": { "input_tokens": 5, "cache_read_input_tokens": 0, "output_tokens": 20 },
+    }));
+    finish(turn).unwrap();
+    let mut session = Session::blank("s", HarnessId::Claude, "claude:sonnet-5", "/repo");
+    session.blocks.push(monocode_core::block::Block::new(
+        "user-turn",
+        BlockRole::User,
+        "Run tests",
+    ));
+    for event in events.all() {
+        session = apply_harness_event(&session, &event);
+    }
+    let metrics = session.blocks[0].turn_metrics.clone().unwrap();
+    assert_eq!(metrics.input_tokens, Some(55));
+    assert_eq!(metrics.output_tokens, Some(1020));
+}
+
+#[test]
+fn passes_an_explicit_thinking_off_to_claude() {
+    let h = Harness::new();
+    let mut settings = ModelSettings::new();
+    settings.insert("thinking".into(), "false".into());
+    let input = SendTurnInput {
+        session: HarnessSessionInput {
+            session_id: "s1".into(),
+            cwd: "/repo".into(),
+            model: "claude:claude-sonnet-5".into(),
+            model_settings: Some(settings),
+            provider_account_id: None,
+            runtime_mode: RuntimeMode::Supervised,
+            intent: None,
+            controls_agents: None,
+            app_access: None,
+        },
+        text: "hi".into(),
+        attachments: Some(Vec::new()),
+    };
+    let sessions = h.sessions.clone();
+    let events = Events::default();
+    let sink = events.sink();
+    let turn = smol::spawn(async move { sessions.send_turn(input, sink).await });
+    h.wait_for(|| h.spawned().len() == 1, "Claude process");
+    h.ack_init();
+    h.wait_for(|| h.user_count() == 1, "user prompt");
+    let args = &h.spawned()[0];
+    let index = args.iter().position(|arg| arg == "--settings").unwrap();
+    let settings: Value = serde_json::from_str(&args[index + 1]).unwrap();
+    assert_eq!(settings["alwaysThinkingEnabled"], json!(false));
+    h.result("sess_1");
+    finish(turn).unwrap();
 }

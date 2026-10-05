@@ -1058,11 +1058,23 @@ impl PiFamily {
             match delta.kind {
                 PiDeltaKind::Text => {
                     state.emitted_assistant.push_str(&delta.text);
-                    fx.emit(state, HarnessEvent::MessageDelta { text: delta.text });
+                    fx.emit(
+                        state,
+                        HarnessEvent::MessageDelta {
+                            text: delta.text,
+                            append: None,
+                        },
+                    );
                 }
                 PiDeltaKind::Thinking => {
                     state.emitted_reasoning.push_str(&delta.text);
-                    fx.emit(state, HarnessEvent::ReasoningDelta { text: delta.text });
+                    fx.emit(
+                        state,
+                        HarnessEvent::ReasoningDelta {
+                            text: delta.text,
+                            append: None,
+                        },
+                    );
                 }
             }
         }

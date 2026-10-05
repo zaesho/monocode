@@ -1073,7 +1073,7 @@ impl TextBackend for Adapter {
                 let original = input.on_event.clone();
                 let bound = input.on_thread_id.clone();
                 Arc::new(move |event: HarnessEvent| {
-                    if let HarnessEvent::MessageDelta { text: delta } = &event {
+                    if let HarnessEvent::MessageDelta { text: delta, .. } = &event {
                         text.lock().push_str(delta);
                     }
                     if let HarnessEvent::SessionProviderBound {

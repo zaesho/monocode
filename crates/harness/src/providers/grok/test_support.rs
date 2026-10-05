@@ -427,7 +427,7 @@ pub fn reply_text(events: &[HarnessEvent]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()

@@ -459,6 +459,7 @@ fn records_harness_activity_blocks_for_a_btw_reply() {
         &[],
         &HarnessEvent::ReasoningDelta {
             text: "Checking docs".into(),
+            append: None,
         },
         HarnessId::Codex,
         "codex:gpt-5.4",
@@ -476,6 +477,7 @@ fn seals_streaming_reply_blocks() {
         &[],
         &HarnessEvent::MessageDelta {
             text: "Because.".into(),
+            append: None,
         },
         HarnessId::Claude,
         "claude:sonnet",

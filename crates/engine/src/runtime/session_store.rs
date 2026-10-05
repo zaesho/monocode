@@ -334,6 +334,15 @@ pub fn sanitize_block(block: &Value, hydrate: bool) -> Option<Value> {
             next.insert(key.into(), value.clone());
         }
     }
+    // A later snapshot of the same provider part corrects this block's text.
+    if (role == "assistant" || role == "reasoning")
+        && let Some(part_id) = block
+            .get("providerPartId")
+            .and_then(Value::as_str)
+            .filter(|part_id| is_persistable_id(part_id))
+    {
+        next.insert("providerPartId".into(), Value::from(part_id));
+    }
     if let Some(attachments) = block.get("attachments").and_then(Value::as_array)
         && !attachments.is_empty()
     {
@@ -1611,6 +1620,23 @@ mod tests {
             &[],
             Some(&extra),
         )
+    }
+
+    #[test]
+    fn preserves_provider_part_identity_for_transcript_corrections_after_reload() {
+        let assistant = json!({ "id": "block", "role": "assistant", "text": "Hello", "providerPartId": "prt_fixed" });
+        assert_eq!(
+            sanitize_block(&assistant, false).unwrap()["providerPartId"],
+            "prt_fixed"
+        );
+        let user =
+            json!({ "id": "user", "role": "user", "text": "Hi", "providerPartId": "prt_fixed" });
+        assert!(
+            sanitize_block(&user, false)
+                .unwrap()
+                .get("providerPartId")
+                .is_none()
+        );
     }
 
     #[test]

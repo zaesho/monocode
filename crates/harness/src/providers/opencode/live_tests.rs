@@ -1216,16 +1216,20 @@ fn reports_streamed_text_tools_retries_usage_and_session_errors() {
         done.await.unwrap();
 
         let events = h.events();
-        let deltas: Vec<&HarnessEvent> = events
+        let parts: Vec<&str> = events
             .iter()
-            .filter(|event| matches!(event, HarnessEvent::MessageDelta { .. }))
+            .filter_map(|event| match event {
+                HarnessEvent::MessagePart { part_id, text, .. } if part_id == "text_1" => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
             .collect();
-        assert_eq!(
-            deltas,
-            [
-                &HarnessEvent::MessageDelta { text: "Hel".into() },
-                &HarnessEvent::MessageDelta { text: "lo".into() },
-            ]
+        assert_eq!(parts, ["Hel", "Hello"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::MessageDelta { .. }))
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -1624,5 +1628,58 @@ fn does_not_submit_a_resumed_prompt_after_its_permission_patch_fails() {
         assert!(error.to_string().contains("Permission update failed"));
         assert_eq!(h.prompts(), 0);
         assert!(!h.host.kills().is_empty());
+    });
+}
+
+/// The texts of `part_id`'s snapshots, in order.
+fn part_texts(events: &[HarnessEvent], part: &str) -> Vec<(String, bool)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            HarnessEvent::MessagePart {
+                part_id,
+                text,
+                streaming,
+                ..
+            } if part_id == part => Some((text.clone(), *streaming)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn applies_final_corrections_to_one_part_and_ignores_its_late_deltas() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        let part = |text: &str, end: Option<i64>| {
+            let mut time = json!({ "start": 1 });
+            if let Some(end) = end {
+                time["end"] = json!(end);
+            }
+            json!({ "id": "text_part", "messageID": "assistant_text", "type": "text", "text": text, "time": time })
+        };
+        // A part that arrives before its message's role waits for it.
+        h.part(ROOT, part("Hello worle", None));
+        h.settle().await;
+        assert!(part_texts(&h.events(), "text_part").is_empty());
+        h.message(ROOT, "assistant_text", "assistant", None, None);
+        h.part(ROOT, part("Hello world", Some(2)));
+        h.sse(json!({
+            "type": "message.part.delta",
+            "properties": { "sessionID": ROOT, "partID": "text_part", "field": "text", "delta": "ld" },
+        }));
+        h.part(ROOT, part("Hello", Some(3)));
+        h.settle().await;
+        assert_eq!(
+            part_texts(&h.events(), "text_part"),
+            [
+                ("Hello worle".to_string(), true),
+                ("Hello world".to_string(), false),
+                ("Hello".to_string(), false),
+            ]
+        );
+        h.idle(ROOT);
+        done.await.unwrap();
     });
 }

@@ -454,11 +454,17 @@ pub struct MergedText {
 
 /// `mergeOpenCodeAssistantText`: fold a part snapshot into the text already
 /// shown. A shorter snapshot that the shown text starts with is stale and
-/// keeps the longer text.
-pub fn merge_open_code_assistant_text(previous_text: Option<&str>, next_text: &str) -> MergedText {
+/// keeps the longer text, unless it is the part's `final` snapshot, which
+/// may correct or shorten the text.
+pub fn merge_open_code_assistant_text(
+    previous_text: Option<&str>,
+    next_text: &str,
+    final_snapshot: bool,
+) -> MergedText {
     let latest_text = match previous_text {
         Some(previous)
-            if !previous.is_empty()
+            if !final_snapshot
+                && !previous.is_empty()
                 && previous.len() > next_text.len()
                 && previous.starts_with(next_text) =>
         {
@@ -1134,7 +1140,7 @@ mod tests {
     #[test]
     fn merge_emits_only_the_new_suffix() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hel"), "Hello"),
+            merge_open_code_assistant_text(Some("Hel"), "Hello", false),
             MergedText {
                 latest_text: "Hello".into(),
                 delta_to_emit: "lo".into(),
@@ -1145,7 +1151,7 @@ mod tests {
     #[test]
     fn merge_keeps_a_longer_snapshot_if_the_next_update_shrinks() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hello world"), "Hello"),
+            merge_open_code_assistant_text(Some("Hello world"), "Hello", false),
             MergedText {
                 latest_text: "Hello world".into(),
                 delta_to_emit: "".into(),
@@ -1156,13 +1162,23 @@ mod tests {
     #[test]
     fn merge_slices_at_character_boundaries() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("caf"), "café!").delta_to_emit,
+            merge_open_code_assistant_text(Some("caf"), "café!", false).delta_to_emit,
             "é!"
         );
         assert_eq!(
-            merge_open_code_assistant_text(None, "naïve").delta_to_emit,
+            merge_open_code_assistant_text(None, "naïve", false).delta_to_emit,
             "naïve"
         );
+    }
+
+    #[test]
+    fn accepts_final_text_corrections_and_shortening() {
+        let merge = |previous: &str, next: &str| {
+            merge_open_code_assistant_text(Some(previous), next, true).latest_text
+        };
+        assert_eq!(merge("Hello worle", "Hello world"), "Hello world");
+        assert_eq!(merge("Hello world", "Hello"), "Hello");
+        assert_eq!(merge("Hello", ""), "");
     }
 
     // describe("OpenCode helpers")

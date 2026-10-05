@@ -7,7 +7,7 @@
 //! `turns` promise chain is an async mutex: prompts run one at a time, and a
 //! failed one does not block the next.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -30,7 +30,6 @@ use super::protocol::{
     append_open_code_assistant_text_delta, compare_semver, event_session_id, field,
     is_known_hidden_agent, is_truthy, merge_open_code_assistant_text, parse_open_code_model_slug,
     parse_open_code_version, parse_server_url_from_output, record_field, string_field,
-    text_delta_event,
 };
 use crate::core::abort_text_prompt::with_text_prompt_abort;
 use crate::core::catalog::SharedCatalog;
@@ -66,6 +65,8 @@ struct TextState {
     message_role_by_id: HashMap<String, Role>,
     part_by_id: PartStore,
     emitted_text_by_part_id: HashMap<String, String>,
+    /// Parts whose final snapshot was emitted.
+    emitted_ended_part_ids: HashSet<String>,
     pending_text_delta_by_part_id: HashMap<String, String>,
     on_event: Option<EventSink>,
     outbox: Vec<HarnessEvent>,
@@ -150,7 +151,10 @@ impl OpenCodeText {
                 input.model_settings.as_ref(),
             )
             .await?;
-        if let Some(signal) = &input.signal {
+        // A prompt cancelled while the server started must not leave it
+        // running for the next prompt.
+        if let Some(signal) = input.signal.as_ref().filter(|signal| signal.is_aborted()) {
+            self.drop_live().await;
             signal.throw_if_aborted()?;
         }
         session.state.lock().on_event = input.on_event.clone();
@@ -204,6 +208,9 @@ impl OpenCodeText {
             };
             bail!(message);
         }
+        // The HTTP response can arrive before the completed SSE snapshot, so
+        // its parts are final too.
+        handle_text_result(session, result.info.as_ref(), result.parts.as_deref());
         let text = get_open_code_text_response(result.parts.as_deref());
         if text.is_empty() {
             bail!("OpenCode returned empty output.");
@@ -457,6 +464,42 @@ pub fn get_open_code_text_response(parts: Option<&[Value]>) -> String {
     js::trim(&text).to_string()
 }
 
+/// Apply a finished prompt's message and parts as final snapshots.
+fn handle_text_result(session: &LiveText, info: Option<&Record>, parts: Option<&[Value]>) {
+    let (events, sink) = {
+        let mut state = session.state.lock();
+        if let Some(info) = info {
+            let mut event = Record::new();
+            event.insert("type".into(), Value::from("message.updated"));
+            let mut properties = Record::new();
+            properties.insert("info".into(), Value::Object(info.clone()));
+            event.insert("properties".into(), Value::Object(properties));
+            apply_text_event(session, &mut state, &event);
+        }
+        for value in parts.unwrap_or_default() {
+            let Some(mut part) = parse_text_part(Some(value)) else {
+                continue;
+            };
+            let time = part.time.unwrap_or_default();
+            part.time = Some(PartTime {
+                end: time.end.or(Some(0.0)),
+                ..time
+            });
+            state.part_by_id.set(part.clone());
+            state.pending_text_delta_by_part_id.remove(&part.id);
+            if text_part_role(&state, &part) == Some(Role::Assistant) {
+                emit_text_part(&mut state, &part);
+            }
+        }
+        (std::mem::take(&mut state.outbox), state.on_event.clone())
+    };
+    if let Some(sink) = sink {
+        for event in events {
+            sink(event);
+        }
+    }
+}
+
 fn handle_text_event(session: &LiveText, event: &Record) {
     let (events, sink) = {
         let mut state = session.state.lock();
@@ -518,6 +561,7 @@ fn apply_text_event(session: &LiveText, state: &mut TextState, event: &Record) {
                     merge_open_code_assistant_text(
                         Some(&pending_delta),
                         part.text.as_deref().unwrap_or_default(),
+                        false,
                     )
                     .latest_text,
                 );
@@ -569,15 +613,11 @@ fn apply_text_event(session: &LiveText, state: &mut TextState, event: &Record) {
     if text_part_role(state, &next_part) != Some(Role::Assistant) {
         return;
     }
-    state
-        .emitted_text_by_part_id
-        .insert(next_part.id.clone(), next.next_text);
-    if let Some(mapped) = text_delta_event(&next_part, &next.delta_to_emit) {
-        state.outbox.push(mapped);
-    }
+    emit_text_part(state, &next_part);
 }
 
-/// `emitTextPart`.
+/// `emitTextPart`: the part's whole text, once per change. An ended part's
+/// snapshot is final and replaces what was shown.
 fn emit_text_part(state: &mut TextState, part: &OpenCodePart) {
     if part.part_type != "text" && part.part_type != "reasoning" {
         return;
@@ -585,14 +625,28 @@ fn emit_text_part(state: &mut TextState, part: &OpenCodePart) {
     let Some(text) = part.text.as_deref() else {
         return;
     };
-    let previous = state.emitted_text_by_part_id.get(&part.id).cloned();
-    let next = merge_open_code_assistant_text(previous.as_deref(), text);
+    let previous = state.emitted_text_by_part_id.get(&part.id);
+    let ended = part.time.and_then(|time| time.end).is_some();
+    if previous.map(String::as_str) == Some(text)
+        && state.emitted_ended_part_ids.contains(&part.id) == ended
+    {
+        return;
+    }
+    if previous.is_none() && text.is_empty() && !ended {
+        return;
+    }
     state
         .emitted_text_by_part_id
-        .insert(part.id.clone(), next.latest_text);
-    if let Some(mapped) = text_delta_event(part, &next.delta_to_emit) {
-        state.outbox.push(mapped);
+        .insert(part.id.clone(), text.to_string());
+    if ended {
+        state.emitted_ended_part_ids.insert(part.id.clone());
     }
+    state.outbox.push(HarnessEvent::MessagePart {
+        part_id: part.id.clone(),
+        text: text.to_string(),
+        reasoning: part.part_type == "reasoning",
+        streaming: !ended,
+    });
 }
 
 /// `textPartRole`.
@@ -632,12 +686,16 @@ fn merge_text_part(previous: Option<&OpenCodePart>, next: OpenCodePart) -> OpenC
         return next;
     };
     let ended = |part: &OpenCodePart| part.time.and_then(|time| time.end).is_some();
-    if ended(previous) && !ended(&next) {
+    if ended(&next) {
+        return next;
+    }
+    if ended(previous) {
         return previous.clone();
     }
     let text = merge_open_code_assistant_text(
         previous.text.as_deref(),
         next.text.as_deref().unwrap_or_default(),
+        false,
     )
     .latest_text;
     OpenCodePart {
@@ -757,8 +815,14 @@ mod tests {
         }
     }
 
-    fn delta(text: &str) -> HarnessEvent {
-        HarnessEvent::MessageDelta { text: text.into() }
+    /// A snapshot of the assistant message's one text part.
+    fn snapshot(text: &str, streaming: bool) -> HarnessEvent {
+        HarnessEvent::MessagePart {
+            part_id: "part_assistant_message".into(),
+            text: text.into(),
+            reasoning: false,
+            streaming,
+        }
     }
 
     async fn prompt_started(harness: &Harness) {
@@ -772,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn forwards_only_incremental_opencode_assistant_text() {
+    fn forwards_assistant_text_as_part_snapshots_without_user_text() {
         smol::block_on(async {
             let mut harness = Harness::new();
             let reply = harness.host.defer("POST", "/session/text_session/message");
@@ -786,7 +850,10 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("lo")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![snapshot("Hel", true), snapshot("Hello", true)]
+            );
         });
     }
 
@@ -805,7 +872,10 @@ mod tests {
             harness.finish(reply, "Hello!").await;
 
             assert_eq!(result.await.unwrap(), "Hello!");
-            assert_eq!(harness.deltas(), vec![delta("Hello"), delta("!")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![snapshot("Hello", true), snapshot("Hello!", true)]
+            );
         });
     }
 
@@ -823,7 +893,7 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hello")]);
+            assert_eq!(harness.deltas(), vec![snapshot("Hello", false)]);
         });
     }
 
@@ -842,7 +912,49 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("lo")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![
+                    snapshot("Hel", true),
+                    snapshot("Hello", true),
+                    snapshot("Hello", false),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn applies_a_final_correction_and_treats_response_parts_as_final() {
+        smol::block_on(async {
+            let mut harness = Harness::new();
+            let reply = harness.host.defer("POST", "/session/text_session/message");
+            let result = harness.run();
+            prompt_started(&harness).await;
+            harness.message("assistant_message", "assistant");
+            harness.part("assistant_message", "Hello worle", false);
+            let injected = harness.injected;
+            wait_for("events handled", || {
+                harness.text.processed_events() >= injected
+            })
+            .await;
+            // The HTTP reply arrives before the completed SSE snapshot.
+            let body = json!({
+                "info": { "id": "assistant_message", "role": "assistant", "sessionID": "text_session" },
+                "parts": [{
+                    "id": "part_assistant_message", "messageID": "assistant_message",
+                    "type": "text", "text": "Hello world",
+                }],
+            });
+            reply.send((200, body.to_string())).unwrap();
+
+            assert_eq!(result.await.unwrap(), "Hello world");
+            assert_eq!(
+                harness.deltas(),
+                vec![
+                    snapshot("Hello worle", true),
+                    snapshot("Hello world", false)
+                ]
+            );
         });
     }
 

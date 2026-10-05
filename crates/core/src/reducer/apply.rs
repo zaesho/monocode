@@ -139,6 +139,44 @@ pub fn apply_harness_event_mut(
         HarnessEvent::MessageDelta { text } => {
             patch_streaming(env, session, BlockRole::Assistant, &[text.as_str()], true)
         }
+        HarnessEvent::MessagePart {
+            part_id,
+            text,
+            reasoning,
+            streaming,
+        } => {
+            let role = if *reasoning {
+                BlockRole::Reasoning
+            } else {
+                BlockRole::Assistant
+            };
+            let existing = session.blocks.iter_mut().find(|block| {
+                block.provider_part_id.as_deref() == Some(part_id.as_str()) && block.role == role
+            });
+            match existing {
+                Some(block) => {
+                    if block.text == *text && block.streaming == Some(*streaming) {
+                        return false;
+                    }
+                    block.text = text.clone();
+                    block.streaming = Some(*streaming);
+                }
+                None => {
+                    if text.is_empty() {
+                        return false;
+                    }
+                    append_block(
+                        session,
+                        Block {
+                            provider_part_id: Some(part_id.clone()),
+                            streaming: Some(*streaming),
+                            ..Block::new(env.new_id(), role, text.clone())
+                        },
+                    );
+                }
+            }
+            true
+        }
         HarnessEvent::MessageCompleted => {
             finish_role(session, BlockRole::Assistant);
             true

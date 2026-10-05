@@ -64,7 +64,7 @@ use super::protocol::{
     event_session_id, field, is_known_hidden_agent, is_supported_open_code_version, is_truthy,
     merge_open_code_assistant_text, open_code_child_session_id, parse_open_code_model_slug,
     parse_open_code_version, parse_server_url_from_output, permission_title,
-    preview_from_tool_part, record_field, session_error_message, string_field, text_delta_event,
+    preview_from_tool_part, record_field, session_error_message, string_field,
     to_open_code_permission_reply, to_open_code_prompt_parts, tool_kind_from_name,
     turn_metrics_from_message_info, unsupported_open_code_version_message,
 };
@@ -1438,6 +1438,14 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
                 if let Some(role) = role {
                     let role = if hidden { Role::Hidden } else { role };
                     s.message_role_by_id.insert(id.to_string(), role);
+                    for part in s.part_by_id.of_message(id) {
+                        if role_for_part(s, &part) == Some(Role::Assistant) {
+                            emit_assistant_text(s, &part);
+                            if part.part_type == "tool" {
+                                emit_tool(s, &live.open_code_session_id, &part);
+                            }
+                        }
+                    }
                 }
             }
             // A compaction assistant's usage describes the summarization call,
@@ -1461,7 +1469,9 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
             let Some(existing) = s.part_by_id.get(part_id).cloned() else {
                 return;
             };
-            if role_for_part(s, &existing) != Some(Role::Assistant) {
+            // An ended part's snapshot is final, so a late delta must not
+            // grow it again.
+            if part_ended(&existing) || role_for_part(s, &existing) != Some(Role::Assistant) {
                 return;
             }
             let previous = s
@@ -1473,14 +1483,15 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
             let next = append_open_code_assistant_text_delta(&previous, &delta);
             s.emitted_text_by_part_id
                 .insert(part_id.to_string(), next.next_text.clone());
-            if existing.part_type == "text" || existing.part_type == "reasoning" {
-                s.part_by_id.set(OpenCodePart {
-                    text: Some(next.next_text.clone()),
-                    ..existing.clone()
-                });
+            let next_part = OpenCodePart {
+                text: Some(next.next_text),
+                ..existing
+            };
+            if next_part.part_type == "text" || next_part.part_type == "reasoning" {
+                s.part_by_id.set(next_part.clone());
             }
-            if let Some(mapped) = text_delta_event(&existing, &next.delta_to_emit) {
-                s.emit(mapped);
+            if !next.delta_to_emit.is_empty() {
+                emit_assistant_snapshot(s, &next_part);
             }
         }
         "message.part.updated" => {
@@ -1488,11 +1499,13 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
                 return;
             };
             s.part_by_id.set(part.clone());
+            // A part whose message role is not known yet waits for its
+            // `message.updated`, which replays it.
             if role_for_part(s, &part) == Some(Role::Assistant) {
                 emit_assistant_text(s, &part);
-            }
-            if part.part_type == "tool" {
-                emit_tool(s, &live.open_code_session_id, &part);
+                if part.part_type == "tool" {
+                    emit_tool(s, &live.open_code_session_id, &part);
+                }
             }
         }
         "session.status" => {
@@ -1651,18 +1664,48 @@ fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record
     });
 }
 
-/// `emitAssistantText`.
+/// `emitAssistantText`. An ended part's snapshot is final and may correct
+/// text already shown.
 fn emit_assistant_text(s: &mut LiveState, part: &OpenCodePart) {
     let Some(text) = part.text.as_deref() else {
         return;
     };
+    let ended = part_ended(part);
     let previous = s.emitted_text_by_part_id.get(&part.id).cloned();
-    let next = merge_open_code_assistant_text(previous.as_deref(), text);
+    let next = merge_open_code_assistant_text(previous.as_deref(), text, ended);
     s.emitted_text_by_part_id
-        .insert(part.id.clone(), next.latest_text);
-    if let Some(mapped) = text_delta_event(part, &next.delta_to_emit) {
-        s.emit(mapped);
+        .insert(part.id.clone(), next.latest_text.clone());
+    if !next.delta_to_emit.is_empty()
+        || previous.as_deref() != Some(next.latest_text.as_str())
+        || ended
+    {
+        emit_assistant_snapshot(
+            s,
+            &OpenCodePart {
+                text: Some(next.latest_text),
+                ..part.clone()
+            },
+        );
     }
+}
+
+/// `emitAssistantSnapshot`: the part's whole text, which replaces what the
+/// transcript shows for it.
+fn emit_assistant_snapshot(s: &mut LiveState, part: &OpenCodePart) {
+    if part.part_type != "text" && part.part_type != "reasoning" {
+        return;
+    }
+    s.emit(HarnessEvent::MessagePart {
+        part_id: part.id.clone(),
+        text: part.text.clone().unwrap_or_default(),
+        reasoning: part.part_type == "reasoning",
+        streaming: !part_ended(part),
+    });
+}
+
+/// `typeof part.time?.end === "number"`.
+fn part_ended(part: &OpenCodePart) -> bool {
+    part.time.and_then(|time| time.end).is_some()
 }
 
 /// The row title `emitTool` and `emitSubagentStep` share.
@@ -1877,6 +1920,7 @@ fn handle_subagent_event(
         let existing = string_field(props, "partID").and_then(|id| s.part_by_id.get(id));
         let delta = stream_text_delta(field(props, "delta"));
         if let Some(existing) = existing
+            && !part_ended(existing)
             && !delta.is_empty()
             && (existing.part_type == "text" || existing.part_type == "reasoning")
         {
@@ -2064,14 +2108,11 @@ fn parse_part(value: Option<&Value>) -> Option<OpenCodePart> {
     })
 }
 
-/// `roleForPart`.
+/// `roleForPart`. A part of a message whose role is not known yet has no
+/// role: it could be the user's prompt.
 fn role_for_part(s: &LiveState, part: &OpenCodePart) -> Option<Role> {
-    if let Some(known) = part
-        .message_id
-        .as_ref()
-        .and_then(|id| s.message_role_by_id.get(id))
-    {
-        return Some(*known);
+    if let Some(message_id) = &part.message_id {
+        return s.message_role_by_id.get(message_id).copied();
     }
     matches!(part.part_type.as_str(), "tool" | "text" | "reasoning").then_some(Role::Assistant)
 }

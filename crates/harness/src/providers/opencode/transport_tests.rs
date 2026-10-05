@@ -280,7 +280,11 @@ fn runs_an_opencode_session_through_the_host_http_and_sse_bridge() {
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessagePart {
+                text,
+                reasoning: false,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect();
@@ -335,7 +339,11 @@ fn live_turn_with_a_real_opencode() {
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessagePart {
+                text,
+                reasoning: false,
+                ..
+            } => Some(text.as_str()),
             _ => None,
         })
         .collect();

@@ -173,6 +173,7 @@ impl OpenCodeText {
     ) -> Result<String> {
         let prompt = PromptInput {
             session_id: session.session_id.clone(),
+            message_id: None,
             model: session.model.clone(),
             agent: Some(open_code_text_agent(
                 input.intent,

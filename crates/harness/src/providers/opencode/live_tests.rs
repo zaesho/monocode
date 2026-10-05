@@ -15,7 +15,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use monocode_core::block::{AgentStepKind, ApprovalDecided, TurnIntent};
+use monocode_core::block::{AgentStepKind, ApprovalDecided, ModelSettings, TurnIntent};
 use monocode_core::harness::RuntimeMode;
 use monocode_core::harness_event::{
     ApprovalDecision, HarnessEvent, HarnessSessionInput, QuestionDecision, RewindLastTurnInput,
@@ -39,6 +39,68 @@ struct Harness {
     adapter: OpenCodeAdapter,
     events: Events,
     injected: usize,
+    session: Arc<Mutex<FakeSession>>,
+}
+
+/// The durable side of the fake OpenCode session.
+struct FakeSession {
+    messages: Vec<Value>,
+    /// The `messageID` of the last `prompt_async`.
+    prompt_id: Option<String>,
+    status: &'static str,
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// `defaultHarnessHttp`: a prompt adds its user message to the history and
+/// announces it, and `/session/status` reports the fake status.
+fn session_handler(
+    host: &FakeHost,
+    session: &Arc<Mutex<FakeSession>>,
+) -> impl Fn(&HttpRequest) -> (u16, String) + Send + Sync + 'static {
+    let host = host.clone();
+    let session = session.clone();
+    move |request: &HttpRequest| {
+        let path = path_of(&request.url);
+        if path.ends_with("/prompt_async") {
+            let body = body(request);
+            let info = json!({
+                "id": body["messageID"].clone(),
+                "sessionID": ROOT,
+                "role": "user",
+                "agent": body["agent"].clone(),
+                "time": { "created": now() },
+            });
+            {
+                let mut session = session.lock();
+                session.prompt_id = body["messageID"].as_str().map(str::to_string);
+                session.status = "busy";
+                session
+                    .messages
+                    .push(json!({ "info": info.clone(), "parts": body["parts"].clone() }));
+            }
+            host.sse(
+                THREAD,
+                json!({ "type": "message.updated", "properties": { "info": info } }),
+            );
+            return (204, String::new());
+        }
+        match (request.method.as_str(), path.as_str()) {
+            ("GET", "/session/status") => (
+                200,
+                json!({ ROOT: { "type": session.lock().status } }).to_string(),
+            ),
+            ("GET", "/session/session_1/message") => (
+                200,
+                Value::Array(session.lock().messages.clone()).to_string(),
+            ),
+            _ => live_test_handler(json!([]))(request),
+        }
+    }
 }
 
 fn sink(events: &Events) -> EventSink {
@@ -73,11 +135,16 @@ impl Harness {
         Self::with_messages(json!([]))
     }
 
-    /// `sessionMessages` is what `GET /session/session_1/message` returns.
+    /// `sessionMessages` is what `GET /session/session_1/message` returns
+    /// before any prompt.
     fn with_messages(session_messages: Value) -> Self {
         let host = FakeHost::new();
-        let handler = live_test_handler(session_messages);
-        host.respond_with(move |request| handler(request));
+        let session = Arc::new(Mutex::new(FakeSession {
+            messages: session_messages.as_array().cloned().unwrap_or_default(),
+            prompt_id: None,
+            status: "idle",
+        }));
+        host.respond_with(session_handler(&host, &session));
         let adapter =
             OpenCodeAdapter::new(host.children(), SharedCatalog::new(), host.spawner(), None);
         Self {
@@ -85,7 +152,47 @@ impl Harness {
             adapter,
             events: Arc::default(),
             injected: 0,
+            session,
         }
+    }
+
+    /// Put back the default handler after a test replaced it.
+    fn restore_handler(&self) {
+        self.host
+            .respond_with(session_handler(&self.host, &self.session));
+    }
+
+    /// The handler a test wraps: the default reply for `request`.
+    fn default_handler(&self) -> impl Fn(&HttpRequest) -> (u16, String) + Send + Sync + 'static {
+        session_handler(&self.host, &self.session)
+    }
+
+    /// The id of the last prompt OpenCode accepted.
+    fn prompt_id(&self) -> Option<String> {
+        self.session.lock().prompt_id.clone()
+    }
+
+    /// Add a durable message and announce it on the stream.
+    fn emit_message(&mut self, info: Value, parts: Value) {
+        let mut info = info;
+        if info.get("time").is_none() {
+            info["time"] = json!({ "created": now() });
+        }
+        self.session
+            .lock()
+            .messages
+            .push(json!({ "info": info.clone(), "parts": parts }));
+        info["sessionID"] = json!(ROOT);
+        self.sse(json!({ "type": "message.updated", "properties": { "info": info } }));
+    }
+
+    /// `session.status` idle with no durable change.
+    fn raw_idle(&mut self) {
+        self.session.lock().status = "idle";
+        self.sse(json!({
+            "type": "session.status",
+            "properties": { "sessionID": ROOT, "status": { "type": "idle" } },
+        }));
     }
 
     fn send(&self, input: SendTurnInput, events: &Events) -> smol::Task<anyhow::Result<()>> {
@@ -160,7 +267,23 @@ impl Harness {
         }));
     }
 
+    /// `idle`: for the root session, the turn's reply lands in the history
+    /// first.
     fn idle(&mut self, session_id: &str) {
+        if session_id == ROOT {
+            let mut session = self.session.lock();
+            session.status = "idle";
+            if let Some(prompt_id) = session.prompt_id.clone() {
+                let id = format!("assistant_{}", session.messages.len());
+                session.messages.push(json!({
+                    "info": {
+                        "id": id, "role": "assistant", "agent": "build", "parentID": prompt_id,
+                        "finish": "stop", "time": { "completed": now() },
+                    },
+                    "parts": [],
+                }));
+            }
+        }
         self.sse(json!({
             "type": "session.status",
             "properties": { "sessionID": session_id, "status": { "type": "idle" } },
@@ -379,11 +502,15 @@ fn reports_when_opencode_accepts_a_turn() {
                 HarnessEvent::SessionStarted,
             ]
         );
-        let prompt = &h.host.calls_to("/prompt_async")[0];
+        let prompt = h.host.calls_to("/prompt_async")[0].body.clone().unwrap();
+        let message_id = body(&h.host.calls_to("/prompt_async")[0])["messageID"]
+            .as_str()
+            .unwrap()
+            .to_string();
         assert_eq!(
-            prompt.body.as_deref(),
-            Some(
-                r#"{"model":{"providerID":"openrouter","modelID":"anthropic/claude-sonnet-4.6"},"agent":"build","parts":[{"type":"text","text":"delegate the investigation"}]}"#
+            prompt,
+            format!(
+                r#"{{"messageID":"{message_id}","model":{{"providerID":"openrouter","modelID":"anthropic/claude-sonnet-4.6"}},"agent":"build","parts":[{{"type":"text","text":"delegate the investigation"}}]}}"#
             )
         );
         let spawn = &h.host.spawns()[0];
@@ -1180,6 +1307,7 @@ fn answers_permissions_itself_while_planning() {
 fn reports_streamed_text_tools_retries_usage_and_session_errors() {
     smol::block_on(async {
         let mut h = Harness::new();
+        h.adapter.set_error_grace(Duration::from_millis(20));
         let done = h.start_turn().await;
         h.message(ROOT, "assistant_1", "assistant", None, None);
         h.part(
@@ -1209,6 +1337,9 @@ fn reports_streamed_text_tools_retries_usage_and_session_errors() {
                 "tokens": { "input": 100, "output": 20, "reasoning": 5, "cache": { "read": 300, "write": 0 } },
             } },
         }));
+        // The error ends the turn once the session stays idle without
+        // progress for the grace period.
+        h.session.lock().status = "idle";
         h.sse(json!({
             "type": "session.error",
             "properties": { "sessionID": ROOT, "error": { "data": { "message": "Provider overloaded" } } },
@@ -1295,12 +1426,26 @@ fn steers_only_an_active_turn_with_the_model_settings() {
         );
         let done = h.start_turn().await;
         steer(&h).await.unwrap();
-        let steered = &h.host.calls_to("/prompt_async")[1];
+        let steered = body(&h.host.calls_to("/prompt_async")[1]);
+        let message_id = steered["messageID"].as_str().unwrap().to_string();
+        assert!(message_id.starts_with("msg_"));
+        assert_ne!(
+            Some(message_id),
+            h.host
+                .calls_to("/prompt_async")
+                .first()
+                .map(|first| body(first)["messageID"].as_str().unwrap().to_string())
+        );
+        // A steer joins the turn, so it keeps the turn's agent.
         assert_eq!(
-            steered.body.as_deref(),
-            Some(
-                r#"{"model":{"providerID":"openai","modelID":"gpt-5.4"},"agent":"review","variant":"high","parts":[{"type":"text","text":"also check the tests"}]}"#
-            )
+            steered,
+            json!({
+                "messageID": steered["messageID"].clone(),
+                "model": { "providerID": "openai", "modelID": "gpt-5.4" },
+                "agent": "build",
+                "variant": "high",
+                "parts": [{ "type": "text", "text": "also check the tests" }],
+            })
         );
         h.idle(ROOT);
         done.await.unwrap();
@@ -1682,4 +1827,419 @@ fn applies_final_corrections_to_one_part_and_ignores_its_late_deltas() {
         h.idle(ROOT);
         done.await.unwrap();
     });
+}
+
+// Turn recovery: the durable history settles a turn, not the idle event.
+
+fn compact(h: &Harness) -> smol::Task<anyhow::Result<()>> {
+    let adapter = h.adapter.clone();
+    smol::spawn(async move {
+        adapter
+            .compact_context(session_input(RuntimeMode::Supervised), ignore_events())
+            .await
+    })
+}
+
+/// Give spawned work a moment, then report whether `task` settled.
+async fn settled<T>(task: &smol::Task<T>) -> bool {
+    smol::Timer::after(Duration::from_millis(40)).await;
+    task.is_finished()
+}
+
+fn session_error(name: &str, message: &str) -> Value {
+    json!({
+        "type": "session.error",
+        "properties": { "sessionID": ROOT, "error": { "name": name, "data": { "message": message } } },
+    })
+}
+
+#[test]
+fn waits_through_recoverable_context_overflow_and_returns_its_resumed_answer() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        h.sse(session_error("ContextOverflowError", "Context exceeded"));
+        h.emit_message(
+            json!({ "id": "compact_user", "role": "user" }),
+            json!([{ "type": "compaction", "auto": true }]),
+        );
+        h.emit_message(
+            json!({ "id": "summary", "role": "assistant", "agent": "compaction", "parentID": "compact_user", "finish": "stop" }),
+            json!([]),
+        );
+        let replayed = h.session.lock().messages[0]["parts"].clone();
+        h.emit_message(json!({ "id": "replayed_user", "role": "user" }), replayed);
+        assert!(!settled(&done).await);
+        assert!(!has_error(&h.events()));
+        assert!(h.events().contains(&HarnessEvent::Status {
+            text: "OpenCode is compacting context after the provider rejected its size.".into()
+        }));
+        h.emit_message(
+            json!({ "id": "recovered", "role": "assistant", "agent": "build", "parentID": "replayed_user", "finish": "stop" }),
+            json!([]),
+        );
+        h.part(
+            ROOT,
+            json!({ "id": "recovered_text", "messageID": "recovered", "type": "text", "text": "Recovered after compaction", "time": { "start": 1, "end": 2 } }),
+        );
+        h.raw_idle();
+        done.await.unwrap();
+        assert_eq!(
+            part_texts(&h.events(), "recovered_text"),
+            [("Recovered after compaction".to_string(), false)]
+        );
+        assert!(!has_error(&h.events()));
+    });
+}
+
+#[test]
+fn reports_context_overflow_when_the_compaction_itself_fails() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        h.sse(session_error("ContextOverflowError", "Context exceeded"));
+        h.emit_message(
+            json!({ "id": "compact_user", "role": "user" }),
+            json!([{ "type": "compaction", "auto": true }]),
+        );
+        h.emit_message(
+            json!({
+                "id": "summary", "role": "assistant", "agent": "compaction", "parentID": "compact_user",
+                "error": { "name": "ContextOverflowError", "data": { "message": "Too large to compact" } },
+            }),
+            json!([]),
+        );
+        h.raw_idle();
+        done.await.unwrap();
+        assert!(h.events().contains(&HarnessEvent::SessionError {
+            message: "Too large to compact".into()
+        }));
+    });
+}
+
+#[test]
+fn ignores_late_users_and_unrelated_newer_users_when_checking_idle() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        h.emit_message(
+            json!({ "id": "old_user", "role": "user", "time": { "created": 1 } }),
+            json!([{ "type": "text", "text": "Old request" }]),
+        );
+        h.emit_message(
+            json!({ "id": "old_reply", "role": "assistant", "parentID": "old_user", "agent": "build", "finish": "stop" }),
+            json!([]),
+        );
+        h.emit_message(
+            json!({ "id": "unrelated_user", "role": "user" }),
+            json!([{ "type": "text", "text": "Unrelated request" }]),
+        );
+        h.emit_message(
+            json!({ "id": "unrelated_reply", "role": "assistant", "parentID": "unrelated_user", "agent": "build", "finish": "stop" }),
+            json!([]),
+        );
+        h.raw_idle();
+        assert!(!settled(&done).await);
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn rechecks_an_idle_that_arrives_during_an_older_status_request() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        let stale = h.host.defer("GET", "/session/status");
+        h.raw_idle();
+        wait_for("status request", || {
+            !h.host.calls_to("/session/status").is_empty()
+        })
+        .await;
+        h.idle(ROOT);
+        h.settle().await;
+        stale
+            .send((200, json!({ ROOT: { "type": "busy" } }).to_string()))
+            .unwrap();
+        done.await.unwrap();
+        assert_eq!(h.host.calls_to("/session/status").len(), 2);
+    });
+}
+
+fn steer_input(text: &str) -> SteerTurnInput {
+    SteerTurnInput {
+        session_id: THREAD.into(),
+        cwd: "/repo".into(),
+        model: "opencode:openrouter/anthropic/claude-sonnet-4.6".into(),
+        model_settings: Some(ModelSettings::from([(
+            "agent".to_string(),
+            "build".to_string(),
+        )])),
+        text: text.into(),
+        attachments: None,
+    }
+}
+
+#[test]
+fn waits_for_the_latest_owned_steering_prompt_at_idle() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        let original = h.prompt_id().unwrap();
+        h.adapter
+            .steer_turn(steer_input("Current steering request"))
+            .await
+            .unwrap();
+        h.emit_message(
+            json!({ "id": "first_reply", "role": "assistant", "parentID": original, "agent": "build", "finish": "stop" }),
+            json!([]),
+        );
+        h.raw_idle();
+        assert!(!settled(&done).await);
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn keeps_the_plan_agent_on_a_steered_follow_up() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.send(plan_input(RuntimeMode::Supervised), &h.events);
+        wait_for("Plan prompt", || h.prompts() == 1).await;
+        h.adapter
+            .steer_turn(steer_input("Also account for Windows"))
+            .await
+            .unwrap();
+        let agents: Vec<Value> = h
+            .host
+            .calls_to("/prompt_async")
+            .iter()
+            .map(|call| body(call)["agent"].clone())
+            .collect();
+        assert_eq!(agents, [json!("plan"), json!("plan")]);
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn correlates_a_synthetic_continuation_only_after_its_current_compaction() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        h.emit_message(
+            json!({ "id": "compact_user", "role": "user" }),
+            json!([{ "type": "compaction", "auto": true }]),
+        );
+        h.emit_message(
+            json!({ "id": "summary", "role": "assistant", "parentID": "compact_user", "agent": "compaction", "finish": "stop" }),
+            json!([]),
+        );
+        h.emit_message(
+            json!({ "id": "continue_user", "role": "user" }),
+            json!([{ "type": "text", "text": "Continue", "synthetic": true, "metadata": { "compaction_continue": true } }]),
+        );
+        h.emit_message(
+            json!({ "id": "final_reply", "role": "assistant", "parentID": "continue_user", "agent": "build", "finish": "stop" }),
+            json!([]),
+        );
+        h.raw_idle();
+        done.await.unwrap();
+        assert!(completed(&h.events()));
+    });
+}
+
+#[test]
+fn does_not_use_a_delayed_manual_compaction_idle_to_complete_a_new_prompt() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        compact(&h).await.unwrap();
+        let done = h.start_turn().await;
+        h.raw_idle();
+        assert!(!settled(&done).await);
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn fails_manual_compaction_on_a_durable_summary_error() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let handler = h.default_handler();
+        let session = h.session.clone();
+        h.host.respond_with(move |request| {
+            if request.url.contains("/summarize") {
+                session.lock().messages.push(json!({
+                    "info": {
+                        "id": "failed_summary", "role": "assistant", "agent": "compaction",
+                        "error": { "data": { "message": "Summary failed" } },
+                    },
+                }));
+            }
+            handler(request)
+        });
+        let error = compact(&h).await.unwrap_err();
+        assert!(error.to_string().contains("Summary failed"));
+    });
+}
+
+#[test]
+fn keeps_a_failed_attachment_read_warning_nonfatal_through_a_successful_reply() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let handler = h.default_handler();
+        let host = h.host.clone();
+        h.host.respond_with(move |request| {
+            if request.url.contains("/prompt_async") {
+                host.sse(
+                    THREAD,
+                    session_error("UnknownError", "ENOENT: no such file"),
+                );
+            }
+            handler(request)
+        });
+        let done = h.start_turn().await;
+        h.wait_for_event("warning status", |event| {
+            *event
+                == HarnessEvent::Status {
+                    text: "ENOENT: no such file".into(),
+                }
+        })
+        .await;
+        assert!(!has_error(&h.events()));
+        h.idle(ROOT);
+        done.await.unwrap();
+        assert!(!has_error(&h.events()));
+    });
+}
+
+#[test]
+fn reports_terminal_setup_failures_without_waiting_for_a_user_or_idle_event() {
+    for message in ["Agent not found: missing", "Model not found: local/missing"] {
+        smol::block_on(async {
+            let mut h = Harness::new();
+            let handler = h.default_handler();
+            let host = h.host.clone();
+            h.host.respond_with(move |request| {
+                if request.url.contains("/prompt_async") {
+                    host.sse(THREAD, session_error("UnknownError", message));
+                    return (204, String::new());
+                }
+                handler(request)
+            });
+            h.turn().await.unwrap();
+            assert!(h.events().contains(&HarnessEvent::SessionError {
+                message: message.into()
+            }));
+            h.restore_handler();
+            let next = h.start_turn().await;
+            h.idle(ROOT);
+            next.await.unwrap();
+        });
+    }
+}
+
+#[test]
+fn bounds_an_anonymous_preparation_error_with_no_durable_progress() {
+    smol::block_on(async {
+        let h = Harness::new();
+        h.adapter.set_error_grace(Duration::from_millis(150));
+        let handler = h.default_handler();
+        let host = h.host.clone();
+        h.host.respond_with(move |request| {
+            if request.url.contains("/prompt_async") {
+                host.sse(
+                    THREAD,
+                    session_error("UnknownError", "Preparation hook failed"),
+                );
+                return (204, String::new());
+            }
+            handler(request)
+        });
+        let done = h.turn();
+        assert!(!settled(&done).await);
+        done.await.unwrap();
+        assert!(h.events().contains(&HarnessEvent::SessionError {
+            message: "Preparation hook failed".into()
+        }));
+    });
+}
+
+#[test]
+fn does_not_classify_an_attachment_warning_while_its_assistant_is_still_running() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        h.adapter.set_error_grace(Duration::from_millis(20));
+        let done = h.start_turn().await;
+        h.sse(session_error("UnknownError", "Attachment read failed"));
+        let prompt = h.prompt_id().unwrap();
+        h.emit_message(
+            json!({ "id": "running_reply", "role": "assistant", "parentID": prompt, "agent": "build" }),
+            json!([]),
+        );
+        h.raw_idle();
+        smol::Timer::after(Duration::from_millis(150)).await;
+        assert!(!has_error(&h.events()));
+        h.idle(ROOT);
+        done.await.unwrap();
+    });
+}
+
+#[test]
+fn clears_rejected_prompt_state_so_rewind_and_later_prompts_still_work() {
+    smol::block_on(async {
+        let h = Harness::with_messages(json!([{
+            "info": { "id": "previous_user", "role": "user", "time": { "created": 1 } },
+            "parts": [{ "type": "text", "text": "Previous request" }],
+        }]));
+        let handler = h.default_handler();
+        h.host.respond_with(move |request| {
+            if request.url.contains("/prompt_async") {
+                return (500, "Prompt rejected".into());
+            }
+            handler(request)
+        });
+        let error = h.turn().await.unwrap_err();
+        assert!(error.to_string().contains("Prompt rejected"));
+        let error = h
+            .adapter
+            .steer_turn(steer_input("Follow-up"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("No active turn"));
+        assert!(!rewind(&h).await.unwrap().submitted);
+        h.restore_handler();
+        let mut h = h;
+        let next = h.start_turn().await;
+        h.idle(ROOT);
+        next.await.unwrap();
+    });
+}
+
+#[test]
+fn rewinds_the_visible_request_before_internal_messages() {
+    for internal in [
+        json!([{ "type": "compaction", "auto": false }]),
+        json!([{ "type": "text", "text": "Continue", "synthetic": true }]),
+    ] {
+        smol::block_on(async {
+            let h = Harness::with_messages(json!([
+                {
+                    "info": { "id": "visible_user", "role": "user", "time": { "created": 1 } },
+                    "parts": [{ "type": "text", "text": "Original request" }],
+                },
+                { "info": { "id": "internal", "role": "user", "time": { "created": 2 } }, "parts": internal },
+            ]));
+            rewind(&h).await.unwrap();
+            let revert = h
+                .host
+                .http_calls()
+                .into_iter()
+                .find(|call| call.url.contains("/revert"))
+                .unwrap();
+            assert_eq!(body(&revert), json!({ "messageID": "visible_user" }));
+        });
+    }
 }

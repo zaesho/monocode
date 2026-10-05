@@ -227,6 +227,11 @@ pub fn bundled_default_model_id(harness: HarnessId) -> &'static str {
 pub struct ModelCatalog {
     overlays: BTreeMap<HarnessId, Vec<AgentModel>>,
     overlay_defaults: BTreeMap<HarnessId, String>,
+    /// Providers whose overlay came from a probe that did not finish.
+    incomplete: BTreeSet<HarnessId>,
+    /// Catalogs read in one working directory, for providers whose models
+    /// depend on project config. They never replace the home catalog.
+    project_overlays: BTreeMap<String, BTreeMap<HarnessId, Vec<AgentModel>>>,
 }
 
 impl ModelCatalog {
@@ -238,23 +243,87 @@ impl ModelCatalog {
     /// `setHarnessModels`: replace a provider's list with its live catalog.
     /// An empty list is ignored.
     pub fn set_harness_models(&mut self, harness: HarnessId, models: Vec<AgentModel>) {
+        self.set_harness_catalog(harness, models, true);
+    }
+
+    /// `setHarnessModels` with its `complete` flag. An incomplete list (a
+    /// probe still running or one that failed partway) shows in the picker
+    /// but does not count as a live catalog, and a model it lists without
+    /// settings keeps the settings the previous list had for it.
+    pub fn set_harness_catalog(
+        &mut self,
+        harness: HarnessId,
+        models: Vec<AgentModel>,
+        complete: bool,
+    ) {
         if models.is_empty() {
             return;
         }
+        if complete {
+            self.incomplete.remove(&harness);
+        } else {
+            self.incomplete.insert(harness);
+        }
+        let previous = self.overlays.get(&harness);
+        let models: Vec<AgentModel> = models
+            .into_iter()
+            .map(|mut model| {
+                if !complete
+                    && model.settings.is_none()
+                    && let Some(settings) = previous
+                        .and_then(|previous| previous.iter().find(|entry| entry.id == model.id))
+                        .and_then(|entry| entry.settings.clone())
+                {
+                    model.settings = Some(settings);
+                }
+                model
+            })
+            .collect();
         let default_id = pick_default_id(harness, &models);
         self.overlays.insert(harness, models);
         self.overlay_defaults.insert(harness, default_id);
     }
 
-    /// `hasLiveCatalog`: a live CLI catalog has replaced the bundled list.
+    /// `projectHarnessModels`: the catalog read in `cwd`, when one loaded.
+    pub fn project_harness_models(&self, harness: HarnessId, cwd: &str) -> Option<&[AgentModel]> {
+        self.project_overlays
+            .get(cwd)?
+            .get(&harness)
+            .map(Vec::as_slice)
+    }
+
+    /// `setProjectHarnessModels`. An empty list is kept: that project has
+    /// no models.
+    pub fn set_project_harness_models(
+        &mut self,
+        harness: HarnessId,
+        cwd: &str,
+        models: Vec<AgentModel>,
+    ) {
+        self.project_overlays
+            .entry(cwd.to_string())
+            .or_default()
+            .insert(harness, models);
+    }
+
+    /// `hasLiveCatalog`: a complete live CLI catalog has replaced the
+    /// bundled list.
     pub fn has_live_catalog(&self, harness: HarnessId) -> bool {
-        self.overlays.contains_key(&harness)
+        self.overlays.contains_key(&harness) && !self.incomplete.contains(&harness)
     }
 
     /// `resetHarnessModelOverlays`.
     pub fn reset_overlays(&mut self) {
         self.overlays.clear();
+        self.incomplete.clear();
         self.overlay_defaults.clear();
+        self.project_overlays.clear();
+    }
+
+    /// Droid's bundled list is only a placeholder, so saved Droid models and
+    /// settings stay as they are until a complete live catalog loads.
+    fn awaiting_droid_catalog(&self, harness: HarnessId) -> bool {
+        harness == HarnessId::Droid && !self.has_live_catalog(harness)
     }
 
     /// `defaultModelId`.
@@ -293,9 +362,36 @@ impl ModelCatalog {
 
     /// `resolveModel`: the catalog entry a saved model id means for `harness`.
     pub fn resolve_model(&self, harness: HarnessId, id: Option<&str>) -> AgentModel {
-        let available = self.models_for(harness);
+        self.resolve_model_in(harness, id, None)
+    }
+
+    /// `resolveModel(harness, id, cwd)`: like [`Self::resolve_model`], but a
+    /// catalog read in `cwd` replaces the home catalog for that provider.
+    pub fn resolve_model_in(
+        &self,
+        harness: HarnessId,
+        id: Option<&str>,
+        cwd: Option<&str>,
+    ) -> AgentModel {
+        let scoped = cwd.and_then(|cwd| self.project_harness_models(harness, cwd));
+        let available = scoped.unwrap_or_else(|| self.models_for(harness));
+        if self.awaiting_droid_catalog(harness)
+            && let Some(id) = id
+            && id.starts_with("droid:")
+            && id != "droid:default"
+        {
+            if let Some(found) = self.find_model(id) {
+                return found.clone();
+            }
+            let native = native_id_from(id);
+            return AgentModel::new(id, harness, &native).with_native_id(&native);
+        }
         if let Some(id) = id.filter(|id| !id.is_empty()) {
-            if let Some(exact) = self.find_model(id)
+            let exact = match scoped {
+                Some(scoped) => scoped.iter().find(|model| model.id == id),
+                None => self.find_model(id),
+            };
+            if let Some(exact) = exact
                 && exact.harness == harness
             {
                 return exact.clone();
@@ -395,16 +491,36 @@ impl ModelCatalog {
         let fallback = if fallback_id.is_empty() {
             None
         } else {
-            self.find_model(&fallback_id)
+            available.iter().find(|model| model.id == fallback_id)
         };
         fallback.unwrap_or(&available[0]).clone()
     }
 
     /// `modelContextWindow`: catalog-reported context window, when known.
     pub fn model_context_window(&self, id: &str) -> Option<i64> {
-        self.find_model(id)?
-            .context_window
-            .filter(|window| *window > 0)
+        self.model_context_window_in(id, None)
+    }
+
+    /// `modelContextWindow(id, cwd)`: a project's catalog decides the window
+    /// for its own models, even when the home catalog lists the same id.
+    pub fn model_context_window_in(&self, id: &str, cwd: Option<&str>) -> Option<i64> {
+        let global = self.find_model(id);
+        let harness = global.map(|model| model.harness).or_else(|| {
+            HARNESSES
+                .into_iter()
+                .find(|harness| id.starts_with(&format!("{harness}:")))
+        });
+        let scoped = cwd
+            .zip(harness)
+            .and_then(|(cwd, harness)| self.project_harness_models(harness, cwd));
+        let model = match scoped {
+            Some(scoped) => scoped.iter().find(|model| model.id == id).or_else(|| {
+                let native = native_id_from(id);
+                scoped.iter().find(|model| model.native_or_key() == native)
+            }),
+            None => global,
+        };
+        model?.context_window.filter(|window| *window > 0)
     }
 
     /// `nativeModelId` for a saved model key.
@@ -422,7 +538,7 @@ impl ModelCatalog {
         model: &AgentModel,
         current: Option<&ModelSettings>,
     ) -> ModelSettings {
-        if self.models_for(model.harness).is_empty() {
+        if self.models_for(model.harness).is_empty() || self.awaiting_droid_catalog(model.harness) {
             return current.cloned().unwrap_or_default();
         }
         let mut next = default_model_settings(model);
@@ -446,7 +562,7 @@ impl ModelCatalog {
         current: Option<&ModelSettings>,
         last_settings: &ModelSettings,
     ) -> ModelSettings {
-        if self.models_for(model.harness).is_empty() {
+        if self.models_for(model.harness).is_empty() || self.awaiting_droid_catalog(model.harness) {
             return current.cloned().unwrap_or_default();
         }
         let mut merged = current.cloned().unwrap_or_default();
@@ -1721,6 +1837,80 @@ mod tests {
 
     // live catalog overlays
     #[test]
+    fn uses_each_projects_context_limit_for_the_same_provider_model_id() {
+        let mut catalog = ModelCatalog::new();
+        let mut model = AgentModel::new("opencode:fixture/same", HarnessId::Opencode, "Fixture");
+        model.context_window = Some(100_000);
+        let with_window = |window: i64| AgentModel {
+            context_window: Some(window),
+            ..model.clone()
+        };
+        catalog.set_harness_models(HarnessId::Opencode, vec![model.clone()]);
+        catalog.set_project_harness_models(
+            HarnessId::Opencode,
+            "/project-a",
+            vec![with_window(8_192)],
+        );
+        catalog.set_project_harness_models(
+            HarnessId::Opencode,
+            "/project-b",
+            vec![with_window(16_384)],
+        );
+        catalog.set_project_harness_models(HarnessId::Opencode, "/project-empty", Vec::new());
+        assert_eq!(catalog.model_context_window(&model.id), Some(100_000));
+        assert_eq!(
+            catalog.model_context_window_in(&model.id, Some("/project-a")),
+            Some(8_192)
+        );
+        assert_eq!(
+            catalog.model_context_window_in(&model.id, Some("/project-b")),
+            Some(16_384)
+        );
+        assert_eq!(
+            catalog.model_context_window_in(&model.id, Some("/project-other")),
+            Some(100_000)
+        );
+        assert_eq!(
+            catalog.model_context_window_in(&model.id, Some("/project-empty")),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_project_model_selection_when_resolving_in_that_project() {
+        let mut catalog = ModelCatalog::new();
+        catalog.set_harness_models(
+            HarnessId::Opencode,
+            vec![AgentModel::new(
+                "opencode:home/model",
+                HarnessId::Opencode,
+                "Home",
+            )],
+        );
+        let project = AgentModel::new("opencode:fixture/model", HarnessId::Opencode, "Project");
+        catalog.set_project_harness_models(HarnessId::Opencode, "/project", vec![project.clone()]);
+        assert_eq!(
+            catalog
+                .resolve_model_in(HarnessId::Opencode, Some(&project.id), Some("/project"))
+                .id,
+            project.id
+        );
+        assert_eq!(
+            catalog
+                .resolve_model_in(HarnessId::Opencode, Some(&project.id), Some("/other"))
+                .id,
+            "opencode:home/model"
+        );
+        // The home catalog does not borrow a project-only model.
+        assert_eq!(
+            catalog
+                .resolve_model(HarnessId::Opencode, Some("opencode:home/model"))
+                .id,
+            "opencode:home/model"
+        );
+    }
+
+    #[test]
     fn retains_a_saved_codex_model_and_settings_before_its_catalog_loads() {
         let catalog = ModelCatalog::new();
         let model = catalog.resolve_model(HarnessId::Codex, Some("codex:gpt-5.6-sol"));
@@ -2061,5 +2251,54 @@ mod tests {
             "grok-4.5[effort=high]"
         );
         assert_eq!(catalog.model_context_window("grok:grok-4.6"), Some(500_000));
+    }
+
+    #[test]
+    fn preserves_a_saved_droid_model_and_effort_before_a_complete_catalog() {
+        let mut catalog = ModelCatalog::new();
+        let saved = catalog.resolve_model(HarnessId::Droid, Some("droid:gpt-6-luna"));
+        assert_eq!(saved.id, "droid:gpt-6-luna");
+        assert_eq!(native_model_id(&saved), "gpt-6-luna");
+        let effort = settings(&[("effort", "high")]);
+        assert_eq!(catalog.merge_model_settings(&saved, Some(&effort)), effort);
+
+        let other = || vec![AgentModel::new("droid:other", HarnessId::Droid, "Other")];
+        catalog.set_harness_catalog(HarnessId::Droid, other(), false);
+        assert!(!catalog.has_live_catalog(HarnessId::Droid));
+        assert_eq!(
+            catalog.resolve_model(HarnessId::Droid, Some(&saved.id)).id,
+            saved.id
+        );
+        assert_eq!(catalog.merge_model_settings(&saved, Some(&effort)), effort);
+
+        catalog.set_harness_models(HarnessId::Droid, other());
+        assert!(catalog.has_live_catalog(HarnessId::Droid));
+        let resolved = catalog.resolve_model(HarnessId::Droid, Some(&saved.id));
+        assert!(
+            catalog
+                .merge_model_settings(&resolved, Some(&effort))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_incomplete_catalog_keeps_settings_the_previous_list_had() {
+        let mut catalog = ModelCatalog::new();
+        let mut luna = AgentModel::new("droid:luna", HarnessId::Droid, "Luna");
+        luna.settings = Some(vec![select(
+            "effort",
+            "Reasoning",
+            "low",
+            &[("low", "Low"), ("high", "High")],
+        )]);
+        catalog.set_harness_models(HarnessId::Droid, vec![luna.clone()]);
+        let plain = AgentModel::new("droid:luna", HarnessId::Droid, "Luna");
+        catalog.set_harness_catalog(HarnessId::Droid, vec![plain.clone()], false);
+        assert_eq!(
+            catalog.models_for(HarnessId::Droid)[0].settings,
+            luna.settings
+        );
+        catalog.set_harness_catalog(HarnessId::Droid, vec![plain], true);
+        assert_eq!(catalog.models_for(HarnessId::Droid)[0].settings, None);
     }
 }

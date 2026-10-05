@@ -61,6 +61,7 @@ fn batched(event: &HarnessEvent) -> bool {
     matches!(
         event,
         HarnessEvent::MessageDelta { .. }
+            | HarnessEvent::MessagePart { .. }
             | HarnessEvent::ReasoningDelta { .. }
             | HarnessEvent::ToolUpdated { .. }
             | HarnessEvent::AgentStep { .. }

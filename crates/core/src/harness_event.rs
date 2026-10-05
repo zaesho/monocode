@@ -68,6 +68,16 @@ pub enum HarnessEvent {
     },
     #[serde(rename = "message.delta")]
     MessageDelta { text: String },
+    /// The full current text of one provider message part. A repeat with
+    /// the same `part_id` replaces the text in place, so a provider can
+    /// correct text it already streamed.
+    #[serde(rename = "message.part", rename_all = "camelCase")]
+    MessagePart {
+        part_id: String,
+        text: String,
+        reasoning: bool,
+        streaming: bool,
+    },
     #[serde(rename = "message.completed")]
     MessageCompleted,
     /// `image.generated` has two shapes: inline base64 data, or a file on disk.

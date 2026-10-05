@@ -242,3 +242,41 @@ fn starts_a_waiting_recovery_after_another_provider_login_fails(cx: &mut TestApp
     let claude = host.cache.borrow().get("claude:default").cloned().unwrap();
     assert_eq!(claude.error.as_deref(), Some("Claude login failed"));
 }
+
+#[gpui::test]
+fn a_remote_session_shows_no_desktop_usage_and_fetches_none(cx: &mut TestAppContext) {
+    let host = Rc::new(FakeUsage::default());
+    host.answer(
+        RateLimitProvider::Droid,
+        connected(RateLimitProvider::Droid),
+    );
+    let props = |environment_id: Option<&str>| UsageFooterProps {
+        providers: vec![RateLimitProvider::Droid],
+        session: Some(UsageFooterSession {
+            id: Some("droid-session".into()),
+            environment_id: environment_id.map(str::to_string),
+            ..UsageFooterSession::new(HarnessId::Droid)
+        }),
+        ..Default::default()
+    };
+    let (_, remote) = mount_footer(
+        cx,
+        host.clone(),
+        props(Some("host-b")),
+        UsageFooterCallbacks::default(),
+    );
+    assert!(exists(remote, "text:not connected"));
+    click(remote, "button:Refresh usage");
+    assert_eq!(host.fetch_count(RateLimitProvider::Droid), 0);
+    remote.update(|window, _| window.remove_window());
+    remote.run_until_parked();
+
+    let (_, local) = mount_footer(
+        cx,
+        host.clone(),
+        props(None),
+        UsageFooterCallbacks::default(),
+    );
+    assert_eq!(host.fetch_count(RateLimitProvider::Droid), 1);
+    assert!(!exists(local, "text:not connected"));
+}

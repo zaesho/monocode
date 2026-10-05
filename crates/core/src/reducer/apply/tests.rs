@@ -1700,3 +1700,30 @@ fn reports_no_change_where_the_typescript_kept_the_session() {
         assert_eq!(next, session);
     }
 }
+
+#[test]
+fn updates_the_exact_provider_part_after_tools_and_later_text_without_retaining_corrected_text() {
+    let mut t = T::new();
+    let part = |part_id: &str, text: &str, streaming: bool| json!({ "type": "message.part", "partId": part_id, "text": text, "reasoning": false, "streaming": streaming });
+    let session = t.session(HarnessId::Opencode, "/tmp");
+    let session = t.apply_all(
+        &session,
+        &[
+            part("first", "Hello worle", true),
+            json!({ "type": "tool.started", "callId": "read", "title": "Read file" }),
+            part("second", "Next message", true),
+        ],
+    );
+    let first_id = session.blocks[0].id.clone();
+    let session = t.apply(&session, part("first", "Hello world", false));
+    assert_eq!(session.blocks[0].id, first_id);
+    assert_eq!(session.blocks[0].text, "Hello world");
+    assert_eq!(session.blocks[0].streaming, Some(false));
+    assert_eq!(session.blocks[0].provider_part_id.as_deref(), Some("first"));
+    assert_eq!(session.blocks[2].text, "Next message");
+    let session = t.apply(&session, part("first", "Hi", false));
+    assert_eq!(session.blocks[0].text, "Hi");
+    assert_eq!(session.blocks.len(), 3);
+    // An empty first snapshot adds nothing.
+    assert_eq!(t.apply(&session, part("third", "", true)).blocks.len(), 3);
+}

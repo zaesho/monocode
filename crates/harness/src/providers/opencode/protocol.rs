@@ -15,7 +15,6 @@ use monocode_core::attachment::{
     Attachment, attachment_path, attachment_path_text, is_vision_image, prompt_text,
 };
 use monocode_core::block::{ToolPreview, TurnMetrics};
-use monocode_core::harness::RuntimeMode;
 use monocode_core::harness_event::{ApprovalDecision, HarnessEvent};
 use monocode_core::js;
 use monocode_core::task_list::is_task_list_tool_name;
@@ -81,6 +80,7 @@ pub struct OpenCodePermissionRule {
     pub action: PermissionAction,
 }
 
+#[cfg(test)]
 impl OpenCodePermissionRule {
     fn new(permission: &str, pattern: &str, action: PermissionAction) -> Self {
         Self {
@@ -254,6 +254,63 @@ pub fn compare_semver(left: &str, right: &str) -> i64 {
     0
 }
 
+/// The only OpenCode major version whose server API this adapter speaks.
+pub const MAXIMUM_OPENCODE_MAJOR_VERSION: i64 = 1;
+
+/// `isSupportedOpenCodeVersion`: major version 1, at or after the minimum.
+pub fn is_supported_open_code_version(version: &str) -> bool {
+    parse_int(version.split('.').next().unwrap_or_default()) == Some(MAXIMUM_OPENCODE_MAJOR_VERSION)
+        && compare_semver(version, MINIMUM_OPENCODE_VERSION) >= 0
+}
+
+/// `unsupportedOpenCodeVersionMessage`.
+pub fn unsupported_open_code_version_message(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!(
+            "OpenCode v{version} is unsupported. MonoCode requires OpenCode v{MINIMUM_OPENCODE_VERSION} or newer within major version 1. OpenCode 2 uses a different API."
+        ),
+        None => format!(
+            "Unable to determine OpenCode version. MonoCode requires OpenCode v{MINIMUM_OPENCODE_VERSION} or newer within major version 1."
+        ),
+    }
+}
+
+/// The last timestamp `next_open_code_message_id` encoded, and how many ids
+/// it gave out within that millisecond.
+static MESSAGE_ID_CLOCK: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// `nextOpenCodeMessageId`: a `msg_` id in OpenCode's ascending timestamp
+/// encoding. Revert boundaries compare ids, so ids MonoCode generates must
+/// sort after the ones OpenCode already stored.
+pub fn next_open_code_message_id(timestamp: u64) -> String {
+    message_id_from_clock(&MESSAGE_ID_CLOCK, timestamp)
+}
+
+fn message_id_from_clock(clock: &std::sync::Mutex<(u64, u64)>, timestamp: u64) -> String {
+    let counter = {
+        let mut clock = clock.lock().unwrap_or_else(|error| error.into_inner());
+        if clock.0 != timestamp {
+            *clock = (timestamp, 0);
+        }
+        clock.1 += 1;
+        clock.1
+    };
+    let time = (u128::from(timestamp) * 0x1000 + u128::from(counter)) & 0xffff_ffff_ffff;
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let suffix: String = uuid::Uuid::new_v4().as_bytes()[..14]
+        .iter()
+        .map(|byte| CHARS[usize::from(*byte) % CHARS.len()] as char)
+        .collect();
+    format!("msg_{time:012x}{suffix}")
+}
+
+/// The current time for `next_open_code_message_id`, in milliseconds.
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// `isOpenCodeDefaultTitle`: the placeholder title OpenCode gives a session.
 pub fn is_open_code_default_title(title: &str) -> bool {
     OPENCODE_DEFAULT_TITLE_PATTERN.is_match(title)
@@ -304,28 +361,7 @@ pub fn is_open_code_not_found(cause: &Value) -> bool {
     false
 }
 
-/// `buildOpenCodePermissionRules`: the session permission rules for an
-/// access mode. Questions are always allowed so the agent can ask.
-pub fn build_open_code_permission_rules(runtime_mode: RuntimeMode) -> Vec<OpenCodePermissionRule> {
-    use PermissionAction::*;
-    if runtime_mode == RuntimeMode::FullAccess {
-        return vec![OpenCodePermissionRule::new("*", "*", Allow)];
-    }
-    let mut rules = vec![
-        OpenCodePermissionRule::new("*", "*", Ask),
-        OpenCodePermissionRule::new("question", "*", Allow),
-    ];
-    if matches!(
-        runtime_mode,
-        RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto
-    ) {
-        rules.push(OpenCodePermissionRule::new("edit", "*", Allow));
-    }
-    if runtime_mode == RuntimeMode::Auto {
-        rules.push(OpenCodePermissionRule::new("read", "*", Allow));
-    }
-    rules
-}
+pub use super::policy::build_open_code_permission_rules;
 
 /// `toOpenCodePermissionReply`.
 pub fn to_open_code_permission_reply(decision: ApprovalDecision) -> PermissionReply {
@@ -418,11 +454,17 @@ pub struct MergedText {
 
 /// `mergeOpenCodeAssistantText`: fold a part snapshot into the text already
 /// shown. A shorter snapshot that the shown text starts with is stale and
-/// keeps the longer text.
-pub fn merge_open_code_assistant_text(previous_text: Option<&str>, next_text: &str) -> MergedText {
+/// keeps the longer text, unless it is the part's `final` snapshot, which
+/// may correct or shorten the text.
+pub fn merge_open_code_assistant_text(
+    previous_text: Option<&str>,
+    next_text: &str,
+    final_snapshot: bool,
+) -> MergedText {
     let latest_text = match previous_text {
         Some(previous)
-            if !previous.is_empty()
+            if !final_snapshot
+                && !previous.is_empty()
                 && previous.len() > next_text.len()
                 && previous.starts_with(next_text) =>
         {
@@ -597,6 +639,7 @@ pub fn tool_kind_from_name(tool_name: &str) -> String {
         || normalized.contains("glob")
         || normalized.contains("search")
         || normalized.contains("find")
+        || normalized == "list"
     {
         return "search".into();
     }
@@ -851,6 +894,7 @@ impl PartStore {
 mod tests {
     use super::*;
     use monocode_core::attachment::{ATTACHMENT_ONLY_PROMPT, AttachmentKind};
+    use monocode_core::harness::RuntimeMode;
     use serde_json::json;
 
     fn rec(value: Value) -> Record {
@@ -1003,20 +1047,65 @@ mod tests {
         assert!(compare_semver("1.x.2", "1.0.1") > 0);
     }
 
+    #[test]
+    fn checks_the_v1_api_version() {
+        for (version, supported) in [
+            ("1.14.18", false),
+            ("1.14.19", true),
+            ("1.15.0", true),
+            ("2.0.20", false),
+        ] {
+            assert_eq!(
+                is_supported_open_code_version(version),
+                supported,
+                "{version}"
+            );
+        }
+        assert!(
+            unsupported_open_code_version_message(Some("2.0.20"))
+                .contains("OpenCode 2 uses a different API")
+        );
+    }
+
+    #[test]
+    fn generates_ordered_message_ids_with_the_provider_timestamp_encoding() {
+        let timestamp = 1_791_034_039_388_u64;
+        let clock = std::sync::Mutex::new((0, 0));
+        let first = message_id_from_clock(&clock, timestamp);
+        let second = message_id_from_clock(&clock, timestamp);
+        assert!(
+            Regex::new(r"^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+                .unwrap()
+                .is_match(&first)
+        );
+        let encoded = (u128::from(timestamp) * 4096 + 1) & 0xffff_ffff_ffff;
+        assert_eq!(&first[4..16], format!("{encoded:012x}"));
+        assert!(first < second);
+    }
+
+    #[test]
+    fn maps_the_list_tool_to_search() {
+        assert_eq!(tool_kind_from_name("list"), "search");
+    }
+
     // describe("buildOpenCodePermissionRules")
 
     #[test]
     fn allows_everything_in_full_access() {
         assert_eq!(
-            serde_json::to_value(build_open_code_permission_rules(RuntimeMode::FullAccess))
-                .unwrap(),
+            serde_json::to_value(build_open_code_permission_rules(
+                RuntimeMode::FullAccess,
+                false,
+                None
+            ))
+            .unwrap(),
             json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
         );
     }
 
     #[test]
     fn asks_by_default_and_allows_edits_in_auto_accept_edits() {
-        let rules = build_open_code_permission_rules(RuntimeMode::AutoAcceptEdits);
+        let rules = build_open_code_permission_rules(RuntimeMode::AutoAcceptEdits, false, None);
         assert!(rules.contains(&OpenCodePermissionRule::new(
             "edit",
             "*",
@@ -1026,7 +1115,7 @@ mod tests {
             rules[0],
             OpenCodePermissionRule::new("*", "*", PermissionAction::Ask)
         );
-        let auto = build_open_code_permission_rules(RuntimeMode::Auto);
+        let auto = build_open_code_permission_rules(RuntimeMode::Auto, false, None);
         assert!(auto.contains(&OpenCodePermissionRule::new(
             "read",
             "*",
@@ -1051,7 +1140,7 @@ mod tests {
     #[test]
     fn merge_emits_only_the_new_suffix() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hel"), "Hello"),
+            merge_open_code_assistant_text(Some("Hel"), "Hello", false),
             MergedText {
                 latest_text: "Hello".into(),
                 delta_to_emit: "lo".into(),
@@ -1062,7 +1151,7 @@ mod tests {
     #[test]
     fn merge_keeps_a_longer_snapshot_if_the_next_update_shrinks() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hello world"), "Hello"),
+            merge_open_code_assistant_text(Some("Hello world"), "Hello", false),
             MergedText {
                 latest_text: "Hello world".into(),
                 delta_to_emit: "".into(),
@@ -1073,13 +1162,23 @@ mod tests {
     #[test]
     fn merge_slices_at_character_boundaries() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("caf"), "café!").delta_to_emit,
+            merge_open_code_assistant_text(Some("caf"), "café!", false).delta_to_emit,
             "é!"
         );
         assert_eq!(
-            merge_open_code_assistant_text(None, "naïve").delta_to_emit,
+            merge_open_code_assistant_text(None, "naïve", false).delta_to_emit,
             "naïve"
         );
+    }
+
+    #[test]
+    fn accepts_final_text_corrections_and_shortening() {
+        let merge = |previous: &str, next: &str| {
+            merge_open_code_assistant_text(Some(previous), next, true).latest_text
+        };
+        assert_eq!(merge("Hello worle", "Hello world"), "Hello world");
+        assert_eq!(merge("Hello world", "Hello"), "Hello");
+        assert_eq!(merge("Hello", ""), "");
     }
 
     // describe("OpenCode helpers")

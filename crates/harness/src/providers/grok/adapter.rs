@@ -43,8 +43,8 @@ use super::protocol::{
     plan_from_exit_plan, session_id_from_result,
 };
 use super::shared::{
-    Wiring, ignore_unsupported_control, initialize_params, respond_method_not_found,
-    selected_outcome, spawn_method_not_found,
+    Wiring, ignore_unsupported_control, initialize_params, permission_outcome,
+    respond_method_not_found, selected_outcome, spawn_method_not_found,
 };
 use super::text::GrokText;
 
@@ -835,13 +835,21 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
                 ApprovalDecision::Deny
             },
             &request.option_ids,
+            &request.option_kinds,
         );
-        return live.acp.respond(id, selected_outcome(&option_id)).await;
+        return live
+            .acp
+            .respond(id, permission_outcome(option_id.as_deref()))
+            .await;
     }
 
     let runtime_mode = live.state.lock().runtime_mode;
-    if let Some(auto) = pick_auto_option(runtime_mode, request.kind.as_deref(), &request.option_ids)
-    {
+    if let Some(auto) = pick_auto_option(
+        runtime_mode,
+        request.kind.as_deref(),
+        &request.option_ids,
+        &request.option_kinds,
+    ) {
         return live.acp.respond(id, selected_outcome(&auto)).await;
     }
 
@@ -863,7 +871,10 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
     live.acp
         .respond(
             id,
-            selected_outcome(&permission_option_id(decision, &request.option_ids)),
+            permission_outcome(
+                permission_option_id(decision, &request.option_ids, &request.option_kinds)
+                    .as_deref(),
+            ),
         )
         .await
 }

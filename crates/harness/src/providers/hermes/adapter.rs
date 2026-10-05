@@ -37,7 +37,8 @@ use crate::providers::grok::protocol::{
     events_from_acp_update, permission_option_id, permission_request_from_acp, pick_auto_option,
 };
 use crate::providers::grok::shared::{
-    Wiring, initialize_params, respond_method_not_found, selected_outcome, spawn_method_not_found,
+    Wiring, initialize_params, permission_outcome, respond_method_not_found, selected_outcome,
+    spawn_method_not_found,
 };
 
 use super::catalog::HermesCatalog;
@@ -913,14 +914,20 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
             .acp
             .respond(
                 id,
-                selected_outcome(&permission_option_id(decision, &request.option_ids)),
+                permission_outcome(
+                    permission_option_id(decision, &request.option_ids, &request.option_kinds)
+                        .as_deref(),
+                ),
             )
             .await;
     }
 
-    if let Some(automatic) =
-        pick_auto_option(runtime_mode, request.kind.as_deref(), &request.option_ids)
-    {
+    if let Some(automatic) = pick_auto_option(
+        runtime_mode,
+        request.kind.as_deref(),
+        &request.option_ids,
+        &request.option_kinds,
+    ) {
         return live.acp.respond(id, selected_outcome(&automatic)).await;
     }
 
@@ -942,7 +949,10 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
     live.acp
         .respond(
             id,
-            selected_outcome(&permission_option_id(decision, &request.option_ids)),
+            permission_outcome(
+                permission_option_id(decision, &request.option_ids, &request.option_kinds)
+                    .as_deref(),
+            ),
         )
         .await
 }

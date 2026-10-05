@@ -4,6 +4,7 @@
 //! talks to it over HTTP and reads its Server-Sent Events stream.
 //!
 //! - `protocol`: pure helpers over server output, SSE payloads, and parts.
+//! - `policy`: the managed permission rules and server configuration.
 //! - `client`: the HTTP and SSE client for one server.
 //! - `adapter`: live sessions, the [`HarnessAdapter`] implementation.
 //! - `text`, `title`, `git`: one-shot prompts on a separate server.
@@ -18,6 +19,7 @@ pub mod client;
 mod deps;
 pub mod dispatch;
 pub mod git;
+pub mod policy;
 pub mod protocol;
 pub mod text;
 pub mod title;

@@ -23,7 +23,9 @@ use monocode_core::paths::path_key;
 use monocode_core::plan::{
     build_plan_prompt, is_provider_failure_text, plan_turn_key, plan_turn_prompt,
 };
-use monocode_core::reducer::{now_ms, promote_last_assistant_to_plan_mut, stop_streaming_mut};
+use monocode_core::reducer::{
+    MessageParts, now_ms, promote_last_assistant_to_plan_mut, stop_streaming_mut,
+};
 use monocode_core::session::{PendingHarnessSwitch, session_work_cwd};
 use monocode_core::{Attachment, HarnessEvent, HarnessId, Session, js};
 use monocode_harness::core::registry::{AcceptedHook, EventSink, TitleInput};
@@ -182,6 +184,9 @@ pub(crate) struct TurnRun {
 /// The turn's mutable state (the `let` bindings in the TypeScript closure).
 struct TurnState {
     control_text: String,
+    /// Provider parts behind `control_text` and `proposal_text`, so a
+    /// corrected part replaces its text.
+    message_parts: MessageParts,
     control_error: Option<String>,
     proposal: Option<OrchestrationProposal>,
     proposal_text: String,
@@ -211,6 +216,7 @@ pub(crate) async fn run_turn(this: WeakEntity<Submit>, run: TurnRun, cx: &mut As
     let cx: &AsyncApp = cx;
     let mut state = TurnState {
         control_text: String::new(),
+        message_parts: MessageParts::default(),
         control_error: Some("Turn did not complete".into()),
         proposal: run.proposal_draft.clone(),
         proposal_text: String::new(),
@@ -616,6 +622,7 @@ impl TurnRun {
                 first
             } else {
                 state.proposal_text.clear();
+                state.message_parts.clear();
                 state.native_proposal_text.clear();
                 let repair = self.peers.orchestration.repair_prompt(&first);
                 self.send_turn(repair, Vec::new(), state, cx).await?;
@@ -743,6 +750,15 @@ impl TurnRun {
                     state.control_text.push_str(text);
                     keep_tail(&mut state.control_text, 20_000);
                 }
+                HarnessEvent::MessagePart {
+                    part_id,
+                    text,
+                    reasoning: false,
+                    ..
+                } => {
+                    state.control_text = state.message_parts.update(part_id, text);
+                    keep_tail(&mut state.control_text, 20_000);
+                }
                 HarnessEvent::MessageCompleted => state.control_text.push('\n'),
                 _ => {}
             }
@@ -787,6 +803,16 @@ impl TurnRun {
             match &event {
                 HarnessEvent::MessageDelta { text } => {
                     state.proposal_text.push_str(text);
+                    keep_tail(&mut state.proposal_text, 200_000);
+                    return None;
+                }
+                HarnessEvent::MessagePart {
+                    part_id,
+                    text,
+                    reasoning: false,
+                    ..
+                } => {
+                    state.proposal_text = state.message_parts.update(part_id, text);
                     keep_tail(&mut state.proposal_text, 200_000);
                     return None;
                 }

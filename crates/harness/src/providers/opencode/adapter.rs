@@ -54,20 +54,27 @@ use super::git::{
     SharedGitSource, generate_open_code_branch_name, generate_open_code_commit_message,
     generate_open_code_pr_content,
 };
+use super::policy::{
+    build_open_code_permission_rules, managed_open_code_config, parse_open_code_tool_output_glob,
+    verify_managed_open_code_policy,
+};
 use super::protocol::{
-    MINIMUM_OPENCODE_VERSION, OpenCodePart, ParsedOpenCodeModelSlug, PartStore, PartTime, Record,
-    append_open_code_assistant_text_delta, build_open_code_permission_rules, compare_semver,
-    context_used_from_message_info, detail_from_tool_part, event_session_id, field,
-    is_known_hidden_agent, is_truthy, merge_open_code_assistant_text, open_code_child_session_id,
-    parse_open_code_model_slug, parse_open_code_version, parse_server_url_from_output,
-    permission_title, preview_from_tool_part, record_field, session_error_message, string_field,
-    text_delta_event, to_open_code_permission_reply, to_open_code_prompt_parts,
-    tool_kind_from_name, turn_metrics_from_message_info,
+    OpenCodePart, ParsedOpenCodeModelSlug, PartStore, PartTime, Record,
+    append_open_code_assistant_text_delta, as_record, context_used_from_message_info,
+    detail_from_tool_part, event_session_id, field, is_known_hidden_agent,
+    is_supported_open_code_version, is_truthy, merge_open_code_assistant_text,
+    next_open_code_message_id, now_millis, open_code_child_session_id, parse_open_code_model_slug,
+    parse_open_code_version, parse_server_url_from_output, permission_title,
+    preview_from_tool_part, record_field, session_error_message, string_field,
+    to_open_code_permission_reply, to_open_code_prompt_parts, tool_kind_from_name,
+    turn_metrics_from_message_info, unsupported_open_code_version_message,
 };
 use super::text::OpenCodeText;
 use super::title::generate_open_code_session_title;
 use crate::core::catalog::SharedCatalog;
-use crate::core::child::{BinaryPathChoice, ChildEvent, Children, SseEvent, SseEvents};
+use crate::core::child::{
+    BinaryPathChoice, ChildEvent, Children, SpawnRequest, SseEvent, SseEvents,
+};
 use crate::core::registry::{
     AcceptedHook, AdapterCapabilities, EventSink, GeneratedPrContent, HarnessAdapter,
     TextPromptInput, TitleInput,
@@ -85,6 +92,8 @@ const MODEL_ID_ERROR: &str =
 
 static FUNCTIONALITY_NOT_SUPPORTED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)functionality not supported").unwrap());
+static SETUP_FAILURE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(Agent|Model) not found:").unwrap());
 static FILE_PART_MEDIA_TYPE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)file part media type\s+([^\s'"`]+)"#).unwrap());
 
@@ -130,6 +139,59 @@ struct TurnLatch {
     done: oneshot::Sender<Result<(), String>>,
 }
 
+/// `pendingError`: a `session.error` held back while OpenCode may still
+/// recover, for example by compacting after a context overflow.
+#[derive(Debug, Clone)]
+struct PendingError {
+    /// Stands in for the object identity the TypeScript compared.
+    seq: u64,
+    message: String,
+    /// The last time the prompt made durable progress.
+    progress_at: Instant,
+    grace: Duration,
+}
+
+/// `ActivePrompt`: what the turn in flight owns in OpenCode's history.
+struct ActivePrompt {
+    /// Stands in for the object identity the TypeScript compared.
+    id: u64,
+    /// The user messages this turn sent, the first prompt then each steer.
+    message_ids: Vec<String>,
+    /// Assistant messages that answer one of `message_ids`.
+    assistant_ids: HashSet<String>,
+    /// `prompt_async` returned.
+    accepted: bool,
+    /// The stream showed one of `message_ids`.
+    observed: bool,
+    /// An idle arrived while a check ran, so the check runs again.
+    idle_seen: bool,
+    checking: bool,
+    pending_error: Option<PendingError>,
+    /// Bumped to cancel the scheduled error check.
+    error_timer: u64,
+}
+
+impl ActivePrompt {
+    fn new(id: u64, message_id: String) -> Self {
+        Self {
+            id,
+            message_ids: vec![message_id],
+            assistant_ids: HashSet::new(),
+            accepted: false,
+            observed: false,
+            idle_seen: false,
+            checking: false,
+            pending_error: None,
+            error_timer: 0,
+        }
+    }
+
+    fn owns(&self, message_id: &str) -> bool {
+        self.message_ids.iter().any(|id| id == message_id)
+            || self.assistant_ids.contains(message_id)
+    }
+}
+
 /// The mutable half of the TypeScript `Live`.
 struct LiveState {
     runtime_mode: RuntimeMode,
@@ -153,11 +215,14 @@ struct LiveState {
     cancelled: bool,
     mute_updates: bool,
     turn: Option<TurnLatch>,
-    turn_end_pending: bool,
     active_turn: bool,
-    /// The rejection of the last queued operation, which `await live.turns`
-    /// rethrew.
-    turns_error: Option<String>,
+    /// The agent the turn in flight runs, which a steer keeps.
+    active_agent: Option<String>,
+    prompt: Option<ActivePrompt>,
+    /// A manual compaction is running. Its errors belong to it, not a turn.
+    compacting: bool,
+    compaction_error: Option<String>,
+    next_error_seq: u64,
     outbox: Vec<HarnessEvent>,
 }
 
@@ -182,9 +247,12 @@ impl LiveState {
             cancelled: false,
             mute_updates: false,
             turn: None,
-            turn_end_pending: false,
             active_turn: false,
-            turns_error: None,
+            active_agent: None,
+            prompt: None,
+            compacting: false,
+            compaction_error: None,
+            next_error_seq: 0,
             outbox: Vec::new(),
         }
     }
@@ -195,6 +263,14 @@ impl LiveState {
 
     fn turn_token(&self) -> Option<u64> {
         self.turn.as_ref().map(|turn| turn.token)
+    }
+
+    /// `live.prompt === prompt`, and the turn can still settle.
+    fn current_prompt(&mut self, id: u64) -> Option<&mut ActivePrompt> {
+        if !self.active_turn || self.mute_updates || self.cancelled {
+            return None;
+        }
+        self.prompt.as_mut().filter(|prompt| prompt.id == id)
     }
 
     /// Deny every pending approval and skip every pending question.
@@ -212,6 +288,8 @@ impl LiveState {
 
 /// `Live`: one thread's server, session, and stream state.
 struct Live {
+    /// The MonoCode thread this server belongs to.
+    thread_id: String,
     client: OpenCodeClient,
     open_code_session_id: String,
     cwd: String,
@@ -223,6 +301,8 @@ struct Live {
     state: Mutex<LiveState>,
     /// `live.turns`: queued operations run one at a time.
     turns: smol::lock::Mutex<()>,
+    /// How long a non-fatal `session.error` waits for durable progress.
+    error_grace: Duration,
 }
 
 impl Live {
@@ -253,6 +333,12 @@ struct Threads {
     live_by_thread: HashMap<String, Arc<Live>>,
     resume_by_thread: HashMap<String, Resume>,
     cancelled_threads: HashSet<String>,
+    /// How many starts are in flight per thread. A cancel during a start
+    /// must reach the prompt that start was for.
+    opening_threads: HashMap<String, usize>,
+    /// `lifecycleByThread`: starts, cancels, and stops of one thread run one
+    /// at a time.
+    lifecycle_by_thread: HashMap<String, Arc<smol::lock::Mutex<()>>>,
 }
 
 /// What the server watch saw before the client connected.
@@ -275,6 +361,8 @@ struct Inner {
     text: OpenCodeText,
     next_turn_token: AtomicU64,
     processed_events: Arc<AtomicUsize>,
+    /// How long a non-fatal `session.error` waits for durable progress.
+    error_grace_ms: AtomicU64,
 }
 
 /// The OpenCode [`HarnessAdapter`]. Clones share one adapter.
@@ -306,8 +394,17 @@ impl OpenCodeAdapter {
                 threads: Mutex::new(Threads::default()),
                 next_turn_token: AtomicU64::new(0),
                 processed_events: Arc::new(AtomicUsize::new(0)),
+                error_grace_ms: AtomicU64::new(SERVER_TIMEOUT_MS),
             }),
         }
+    }
+
+    /// Report a buffered `session.error` after `grace` in new sessions.
+    #[cfg(test)]
+    pub(crate) fn set_error_grace(&self, grace: Duration) {
+        self.inner
+            .error_grace_ms
+            .store(grace.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// The isolated text backend.
@@ -328,6 +425,36 @@ impl OpenCodeAdapter {
             .live_by_thread
             .get(session_id)
             .cloned()
+    }
+
+    /// `withLifecycle`: run `action` after every earlier start, cancel, or
+    /// stop of the thread.
+    async fn with_lifecycle<T>(&self, session_id: &str, action: impl Future<Output = T>) -> T {
+        let lock = self
+            .inner
+            .threads
+            .lock()
+            .lifecycle_by_thread
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        let _held = lock.lock().await;
+        action.await
+    }
+
+    /// `canRunQueuedOperation`: `Ok(false)` after a cancel, and an error when
+    /// the stream or server ended before the operation's turn came.
+    fn can_run_queued_operation(&self, live: &Arc<Live>) -> Result<bool> {
+        if live.with(|s| s.cancelled) {
+            return Ok(false);
+        }
+        let current = self
+            .live(&live.thread_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, live));
+        if !current || live.with(|s| s.mute_updates) {
+            bail!("OpenCode session ended before this operation could start. Retry the request.");
+        }
+        Ok(true)
     }
 
     fn take_cancelled(&self, session_id: &str) -> bool {
@@ -371,6 +498,7 @@ impl OpenCodeAdapter {
             .ensure_live_or_forget_cancel(&input.session, &on_event)
             .await?;
         if self.take_cancelled(&session_id) {
+            self.stop_owned_live(&session_id, &live).await;
             return Ok(());
         }
         live.with(|s| {
@@ -379,10 +507,9 @@ impl OpenCodeAdapter {
             s.planning = input.session.intent == Some(TurnIntent::Plan);
         });
         let turn = async {
-            live.with(|s| {
-                s.cancelled = false;
-                s.mute_updates = false;
-            });
+            if !self.can_run_queued_operation(&live)? {
+                return Ok(());
+            }
             match self.run_turn(&live, &input, on_accepted).await {
                 Err(_) if live.with(|s| s.cancelled) => Ok(()),
                 result => result,
@@ -399,24 +526,16 @@ impl OpenCodeAdapter {
     ) -> Result<()> {
         let live = self.ensure_live_or_forget_cancel(&input, &on_event).await?;
         if self.take_cancelled(&input.session_id) {
+            self.stop_owned_live(&input.session_id, &live).await;
             return Ok(());
         }
         let model = self.parsed_model(&input.model)?;
         live.with(|s| s.on_event = on_event);
         let compaction = async {
-            live.with(|s| {
-                s.cancelled = false;
-                s.mute_updates = false;
-            });
-            // Unlike prompt_async, summarize responds only after the
-            // compaction pass. Keep this outside the normal turn latch: its
-            // eventual session.status=idle must not become a pending
-            // completion for the next user turn.
-            match live
-                .client
-                .summarize_session(&live.open_code_session_id, &model)
-                .await
-            {
+            if !self.can_run_queued_operation(&live)? {
+                return Ok(());
+            }
+            match run_compaction(&live, &model).await {
                 Err(_) if live.with(|s| s.cancelled) => Ok(()),
                 result => result,
             }
@@ -434,22 +553,22 @@ impl OpenCodeAdapter {
             .ensure_live_or_forget_cancel(&input.session, &on_event)
             .await?;
         if self.take_cancelled(&input.session.session_id) {
+            self.stop_owned_live(&input.session.session_id, &live).await;
             return Ok(RewindLastTurnResult { submitted: false });
         }
         live.with(|s| s.on_event = on_event);
-        {
-            let _turns = live.turns.lock().await;
-            // TODO(port): `await live.turns` rethrew the last queued turn's
-            // rejection, so a failed prompt_async makes the next edit fail
-            // with that old error.
-            if let Some(error) = live.with(|s| s.turns_error.clone()) {
-                bail!(error);
-            }
+        // Wait for queued operations. A failed one is not this edit's error.
+        drop(live.turns.lock().await);
+        if !self.can_run_queued_operation(&live)? {
+            return Ok(RewindLastTurnResult { submitted: false });
         }
         if live.with(|s| s.active_turn) {
             bail!("Stop the current turn before editing the last message");
         }
         let message_id = latest_open_code_user_message_id(&live).await?;
+        if !self.can_run_queued_operation(&live)? {
+            return Ok(RewindLastTurnResult { submitted: false });
+        }
         live.client
             .revert_session(&live.open_code_session_id, &message_id)
             .await?;
@@ -471,21 +590,40 @@ impl OpenCodeAdapter {
         if parts.is_empty() {
             return Ok(());
         }
-        let setting = |key: &str| {
-            input
-                .model_settings
-                .as_ref()
-                .and_then(|settings| settings.get(key).cloned())
-        };
-        live.client
+        // The steer joins the turn: it keeps the turn's agent, and the turn
+        // waits for the reply to this message too.
+        let message_id = next_open_code_message_id(now_millis());
+        let agent = live.with(|s| {
+            if let Some(prompt) = s.prompt.as_mut() {
+                prompt.message_ids.push(message_id.clone());
+                if let Some(pending) = prompt.pending_error.as_mut() {
+                    pending.progress_at = Instant::now();
+                }
+            }
+            s.active_agent.clone()
+        });
+        let result = live
+            .client
             .prompt_async(&PromptInput {
                 session_id: live.open_code_session_id.clone(),
+                message_id: Some(message_id.clone()),
                 model,
-                agent: setting("agent"),
-                variant: setting("variant"),
+                agent,
+                variant: input
+                    .model_settings
+                    .as_ref()
+                    .and_then(|settings| settings.get("variant").cloned()),
                 parts,
             })
-            .await
+            .await;
+        if result.is_err() {
+            live.with(|s| {
+                if let Some(prompt) = s.prompt.as_mut() {
+                    prompt.message_ids.retain(|id| *id != message_id);
+                }
+            });
+        }
+        result
     }
 
     /// `respondOpenCodeApproval`.
@@ -520,41 +658,94 @@ impl OpenCodeAdapter {
         }
     }
 
-    /// `cancelOpenCodeTurn`.
+    /// `cancelOpenCodeTurn`. A cancel during startup also reaches the prompt
+    /// that startup was for.
     async fn cancel_open_code_turn(&self, session_id: &str) -> Result<()> {
-        let Some(live) = self.live(session_id) else {
-            self.inner
-                .threads
-                .lock()
-                .cancelled_threads
-                .insert(session_id.to_string());
-            return Ok(());
+        {
+            let mut threads = self.inner.threads.lock();
+            if threads.opening_threads.contains_key(session_id) {
+                threads.cancelled_threads.insert(session_id.to_string());
+            }
+        }
+        self.with_lifecycle(session_id, self.cancel_live(session_id))
+            .await
+    }
+
+    /// `cancelLive`: abort the turn, then close the stream and kill the
+    /// server, so nothing the cancelled turn started can reach the next one.
+    async fn cancel_live(&self, session_id: &str) -> Result<()> {
+        let live = {
+            let mut threads = self.inner.threads.lock();
+            match threads.live_by_thread.remove(session_id) {
+                Some(live) => live,
+                None => {
+                    // A repeated cancel of an idle, resumable thread has
+                    // nothing to cancel and must not cancel the next prompt.
+                    if threads.resume_by_thread.contains_key(session_id)
+                        && !threads.opening_threads.contains_key(session_id)
+                    {
+                        return Ok(());
+                    }
+                    threads.cancelled_threads.insert(session_id.to_string());
+                    return Ok(());
+                }
+            }
         };
         live.with(|s| {
             s.cancelled = true;
             s.mute_updates = true;
             s.resolve_pending();
         });
-        live.client.abort_session(&live.open_code_session_id).await;
-        live.with(|s| {
-            finish_active_turn(
-                s,
-                vec![
-                    HarnessEvent::MessageCompleted,
-                    HarnessEvent::ReasoningCompleted,
-                ],
-            )
-        });
-        Ok(())
+        let failure = live
+            .client
+            .abort_session(&live.open_code_session_id)
+            .await
+            .err();
+        if let Some(error) = &failure {
+            live.with(|s| {
+                s.emit(HarnessEvent::SessionError {
+                    message: format!("Could not confirm OpenCode cancellation: {error}"),
+                })
+            });
+        }
+        live.client.close_events(session_id).await;
+        self.inner.children.unwatch_child(session_id);
+        let _ = self.inner.children.kill_child(session_id).await;
+        live.with(|s| finish_active_turn(s, completion_events()));
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `stopOpenCodeSession`: kill the server but keep resume state.
     async fn stop_open_code_session(&self, session_id: &str) {
-        let live = {
-            let mut threads = self.inner.threads.lock();
-            threads.cancelled_threads.remove(session_id);
-            threads.live_by_thread.remove(session_id)
-        };
+        self.inner
+            .threads
+            .lock()
+            .cancelled_threads
+            .remove(session_id);
+        self.with_lifecycle(session_id, self.stop_live(session_id))
+            .await;
+    }
+
+    /// `stopOwnedLive`: stop `live` unless another server already replaced
+    /// it.
+    async fn stop_owned_live(&self, session_id: &str, live: &Arc<Live>) {
+        self.with_lifecycle(session_id, async {
+            let owned = self
+                .live(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, live));
+            if owned {
+                self.stop_live(session_id).await;
+            }
+        })
+        .await;
+    }
+
+    /// `stopLive`.
+    async fn stop_live(&self, session_id: &str) {
+        let live = self.inner.threads.lock().live_by_thread.remove(session_id);
         if let Some(live) = live {
             live.with(|s| {
                 s.mute_updates = true;
@@ -564,7 +755,7 @@ impl OpenCodeAdapter {
                     let _ = turn.done.send(Ok(()));
                 }
             });
-            live.client.abort_session(&live.open_code_session_id).await;
+            let _ = live.client.abort_session(&live.open_code_session_id).await;
             live.client.close_events(session_id).await;
         } else {
             // A stream or server that ended on its own already dropped
@@ -601,41 +792,66 @@ impl OpenCodeAdapter {
         );
     }
 
-    /// `ensureLive`.
+    /// `ensureLive`: start or reuse the thread's server, one lifecycle step
+    /// at a time.
     async fn ensure_live(
         &self,
         input: &HarnessSessionInput,
         on_event: &EventSink,
     ) -> Result<Arc<Live>> {
         let session_id = &input.session_id;
-        let existing = self.live(session_id);
-        if let Some(existing) = existing.as_ref().filter(|live| live.cwd == input.cwd) {
-            let mode_changed = existing.with(|s| {
-                s.on_event = on_event.clone();
-                s.runtime_mode != input.runtime_mode
-            });
-            if mode_changed {
-                let permission = build_open_code_permission_rules(input.runtime_mode);
-                existing
-                    .client
-                    .update_session(
-                        &existing.open_code_session_id,
-                        &PermissionUpdate {
-                            permission: &permission,
-                        },
-                    )
-                    .await?;
+        *self
+            .inner
+            .threads
+            .lock()
+            .opening_threads
+            .entry(session_id.clone())
+            .or_insert(0) += 1;
+        let result = self
+            .with_lifecycle(session_id, self.start_live(input, on_event))
+            .await;
+        let mut threads = self.inner.threads.lock();
+        if let Some(count) = threads.opening_threads.get_mut(session_id) {
+            *count -= 1;
+            if *count == 0 {
+                threads.opening_threads.remove(session_id);
             }
-            existing.with(|s| s.runtime_mode = input.runtime_mode);
+        }
+        result
+    }
+
+    /// `startLive`.
+    async fn start_live(
+        &self,
+        input: &HarnessSessionInput,
+        on_event: &EventSink,
+    ) -> Result<Arc<Live>> {
+        let session_id = &input.session_id;
+        let planning = input.intent == Some(TurnIntent::Plan);
+        let existing = self.live(session_id);
+        // The access mode is part of the server's configuration, so a new
+        // mode or a Plan turn starts a new server instead of patching rules.
+        if let Some(existing) = existing.as_ref().filter(|live| {
+            live.cwd == input.cwd
+                && live.with(|s| {
+                    !s.mute_updates
+                        && !s.cancelled
+                        && s.runtime_mode == input.runtime_mode
+                        && s.planning == planning
+                })
+        }) {
+            existing.with(|s| s.on_event = on_event.clone());
             return Ok(existing.clone());
         }
-        if existing.is_some() {
-            self.inner
-                .threads
-                .lock()
-                .resume_by_thread
-                .remove(session_id);
-            self.stop_open_code_session(session_id).await;
+        if let Some(existing) = &existing {
+            if existing.cwd != input.cwd {
+                self.inner
+                    .threads
+                    .lock()
+                    .resume_by_thread
+                    .remove(session_id);
+            }
+            self.stop_live(session_id).await;
         }
 
         let resume = {
@@ -654,6 +870,30 @@ impl OpenCodeAdapter {
         let binary = children.resolve_open_code_binary().await?;
         self.assert_open_code_version(&binary.path, &input.cwd)
             .await?;
+        let exec = |args: &[&str]| {
+            children.exec_child(
+                &binary.path,
+                args.iter().map(|arg| arg.to_string()).collect(),
+                Some(&input.cwd),
+                Some(HarnessId::Opencode),
+                BinaryPathChoice::Runtime,
+            )
+        };
+        let agents = exec(&["agent", "list"]).await?;
+        let restricted = planning || input.runtime_mode != RuntimeMode::FullAccess;
+        let tool_output_glob = if restricted {
+            Some(parse_open_code_tool_output_glob(
+                &exec(&["debug", "paths"]).await?,
+            )?)
+        } else {
+            None
+        };
+        let policy = managed_open_code_config(
+            &agents,
+            input.runtime_mode,
+            planning,
+            tool_output_glob.as_deref(),
+        )?;
 
         let start = Arc::new(Mutex::new(ServerStart::default()));
         let live_ref: Arc<Mutex<Option<Arc<Live>>>> = Arc::default();
@@ -661,27 +901,35 @@ impl OpenCodeAdapter {
 
         let port = children.free_harness_port().await?;
         children
-            .spawn_child(
-                session_id,
-                &binary.path,
-                vec![
+            .spawn_request(SpawnRequest {
+                session_id: session_id.clone(),
+                command: binary.path.clone(),
+                args: vec![
                     "serve".into(),
                     "--hostname=127.0.0.1".into(),
                     format!("--port={port}"),
                 ],
-                &input.cwd,
-                None,
-                Some(HarnessId::Opencode),
-            )
+                cwd: input.cwd.clone(),
+                binary_provider: Some(HarnessId::Opencode),
+                environment: HashMap::from([("OPENCODE_CONFIG_CONTENT".to_string(), policy)]),
+                ..Default::default()
+            })
             .await?;
 
         match self
-            .connect(input, on_event, &start, &live_ref, resume)
+            .connect(
+                input,
+                on_event,
+                &start,
+                &live_ref,
+                resume,
+                tool_output_glob.as_deref(),
+            )
             .await
         {
             Ok(live) => Ok(live),
             Err(error) => {
-                self.stop_open_code_session(session_id).await;
+                self.stop_live(session_id).await;
                 Err(error)
             }
         }
@@ -715,11 +963,21 @@ impl OpenCodeAdapter {
                         ChildEvent::Exit(code) => code,
                     };
                     start.lock().exited = Some(code);
-                    inner.threads.lock().live_by_thread.remove(&session_id);
+                    let live = live_ref.lock().clone();
+                    if let Some(live) = &live {
+                        let mut threads = inner.threads.lock();
+                        // A replacement server may already own the thread.
+                        if threads
+                            .live_by_thread
+                            .get(&session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, live))
+                        {
+                            threads.live_by_thread.remove(&session_id);
+                        }
+                    }
                     let ended = HarnessEvent::SessionEnded {
                         code: code.map(i64::from),
                     };
-                    let live = live_ref.lock().clone();
                     match live {
                         Some(live) => live.with(|s| {
                             if !s.mute_updates {
@@ -746,17 +1004,40 @@ impl OpenCodeAdapter {
         start: &Arc<Mutex<ServerStart>>,
         live_ref: &Arc<Mutex<Option<Arc<Live>>>>,
         resume: Option<Resume>,
+        tool_output_glob: Option<&str>,
     ) -> Result<Arc<Live>> {
         let url = wait_for_server_url(start, SERVER_TIMEOUT_MS).await?;
         let client = OpenCodeClient::new(&url, &input.cwd, self.inner.children.clone());
+        let planning = input.intent == Some(TurnIntent::Plan);
+        if planning || input.runtime_mode != RuntimeMode::FullAccess {
+            // Project config can outrank the managed policy. Check what the
+            // server actually applied before any prompt can use it.
+            let agents = client.get_agents().await?;
+            let config = client.get_config().await?;
+            verify_managed_open_code_policy(
+                &agents,
+                &config,
+                input.runtime_mode,
+                planning,
+                tool_output_glob,
+            )?;
+        }
         let can_resume = resume.is_some();
-        let session =
-            resolve_session(&client, resume.as_ref(), input.runtime_mode, &input.cwd).await?;
+        let session = resolve_session(
+            &client,
+            resume.as_ref(),
+            input.runtime_mode,
+            planning,
+            &input.cwd,
+            tool_output_glob,
+        )
+        .await?;
         if can_resume && let Err(error) = repair_unsupported_file_turn(&client, &session.id).await {
             log::debug!("[monocode] opencode attachment recovery {error:#}");
         }
 
         let live = Arc::new(Live {
+            thread_id: input.session_id.clone(),
             client,
             open_code_session_id: session.id.clone(),
             cwd: input.cwd.clone(),
@@ -769,6 +1050,7 @@ impl OpenCodeAdapter {
                 on_event.clone(),
             )),
             turns: smol::lock::Mutex::new(()),
+            error_grace: Duration::from_millis(self.inner.error_grace_ms.load(Ordering::SeqCst)),
         });
         *live_ref.lock() = Some(live.clone());
         {
@@ -833,15 +1115,25 @@ impl OpenCodeAdapter {
         // prompt_async has no response body to await; the SSE stream is its
         // only completion channel. Reusing a Live after this point accepts the
         // next prompt but can never observe it, which looks like a dead thread.
-        self.inner.threads.lock().live_by_thread.remove(session_id);
         let failed = live.with(|s| {
             let failed = s.turn.take();
             s.mute_updates = true;
             s.resolve_pending();
             failed
         });
-        self.inner.children.unwatch_child(session_id);
-        let _ = self.inner.children.kill_child(session_id).await;
+        // Remove the dead server under the lifecycle lock, and only if it
+        // still owns the thread, so a replacement never starts beside it.
+        self.with_lifecycle(session_id, async {
+            let owned = self
+                .live(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, live));
+            if owned {
+                self.inner.threads.lock().live_by_thread.remove(session_id);
+                self.inner.children.unwatch_child(session_id);
+                let _ = self.inner.children.kill_child(session_id).await;
+            }
+        })
+        .await;
         match failed {
             Some(turn) => {
                 let _ = turn.done.send(Err(message));
@@ -869,18 +1161,22 @@ impl OpenCodeAdapter {
 
         let (done, finished) = oneshot::channel();
         let token = self.inner.next_turn_token.fetch_add(1, Ordering::SeqCst) + 1;
+        let settings = input.session.model_settings.as_ref();
+        let agent = open_code_agent_for_turn(input.session.intent, settings);
+        let message_id = next_open_code_message_id(now_millis());
         live.with(|s| {
             s.turn = Some(TurnLatch { token, done });
+            s.prompt = Some(ActivePrompt::new(token, message_id.clone()));
             s.active_turn = true;
+            s.active_agent = Some(agent.clone());
             s.turn_metrics_by_message_id.clear();
-            settle_pending_turn(s);
         });
 
-        let settings = input.session.model_settings.as_ref();
         let prompt = PromptInput {
             session_id: live.open_code_session_id.clone(),
+            message_id: Some(message_id),
             model,
-            agent: Some(open_code_agent_for_turn(input.session.intent, settings)),
+            agent: Some(agent),
             variant: settings.and_then(|settings| settings.get("variant").cloned()),
             parts,
         };
@@ -889,7 +1185,20 @@ impl OpenCodeAdapter {
             if let Some(on_accepted) = &on_accepted {
                 on_accepted();
             }
-            live.with(settle_pending_turn);
+            // Events that arrived before the reply waited for acceptance.
+            let (pending_error, idle_seen) = live.with(|s| match s.prompt.as_mut() {
+                Some(prompt) => {
+                    prompt.accepted = true;
+                    (prompt.pending_error.is_some(), prompt.idle_seen)
+                }
+                None => (false, false),
+            });
+            if pending_error {
+                schedule_buffered_error_check(live, token, Duration::ZERO);
+            }
+            if idle_seen {
+                reconcile_idle_prompt(live).await?;
+            }
             match finished.await {
                 Ok(Err(message)) => Err(anyhow!(message)),
                 Ok(Ok(())) | Err(_) => Ok(()),
@@ -908,7 +1217,14 @@ impl OpenCodeAdapter {
                 Err(error)
             }
         };
-        live.with(|s| s.turn = None);
+        live.with(|s| {
+            if let Some(prompt) = s.prompt.as_mut() {
+                prompt.error_timer += 1;
+            }
+            s.active_turn = false;
+            s.prompt = None;
+            s.turn = None;
+        });
         result
     }
 
@@ -926,30 +1242,67 @@ impl OpenCodeAdapter {
             )
             .await
             .unwrap_or_default();
-        let Some(version) = parse_open_code_version(&output) else {
-            bail!(
-                "Unable to determine OpenCode version. MonoCode requires v{MINIMUM_OPENCODE_VERSION} or newer."
-            );
-        };
-        if compare_semver(&version, MINIMUM_OPENCODE_VERSION) < 0 {
-            bail!(
-                "OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer."
-            );
+        let version = parse_open_code_version(&output);
+        match version.as_deref() {
+            Some(version) if is_supported_open_code_version(version) => Ok(()),
+            version => bail!(unsupported_open_code_version_message(version)),
         }
-        // TODO(port): there is no upper bound. OpenCode 2 passes this gate but
-        // serves its API under `/api` behind basic auth, answers
-        // `POST /session` with 405, and serves its web app at `/event`, so a
-        // turn fails with "OpenCode HTTP 405". `opencode_major_version` in
-        // monocode-process tells the two apart.
-        Ok(())
     }
 }
 
 /// `live.turns = live.turns.catch(() => undefined).then(run); await live.turns`.
 async fn queue_turn(live: &Arc<Live>, run: impl Future<Output = Result<()>>) -> Result<()> {
     let _turns = live.turns.lock().await;
-    let result = run.await;
-    live.with(|s| s.turns_error = result.as_ref().err().map(ToString::to_string));
+    run.await
+}
+
+/// `runCompaction`. Summarize answers only after the pass, so its result is
+/// read from the history: a new message with an error, or a `session.error`
+/// during the pass, fails it. Its idle never settles a user turn, because it
+/// owns no prompt.
+async fn run_compaction(live: &Arc<Live>, model: &ParsedOpenCodeModelSlug) -> Result<()> {
+    let message_ids = |messages: &[super::client::OpenCodeMessage]| -> HashSet<String> {
+        messages
+            .iter()
+            .filter_map(|message| string_field(message.info.as_ref(), "id").map(str::to_string))
+            .collect()
+    };
+    let before = message_ids(
+        &live
+            .client
+            .get_messages(&live.open_code_session_id)
+            .await?
+            .unwrap_or_default(),
+    );
+    live.with(|s| {
+        s.compacting = true;
+        s.compaction_error = None;
+    });
+    let result = async {
+        live.client
+            .summarize_session(&live.open_code_session_id, model)
+            .await?;
+        let messages = live
+            .client
+            .get_messages(&live.open_code_session_id)
+            .await?
+            .unwrap_or_default();
+        let failed = messages.iter().find_map(|message| {
+            let info = message.info.as_ref();
+            let id = string_field(info, "id").unwrap_or_default();
+            let error = field(info, "error").filter(|error| is_truthy(error))?;
+            (!before.contains(id)).then(|| session_error_message(Some(error)))
+        });
+        match failed.or_else(|| live.with(|s| s.compaction_error.clone())) {
+            Some(message) => Err(anyhow!(message)),
+            None => Ok(()),
+        }
+    }
+    .await;
+    live.with(|s| {
+        s.compacting = false;
+        s.compaction_error = None;
+    });
     result
 }
 
@@ -1055,7 +1408,12 @@ fn handle_event(live: &Arc<Live>, event: &Record) -> Option<Continuation> {
                         if live.with(|s| s.mute_updates || s.turn_token() != turn) {
                             return Ok(());
                         }
-                        match handle_request(&live, &event_type, &properties) {
+                        match handle_request(
+                            &live,
+                            &event_type,
+                            &properties,
+                            Some(&payload_session_id),
+                        ) {
                             Some(next) => next.await,
                             None => Ok(()),
                         }
@@ -1066,18 +1424,40 @@ fn handle_event(live: &Arc<Live>, event: &Record) -> Option<Continuation> {
         }
     }
 
+    let payload_session_id = event_session_id(event);
     match event_type.as_str() {
-        "permission.asked" | "question.asked" => handle_request(live, &event_type, &properties),
+        "permission.asked" | "question.asked" => handle_request(
+            live,
+            &event_type,
+            &properties,
+            payload_session_id.as_deref(),
+        ),
         _ => {
-            live.with(|s| handle_transcript_event(s, live, &event_type, &properties));
-            None
+            let mut next = TranscriptNext::None;
+            live.with(|s| handle_transcript_event(s, live, &event_type, &properties, &mut next));
+            match next {
+                TranscriptNext::None => None,
+                TranscriptNext::CheckError(prompt) => {
+                    schedule_buffered_error_check(live, prompt, Duration::ZERO);
+                    None
+                }
+                TranscriptNext::Reconcile => {
+                    let live = live.clone();
+                    Some(async move { reconcile_idle_prompt(&live).await }.boxed())
+                }
+            }
         }
     }
 }
 
-fn handle_request(live: &Arc<Live>, event_type: &str, properties: &Record) -> Option<Continuation> {
+fn handle_request(
+    live: &Arc<Live>,
+    event_type: &str,
+    properties: &Record,
+    payload_session_id: Option<&str>,
+) -> Option<Continuation> {
     if event_type == "permission.asked" {
-        handle_permission(live, properties)
+        handle_permission(live, properties, payload_session_id)
     } else {
         handle_question(live, properties)
     }
@@ -1088,8 +1468,13 @@ enum PermissionNext {
     Wait(i64, oneshot::Receiver<ApprovalDecision>),
 }
 
-/// The `permission.asked` branch of `handleEvent`.
-fn handle_permission(live: &Arc<Live>, properties: &Record) -> Option<Continuation> {
+/// The `permission.asked` branch of `handleEvent`. `payload_session_id` is
+/// the session that asked.
+fn handle_permission(
+    live: &Arc<Live>,
+    properties: &Record,
+    payload_session_id: Option<&str>,
+) -> Option<Continuation> {
     let props = Some(properties);
     let id = string_field(props, "id")
         .or_else(|| string_field(props, "requestID"))?
@@ -1168,7 +1553,19 @@ fn handle_permission(live: &Arc<Live>, properties: &Record) -> Option<Continuati
         };
 
         if s.planning {
-            let decision = if kind == "read" || kind == "search" {
+            // An Explore task from the primary session is read-only. Every
+            // pattern must name it, and a child cannot delegate further.
+            let explore_task = permission == "task"
+                && payload_session_id == Some(live.open_code_session_id.as_str())
+                && field(props, "patterns")
+                    .and_then(Value::as_array)
+                    .is_some_and(|patterns| {
+                        !patterns.is_empty()
+                            && patterns
+                                .iter()
+                                .all(|pattern| pattern.as_str() == Some("explore"))
+                    });
+            let decision = if kind == "read" || kind == "search" || explore_task {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
@@ -1347,7 +1744,22 @@ fn show_next_question(s: &mut LiveState) {
 }
 
 /// The transcript branches of `handleEvent`, for the thread's own session.
-fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, properties: &Record) {
+/// What a transcript event leaves for the caller, outside the state lock.
+enum TranscriptNext {
+    None,
+    /// The stream went idle during a turn. Check the durable history.
+    Reconcile,
+    /// A `session.error` was buffered for this prompt.
+    CheckError(u64),
+}
+
+fn handle_transcript_event(
+    s: &mut LiveState,
+    live: &Live,
+    event_type: &str,
+    properties: &Record,
+    next: &mut TranscriptNext,
+) {
     let props = Some(properties);
     match event_type {
         "message.updated" => {
@@ -1362,15 +1774,40 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
                     _ => None,
                 };
                 if let Some(role) = role {
+                    let parent_id = string_field(info, "parentID").unwrap_or_default();
+                    if let Some(prompt) = s.prompt.as_mut() {
+                        if role == Role::User && prompt.message_ids.iter().any(|owned| owned == id)
+                        {
+                            prompt.observed = true;
+                        }
+                        if role == Role::Assistant
+                            && prompt.message_ids.iter().any(|owned| owned == parent_id)
+                        {
+                            prompt.assistant_ids.insert(id.to_string());
+                        }
+                        if prompt.owns(id)
+                            && let Some(pending) = prompt.pending_error.as_mut()
+                        {
+                            pending.progress_at = Instant::now();
+                        }
+                    }
                     let role = if hidden { Role::Hidden } else { role };
                     s.message_role_by_id.insert(id.to_string(), role);
+                    for part in s.part_by_id.of_message(id) {
+                        if role_for_part(s, &part) == Some(Role::Assistant) {
+                            emit_assistant_text(s, &part);
+                            if part.part_type == "tool" {
+                                emit_tool(s, &live.open_code_session_id, &part);
+                            }
+                        }
+                    }
                 }
             }
             // A compaction assistant's usage describes the summarization call,
             // not the rebuilt context. Keep the previous meter value until a
             // real turn reports the post-compaction window level.
             if role == Some("assistant") && !hidden {
-                emit_context(s, &live.catalog, info);
+                emit_context(s, &live.catalog, &live.cwd, info);
             }
         }
         "message.removed" => {
@@ -1387,7 +1824,9 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
             let Some(existing) = s.part_by_id.get(part_id).cloned() else {
                 return;
             };
-            if role_for_part(s, &existing) != Some(Role::Assistant) {
+            // An ended part's snapshot is final, so a late delta must not
+            // grow it again.
+            if part_ended(&existing) || role_for_part(s, &existing) != Some(Role::Assistant) {
                 return;
             }
             let previous = s
@@ -1399,14 +1838,15 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
             let next = append_open_code_assistant_text_delta(&previous, &delta);
             s.emitted_text_by_part_id
                 .insert(part_id.to_string(), next.next_text.clone());
-            if existing.part_type == "text" || existing.part_type == "reasoning" {
-                s.part_by_id.set(OpenCodePart {
-                    text: Some(next.next_text.clone()),
-                    ..existing.clone()
-                });
+            let next_part = OpenCodePart {
+                text: Some(next.next_text),
+                ..existing
+            };
+            if next_part.part_type == "text" || next_part.part_type == "reasoning" {
+                s.part_by_id.set(next_part.clone());
             }
-            if let Some(mapped) = text_delta_event(&existing, &next.delta_to_emit) {
-                s.emit(mapped);
+            if !next.delta_to_emit.is_empty() {
+                emit_assistant_snapshot(s, &next_part);
             }
         }
         "message.part.updated" => {
@@ -1414,11 +1854,22 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
                 return;
             };
             s.part_by_id.set(part.clone());
+            if let Some(prompt) = s.prompt.as_mut()
+                && part
+                    .message_id
+                    .as_deref()
+                    .is_some_and(|message_id| prompt.owns(message_id))
+                && let Some(pending) = prompt.pending_error.as_mut()
+            {
+                pending.progress_at = Instant::now();
+            }
+            // A part whose message role is not known yet waits for its
+            // `message.updated`, which replays it.
             if role_for_part(s, &part) == Some(Role::Assistant) {
                 emit_assistant_text(s, &part);
-            }
-            if part.part_type == "tool" {
-                emit_tool(s, &live.open_code_session_id, &part);
+                if part.part_type == "tool" {
+                    emit_tool(s, &live.open_code_session_id, &part);
+                }
             }
         }
         "session.status" => {
@@ -1431,20 +1882,63 @@ fn handle_transcript_event(s: &mut LiveState, live: &Live, event_type: &str, pro
                         });
                     }
                 }
-                Some("idle") if s.active_turn => finish_active_turn(
-                    s,
-                    vec![
-                        HarnessEvent::MessageCompleted,
-                        HarnessEvent::ReasoningCompleted,
-                    ],
-                ),
+                // Idle alone does not end the turn: OpenCode also goes idle
+                // between a context overflow and its compaction retry. The
+                // durable history decides.
+                Some("idle") if s.active_turn => {
+                    if let Some(prompt) = s.prompt.as_mut() {
+                        prompt.idle_seen = true;
+                    }
+                    *next = TranscriptNext::Reconcile;
+                }
                 _ => {}
             }
         }
         "session.error" => {
-            let message = session_error_message(field(props, "error"));
-            s.emit(HarnessEvent::SessionError { message });
-            finish_active_turn(s, Vec::new());
+            let error = field(props, "error");
+            let message = session_error_message(error);
+            let name = string_field(as_record(error), "name").map(str::to_string);
+            if s.compacting {
+                s.compaction_error = Some(message);
+                return;
+            }
+            if !s.active_turn {
+                return;
+            }
+            let seq = s.next_error_seq + 1;
+            let Some(prompt) = s.prompt.as_mut() else {
+                return;
+            };
+            s.next_error_seq = seq;
+            // A missing agent or model cannot recover, so it fails at once.
+            // Anything else may be a warning OpenCode recovers from.
+            let setup_failure = SETUP_FAILURE.is_match(&message)
+                || matches!(
+                    name.as_deref(),
+                    Some("ProviderModelNotFoundError" | "ModelNotFoundError")
+                );
+            let previous = prompt.pending_error.as_ref();
+            let progress_at = previous.map_or_else(Instant::now, |pending| pending.progress_at);
+            let grace = if setup_failure {
+                Duration::from_millis(50)
+            } else {
+                previous.map_or(live.error_grace, |pending| pending.grace)
+            };
+            prompt.pending_error = Some(PendingError {
+                seq,
+                message: message.clone(),
+                progress_at,
+                grace,
+            });
+            let prompt_id = prompt.id;
+            s.emit(HarnessEvent::Status {
+                text: if name.as_deref() == Some("ContextOverflowError") {
+                    "OpenCode is compacting context after the provider rejected its size.".into()
+                } else {
+                    message
+                },
+            });
+            *next = TranscriptNext::CheckError(prompt_id);
         }
         _ => {}
     }
@@ -1509,7 +2003,7 @@ pub fn open_code_agent_for_turn(
 /// `emitContext`. OpenCode reports tokens per assistant message but not the
 /// window, so the window comes from the catalog entry for the model that
 /// produced it.
-fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record>) {
+fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, cwd: &str, info: Option<&Record>) {
     let used = context_used_from_message_info(info);
     let metrics = turn_metrics_from_message_info(info);
     let message_id = string_field(info, "id");
@@ -1568,7 +2062,7 @@ fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record
     ) {
         (Some(provider_id), Some(model_id)) => catalog
             .read()
-            .model_context_window(&format!("opencode:{provider_id}/{model_id}")),
+            .model_context_window_in(&format!("opencode:{provider_id}/{model_id}"), Some(cwd)),
         _ => None,
     };
     s.emit(HarnessEvent::Context {
@@ -1577,18 +2071,48 @@ fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record
     });
 }
 
-/// `emitAssistantText`.
+/// `emitAssistantText`. An ended part's snapshot is final and may correct
+/// text already shown.
 fn emit_assistant_text(s: &mut LiveState, part: &OpenCodePart) {
     let Some(text) = part.text.as_deref() else {
         return;
     };
+    let ended = part_ended(part);
     let previous = s.emitted_text_by_part_id.get(&part.id).cloned();
-    let next = merge_open_code_assistant_text(previous.as_deref(), text);
+    let next = merge_open_code_assistant_text(previous.as_deref(), text, ended);
     s.emitted_text_by_part_id
-        .insert(part.id.clone(), next.latest_text);
-    if let Some(mapped) = text_delta_event(part, &next.delta_to_emit) {
-        s.emit(mapped);
+        .insert(part.id.clone(), next.latest_text.clone());
+    if !next.delta_to_emit.is_empty()
+        || previous.as_deref() != Some(next.latest_text.as_str())
+        || ended
+    {
+        emit_assistant_snapshot(
+            s,
+            &OpenCodePart {
+                text: Some(next.latest_text),
+                ..part.clone()
+            },
+        );
     }
+}
+
+/// `emitAssistantSnapshot`: the part's whole text, which replaces what the
+/// transcript shows for it.
+fn emit_assistant_snapshot(s: &mut LiveState, part: &OpenCodePart) {
+    if part.part_type != "text" && part.part_type != "reasoning" {
+        return;
+    }
+    s.emit(HarnessEvent::MessagePart {
+        part_id: part.id.clone(),
+        text: part.text.clone().unwrap_or_default(),
+        reasoning: part.part_type == "reasoning",
+        streaming: !part_ended(part),
+    });
+}
+
+/// `typeof part.time?.end === "number"`.
+fn part_ended(part: &OpenCodePart) -> bool {
+    part.time.and_then(|time| time.end).is_some()
 }
 
 /// The row title `emitTool` and `emitSubagentStep` share.
@@ -1803,6 +2327,7 @@ fn handle_subagent_event(
         let existing = string_field(props, "partID").and_then(|id| s.part_by_id.get(id));
         let delta = stream_text_delta(field(props, "delta"));
         if let Some(existing) = existing
+            && !part_ended(existing)
             && !delta.is_empty()
             && (existing.part_type == "text" || existing.part_type == "reasoning")
         {
@@ -1940,30 +2465,346 @@ fn emit_subagent_step(
     }
 }
 
-/// `finishActiveTurn`.
+/// `finishActiveTurn`. A finish with no turn in flight does nothing: the
+/// next turn settles only from its own messages.
 fn finish_active_turn(s: &mut LiveState, extra_events: Vec<HarnessEvent>) {
-    s.turn_end_pending = false;
+    if let Some(prompt) = s.prompt.as_mut() {
+        prompt.error_timer += 1;
+    }
     s.active_turn = false;
     for event in extra_events {
         s.emit(event);
     }
-    match s.turn.take() {
-        Some(turn) => {
-            let _ = turn.done.send(Ok(()));
-        }
-        // TODO(port): an idle or a cancel with no turn in flight leaves
-        // `turnEndPending` set, and the next turn then ends as soon as it
-        // starts, before OpenCode replies.
-        None => s.turn_end_pending = true,
+    if let Some(turn) = s.turn.take() {
+        let _ = turn.done.send(Ok(()));
     }
 }
 
-/// `settlePendingTurn`.
-fn settle_pending_turn(s: &mut LiveState) {
-    if !s.turn_end_pending || s.turn.is_none() {
-        return;
+fn completion_events() -> Vec<HarnessEvent> {
+    vec![
+        HarnessEvent::MessageCompleted,
+        HarnessEvent::ReasoningCompleted,
+    ]
+}
+
+/// `reconcileIdlePrompt`: settle the turn from the durable history once the
+/// session is idle. Runs one check at a time; an idle that arrives during a
+/// check runs it again.
+async fn reconcile_idle_prompt(live: &Arc<Live>) -> Result<()> {
+    loop {
+        let start = live.with(|s| {
+            let active = s.active_turn && !s.cancelled && !s.mute_updates;
+            let prompt = s.prompt.as_mut()?;
+            if !active
+                || !prompt.accepted
+                || (!prompt.observed && prompt.pending_error.is_none())
+                || prompt.checking
+            {
+                return None;
+            }
+            prompt.idle_seen = false;
+            prompt.checking = true;
+            Some(prompt.id)
+        });
+        let Some(id) = start else {
+            return Ok(());
+        };
+        let result = check_idle_prompt(live, id).await;
+        let again = live.with(
+            |s| match s.prompt.as_mut().filter(|prompt| prompt.id == id) {
+                Some(prompt) => {
+                    prompt.checking = false;
+                    prompt.idle_seen
+                }
+                None => false,
+            },
+        );
+        result?;
+        if !again {
+            return Ok(());
+        }
     }
-    finish_active_turn(s, Vec::new());
+}
+
+/// One pass of `reconcileIdlePrompt`.
+async fn check_idle_prompt(live: &Arc<Live>, id: u64) -> Result<()> {
+    if live
+        .client
+        .session_status(&live.open_code_session_id)
+        .await?
+        != "idle"
+    {
+        return Ok(());
+    }
+    let messages = live
+        .client
+        .get_messages(&live.open_code_session_id)
+        .await?
+        .unwrap_or_default();
+    let Some(owned) = live.with(|s| {
+        s.prompt
+            .as_ref()
+            .filter(|prompt| prompt.id == id && !s.mute_updates && !s.cancelled)
+            .map(|prompt| prompt.message_ids.clone())
+    }) else {
+        return Ok(());
+    };
+    let related = related_prompt_message_ids(&messages, &owned);
+    let latest = messages
+        .iter()
+        .rfind(|message| {
+            let info = message.info.as_ref();
+            string_field(info, "role") == Some("assistant")
+                && related.contains(string_field(info, "parentID").unwrap_or_default())
+        })
+        .and_then(|message| message.info.clone());
+    let Some(info) = latest else {
+        return reconcile_buffered_error(live, id, false).await;
+    };
+    let info = Some(&info);
+    let error = field(info, "error").filter(|error| is_truthy(error));
+    let finish = string_field(info, "finish");
+    // A tool-calls finish continues with another step, and a compaction
+    // reply is followed by the resumed answer.
+    if error.is_none()
+        && (finish.is_none()
+            || finish == Some("tool-calls")
+            || string_field(info, "agent") == Some("compaction"))
+    {
+        let running = finish.is_none()
+            && !field(record_field(info, "time"), "completed").is_some_and(is_truthy);
+        return reconcile_buffered_error(live, id, running).await;
+    }
+    live.with(|s| {
+        if s.current_prompt(id).is_none() {
+            return;
+        }
+        if let Some(error) = error {
+            s.emit(HarnessEvent::SessionError {
+                message: session_error_message(Some(error)),
+            });
+        }
+        finish_active_turn(s, completion_events());
+    });
+    Ok(())
+}
+
+/// `scheduleBufferedErrorCheck`: run the idle check after `delay`, unless a
+/// later schedule or the end of the turn cancels it.
+fn schedule_buffered_error_check(live: &Arc<Live>, id: u64, delay: Duration) {
+    let Some(timer) = live.with(|s| {
+        let prompt = s.current_prompt(id)?;
+        if !prompt.accepted {
+            return None;
+        }
+        prompt.error_timer += 1;
+        Some(prompt.error_timer)
+    }) else {
+        return;
+    };
+    let task_live = live.clone();
+    live.spawner.spawn(
+        async move {
+            let live = task_live;
+            sleep(delay).await;
+            let current = live.with(|s| {
+                s.prompt
+                    .as_ref()
+                    .is_some_and(|prompt| prompt.id == id && prompt.error_timer == timer)
+            });
+            if !current {
+                return;
+            }
+            if let Err(error) = reconcile_idle_prompt(&live).await {
+                live.with(|s| {
+                    if s.current_prompt(id).is_none() {
+                        return;
+                    }
+                    s.emit(HarnessEvent::SessionError {
+                        message: format!("Could not verify OpenCode error: {error}"),
+                    });
+                    finish_active_turn(s, Vec::new());
+                });
+            }
+        }
+        .boxed(),
+    );
+}
+
+/// `reconcileBufferedError`: report a buffered error once its grace passed
+/// with no durable progress and the session is still idle.
+async fn reconcile_buffered_error(
+    live: &Arc<Live>,
+    id: u64,
+    assistant_running: bool,
+) -> Result<()> {
+    let Some(pending) = live.with(|s| {
+        s.prompt
+            .as_ref()
+            .filter(|prompt| prompt.id == id)
+            .and_then(|prompt| prompt.pending_error.clone())
+    }) else {
+        return Ok(());
+    };
+    if assistant_running {
+        return Ok(());
+    }
+    let remaining = pending.grace.saturating_sub(pending.progress_at.elapsed());
+    if !remaining.is_zero() {
+        schedule_buffered_error_check(live, id, remaining);
+        return Ok(());
+    }
+    let owned = live.with(|s| {
+        s.prompt
+            .as_ref()
+            .map(|prompt| prompt.message_ids.clone())
+            .unwrap_or_default()
+    });
+    if live
+        .client
+        .session_status(&live.open_code_session_id)
+        .await?
+        != "idle"
+    {
+        return Ok(());
+    }
+    live.with(|s| {
+        let Some(prompt) = s.current_prompt(id) else {
+            return;
+        };
+        // A steer or new progress during the status request makes the
+        // snapshot stale.
+        let unchanged = prompt.pending_error.as_ref().is_some_and(|current| {
+            current.seq == pending.seq && current.progress_at == pending.progress_at
+        }) && prompt.message_ids == owned;
+        if !unchanged {
+            return;
+        }
+        s.emit(HarnessEvent::SessionError {
+            message: pending.message.clone(),
+        });
+        finish_active_turn(s, completion_events());
+    });
+    Ok(())
+}
+
+/// `relatedPromptMessageIDs`: the latest owned user message, plus the user
+/// messages OpenCode wrote to continue it: an automatic compaction request,
+/// and after a successful compaction, the synthetic continuation or the
+/// replayed prompt.
+fn related_prompt_message_ids(
+    messages: &[super::client::OpenCodeMessage],
+    owned: &[String],
+) -> HashSet<String> {
+    let mut related = HashSet::new();
+    let id_of = |message: &super::client::OpenCodeMessage| {
+        string_field(message.info.as_ref(), "id").map(str::to_string)
+    };
+    let owned_positions: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| id_of(message).is_some_and(|id| owned.contains(&id)))
+        .map(|(index, _)| index)
+        .collect();
+    if owned_positions.len() != owned.len() {
+        return related;
+    }
+    let Some(&boundary) = owned_positions.last() else {
+        return related;
+    };
+    let latest_owned = &messages[boundary];
+    related.insert(id_of(latest_owned).unwrap_or_default());
+    let Some(created) =
+        field(record_field(latest_owned.info.as_ref(), "time"), "created").and_then(Value::as_f64)
+    else {
+        return related;
+    };
+    let owned_parts = replay_content(&latest_owned.parts);
+    let mut compacted = false;
+    for message in &messages[boundary + 1..] {
+        let info = message.info.as_ref();
+        let Some(id) = string_field(info, "id") else {
+            continue;
+        };
+        if string_field(info, "role") == Some("assistant") {
+            if related.contains(string_field(info, "parentID").unwrap_or_default())
+                && string_field(info, "agent") == Some("compaction")
+                && !field(info, "error").is_some_and(is_truthy)
+                && string_field(info, "finish") == Some("stop")
+            {
+                compacted = true;
+            }
+            continue;
+        }
+        if string_field(info, "role") != Some("user") || owned.iter().any(|owned| owned == id) {
+            continue;
+        }
+        let message_created = field(record_field(info, "time"), "created").and_then(Value::as_f64);
+        if message_created.is_none_or(|time| time < created) {
+            continue;
+        }
+        let parts: Vec<&Record> = message.parts.iter().filter_map(Value::as_object).collect();
+        let automatic_compaction = !parts.is_empty()
+            && parts.iter().all(|part| {
+                part.get("type").and_then(Value::as_str) == Some("compaction")
+                    && part.get("auto") == Some(&Value::Bool(true))
+            });
+        let continuation = compacted
+            && !parts.is_empty()
+            && parts.iter().all(|part| {
+                part.get("type").and_then(Value::as_str) == Some("text")
+                    && part.get("synthetic") == Some(&Value::Bool(true))
+                    && field(record_field(Some(part), "metadata"), "compaction_continue")
+                        == Some(&Value::Bool(true))
+            });
+        let replay =
+            compacted && !parts.is_empty() && owned_parts == replay_content(&message.parts);
+        if automatic_compaction || continuation || replay {
+            related.insert(id.to_string());
+        }
+    }
+    related
+}
+
+/// `replayContent`: what a replayed prompt must repeat. OpenCode replays
+/// images and PDFs as text placeholders.
+fn replay_content(parts: &[Value]) -> Value {
+    Value::Array(
+        parts
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|part| {
+                let part_type = part.get("type").and_then(Value::as_str);
+                match part_type {
+                    Some("compaction") => None,
+                    Some("text") => Some(json!({
+                        "type": "text",
+                        "text": part.get("text").cloned().unwrap_or(Value::Null),
+                        "synthetic": part.get("synthetic") == Some(&Value::Bool(true)),
+                    })),
+                    Some("file") => {
+                        let mime = string_field(Some(part), "mime").unwrap_or_default();
+                        if mime.starts_with("image/") || mime == "application/pdf" {
+                            let name = string_field(Some(part), "filename").unwrap_or("file");
+                            Some(json!({
+                                "type": "text",
+                                "text": format!("[Attached {mime}: {name}]"),
+                                "synthetic": false,
+                            }))
+                        } else {
+                            Some(json!({
+                                "type": "file",
+                                "mime": mime,
+                                "filename": part.get("filename").cloned().unwrap_or(Value::Null),
+                                "url": part.get("url").cloned().unwrap_or(Value::Null),
+                            }))
+                        }
+                    }
+                    _ => Some(json!({ "type": part.get("type").cloned().unwrap_or(Value::Null) })),
+                }
+            })
+            .collect(),
+    )
 }
 
 /// `parsePart`.
@@ -1990,14 +2831,11 @@ fn parse_part(value: Option<&Value>) -> Option<OpenCodePart> {
     })
 }
 
-/// `roleForPart`.
+/// `roleForPart`. A part of a message whose role is not known yet has no
+/// role: it could be the user's prompt.
 fn role_for_part(s: &LiveState, part: &OpenCodePart) -> Option<Role> {
-    if let Some(known) = part
-        .message_id
-        .as_ref()
-        .and_then(|id| s.message_role_by_id.get(id))
-    {
-        return Some(*known);
+    if let Some(message_id) = &part.message_id {
+        return s.message_role_by_id.get(message_id).copied();
     }
     matches!(part.part_type.as_str(), "tool" | "text" | "reasoning").then_some(Role::Assistant)
 }
@@ -2014,9 +2852,11 @@ async fn resolve_session(
     client: &OpenCodeClient,
     resume: Option<&Resume>,
     runtime_mode: RuntimeMode,
+    planning: bool,
     cwd: &str,
+    tool_output_glob: Option<&str>,
 ) -> Result<OpenCodeSession> {
-    let permission = build_open_code_permission_rules(runtime_mode);
+    let permission = build_open_code_permission_rules(runtime_mode, planning, tool_output_glob);
     let update = PermissionUpdate {
         permission: &permission,
     };
@@ -2028,12 +2868,14 @@ async fn resolve_session(
                 .as_deref()
                 .filter(|directory| !directory.is_empty())
                 .is_none_or(|directory| same_directory(directory, cwd));
+            // A resumed session keeps the rules it was created with until
+            // this patch lands, so a failed patch must not reach a prompt.
             if same {
-                let _ = client.update_session(&adopted.id, &update).await;
+                client.update_session(&adopted.id, &update).await?;
                 return Ok(adopted);
             }
             let forked = client.fork_session(&adopted.id, cwd).await?;
-            let _ = client.update_session(&forked.id, &update).await;
+            client.update_session(&forked.id, &update).await?;
             Ok(forked)
         }
         .await;
@@ -2058,6 +2900,16 @@ async fn latest_open_code_user_message_id(live: &Live) -> Result<String> {
         .filter_map(|message| {
             let info = message.info.as_ref();
             if string_field(info, "role") != Some("user") {
+                return None;
+            }
+            // OpenCode's own continuation and compaction requests are not
+            // something the user can edit.
+            let visible = message.parts.iter().any(|part| {
+                let part = part.as_object();
+                field(part, "synthetic") != Some(&Value::Bool(true))
+                    && matches!(string_field(part, "type"), Some("text" | "file"))
+            });
+            if !message.parts.is_empty() && !visible {
                 return None;
             }
             let id = string_field(info, "id")?;
@@ -2281,6 +3133,15 @@ impl HarnessAdapter for OpenCodeAdapter {
 
     fn refresh_catalog(&self) -> BoxFuture<'_, Result<()>> {
         let refresh = self.inner.refresher.refresh();
+        async move {
+            refresh.await;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn refresh_project_catalog(&self, cwd: String) -> BoxFuture<'_, Result<()>> {
+        let refresh = self.inner.text.refresh_project_catalog(&cwd);
         async move {
             refresh.await;
             Ok(())

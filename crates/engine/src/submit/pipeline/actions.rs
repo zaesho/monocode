@@ -106,7 +106,11 @@ impl Submit {
         let kv = self.config.kv.clone();
         let (resolved, model_settings) = {
             let catalog = self.config.catalog.read();
-            let resolved = catalog.resolve_model(harness, Some(model));
+            let resolved = catalog.resolve_model_in(
+                harness,
+                Some(model),
+                Some(monocode_core::session::session_work_cwd(&current)),
+            );
             save_recent_model_choice(&kv, resolved.harness, &resolved.id);
             save_last_model_settings(&kv, &current.model_settings, SaveSettingsMode::Fill);
             let last = load_model_prefs(&kv).last_model_settings;

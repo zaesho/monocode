@@ -531,6 +531,10 @@ pub enum BlockNotice {
 #[serde(rename_all = "camelCase")]
 pub struct Block {
     pub id: String,
+    /// The provider part this assistant or reasoning block shows. Later
+    /// snapshots of that part replace the text, even after a reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_part_id: Option<String>,
     pub role: BlockRole,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]

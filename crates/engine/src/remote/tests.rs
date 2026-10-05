@@ -704,6 +704,7 @@ fn remote_setup(cx: &mut TestAppContext, bound: Option<&str>) -> (Setup, Arc<Mut
             id: "p1".into(),
             cwd: "/home/me/repo".into(),
             name: "repo".into(),
+            remote_url: None,
         },
     );
     if let Some(bound) = bound {
@@ -1340,6 +1341,7 @@ fn a_tab_without_a_machine_explains_why(cx: &mut TestAppContext) {
             id: "p1".into(),
             cwd: "/home/me/repo".into(),
             name: "repo".into(),
+            remote_url: None,
         },
     );
     let tab = s

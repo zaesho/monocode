@@ -146,6 +146,10 @@ pub trait ProjectsBackend: Send + Sync + 'static {
         path: &str,
         identity: Option<&str>,
     ) -> Result<Option<ProjectLocation>, String>;
+    /// `git_remote_url`: the URL of the folder's main git remote. Blocks.
+    fn git_remote_url(&self, _cwd: &str) -> Option<String> {
+        None
+    }
     /// `save_project_logo`: copy an image into app data; returns its path.
     fn save_project_logo(&self, project: &str, source_path: &str) -> Result<String, String>;
     /// `forget_logo_file`.
@@ -331,6 +335,10 @@ impl ProjectsBackend for LocalProjectsBackend {
             identity.map(str::to_string),
         )?;
         location.map(from_json::<ProjectLocation>).transpose()
+    }
+
+    fn git_remote_url(&self, cwd: &str) -> Option<String> {
+        monocode_git::fs::git_remote_url(cwd)
     }
 
     fn save_project_logo(&self, project: &str, source_path: &str) -> Result<String, String> {

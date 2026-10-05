@@ -167,6 +167,47 @@ fn wait_until(mut done: impl FnMut() -> bool) {
 }
 
 #[test]
+fn lists_and_opens_projects_with_their_git_remote_url() {
+    let s = setup(&REMOTE_PROVIDERS);
+    let cwd = s.project.cwd.clone();
+    let listed = s.call("projects.list", json!({}));
+    assert_eq!(listed.0, 200);
+    assert!(listed.1["result"][0].get("remoteUrl").is_none());
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&cwd)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        return;
+    }
+    assert!(git(&[
+        "remote",
+        "add",
+        "fork",
+        "https://example.com/fork.git"
+    ]));
+    assert!(git(&[
+        "remote",
+        "add",
+        "origin",
+        "git@github.com:acme/app.git"
+    ]));
+    let listed = s.call("projects.list", json!({}));
+    assert_eq!(
+        listed.1["result"][0]["remoteUrl"],
+        "git@github.com:acme/app.git"
+    );
+    let opened = s.call("projects.open", json!({ "cwd": cwd }));
+    assert_eq!(
+        opened.1["result"]["remoteUrl"],
+        "git@github.com:acme/app.git"
+    );
+}
+
+#[test]
 fn rejects_a_credential_revoked_while_its_request_body_is_arriving() {
     let s = setup(&[HarnessId::Codex]);
     let body = json!({

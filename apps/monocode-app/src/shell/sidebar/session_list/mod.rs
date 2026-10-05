@@ -54,6 +54,8 @@ pub struct SessionCard {
     pub created_at: i64,
     pub status: SessionStatus,
     pub pinned: bool,
+    /// The machine the session runs on, when the project has several.
+    pub machine: Option<String>,
 }
 
 /// What the list draws for one frame.
@@ -99,7 +101,8 @@ pub struct SessionList {
     link_dialog: Option<Entity<monocode_view_inbox::pr::link_dialog::LinkSessionWorkItemDialog>>,
     link_subscription: Option<Subscription>,
     history_observation: Option<(gpui::EntityId, Subscription)>,
-    remote_watch: Option<(String, Subscription)>,
+    /// Session list watches of the project's remote locations.
+    remote_watches: Vec<(String, Subscription)>,
     insert_motion: insert_motion::SessionInsertMotion,
     /// A drawn card's height, which a new row grows to.
     card_height: Rc<Cell<Option<Pixels>>>,
@@ -155,6 +158,11 @@ impl SessionList {
             let connections = remote.connections.clone();
             subscriptions.push(cx.observe(&connections, |_, _, cx| cx.notify()));
         }
+        // Linking or unlinking a folder changes which sessions the list merges.
+        if let Some(projects) = monocode_engine::projects::ProjectsGlobal::try_global(cx) {
+            let projects = projects.projects.clone();
+            subscriptions.push(cx.observe(&projects, |_, _, cx| cx.notify()));
+        }
         Self {
             shell,
             session_search,
@@ -167,7 +175,7 @@ impl SessionList {
             link_dialog: None,
             link_subscription: None,
             history_observation: None,
-            remote_watch: None,
+            remote_watches: Vec::new(),
             insert_motion: Default::default(),
             card_height: Rc::default(),
             _subscriptions: subscriptions,
@@ -442,6 +450,15 @@ impl SessionList {
                     )
                     .child(div().min_w_0().truncate().child(branch)),
             )
+            .children(session.machine.clone().map(|machine| {
+                div()
+                    .flex_none()
+                    .max_w(u(96.))
+                    .truncate()
+                    .text_px(theme.text.caption)
+                    .text_color(theme.content(0.45))
+                    .child(machine)
+            }))
             .child(diff_stat(session.additions, session.deletions));
 
         let mut card = div()
@@ -513,7 +530,14 @@ impl SessionList {
                         })
                     });
                     if let Some(id) = selected {
-                        this.with_shell(cx, |shell, cx| shell.open_session(&id, cx));
+                        let cwd = data
+                            .listed
+                            .iter()
+                            .find(|row| row.id == id)
+                            .map(|row| row.cwd.clone());
+                        this.with_shell(cx, |shell, cx| {
+                            shell.open_listed_session(&id, cwd.as_deref(), cx)
+                        });
                     }
                     cx.notify();
                 })

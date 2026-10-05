@@ -108,6 +108,7 @@ fn remote_workspace_shortcut_preserves_selection_and_creates_the_host_worktree_b
                 id: "project".into(),
                 cwd: "/repo".into(),
                 name: "repo".into(),
+                remote_url: None,
             },
         );
         RemoteGlobal::init(

@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+monocode-core = { path = "../core" }
 monocode-platform = { path = "../platform" }
 monocode-process = { path = "../process" }
 base64.workspace = true

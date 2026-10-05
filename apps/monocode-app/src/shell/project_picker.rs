@@ -474,6 +474,7 @@ mod tests {
             color: 0x7dd3fc,
             logo: None,
             mascot: None,
+            locations: Vec::new(),
         };
         let projects = vec![
             project("Remote backend", "remote://host/srv/api"),

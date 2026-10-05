@@ -130,10 +130,15 @@ pub struct HostDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HostProject {
     pub id: String,
     pub cwd: String,
     pub name: String,
+    /// The URL of the folder's main git remote. Hosts before this field omit
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

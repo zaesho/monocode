@@ -63,7 +63,13 @@ export type HostDescriptor = {
   /** Network addresses the host listens on, such as `https://10.0.0.5:3774`. */
   endpoints?: string[];
 };
-export type HostProject = { id: string; cwd: string; name: string };
+export type HostProject = {
+  id: string;
+  cwd: string;
+  name: string;
+  /** The URL of the folder's main git remote. Hosts before this field omit it. */
+  remoteUrl?: string;
+};
 export type HostDirectory = {
   path: string;
   parent: string | null;

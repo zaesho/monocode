@@ -4429,6 +4429,17 @@ fn git_sync_for(root: &Path) -> GitSync {
     }
 }
 
+/// `git_remote_url`: the URL of the remote that names this repository
+/// (`origin`, then `upstream`, then the first remote by name). `None` outside
+/// a repository or without a remote.
+pub fn git_remote_url(cwd: &str) -> Option<String> {
+    let root = Path::new(cwd);
+    let names = git_stdout(root, &["remote"])?;
+    let names: Vec<&str> = names.lines().collect();
+    let name = monocode_core::git_remote::pick_git_remote(&names)?;
+    git_stdout(root, &["remote", "get-url", &name])
+}
+
 fn git_remote_name(root: &Path) -> Option<String> {
     let remotes = git_stdout(root, &["remote"])?;
     let mut names = remotes
@@ -6296,6 +6307,44 @@ mod tests {
         let info = git_info_for(&dir.0);
         assert_eq!(info.branch.as_deref(), Some("fix-sidebar"));
         assert_eq!(info.repo.as_deref(), Some("widget"));
+    }
+
+    #[test]
+    fn git_remote_url_prefers_origin_then_upstream_then_the_first_name() {
+        let dir = tmp("git-remote-url");
+        if !init_git(&dir.0, "main", None) {
+            return;
+        }
+        let cwd = dir.0.to_string_lossy().into_owned();
+        assert_eq!(git_remote_url(&cwd), None);
+        assert!(git(
+            &dir.0,
+            &["remote", "add", "zeta", "https://example.com/z.git"]
+        ));
+        assert!(git(
+            &dir.0,
+            &["remote", "add", "fork", "https://example.com/f.git"]
+        ));
+        assert_eq!(
+            git_remote_url(&cwd).as_deref(),
+            Some("https://example.com/f.git")
+        );
+        assert!(git(
+            &dir.0,
+            &["remote", "add", "upstream", "https://example.com/u.git"]
+        ));
+        assert_eq!(
+            git_remote_url(&cwd).as_deref(),
+            Some("https://example.com/u.git")
+        );
+        assert!(git(
+            &dir.0,
+            &["remote", "add", "origin", "git@example.com:o/repo.git"]
+        ));
+        assert_eq!(
+            git_remote_url(&cwd).as_deref(),
+            Some("git@example.com:o/repo.git")
+        );
     }
 
     #[test]

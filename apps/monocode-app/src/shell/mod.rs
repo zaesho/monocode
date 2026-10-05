@@ -285,6 +285,7 @@ pub struct Shell {
 impl Shell {
     pub fn new(options: ShellOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         packages::ensure(cx);
+        crate::machines::init(cx);
         let rail_width = AppServices::try_global(cx)
             .map(|services| {
                 monocode_settings::load_app_settings(
@@ -471,6 +472,12 @@ impl Shell {
                 ShellRequest::BringForward => windows::bring_forward(window, cx),
                 ShellRequest::HideWindow => windows::hide_window(window, cx),
                 ShellRequest::SetCompactRail(_) => {},
+                ShellRequest::OpenRemoteProject { link_to, session_id } => {
+                    this.show_remote_project_dialog(link_to.clone(), session_id.clone(), window, cx)
+                }
+                ShellRequest::AddLocalLocation { home, session_id } => {
+                    crate::machines::add_local_location(home.clone(), session_id.clone(), cx)
+                }
                 ShellRequest::ProjectSidebarRemoved(path) => {
                     if same_project_path(&this.sidebar_project, path) {
                         this.sidebar_project = "~".into();
@@ -708,6 +715,26 @@ impl Shell {
                 .update(cx, |workspace, cx| workspace.open_session(session_id, cx))
                 .detach();
         }
+    }
+
+    /// Open a sidebar row: a host session of a remote location opens in a
+    /// remote tab, anything else as `open_session`.
+    pub fn open_listed_session(
+        &mut self,
+        session_id: &str,
+        cwd: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(cwd) = cwd.filter(|cwd| monocode_layout::paths::is_remote_project_path(cwd))
+        else {
+            return self.open_session(session_id, cx);
+        };
+        self.close_page(cx);
+        let host = match &self.history {
+            Some(history) => history.read(cx).host(),
+            None => return,
+        };
+        host.select_remote_session(cwd, session_id, cx);
     }
 
     /// `onNew`: a new chat with the default model in a new tab, in the

@@ -20,6 +20,7 @@ pub use crate::runtime::util::project_path::{
 
 use super::js_object::{Parsed, finite_i64, parse};
 use super::now_ms;
+use super::project_machines::ProjectMachines;
 
 pub const KEY: &str = "monocode.recentProjects";
 pub const RAIL_ORDER_KEY: &str = "monocode.projectRailOrder";
@@ -94,7 +95,9 @@ fn save(kv: &Kv, next: &[RecentProject]) {
 /// `rememberProject`: move the project to the front of the recents and take
 /// it out of the archive.
 pub fn remember_project(kv: &Kv, path: &str) -> Vec<RecentProject> {
-    let normalized = normalize_project_path(path);
+    // A linked folder counts as its project's home, so members never take a
+    // recents slot.
+    let normalized = super::project_machines::project_home(kv, path);
     if normalized == "~" {
         return load_recents(kv);
     }
@@ -135,6 +138,10 @@ pub fn replace_project_path(kv: &Kv, from: &str, to: &str) -> Vec<RecentProject>
     let next_path = normalize_project_path(to);
     if same_project_path(&previous, &next_path) {
         return load_recents(kv);
+    }
+    let mut machines = super::project_machines::load(kv);
+    if machines.replace_path(&previous, &next_path) {
+        super::project_machines::save(kv, &machines);
     }
 
     let mut recents = Vec::new();
@@ -446,17 +453,26 @@ impl<K: Into<String>> FromIterator<(K, RecentProject)> for RailProjects {
 }
 
 /// `collectRailProjects`: every project for the rail, keyed by path key.
-pub fn collect_rail_projects(recents: &[RecentProject], current_cwd: &str) -> RailProjects {
+/// A linked folder shows as its project's home.
+pub fn collect_rail_projects(
+    recents: &[RecentProject],
+    current_cwd: &str,
+    machines: &ProjectMachines,
+) -> RailProjects {
     let mut map = RailProjects::new();
     for item in recents {
         if !looks_like_project(&item.path) {
             continue;
         }
-        let path = normalize_project_path(&item.path);
-        map.set(path_key(&path), RecentProject::new(path, item.opened_at));
+        let path = machines.project_home(&item.path);
+        let key = path_key(&path);
+        let opened_at = map
+            .get(&key)
+            .map_or(item.opened_at, |seen| seen.opened_at.max(item.opened_at));
+        map.set(key, RecentProject::new(path, opened_at));
     }
     if !current_cwd.is_empty() && looks_like_project(current_cwd) {
-        let path = normalize_project_path(current_cwd);
+        let path = machines.project_home(current_cwd);
         let key = path_key(&path);
         if !map.has(&key) {
             map.set(key, RecentProject::new(path, now_ms()));
@@ -497,8 +513,9 @@ pub fn project_rail_sections(
     current_cwd: &str,
     order: &[String],
     pinned_paths: &[String],
+    machines: &ProjectMachines,
 ) -> ProjectRailSections {
-    let projects = collect_rail_projects(recents, current_cwd);
+    let projects = collect_rail_projects(recents, current_cwd, machines);
     let synced_order = sync_project_rail_order(order, &projects);
     let pinned_set: HashSet<String> = pinned_paths.iter().map(|path| path_key(path)).collect();
     let mut sections = ProjectRailSections::default();
@@ -523,9 +540,16 @@ pub fn project_rail_items(
     recents: &[RecentProject],
     current_cwd: &str,
 ) -> Vec<RecentProject> {
-    let projects = collect_rail_projects(recents, current_cwd);
+    let machines = super::project_machines::load(kv);
+    let projects = collect_rail_projects(recents, current_cwd, &machines);
     let order = sync_project_rail_order(&load_project_rail_order(kv), &projects);
-    let sections = project_rail_sections(recents, current_cwd, &order, &load_pinned_projects(kv));
+    let sections = project_rail_sections(
+        recents,
+        current_cwd,
+        &order,
+        &load_pinned_projects(kv),
+        &machines,
+    );
     sections
         .pinned
         .into_iter()
@@ -625,6 +649,7 @@ mod tests {
             "/tmp/current/",
             &["/tmp/older".into(), "/tmp/current".into()],
             &[],
+            &ProjectMachines::default(),
         );
         let all: Vec<RecentProject> = sections
             .pinned
@@ -646,6 +671,7 @@ mod tests {
             "/tmp/a",
             &["/tmp/a".into(), "/tmp/b".into(), "/tmp/c".into()],
             &["/tmp/b".into()],
+            &ProjectMachines::default(),
         );
         assert_eq!(paths(&sections.pinned), ["/tmp/b"]);
         assert_eq!(paths(&sections.projects), ["/tmp/a", "/tmp/c"]);
@@ -678,6 +704,26 @@ mod tests {
             sync_project_rail_order(&[], &projects),
             ["/tmp/b", "/tmp/c", "/tmp/a"]
         );
+    }
+
+    #[test]
+    fn linked_folders_show_as_their_home_and_select_it() {
+        let kv = Kv::in_memory();
+        assert!(super::super::project_machines::link_project_location(
+            &kv,
+            "/tmp/app",
+            "remote://mini/home/me/app"
+        ));
+        let recents = [
+            RecentProject::new("remote://mini/home/me/app", 9),
+            RecentProject::new("/tmp/app", 1),
+            RecentProject::new("/tmp/other", 2),
+        ];
+        let items = project_rail_items(&kv, &recents, "remote://mini/home/me/app");
+        assert_eq!(paths(&items), ["/tmp/app", "/tmp/other"]);
+        assert_eq!(items[0].opened_at, 9);
+        remember_project(&kv, "remote://mini/home/me/app/");
+        assert_eq!(load_recents(&kv)[0].path, "/tmp/app");
     }
 
     // projectRailItems

@@ -41,8 +41,19 @@ pub enum AddRemoteProjectEvent {
     OpenConnections,
 }
 
+/// Link mode: the dialog adds a folder to an existing project instead of
+/// opening a new one (docs/repo-machines.md).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RemoteLinkTarget {
+    /// The project's name, for the title.
+    pub name: String,
+    /// Environment ids of machines that already have a folder for it.
+    pub taken: Vec<String>,
+}
+
 pub struct AddRemoteProjectDialog {
     host: Rc<dyn RemoteHost>,
+    link: Option<RemoteLinkTarget>,
     machines: Vec<RemoteMachine>,
     loaded: bool,
     machine_id: Option<String>,
@@ -87,6 +98,7 @@ impl AddRemoteProjectDialog {
             ];
         let mut this = Self {
             host,
+            link: None,
             machines: Vec::new(),
             loaded: false,
             machine_id: None,
@@ -127,11 +139,30 @@ impl AddRemoteProjectDialog {
         }));
     }
 
-    /// The chosen machine, or the first one.
+    /// Add the folder to an existing project instead of opening a new one.
+    pub fn set_link_target(&mut self, target: Option<RemoteLinkTarget>, cx: &mut Context<Self>) {
+        self.link = target;
+        self.select = None;
+        self.effects(cx);
+    }
+
+    pub fn link_target(&self) -> Option<&RemoteLinkTarget> {
+        self.link.as_ref()
+    }
+
+    /// In link mode, whether the project already has a folder on `machine`.
+    pub fn is_taken(&self, machine: &RemoteMachine) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|link| link.taken.contains(&machine.environment_id))
+    }
+
+    /// The chosen machine, or the first one the project can still use.
     pub fn machine(&self) -> Option<&RemoteMachine> {
         self.machine_id
             .as_ref()
             .and_then(|id| self.machines.iter().find(|entry| &entry.id == id))
+            .or_else(|| self.machines.iter().find(|entry| !self.is_taken(entry)))
             .or_else(|| self.machines.first())
     }
 
@@ -225,7 +256,7 @@ impl AddRemoteProjectDialog {
         let Some(machine) = self.machine().cloned() else {
             return;
         };
-        if path.trim().is_empty() || self.opening {
+        if path.trim().is_empty() || self.opening || self.is_taken(&machine) {
             return;
         }
         self.request_version += 1;
@@ -291,7 +322,12 @@ impl AddRemoteProjectDialog {
             .machines
             .iter()
             .map(|entry| {
-                SearchableSelectOption::new(entry.id.clone(), entry.name.clone()).keywords(
+                let label = if self.is_taken(entry) {
+                    format!("{} (Already added)", entry.name)
+                } else {
+                    entry.name.clone()
+                };
+                SearchableSelectOption::new(entry.id.clone(), label).keywords(
                     entry
                         .ssh
                         .as_ref()
@@ -362,16 +398,21 @@ impl Render for AddRemoteProjectDialog {
                             .text_px(theme.text.body)
                             .medium()
                             .leading(theme.leading.tight)
-                            .child("Open folder on a machine"),
+                            .child(match &self.link {
+                                Some(link) => format!("Add {} on a machine", link.name),
+                                None => "Open folder on a machine".into(),
+                            }),
                     )
                     .child(
                         div()
                             .text_px(theme.text.label)
                             .leading(theme.leading.snug)
                             .text_color(theme.content(0.55))
-                            .child(
-                                "Sessions in this project run on that machine, using its checkout and its Codex or Claude Code sign-in. They keep running when you close MonoCode here.",
-                            ),
+                            .child(if self.link.is_some() {
+                                "Choose this repository's folder on the machine. New sessions in the project can then run there, using its checkout and its Codex or Claude Code sign-in."
+                            } else {
+                                "Sessions in this project run on that machine, using its checkout and its Codex or Claude Code sign-in. They keep running when you close MonoCode here."
+                            }),
                     ),
             );
         if self.loaded {
@@ -483,6 +524,14 @@ impl AddRemoteProjectDialog {
                         SharedString::from(machine.name.clone()),
                         Some(theme.content(0.80)),
                     ),
+                    (
+                        SharedString::from(if self.is_taken(machine) {
+                            " · Already added"
+                        } else {
+                            ""
+                        }),
+                        None,
+                    ),
                 ])),
         };
 
@@ -512,6 +561,7 @@ impl AddRemoteProjectDialog {
             .child(rows);
 
         let path_empty = self.path(cx).trim().is_empty();
+        let taken = self.is_taken(machine);
         let mut body = div()
             .relative()
             .flex()
@@ -557,7 +607,7 @@ impl AddRemoteProjectDialog {
                     .selector("button:Open")
                     .small()
                     .radius(theme.radius.md)
-                    .disabled(self.opening || path_empty)
+                    .disabled(self.opening || path_empty || taken)
                     .on_click(cx.listener(|this, _, _, cx| this.open(cx))),
                 ),
         )

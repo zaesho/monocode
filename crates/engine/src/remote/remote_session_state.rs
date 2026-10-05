@@ -92,6 +92,7 @@ mod tests {
                 environment_id: "env".into(),
                 project_id: "project".into(),
                 cwd: "/home/me/repo".into(),
+                remote_url: None,
                 extra: Extra::new(),
             },
         );

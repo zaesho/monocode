@@ -6,25 +6,48 @@ use monocode_view_inbox::pr::link_dialog::{LinkDialogEvent, LinkSessionWorkItemD
 use serde_json::{Value, json};
 
 impl SessionList {
+    /// The machine, host project, and client for a remote location.
     fn remote_target(
         &self,
+        cwd: &str,
         cx: &App,
     ) -> Option<(
         String,
         String,
         monocode_engine::remote::client::RemoteClient,
     )> {
-        let cwd = self.shell.upgrade()?.read(cx).sidebar_cwd(cx);
-        if !monocode_layout::paths::is_remote_project_path(&cwd) {
+        if !monocode_layout::paths::is_remote_project_path(cwd) {
             return None;
         }
         let remote = RemoteGlobal::try_global(cx)?;
         let connections = remote.connections.read(cx);
-        let project = connections.remote_project_for(&cwd)?;
-        let machine = connections.project_sessions(&cwd).machine?;
+        let project = connections.remote_project_for(cwd)?;
+        let machine = connections.project_sessions(cwd).machine?;
         Some((machine.id, project.project_id, remote.client.clone()))
     }
 
+    /// The location each session row belongs to, falling back to the
+    /// sidebar's.
+    pub(super) fn row_locations(&self, ids: &[String], cx: &mut Context<Self>) -> Vec<String> {
+        let sidebar = self
+            .shell
+            .upgrade()
+            .map(|shell| shell.read(cx).sidebar_cwd(cx))
+            .unwrap_or_default();
+        let listed = self.data(cx).listed;
+        ids.iter()
+            .map(|id| {
+                listed
+                    .iter()
+                    .find(|row| &row.id == id)
+                    .map_or_else(|| sidebar.clone(), |row| row.cwd.clone())
+            })
+            .collect()
+    }
+
+    /// Send a change for the remote rows among `ids` to their hosts.
+    /// Returns true when every row was remote, so nothing is left for the
+    /// local history.
     pub(super) fn remote_change(
         &self,
         ids: Vec<String>,
@@ -32,22 +55,33 @@ impl SessionList {
         delete: bool,
         cx: &mut Context<Self>,
     ) -> bool {
-        let cwd = self
-            .shell
-            .upgrade()
-            .map(|shell| shell.read(cx).sidebar_cwd(cx))
-            .unwrap_or_default();
-        if !monocode_layout::paths::is_remote_project_path(&cwd) {
+        let cwds = self.row_locations(&ids, cx);
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        for (id, cwd) in ids.iter().zip(&cwds) {
+            if !monocode_layout::paths::is_remote_project_path(cwd) {
+                continue;
+            }
+            match groups.iter_mut().find(|(group, _)| group == cwd) {
+                Some((_, members)) => members.push(id.clone()),
+                None => groups.push((cwd.clone(), vec![id.clone()])),
+            }
+        }
+        if groups.is_empty() {
             return false;
         }
-        let Some((machine, project, client)) = self.remote_target(cx) else {
-            monocode_app::bridge::dialogs::alert(
-                "Connect this project's machine to change its sessions.",
-                true,
-                cx,
-            );
-            return true;
-        };
+        let all_remote = groups.iter().map(|(_, ids)| ids.len()).sum::<usize>() == ids.len();
+        let mut targets = Vec::new();
+        for (cwd, ids) in groups {
+            let Some(target) = self.remote_target(&cwd, cx) else {
+                monocode_app::bridge::dialogs::alert(
+                    "Connect this project's machine to change its sessions.",
+                    true,
+                    cx,
+                );
+                return all_remote;
+            };
+            targets.push((cwd, ids, target));
+        }
         let confirmation = delete.then(|| {
             monocode_app::bridge::dialogs::confirm(
                 "Delete these conversations? This cannot be undone.",
@@ -61,56 +95,58 @@ impl SessionList {
             {
                 return;
             }
-            for id in ids {
-                let mut params = patch.as_object().cloned().unwrap_or_default();
-                params.insert("projectId".into(), project.clone().into());
-                params.insert("sessionId".into(), id.clone().into());
-                if let Err(error) = client
-                    .request(
-                        &machine,
-                        if delete {
-                            "sessions.delete"
-                        } else {
-                            "sessions.update"
-                        },
-                        params.into(),
-                    )
-                    .await
-                {
-                    cx.update(|cx| {
-                        monocode_app::bridge::dialogs::alert(
-                            &format!("Could not change this conversation.\n\n{error}"),
-                            true,
-                            cx,
+            'targets: for (cwd, ids, (machine, project, client)) in targets {
+                for id in ids {
+                    let mut params = patch.as_object().cloned().unwrap_or_default();
+                    params.insert("projectId".into(), project.clone().into());
+                    params.insert("sessionId".into(), id.clone().into());
+                    if let Err(error) = client
+                        .request(
+                            &machine,
+                            if delete {
+                                "sessions.delete"
+                            } else {
+                                "sessions.update"
+                            },
+                            params.into(),
                         )
-                    });
-                    break;
-                }
-                if delete {
-                    cx.update(|cx| {
-                        let Some(remote) = RemoteGlobal::try_global(cx) else {
-                            return;
-                        };
-                        let connections = remote.connections.clone();
-                        let ids = Engine::sessions(cx)
-                            .read(cx)
-                            .all()
-                            .iter()
-                            .filter(|session| {
-                                monocode_layout::paths::same_project_path(&session.cwd, &cwd)
-                                    && connections
-                                        .read(cx)
-                                        .remote_session_for(&session.id)
-                                        .as_deref()
-                                        == Some(&id)
-                            })
-                            .map(|session| session.id.clone())
-                            .collect::<Vec<_>>();
-                        for id in ids {
-                            crate::slots::forget_session_in_windows(&id, cx);
-                            RemoteGlobal::forget_tab(&id, cx);
-                        }
-                    });
+                        .await
+                    {
+                        cx.update(|cx| {
+                            monocode_app::bridge::dialogs::alert(
+                                &format!("Could not change this conversation.\n\n{error}"),
+                                true,
+                                cx,
+                            )
+                        });
+                        break 'targets;
+                    }
+                    if delete {
+                        cx.update(|cx| {
+                            let Some(remote) = RemoteGlobal::try_global(cx) else {
+                                return;
+                            };
+                            let connections = remote.connections.clone();
+                            let ids = Engine::sessions(cx)
+                                .read(cx)
+                                .all()
+                                .iter()
+                                .filter(|session| {
+                                    monocode_layout::paths::same_project_path(&session.cwd, &cwd)
+                                        && connections
+                                            .read(cx)
+                                            .remote_session_for(&session.id)
+                                            .as_deref()
+                                            == Some(&id)
+                                })
+                                .map(|session| session.id.clone())
+                                .collect::<Vec<_>>();
+                            for id in ids {
+                                crate::slots::forget_session_in_windows(&id, cx);
+                                RemoteGlobal::forget_tab(&id, cx);
+                            }
+                        });
+                    }
                 }
             }
             cx.update(|cx| {
@@ -122,7 +158,7 @@ impl SessionList {
             });
         })
         .detach();
-        true
+        all_remote
     }
 
     fn start_rename(
@@ -245,8 +281,22 @@ impl SessionList {
             .history(cx)
             .map(|history| history.read(cx).session_menu_state(&data.listed))
             .unwrap_or_default();
-        let remote_project = self.shell.upgrade().is_some_and(|shell| {
-            monocode_layout::paths::is_remote_project_path(&shell.read(cx).sidebar_cwd(cx))
+        let menu_ids = if state.session_ids.is_empty() {
+            self.menu_session.clone().into_iter().collect()
+        } else {
+            state.session_ids.clone()
+        };
+        let remote_project = menu_ids.iter().any(|id| {
+            data.listed.iter().find(|row| &row.id == id).map_or_else(
+                || {
+                    self.shell.upgrade().is_some_and(|shell| {
+                        monocode_layout::paths::is_remote_project_path(
+                            &shell.read(cx).sidebar_cwd(cx),
+                        )
+                    })
+                },
+                |row| monocode_layout::paths::is_remote_project_path(&row.cwd),
+            )
         });
         let mut entries: Vec<MenuEntry> = vec![
             MenuItem::new("open", "Open in new tab")

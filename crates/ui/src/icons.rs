@@ -148,6 +148,8 @@ pub enum IconName {
     MessageSquarePlus,
     /// Hugeicons `MinusSignIcon`.
     Minus,
+    /// Hugeicons `ComputerIcon`.
+    Monitor,
     /// Hugeicons `MoreHorizontalIcon`.
     MoreHorizontal,
     /// Hugeicons `PaintBoardIcon`.
@@ -298,6 +300,7 @@ impl IconName {
         Self::MessageSquare,
         Self::MessageSquarePlus,
         Self::Minus,
+        Self::Monitor,
         Self::MoreHorizontal,
         Self::Palette,
         Self::Pause,
@@ -409,6 +412,7 @@ impl IconName {
             Self::MessageSquare => "monocode/icons/message-square.svg",
             Self::MessageSquarePlus => "monocode/icons/message-square-plus.svg",
             Self::Minus => "monocode/icons/minus.svg",
+            Self::Monitor => "monocode/icons/monitor.svg",
             Self::MoreHorizontal => "monocode/icons/more-horizontal.svg",
             Self::Palette => "monocode/icons/palette.svg",
             Self::Pause => "monocode/icons/pause.svg",
@@ -521,6 +525,7 @@ impl IconName {
             Self::MessageSquare => "MessageSquare",
             Self::MessageSquarePlus => "MessageSquarePlus",
             Self::Minus => "Minus",
+            Self::Monitor => "Monitor",
             Self::MoreHorizontal => "MoreHorizontal",
             Self::Palette => "Palette",
             Self::Pause => "Pause",
@@ -729,7 +734,7 @@ mod tests {
 
     #[test]
     fn every_icon_has_an_asset() {
-        assert_eq!(IconName::ALL.len(), 106);
+        assert_eq!(IconName::ALL.len(), 107);
         for icon in IconName::ALL {
             let data = crate::Assets.load(icon.path()).unwrap();
             assert!(data.is_some(), "missing {}", icon.path());

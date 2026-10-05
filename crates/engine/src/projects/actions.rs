@@ -948,6 +948,10 @@ pub fn on_remove_project(path: &str, purge_data: bool, cx: &mut App) {
         }
         projects.recents().to_vec()
     });
+    let names = hooks.machine_names(cx);
+    projects.update(cx, |projects, cx| {
+        projects.forget_machine_location(&normalized, &names, cx)
+    });
     if purge_data {
         projects.update(cx, |projects, _| projects.forget_location(&normalized));
         hooks.project_sidebar_tab_removed(&normalized, cx);

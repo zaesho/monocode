@@ -4935,6 +4935,7 @@ name = "monocode-git"
 version = "0.7.0"
 dependencies = [
  "base64 0.22.1",
+ "monocode-core",
  "monocode-platform",
  "monocode-process",
  "monocode-store",

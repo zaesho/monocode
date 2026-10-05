@@ -53,6 +53,10 @@ pub struct History {
     loaded_projects: HashSet<String>,
     /// `historyErrorCwd`: the project whose listing failed.
     error_cwd: Option<String>,
+    /// Other locations of the sidebar project whose rows the sidebar merges
+    /// (docs/repo-machines.md), and those still listing.
+    location_cwds: HashSet<String>,
+    location_listing: HashSet<String>,
     /// `sidebarCwd`.
     pub(super) sidebar_cwd: String,
     /// `sessionNavigationIdsRef`: the sidebar's keyboard order.
@@ -76,6 +80,8 @@ impl History {
             stored_linked_sessions: Vec::new(),
             loaded_projects: HashSet::new(),
             error_cwd: None,
+            location_cwds: HashSet::new(),
+            location_listing: HashSet::new(),
             sidebar_cwd: String::new(),
             navigation_ids: Vec::new(),
             delete_confirmation_pending: false,
@@ -162,11 +168,79 @@ impl History {
 
     /// The `{ branch, repo }` overlay App.tsx passed with live sessions.
     fn git_overlay(&self, branch: Option<&str>) -> SessionGitHint {
-        SessionGitHint {
-            branch: branch.filter(|b| !b.is_empty()).map(str::to_string),
-            repo: (!self.sidebar_cwd.is_empty() && self.sidebar_cwd != "~")
-                .then(|| project_name(&self.sidebar_cwd)),
+        location_git_overlay(&self.sidebar_cwd, branch)
+    }
+
+    /// The rows of another location of the sidebar project, plus its live
+    /// sessions not saved yet. Call `load_location` first.
+    pub fn location_history(
+        &self,
+        cwd: &str,
+        sessions: &[Session],
+        branch: Option<&str>,
+        runs: &[LiveRun],
+    ) -> Vec<SessionSummary> {
+        history_with_live_sessions(
+            &self.rows,
+            sessions,
+            cwd,
+            Some(&location_git_overlay(cwd, branch)),
+            runs,
+        )
+    }
+
+    /// Open chats of another location of the sidebar project, as rows.
+    pub fn open_location_sessions(
+        &self,
+        cwd: &str,
+        sessions: &[Session],
+        branch: Option<&str>,
+    ) -> Vec<SessionSummary> {
+        let hint = location_git_overlay(cwd, branch);
+        sessions
+            .iter()
+            .filter(|session| {
+                session.inbox_ask.is_none()
+                    && session.orchestration_lead_id.is_none()
+                    && same_project_path(&session.cwd, cwd)
+            })
+            .map(|session| summary_from_session(session, Some(&hint)))
+            .collect()
+    }
+
+    /// Whether a location's first listing has not arrived.
+    pub fn location_pending(&self, cwd: &str) -> bool {
+        !self.loaded_projects.contains(&normalize_project_path(cwd))
+    }
+
+    /// List another location of the sidebar project once, so the sidebar
+    /// can merge its rows.
+    pub fn load_location(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        let key = normalize_project_path(cwd);
+        if cwd.is_empty() || cwd == "~" || is_remote_project_path(cwd) {
+            return;
         }
+        self.location_cwds.insert(key.clone());
+        if self.loaded_projects.contains(&key) || !self.location_listing.insert(key.clone()) {
+            return;
+        }
+        let list = Engine::writer(cx).list_sessions_by_project(cwd);
+        let cwd = cwd.to_string();
+        cx.spawn(async move |this, cx| {
+            let listed = list.await;
+            this.update(cx, |this, cx| {
+                this.location_listing.remove(&key);
+                if let Ok(rows) = listed {
+                    this.rows = replace_project_history(&this.rows, &cwd, rows);
+                }
+                // A failed listing still counts as loaded, so the sidebar
+                // shows what the other locations have.
+                this.loaded_projects.insert(key);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// `sidebarHistory`: the project's rows plus live sessions not saved yet.
@@ -329,7 +403,11 @@ impl History {
             SessionsEvent::Persisted(summary) => {
                 // `persistSession` merged only rows of the sidebar project,
                 // compared as written.
-                if summary.cwd == self.sidebar_cwd {
+                if summary.cwd == self.sidebar_cwd
+                    || self
+                        .location_cwds
+                        .contains(&normalize_project_path(&summary.cwd))
+                {
                     self.rows = merge_project_history_summary(&self.rows, (**summary).clone());
                     cx.notify();
                 }
@@ -1141,6 +1219,14 @@ impl RemovalAdapter for HistoryRemoval {
 }
 
 /// `ensureOpenSession` from an async context.
+/// The `{ branch, repo }` overlay for one location's live sessions.
+fn location_git_overlay(cwd: &str, branch: Option<&str>) -> SessionGitHint {
+    SessionGitHint {
+        branch: branch.filter(|b| !b.is_empty()).map(str::to_string),
+        repo: (!cwd.is_empty() && cwd != "~").then(|| project_name(cwd)),
+    }
+}
+
 async fn ensure_open(session_id: &str, cx: &mut AsyncApp) -> Option<Session> {
     let open = cx.update(|cx| {
         Engine::sessions(cx).update(cx, |sessions, cx| sessions.ensure_open(session_id, cx))

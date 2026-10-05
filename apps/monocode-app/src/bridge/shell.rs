@@ -34,6 +34,17 @@ pub enum ShellRequest {
     HideWindow,
     /// Apply the saved rail mode to every open window.
     SetCompactRail(bool),
+    /// Show the open-folder-on-a-machine dialog. With `link_to`, the folder
+    /// joins that project, and the blank session `session_id` moves to it.
+    OpenRemoteProject {
+        link_to: Option<String>,
+        session_id: Option<String>,
+    },
+    /// "Add folder on this computer…" for the project `home`.
+    AddLocalLocation {
+        home: String,
+        session_id: Option<String>,
+    },
     /// The remembered sidebar selection follows project removal or rename.
     ProjectSidebarRemoved(String),
     ProjectSidebarMoved {

@@ -530,6 +530,7 @@ fn append_handoff_block(
             to,
             status,
             pending: pending.then_some(true),
+            transfer: None,
             extra: Extra::new(),
         }),
         ..Block::new(uuid::Uuid::new_v4().to_string(), BlockRole::Handoff, text)

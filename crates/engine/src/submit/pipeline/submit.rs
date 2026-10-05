@@ -690,6 +690,7 @@ impl Submit {
         let sessions = Engine::sessions(cx);
         if behavior == FollowUpBehavior::Queue {
             let message = QueuedMessage {
+                selection: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 text: text.to_string(),
                 attachments,

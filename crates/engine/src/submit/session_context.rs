@@ -77,7 +77,7 @@ pub(crate) async fn expand_dropped_sessions(text: String, cx: &AsyncApp) -> Stri
         let Some(session) = cx.update(|cx| open_or_stored(&id, cx)).await else {
             continue;
         };
-        let snapshot = build_portable_context_snapshot(&session, None);
+        let snapshot = build_portable_context_snapshot(&session, None, &[]);
         let path = match snapshot {
             Ok(snapshot) => {
                 let name = session

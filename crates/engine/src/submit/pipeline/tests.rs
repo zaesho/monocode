@@ -950,6 +950,7 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
         Engine::sessions(cx).update(cx, |sessions, cx| {
             sessions.update("s", cx, |session| {
                 session.queued_messages = Some(vec![QueuedMessage {
+                    selection: None,
                     app_request_id: None,
                     id: "q".into(),
                     text: "next".into(),

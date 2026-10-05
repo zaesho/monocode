@@ -111,6 +111,7 @@ mod tests {
                 to: HarnessId::Claude,
                 status: HandoffStatus::Preparing,
                 pending: None,
+                transfer: None,
                 extra: Extra::new(),
             }),
             ..Block::new("h", BlockRole::Handoff, "")

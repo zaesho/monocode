@@ -3,13 +3,14 @@
 //! JSON items another agent can read. Selection keeps whole messages, never
 //! shortens one, and records what it left out and why.
 //!
-//! The dropped-session context in `chat_context` uses this today. A later
-//! port of provider switching can build on the same export.
+//! Provider switching sends this history to the next provider, and the
+//! dropped-session context in the engine's `chat_context` uses the same
+//! export.
 
-use monocode_core::attachment::AttachmentKind;
-use monocode_core::block::{BlockRole, PlanStatus, TurnModel};
-use monocode_core::{Attachment, Block, Session};
-use serde::Serialize;
+use crate::attachment::AttachmentKind;
+use crate::block::{BlockRole, PlanStatus, TurnModel};
+use crate::{Attachment, Block, Session};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// `DEFAULT_HISTORY_BYTES`.
@@ -34,6 +35,20 @@ pub struct PortableAttachment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// `ContextAssetSnapshot`: a durable copy of one historical attachment, or
+/// the reason it could not be saved.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextAssetSnapshot {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
 }
 
@@ -122,6 +137,8 @@ pub struct PortableContextOptions<'a> {
     pub window_tokens: Option<usize>,
     pub occupied_tokens: Option<usize>,
     pub attachment_tokens: Option<usize>,
+    /// Durable attachment copies that replace the original paths.
+    pub asset_snapshots: &'a [ContextAssetSnapshot],
     /// Export only user and assistant messages. Tool, plan, task, and notice
     /// rows are out of scope rather than omitted, so they get no omission
     /// entry. The TypeScript exporter has no such option.
@@ -386,6 +403,114 @@ fn check_request_capacity(options: &PortableContextOptions<'_>) -> Result<(), St
     Ok(())
 }
 
+/// `currentAttachmentTokens`: the request's attachments as tokens, with
+/// the path metadata providers add even for empty folders. URI escaping can
+/// use three bytes for each source byte.
+pub fn current_attachment_tokens(attachments: &[Attachment]) -> usize {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let media = if attachment.kind == AttachmentKind::Image {
+                4_000
+            } else {
+                16_000.min((attachment.size.max(0) as usize).div_ceil(2))
+            };
+            let path = match attachment.path.as_deref().filter(|path| !path.is_empty()) {
+                Some(path) => {
+                    128 + 3 * bytes(&to_json(&json!({
+                        "kind": attachment.kind,
+                        "name": attachment.name,
+                        "mimeType": attachment.mime_type,
+                        "path": path,
+                    })))
+                }
+                None => 0,
+            };
+            media + path
+        })
+        .sum()
+}
+
+/// `historicalContextAttachments`: the attachments on exported history
+/// through `through_block_id`, each id once.
+pub fn historical_context_attachments(
+    session: &Session,
+    through_block_id: Option<&str>,
+) -> Vec<Attachment> {
+    let Ok(context) = export_portable_context(
+        session,
+        &PortableContextOptions {
+            through_block_id,
+            ..Default::default()
+        },
+    ) else {
+        return Vec::new();
+    };
+    let eligible: std::collections::HashSet<&str> = context
+        .items
+        .iter()
+        .map(|item| item.source_block_id.as_str())
+        .collect();
+    let mut attachments: Vec<Attachment> = Vec::new();
+    let mut push = |attachment: Attachment| match attachments
+        .iter()
+        .position(|saved| saved.id == attachment.id)
+    {
+        Some(index) => attachments[index] = attachment,
+        None => attachments.push(attachment),
+    };
+    for block in &session.blocks {
+        if !eligible.contains(block.id.as_str()) {
+            continue;
+        }
+        for attachment in block.attachments.iter().flatten() {
+            push(attachment.clone());
+        }
+        if let Some(image) = &block.image {
+            push(Attachment {
+                id: block.id.clone(),
+                kind: AttachmentKind::Image,
+                name: image.name.clone(),
+                mime_type: image.mime_type.clone(),
+                size: image.size,
+                path: Some(image.path.clone()).filter(|path| !path.is_empty()),
+                ..Default::default()
+            });
+        }
+    }
+    attachments
+}
+
+/// `snapshotPortableContextAssets`: point each attachment at its durable
+/// copy, or record why it is unavailable.
+pub fn snapshot_portable_context_assets(
+    mut context: PortableContext,
+    snapshots: &[ContextAssetSnapshot],
+) -> PortableContext {
+    if snapshots.is_empty() {
+        return context;
+    }
+    for item in &mut context.items {
+        for attachment in item.attachments.iter_mut().flatten() {
+            let Some(snapshot) = snapshots.iter().find(|saved| saved.id == attachment.id) else {
+                continue;
+            };
+            attachment.path = snapshot
+                .path
+                .clone()
+                .filter(|_| snapshot.unavailable_reason.is_none());
+            if snapshot.sha256.is_some() {
+                attachment.sha256 = snapshot.sha256.clone();
+            }
+            if snapshot.unavailable_reason.is_some() {
+                attachment.unavailable_reason = snapshot.unavailable_reason.clone();
+            }
+        }
+    }
+    context.byte_length = portable_context_cost(&context);
+    context
+}
+
 /// `buildPortableContext`: whole items within the byte budget. The last
 /// user message, the last assistant message, and the first user message go
 /// first, then the rest from newest to oldest. The chosen items keep their
@@ -395,7 +520,10 @@ pub fn build_portable_context(
     options: &PortableContextOptions<'_>,
 ) -> Result<PortableContext, String> {
     check_request_capacity(options)?;
-    let mut context = export_portable_context(session, options)?;
+    let mut context = snapshot_portable_context_assets(
+        export_portable_context(session, options)?,
+        options.asset_snapshots,
+    );
     let eligible = std::mem::take(&mut context.items);
     let limit = history_budget(options);
     let last_user = eligible
@@ -460,14 +588,18 @@ const ATTACHMENT_DELIVERY: &str = "Historical attachments are file references. T
 pub fn build_portable_context_snapshot(
     session: &Session,
     through_block_id: Option<&str>,
+    asset_snapshots: &[ContextAssetSnapshot],
 ) -> Result<String, String> {
-    let context = export_portable_context(
-        session,
-        &PortableContextOptions {
-            through_block_id,
-            ..Default::default()
-        },
-    )?;
+    let context = snapshot_portable_context_assets(
+        export_portable_context(
+            session,
+            &PortableContextOptions {
+                through_block_id,
+                ..Default::default()
+            },
+        )?,
+        asset_snapshots,
+    );
     Ok([
         "# MonoCode shared conversation history".to_string(),
         SNAPSHOT_NOTE.to_string(),
@@ -567,8 +699,8 @@ pub fn portable_context_cost(context: &PortableContext) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use monocode_core::HarnessId;
-    use monocode_core::block::BlockTool;
+    use crate::HarnessId;
+    use crate::block::BlockTool;
 
     fn block(id: &str, role: BlockRole, text: &str) -> Block {
         Block::new(id, role, text)
@@ -768,6 +900,7 @@ mod tests {
         let snapshot = build_portable_context_snapshot(
             &session(vec![block("u1", BlockRole::User, "hello")]),
             None,
+            &[],
         )
         .unwrap();
         assert!(snapshot.starts_with("# MonoCode shared conversation history"));
@@ -782,5 +915,176 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn file(id: &str, path: Option<&str>) -> Attachment {
+        Attachment {
+            id: id.into(),
+            name: format!("{id}.txt"),
+            mime_type: "text/plain".into(),
+            kind: AttachmentKind::File,
+            size: 4,
+            path: path.map(str::to_string),
+            data: Some("bytes".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn collects_attachments_only_from_settled_history_before_the_boundary() {
+        let with = |block: Block, id: &str| Block {
+            attachments: Some(vec![file(id, None)]),
+            ..block
+        };
+        let generated = Block {
+            image: Some(crate::block::GeneratedImageMeta {
+                path: "/original/generated.png".into(),
+                name: "generated.png".into(),
+                mime_type: "image/png".into(),
+                size: 4,
+                alt: None,
+                extra: Default::default(),
+            }),
+            ..block("generated", BlockRole::Image, "")
+        };
+        let source = session(vec![
+            with(block("u", BlockRole::User, "submitted"), "user-file"),
+            with(
+                Block {
+                    draft: Some(true),
+                    ..block("draft", BlockRole::User, "draft")
+                },
+                "draft-file",
+            ),
+            with(
+                Block {
+                    internal: Some(true),
+                    ..block("internal", BlockRole::User, "internal")
+                },
+                "internal-file",
+            ),
+            generated,
+            with(block("future", BlockRole::User, "later"), "future-file"),
+        ]);
+        let ids: Vec<String> = historical_context_attachments(&source, Some("generated"))
+            .into_iter()
+            .map(|attachment| attachment.id)
+            .collect();
+        assert_eq!(ids, ["user-file", "generated"]);
+    }
+
+    #[test]
+    fn rewrites_references_to_saved_copies_without_touching_the_transcript() {
+        let source = session(vec![Block {
+            attachments: Some(vec![file("a", Some("/temporary/file.txt"))]),
+            ..block("u", BlockRole::User, "Inspect the file")
+        }]);
+        let context = build_portable_context(&source, &PortableContextOptions::default()).unwrap();
+        let snapshots = [ContextAssetSnapshot {
+            id: "a".into(),
+            path: Some("/app-data/context-history/src/assets/hash.txt".into()),
+            sha256: Some("hash".into()),
+            unavailable_reason: None,
+        }];
+        let saved = snapshot_portable_context_assets(context.clone(), &snapshots);
+        let attachment = &saved.items[0].attachments.as_ref().unwrap()[0];
+        assert_eq!(attachment.path, snapshots[0].path);
+        assert_eq!(attachment.sha256.as_deref(), Some("hash"));
+        assert_eq!(
+            context.items[0].attachments.as_ref().unwrap()[0]
+                .path
+                .as_deref(),
+            Some("/temporary/file.txt")
+        );
+        assert!(
+            build_portable_context_snapshot(&source, Some("u"), &snapshots)
+                .unwrap()
+                .contains("/app-data/context-history/src/assets/hash.txt")
+        );
+        let unavailable = snapshot_portable_context_assets(
+            context,
+            &[ContextAssetSnapshot {
+                id: "a".into(),
+                unavailable_reason: Some("The source file is missing".into()),
+                ..Default::default()
+            }],
+        );
+        let attachment = &unavailable.items[0].attachments.as_ref().unwrap()[0];
+        assert!(attachment.path.is_none());
+        assert_eq!(
+            attachment.unavailable_reason.as_deref(),
+            Some("The source file is missing")
+        );
+    }
+
+    #[test]
+    fn counts_saved_paths_before_selecting_history() {
+        let source = session(vec![Block {
+            attachments: Some(vec![file("a", Some("/short"))]),
+            ..block("u", BlockRole::User, "Inspect the file")
+        }]);
+        let options = PortableContextOptions {
+            max_bytes: Some(1_800),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_portable_context(&source, &options)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        let snapshots = [ContextAssetSnapshot {
+            id: "a".into(),
+            path: Some(format!("/{}asset.txt", "long-path-segment/".repeat(200))),
+            sha256: Some("hash".into()),
+            unavailable_reason: None,
+        }];
+        let budgeted = build_portable_context(
+            &source,
+            &PortableContextOptions {
+                asset_snapshots: &snapshots,
+                ..options
+            },
+        )
+        .unwrap();
+        assert!(budgeted.items.is_empty());
+        assert_eq!(budgeted.omitted[0].reason, OmissionReason::Budget);
+    }
+
+    #[test]
+    fn rejects_long_zero_size_folder_references_before_history_import() {
+        let attachments: Vec<Attachment> = (0..20)
+            .map(|index| Attachment {
+                id: format!("folder-{index}"),
+                name: format!("folder-{index}"),
+                mime_type: "inode/directory".into(),
+                kind: AttachmentKind::File,
+                size: 0,
+                path: Some(format!(
+                    "/tmp/{}{}/{index}",
+                    "nested-folder/".repeat(8),
+                    "多字节目录".repeat(10)
+                )),
+                ..Default::default()
+            })
+            .collect();
+        let source = session(vec![block("history", BlockRole::User, "Retain this.")]);
+        let result = build_portable_context(
+            &source,
+            &PortableContextOptions {
+                window_tokens: Some(20_000),
+                occupied_tokens: Some(18_800),
+                current_request: Some("Continue"),
+                attachment_tokens: Some(current_attachment_tokens(&attachments)),
+                ..Default::default()
+            },
+        );
+        assert!(result.unwrap_err().contains("remaining context"));
+        let image = Attachment {
+            kind: AttachmentKind::Image,
+            ..file("image", None)
+        };
+        assert_eq!(current_attachment_tokens(&[image]), 4_000);
     }
 }

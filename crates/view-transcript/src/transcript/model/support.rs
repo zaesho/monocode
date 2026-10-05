@@ -188,6 +188,7 @@ mod tests {
             to: HarnessId::Claude,
             status: HandoffStatus::Ready,
             pending: None,
+            transfer: None,
             extra: Default::default(),
         });
         let blocks = vec![

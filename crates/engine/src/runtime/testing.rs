@@ -233,6 +233,7 @@ fn record_from_upsert(payload: &SessionUpsert) -> SessionRecord {
         title: payload.title.clone(),
         provider_session_id: payload.provider_session_id.clone(),
         provider_account_id: payload.provider_account_id.clone(),
+        provider_context: payload.provider_context.clone(),
         blocks: payload.blocks.clone(),
         context_used: payload.context_used,
         context_window: payload.context_window,

@@ -286,17 +286,29 @@ fn keep_reminder_after_move(session_id: &str, before: Session, cx: &mut App) {
     let Some(moved) = find_session(session_id, cx).filter(|moved| moved.cwd != before.cwd) else {
         return;
     };
-    if is_storable_session(&moved) {
-        Engine::writer(cx)
-            .upsert_session_allow_empty(&moved)
-            .detach();
-    } else {
+    let session_id = session_id.to_owned();
+    if !is_storable_session(&moved) {
         reminders
             .update(cx, |reminders, cx| {
-                reminders.cancel(vec![session_id.to_owned()], None, cx)
+                reminders.cancel(vec![session_id], None, cx)
             })
             .detach();
+        return;
     }
+    let saving = Engine::writer(cx).upsert_session_allow_empty(&moved);
+    // A failed save leaves the stored session in its old project.
+    cx.spawn(async move |cx| {
+        if saving.await.is_err() {
+            cx.update(|cx| {
+                reminders
+                    .update(cx, |reminders, cx| {
+                        reminders.cancel(vec![session_id], None, cx)
+                    })
+                    .detach()
+            });
+        }
+    })
+    .detach();
 }
 
 /// `onBranchChange`: the branch picker checked out another branch. The

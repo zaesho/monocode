@@ -209,7 +209,11 @@ struct Live {
     claude_session_id: String,
     provider_account_id: Option<String>,
     runtime_mode: RuntimeMode,
+    /// The user asked for a plan: the child launched in plan mode.
     planning: bool,
+    /// Claude's own Plan Mode state, which EnterPlanMode and ExitPlanMode
+    /// change during a turn.
+    provider_planning: bool,
     settings_key: String,
     on_event: EventSink,
     // Ui ids only grow, so key order is insertion order.
@@ -909,6 +913,13 @@ impl Live {
             let Some(tool) = self.tools_by_id.get(&result.tool_use_id).cloned() else {
                 continue;
             };
+            if !result.is_error {
+                match tool.name.as_str() {
+                    "EnterPlanMode" => self.provider_planning = true,
+                    "ExitPlanMode" => self.provider_planning = false,
+                    _ => {}
+                }
+            }
             let agent = is_agent_tool_name(&tool.name);
             if agent && self.is_backgrounded_agent_tool(&tool.id) {
                 continue;
@@ -1850,6 +1861,15 @@ impl Live {
         self.finish_active_turn(&[]);
     }
 
+    /// Allowing EnterPlanMode or ExitPlanMode changes Claude's Plan Mode.
+    fn note_plan_mode_allowed(&mut self, tool_name: &str) {
+        match tool_name {
+            "EnterPlanMode" => self.provider_planning = true,
+            "ExitPlanMode" => self.provider_planning = false,
+            _ => {}
+        }
+    }
+
     // `markInitialized`.
     fn mark_initialized(&mut self) {
         if self.initialized {
@@ -1968,7 +1988,10 @@ impl Live {
             .boxed();
         }
 
-        if tool_name == "ExitPlanMode" {
+        // A plan the user asked for is captured and Claude stops there.
+        // Otherwise ExitPlanMode leaves a Plan Mode Claude entered on its own,
+        // and is approved like any other tool.
+        if tool_name == "ExitPlanMode" && self.planning {
             if let Some(plan) = extract_exit_plan_mode_plan(&Value::Object(input.clone())) {
                 self.emit_plan(plan);
             }
@@ -1997,6 +2020,7 @@ impl Live {
         }
 
         if self.runtime_mode == RuntimeMode::FullAccess {
+            self.note_plan_mode_allowed(&tool_name);
             return self.write_json(&build_control_response(
                 &control.request_id,
                 to_claude_permission_result(ApprovalDecision::Allow, &input),
@@ -2033,7 +2057,12 @@ impl Live {
             }
             let decision = match decision {
                 ApprovalOutcome::Cancelled => return Ok(()),
-                ApprovalOutcome::Allow => ApprovalDecision::Allow,
+                ApprovalOutcome::Allow => {
+                    if let Some(cell) = cell.upgrade() {
+                        cell.lock().note_plan_mode_allowed(&tool_name);
+                    }
+                    ApprovalDecision::Allow
+                }
                 ApprovalOutcome::Deny => ApprovalDecision::Deny,
             };
             write_json(
@@ -2665,9 +2694,14 @@ impl ClaudeSessions {
         let existing = self.live(&thread_id);
         if let Some(existing) = &existing {
             let mut live = existing.lock();
+            // Claude entered Plan Mode on its own, so a Build turn needs a
+            // process that launched with the normal permission mode.
+            let stuck_in_plan = input.intent == Some(TurnIntent::Build) && live.provider_planning;
             if live.cwd == input.cwd
                 && live.settings_key == settings_key
                 && live.planning == planning
+                && !stuck_in_plan
+                && !live.closed
             {
                 live.on_event = on_event;
                 live.runtime_mode = input.runtime_mode;
@@ -2778,6 +2812,7 @@ impl ClaudeSessions {
                 provider_account_id: input.provider_account_id.clone(),
                 runtime_mode: input.runtime_mode,
                 planning,
+                provider_planning: planning,
                 settings_key,
                 on_event,
                 approvals: BTreeMap::new(),

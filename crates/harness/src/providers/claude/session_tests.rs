@@ -3210,3 +3210,118 @@ fn declines_an_mcp_form_the_question_ui_cannot_show() {
     h.result("sess_1");
     finish(turn).unwrap();
 }
+
+// describe("Claude's own Plan Mode")
+
+fn plan_tool_request(h: &Harness, request_id: &str, tool_name: &str) {
+    h.emit(json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {
+            "subtype": "can_use_tool",
+            "tool_name": tool_name,
+            "tool_use_id": format!("{request_id}-tool"),
+            "input": if tool_name == "ExitPlanMode" {
+                json!({ "plan": "# Plan\n\n1. Modify the file" })
+            } else {
+                json!({})
+            },
+        },
+    }));
+}
+
+fn approval_ids(events: &Events) -> Vec<i64> {
+    events
+        .all()
+        .into_iter()
+        .filter_map(|event| match event {
+            HarnessEvent::ApprovalRequested { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn allows_exit_plan_mode_during_a_full_access_implementation_turn() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn(
+        "s1",
+        TurnOptions {
+            runtime_mode: Some(RuntimeMode::FullAccess),
+            ..Default::default()
+        },
+    );
+    plan_tool_request(&h, "exit-plan", "ExitPlanMode");
+    h.wait_for(
+        || h.response_for("exit-plan").is_some(),
+        "exit plan response",
+    );
+    assert_eq!(
+        h.response_for("exit-plan").unwrap()["response"]["response"]["behavior"],
+        "allow"
+    );
+    assert!(approval_ids(&events).is_empty());
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn restarts_in_build_mode_after_an_autonomous_plan() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    plan_tool_request(&h, "enter-plan", "EnterPlanMode");
+    h.wait_for(|| approval_ids(&events).len() == 1, "enter approval");
+    h.sessions
+        .respond_approval("s1", approval_ids(&events)[0], ApprovalDecision::Allow);
+    h.wait_for(|| h.response_for("enter-plan").is_some(), "enter response");
+    plan_tool_request(&h, "exit-plan", "ExitPlanMode");
+    h.wait_for(|| approval_ids(&events).len() == 2, "exit approval");
+    h.sessions
+        .respond_approval("s1", approval_ids(&events)[1], ApprovalDecision::Deny);
+    h.wait_for(|| h.response_for("exit-plan").is_some(), "exit response");
+    h.result("sess_1");
+    finish(turn).unwrap();
+
+    let (_, build) = h.send(
+        "s1",
+        TurnOptions {
+            intent: Some(TurnIntent::Build),
+            text: Some("Build approved plan"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(|| h.spawned().len() == 2, "Build process");
+    h.ack_init();
+    h.wait_for(|| h.user_count() == 2, "build prompt");
+    h.result("sess_1");
+    finish(build).unwrap();
+}
+
+#[test]
+fn reuses_the_process_for_build_when_claude_left_plan_mode() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    plan_tool_request(&h, "enter-plan", "EnterPlanMode");
+    h.wait_for(|| approval_ids(&events).len() == 1, "enter approval");
+    h.sessions
+        .respond_approval("s1", approval_ids(&events)[0], ApprovalDecision::Allow);
+    plan_tool_request(&h, "exit-plan", "ExitPlanMode");
+    h.wait_for(|| approval_ids(&events).len() == 2, "exit approval");
+    h.sessions
+        .respond_approval("s1", approval_ids(&events)[1], ApprovalDecision::Allow);
+    h.wait_for(|| h.response_for("exit-plan").is_some(), "exit response");
+    h.result("sess_1");
+    finish(turn).unwrap();
+
+    let (_, build) = h.send(
+        "s1",
+        TurnOptions {
+            intent: Some(TurnIntent::Build),
+            ..Default::default()
+        },
+    );
+    h.wait_for(|| h.user_count() == 2, "build prompt");
+    assert_eq!(h.spawned().len(), 1);
+    h.result("sess_1");
+    finish(build).unwrap();
+}

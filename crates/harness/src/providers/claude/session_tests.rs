@@ -3134,3 +3134,79 @@ fn automatic_helpers_launch_with_no_tools_and_fail_a_rejected_initialize() {
     assert!(format!("{error:#}").contains("bad flags"));
     assert_eq!(h.user_count(), 0);
 }
+
+// describe("MCP form elicitation")
+
+fn last_question_id(events: &Events) -> i64 {
+    events
+        .all()
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            HarnessEvent::QuestionAsked { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .expect("no form shown")
+}
+
+fn form_answer(count: &str) -> UserQuestionReply {
+    UserQuestionReply::Answered {
+        answers: [("__mcp_action".to_string(), vec!["accept".to_string()])].into(),
+        custom: Some([("count".to_string(), count.to_string())].into()),
+    }
+}
+
+#[test]
+fn keeps_an_mcp_form_open_after_invalid_input_and_sends_the_corrected_typed_answer() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "control_request",
+        "request_id": "form",
+        "request": {
+            "subtype": "elicitation",
+            "mode": "form",
+            "requested_schema": {
+                "type": "object",
+                "properties": { "count": { "type": "integer", "minimum": 1 } },
+                "required": ["count"],
+            },
+        },
+    }));
+    h.wait_for(
+        || events.any(|e| matches!(e, HarnessEvent::QuestionAsked { .. })),
+        "form",
+    );
+    let first = last_question_id(&events);
+    h.sessions.respond_question("s1", first, form_answer("0"));
+    h.wait_for(|| last_question_id(&events) != first, "form shown again");
+    assert!(h.response_for("form").is_none());
+    h.sessions
+        .respond_question("s1", last_question_id(&events), form_answer("2"));
+    h.wait_for(|| h.response_for("form").is_some(), "form response");
+    assert_eq!(
+        h.response_for("form").unwrap()["response"]["response"],
+        json!({ "action": "accept", "content": { "count": 2 } })
+    );
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn declines_an_mcp_form_the_question_ui_cannot_show() {
+    let h = Harness::new();
+    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    h.emit(json!({
+        "type": "control_request",
+        "request_id": "url-form",
+        "request": { "subtype": "elicitation", "mode": "url", "url": "https://example.com" },
+    }));
+    h.wait_for(|| h.response_for("url-form").is_some(), "decline");
+    assert_eq!(
+        h.response_for("url-form").unwrap()["response"]["response"],
+        json!({ "action": "decline" })
+    );
+    assert!(!events.any(|e| matches!(e, HarnessEvent::QuestionAsked { .. })));
+    h.result("sess_1");
+    finish(turn).unwrap();
+}

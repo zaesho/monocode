@@ -41,6 +41,7 @@ use crate::core::provider_accounts::same_provider_account_id;
 use crate::core::registry::EventSink;
 use crate::core::task::{SharedSpawner, sleep, timeout};
 
+use super::elicitation::{elicitation_questions, elicitation_response};
 use super::io::{SharedChildIo, claude_account};
 use super::protocol::*;
 use super::shared::{OrderedMap, is_agent_tool_name, snapshot_remainder};
@@ -1875,6 +1876,9 @@ impl Live {
         &mut self,
         control: ClaudeControlRequest,
     ) -> BoxFuture<'static, Result<()>> {
+        if control.subtype == "elicitation" {
+            return self.begin_elicitation(control);
+        }
         if control.subtype != "can_use_tool" && control.subtype != "permission" {
             return self.write_json(&build_control_response(&control.request_id, json!({})));
         }
@@ -1922,6 +1926,10 @@ impl Live {
             return async move {
                 // A dropped sender means the session went away; nothing answers.
                 let outcome = pending.await.unwrap_or(QuestionOutcome::Cancelled);
+                // A stopped child has no one left to answer.
+                if cell.upgrade().is_none_or(|cell| cell.lock().closed) {
+                    return Ok(());
+                }
                 let decision = match &outcome {
                     QuestionOutcome::Cancelled => QuestionDecision::Cancelled,
                     QuestionOutcome::Reply(UserQuestionReply::Answered { .. }) => {
@@ -2010,6 +2018,9 @@ impl Live {
         let thread_id = self.thread_id.clone();
         async move {
             let decision = pending.await.unwrap_or(ApprovalOutcome::Cancelled);
+            if cell.upgrade().is_none_or(|cell| cell.lock().closed) {
+                return Ok(());
+            }
             if let Some(cell) = cell.upgrade() {
                 cell.lock().emit(HarnessEvent::ApprovalResolved {
                     request_id: ui_id,
@@ -2034,6 +2045,114 @@ impl Live {
                 ),
             )
             .await
+        }
+        .boxed()
+    }
+
+    /// An MCP server asks for form input. The form shows in the question UI
+    /// and goes back typed: accepted content, decline, or cancel. An answer
+    /// that does not fit the schema shows the form again with the problem as
+    /// its title. A form the UI cannot show is declined.
+    fn begin_elicitation(
+        &mut self,
+        control: ClaudeControlRequest,
+    ) -> BoxFuture<'static, Result<()>> {
+        let request = control.request.clone().unwrap_or_default();
+        let request_id = control.request_id.clone();
+        if self.cancelled || self.mute_updates {
+            return self.write_json(&build_control_response(
+                &request_id,
+                json!({ "action": "cancel" }),
+            ));
+        }
+        let questions = match elicitation_questions(&request) {
+            Ok(questions) => questions,
+            Err(text) => {
+                self.emit(HarnessEvent::Status { text });
+                return self.write_json(&build_control_response(
+                    &request_id,
+                    json!({ "action": "decline" }),
+                ));
+            }
+        };
+        let mut title = string_field(Some(&request), "message")
+            .unwrap_or("MCP form")
+            .to_string();
+        let cell = self.cell.clone();
+        let io = self.io.clone();
+        let thread_id = self.thread_id.clone();
+        async move {
+            loop {
+                let (ui_id, pending) = {
+                    let Some(cell) = cell.upgrade() else {
+                        return Ok(());
+                    };
+                    let mut live = cell.lock();
+                    if live.closed {
+                        return Ok(());
+                    }
+                    let ui_id = live.next_approval_ui_id;
+                    live.next_approval_ui_id += 1;
+                    let pending = live.wait_question(
+                        ui_id,
+                        &request_id,
+                        HarnessEvent::QuestionAsked {
+                            request_id: ui_id,
+                            title: Some(title.clone()),
+                            questions: questions.clone(),
+                            call_id: None,
+                            auto_resolve_at: None,
+                        },
+                    );
+                    live.show_next_question();
+                    (ui_id, pending)
+                };
+                let outcome = pending.await.unwrap_or(QuestionOutcome::Cancelled);
+                {
+                    let Some(cell) = cell.upgrade() else {
+                        return Ok(());
+                    };
+                    let mut live = cell.lock();
+                    if live.closed {
+                        return Ok(());
+                    }
+                    live.emit(HarnessEvent::QuestionResolved {
+                        request_id: ui_id,
+                        decision: match &outcome {
+                            QuestionOutcome::Cancelled => QuestionDecision::Cancelled,
+                            QuestionOutcome::Reply(UserQuestionReply::Answered { .. }) => {
+                                QuestionDecision::Answered
+                            }
+                            QuestionOutcome::Reply(UserQuestionReply::Skipped) => {
+                                QuestionDecision::Skipped
+                            }
+                        },
+                    });
+                    live.show_next_question();
+                }
+                // Claude withdrew the request.
+                let QuestionOutcome::Reply(reply) = outcome else {
+                    return Ok(());
+                };
+                match elicitation_response(&request, &questions, &reply) {
+                    Ok(response) => {
+                        return write_json(
+                            &io,
+                            &thread_id,
+                            &build_control_response(&request_id, response),
+                        )
+                        .await;
+                    }
+                    Err(problem) => {
+                        if let Some(cell) = cell.upgrade() {
+                            cell.lock().emit(HarnessEvent::Status {
+                                text: problem.clone(),
+                            });
+                        }
+                        title = problem;
+                    }
+                }
+            }
         }
         .boxed()
     }

@@ -22,6 +22,7 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::catalog::CatalogRefresher;
 use super::client::{OpenCodeClient, PromptInput, parse_event};
 use super::deps::stream_text_delta;
 use super::protocol::{
@@ -36,7 +37,7 @@ use crate::core::catalog::SharedCatalog;
 use crate::core::child::{BinaryPathChoice, ChildEvent, Children, SseEvent};
 use crate::core::json_text::js_string;
 use crate::core::registry::{EventSink, TextPromptInput};
-use crate::core::task::{SharedSpawner, sleep};
+use crate::core::task::{BoxFuture, SharedSpawner, sleep};
 
 /// Shared prompt builders can use either OpenCode transport.
 pub trait TextBackend: Send + Sync {
@@ -84,6 +85,7 @@ struct LiveText {
 }
 
 struct TextInner {
+    refresher: CatalogRefresher,
     children: Children,
     catalog: SharedCatalog,
     spawner: SharedSpawner,
@@ -103,6 +105,11 @@ impl OpenCodeText {
     pub fn new(children: Children, catalog: SharedCatalog, spawner: SharedSpawner) -> Self {
         Self {
             inner: Arc::new(TextInner {
+                refresher: CatalogRefresher::new(
+                    children.clone(),
+                    catalog.clone(),
+                    spawner.clone(),
+                ),
                 children,
                 catalog,
                 spawner,
@@ -118,6 +125,12 @@ impl OpenCodeText {
     #[cfg(test)]
     pub(crate) fn processed_events(&self) -> usize {
         self.inner.processed_events.load(Ordering::SeqCst)
+    }
+
+    /// `refreshProjectOpenCodeCatalog`: shared with the adapter, so one
+    /// project refresh serves both.
+    pub fn refresh_project_catalog(&self, cwd: &str) -> BoxFuture<'static, ()> {
+        self.inner.refresher.refresh_project(cwd)
     }
 
     /// `stopOpenCodeTextPrompt`.
@@ -227,7 +240,16 @@ impl OpenCodeText {
         requested_model: Option<&str>,
         model_settings: Option<&ModelSettings>,
     ) -> Result<Arc<LiveText>> {
-        let model = self.pick_text_model(requested_model);
+        // Without a requested model, the project's own catalog decides.
+        if requested_model.is_none()
+            && !self
+                .inner
+                .catalog
+                .has_project_harness_models(HarnessId::Opencode, cwd)
+        {
+            self.inner.refresher.refresh_project(cwd).await;
+        }
+        let model = self.pick_text_model(requested_model, cwd);
         let settings_key = model_settings_key(model_settings);
         let current = self.inner.live.lock().clone();
         if let Some(live) = &current
@@ -394,7 +416,7 @@ impl OpenCodeText {
     }
 
     /// `pickTextModel`.
-    fn pick_text_model(&self, requested: Option<&str>) -> ParsedOpenCodeModelSlug {
+    fn pick_text_model(&self, requested: Option<&str>, cwd: &str) -> ParsedOpenCodeModelSlug {
         let selected = requested.map(js::trim).unwrap_or_default();
         if !selected.is_empty() {
             let model_slug = selected.strip_prefix("opencode:").unwrap_or(selected);
@@ -409,7 +431,10 @@ impl OpenCodeText {
             }
         }
         let catalog = self.inner.catalog.read();
-        for model in catalog.models_for(HarnessId::Opencode) {
+        let models = catalog
+            .project_harness_models(HarnessId::Opencode, cwd)
+            .unwrap_or_else(|| catalog.models_for(HarnessId::Opencode));
+        for model in models {
             let slug = model.native_id.as_deref().unwrap_or(&model.id);
             if let Some(parsed) = parse_open_code_model_slug(Some(slug)) {
                 return parsed;
@@ -1039,20 +1064,42 @@ mod tests {
     #[test]
     fn picks_text_models_from_the_request_or_the_catalog() {
         let host = FakeHost::new();
-        let text = OpenCodeText::new(host.children(), SharedCatalog::new(), host.spawner());
+        let catalog = SharedCatalog::new();
+        let text = OpenCodeText::new(host.children(), catalog.clone(), host.spawner());
         let slug = |provider: &str, model: &str| ParsedOpenCodeModelSlug {
             provider_id: provider.into(),
             model_id: model.into(),
         };
         assert_eq!(
-            text.pick_text_model(Some("opencode:openai/gpt-5.4")),
+            text.pick_text_model(Some("opencode:openai/gpt-5.4"), "/repo"),
             slug("openai", "gpt-5.4")
         );
         assert_eq!(
-            text.pick_text_model(Some(" kimi ")),
+            text.pick_text_model(Some(" kimi "), "/repo"),
             slug("opencode", "kimi")
         );
-        assert_eq!(text.pick_text_model(None), slug("opencode", "glm-5"));
+        assert_eq!(
+            text.pick_text_model(None, "/repo"),
+            slug("opencode", "glm-5")
+        );
+        // A project's own catalog decides the model for prompts run there.
+        catalog.set_project_harness_models(
+            HarnessId::Opencode,
+            "/repo",
+            vec![
+                monocode_core::models::AgentModel::new(
+                    "opencode:local/model",
+                    HarnessId::Opencode,
+                    "Local",
+                )
+                .with_native_id("local/model"),
+            ],
+        );
+        assert_eq!(text.pick_text_model(None, "/repo"), slug("local", "model"));
+        assert_eq!(
+            text.pick_text_model(None, "/other"),
+            slug("opencode", "glm-5")
+        );
         assert_eq!(
             get_open_code_text_response(Some(&[
                 json!({ "type": "text", "text": " a" }),

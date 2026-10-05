@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::Shared;
 use gpui::{App, AsyncApp, Context, EventEmitter, Task, WeakEntity};
+use monocode_core::session::session_work_cwd;
 use monocode_core::{HarnessEvent, HarnessId, Session};
 
 use super::engine::Engine;
@@ -987,15 +988,26 @@ impl Sessions {
         hooks.harness.probe_availability(cx);
         // Only the harnesses already in this window. Probing every installed
         // CLI at boot left unused agents running in the background.
+        // OpenCode reads its models from project config, so its catalog
+        // loads once per session working directory instead.
         let mut harnesses: Vec<HarnessId> = Vec::new();
+        let mut opencode_directories: Vec<String> = Vec::new();
         for session in &self.list {
-            if !harnesses.contains(&session.harness) {
+            if session.harness == HarnessId::Opencode {
+                let directory = session_work_cwd(session).to_string();
+                if !opencode_directories.contains(&directory) {
+                    opencode_directories.push(directory);
+                }
+            } else if !harnesses.contains(&session.harness) {
                 harnesses.push(session.harness);
             }
         }
         let refresh = hooks.harness.refresh_catalogs(harnesses, cx);
+        let projects = hooks
+            .harness
+            .refresh_project_catalogs(opencode_directories, cx);
         cx.spawn(async move |this, cx| {
-            refresh.await;
+            futures::join!(refresh, projects);
             this.update(cx, |this, cx| {
                 let hooks = Engine::hooks(cx);
                 let updates: Vec<(String, String, monocode_core::ModelSettings)> = this

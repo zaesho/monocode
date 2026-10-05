@@ -41,6 +41,8 @@ pub struct CatalogModelSource {
     catalog: SharedCatalog,
     availability: HarnessAvailabilityStore,
     registry: HarnessRegistry,
+    /// The working directory whose OpenCode catalog the picker shows.
+    project: Option<String>,
 }
 
 impl CatalogModelSource {
@@ -49,20 +51,50 @@ impl CatalogModelSource {
             catalog: services.catalog.clone(),
             availability: services.availability.clone(),
             registry: services.registry.clone(),
+            project: None,
         }
+    }
+
+    /// `localProjectModelSource`: OpenCode reads its models from project
+    /// config, so a session shows the catalog of its own working directory.
+    pub fn for_project(mut self, project: Option<String>) -> Self {
+        self.project = project.filter(|project| !project.is_empty());
+        self
+    }
+
+    /// The catalog read in this source's project, for a provider that has one.
+    fn project_models(&self, harness: HarnessId) -> Option<Vec<AgentModel>> {
+        let project = self.project.as_deref()?;
+        (harness == HarnessId::Opencode)
+            .then(|| {
+                self.catalog
+                    .read()
+                    .project_harness_models(harness, project)
+                    .map(<[AgentModel]>::to_vec)
+            })
+            .flatten()
     }
 }
 
 impl ModelSource for CatalogModelSource {
     fn models_for(&self, harness: HarnessId) -> Vec<AgentModel> {
-        self.catalog.read().models_for(harness).to_vec()
+        self.project_models(harness)
+            .unwrap_or_else(|| self.catalog.read().models_for(harness).to_vec())
     }
 
     fn resolve(&self, harness: HarnessId, id: Option<&str>) -> AgentModel {
-        self.catalog.read().resolve_model(harness, id)
+        self.catalog
+            .read()
+            .resolve_model_in(harness, id, self.project.as_deref())
     }
 
     fn find(&self, id: &str) -> Option<AgentModel> {
+        if id.starts_with("opencode:") {
+            return self
+                .models_for(HarnessId::Opencode)
+                .into_iter()
+                .find(|model| model.id == id);
+        }
         self.catalog.read().find_model(id).cloned()
     }
 
@@ -78,8 +110,20 @@ impl ModelSource for CatalogModelSource {
     fn refresh(&self, harnesses: &[HarnessId]) {
         let registry = self.registry.clone();
         let catalog = self.catalog.clone();
-        let harnesses = harnesses.to_vec();
+        let project = self.project.clone();
+        // A project's OpenCode catalog replaces the home one there.
+        let opencode_project = project.filter(|_| harnesses.contains(&HarnessId::Opencode));
+        let harnesses: Vec<HarnessId> = harnesses
+            .iter()
+            .copied()
+            .filter(|harness| opencode_project.is_none() || *harness != HarnessId::Opencode)
+            .collect();
         registry.clone().spawner().spawn(Box::pin(async move {
+            if let Some(project) = &opencode_project {
+                registry
+                    .refresh_project_harness_catalog(HarnessId::Opencode, project)
+                    .await;
+            }
             registry
                 .refresh_harness_catalogs(harnesses, false, |id| catalog.has_live_catalog(id))
                 .await;
@@ -203,11 +247,7 @@ impl SessionComposerHost {
             .as_ref()
             .and_then(|submit| submit.read(cx).mcp_settings().cloned());
         let model_source = services.map(|services| {
-            Rc::new(CatalogModelSource {
-                catalog: services.catalog.clone(),
-                availability: services.availability.clone(),
-                registry: services.registry.clone(),
-            }) as Rc<dyn ModelSource>
+            Rc::new(CatalogModelSource::from_services(services)) as Rc<dyn ModelSource>
         });
         Self {
             session_id,
@@ -624,8 +664,19 @@ impl ComposerHost for SessionComposerHost {
             .is_some_and(|files| files.index.read(cx).peek_project_files(cwd).is_none())
     }
 
-    fn model_source(&self, _: &mut App) -> Option<Rc<dyn ModelSource>> {
-        self.model_source.clone()
+    fn model_source(&self, cx: &mut App) -> Option<Rc<dyn ModelSource>> {
+        // The picker reads the catalog of the session's execution directory,
+        // which is its worktree when it has one.
+        let project = Engine::sessions(cx)
+            .read(cx)
+            .get(&self.session_id)
+            .map(|session| monocode_core::session::session_work_cwd(session).to_string());
+        match (AppServices::try_global(cx), project) {
+            (Some(services), Some(project)) => Some(Rc::new(
+                CatalogModelSource::from_services(services).for_project(Some(project)),
+            )),
+            _ => self.model_source.clone(),
+        }
     }
 
     fn model_prefs(&self, _: &mut App) -> ModelPrefs {

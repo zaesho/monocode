@@ -210,6 +210,12 @@ pub trait HarnessAdapter: Send + Sync {
         ok(())
     }
 
+    /// Read the models available in one working directory, for providers
+    /// whose catalog depends on project config.
+    fn refresh_project_catalog(&self, _cwd: String) -> BoxFuture<'_, Result<()>> {
+        ok(())
+    }
+
     /// LLM tab title for the first turn.
     fn generate_title(
         &self,
@@ -868,6 +874,17 @@ impl HarnessRegistry {
                 }
             });
         futures::future::join_all(refreshes).await;
+    }
+
+    /// `refreshProjectOpenCodeCatalog`, for any provider: read the catalog
+    /// `harness` offers in `cwd`. Failures are logged.
+    pub async fn refresh_project_harness_catalog(&self, harness: HarnessId, cwd: &str) {
+        let Some(adapter) = self.get_harness(harness) else {
+            return;
+        };
+        if let Err(error) = adapter.refresh_project_catalog(cwd.to_string()).await {
+            log::debug!("[monocode] {harness} project catalog {error:#}");
+        }
     }
 
     /// `generateHarnessTitle`.

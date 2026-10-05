@@ -57,6 +57,36 @@ impl SharedCatalog {
         }
     }
 
+    /// `setProjectHarnessModels`: the catalog read in `cwd`. Listeners run
+    /// after the write lock is released.
+    pub fn set_project_harness_models(
+        &self,
+        harness: HarnessId,
+        cwd: &str,
+        models: Vec<AgentModel>,
+    ) {
+        self.catalog
+            .write()
+            .set_project_harness_models(harness, cwd, models);
+        let listeners: Vec<Listener> = self
+            .listeners
+            .lock()
+            .iter()
+            .map(|(_, listener)| listener.clone())
+            .collect();
+        for listener in listeners {
+            listener(harness);
+        }
+    }
+
+    /// `projectHarnessModels`: whether a catalog for `cwd` has loaded.
+    pub fn has_project_harness_models(&self, harness: HarnessId, cwd: &str) -> bool {
+        self.catalog
+            .read()
+            .project_harness_models(harness, cwd)
+            .is_some()
+    }
+
     /// `hasLiveCatalog`.
     pub fn has_live_catalog(&self, harness: HarnessId) -> bool {
         self.catalog.read().has_live_catalog(harness)

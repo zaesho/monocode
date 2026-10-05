@@ -143,9 +143,23 @@ impl HarnessHooks for AppHarnessHooks {
         })
     }
 
+    fn refresh_project_catalogs(&self, directories: Vec<String>, cx: &mut App) -> Task<()> {
+        let registry = self.registry.clone();
+        cx.background_spawn(async move {
+            let refreshes = directories.iter().map(|directory| {
+                registry.refresh_project_harness_catalog(HarnessId::Opencode, directory)
+            });
+            futures::future::join_all(refreshes).await;
+        })
+    }
+
     fn resolve_model(&self, session: &Session, _cx: &App) -> Option<(String, ModelSettings)> {
         let catalog = self.catalog.read();
-        let resolved = catalog.resolve_model(session.harness, Some(&session.model));
+        let resolved = catalog.resolve_model_in(
+            session.harness,
+            Some(&session.model),
+            Some(monocode_core::session::session_work_cwd(session)),
+        );
         let settings = catalog.merge_model_settings(&resolved, Some(&session.model_settings));
         Some((resolved.id, settings))
     }

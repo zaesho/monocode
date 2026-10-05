@@ -37,6 +37,7 @@ type Events = Arc<Mutex<Vec<HarnessEvent>>>;
 struct Harness {
     host: FakeHost,
     adapter: OpenCodeAdapter,
+    catalog: SharedCatalog,
     events: Events,
     injected: usize,
     session: Arc<Mutex<FakeSession>>,
@@ -145,11 +146,12 @@ impl Harness {
             status: "idle",
         }));
         host.respond_with(session_handler(&host, &session));
-        let adapter =
-            OpenCodeAdapter::new(host.children(), SharedCatalog::new(), host.spawner(), None);
+        let catalog = SharedCatalog::new();
+        let adapter = OpenCodeAdapter::new(host.children(), catalog.clone(), host.spawner(), None);
         Self {
             host,
             adapter,
+            catalog,
             events: Arc::default(),
             injected: 0,
             session,
@@ -2390,5 +2392,41 @@ fn does_not_carry_repeated_idle_cancellation_into_the_next_prompt() {
         assert!(!settled(&next).await);
         h.idle(ROOT);
         next.await.unwrap();
+    });
+}
+
+#[test]
+fn reports_the_current_projects_custom_model_context_window() {
+    use monocode_core::harness::HarnessId;
+    use monocode_core::models::AgentModel;
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let mut model = AgentModel::new("opencode:openai/review", HarnessId::Opencode, "Review");
+        model.context_window = Some(100_000);
+        h.catalog
+            .set_harness_models(HarnessId::Opencode, vec![model.clone()]);
+        model.context_window = Some(8_192);
+        h.catalog
+            .set_project_harness_models(HarnessId::Opencode, "/repo", vec![model]);
+        let done = h.start_turn().await;
+        let prompt = h.prompt_id().unwrap();
+        h.emit_message(
+            json!({
+                "id": "context_reply", "role": "assistant", "parentID": prompt,
+                "providerID": "openai", "modelID": "review",
+                "tokens": { "input": 250, "output": 20, "cache": { "read": 0, "write": 0 } },
+            }),
+            json!([]),
+        );
+        h.wait_for_event("context", |event| {
+            matches!(event, HarnessEvent::Context { .. })
+        })
+        .await;
+        assert!(h.events().contains(&HarnessEvent::Context {
+            used: Some(270),
+            window: Some(8_192),
+        }));
+        h.idle(ROOT);
+        done.await.unwrap();
     });
 }

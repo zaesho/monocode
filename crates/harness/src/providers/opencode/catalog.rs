@@ -2,6 +2,7 @@
 //! the model catalog from `opencode models --verbose` and `opencode agent
 //! list`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Result, bail};
@@ -334,11 +335,14 @@ type Inflight = Shared<BoxFuture<'static, ()>>;
 
 /// `refreshOpenCodeCatalog` and its module-level `inflight` promise. One
 /// refresh runs at a time; callers that arrive meanwhile share it.
+#[derive(Clone)]
 pub struct CatalogRefresher {
     children: Children,
     catalog: SharedCatalog,
     spawner: SharedSpawner,
     inflight: Arc<Mutex<Option<Inflight>>>,
+    /// Project refreshes in flight, by working directory.
+    project_inflight: Arc<Mutex<HashMap<String, Inflight>>>,
 }
 
 impl CatalogRefresher {
@@ -348,7 +352,41 @@ impl CatalogRefresher {
             catalog,
             spawner,
             inflight: Arc::new(Mutex::new(None)),
+            project_inflight: Arc::default(),
         }
+    }
+
+    /// `refreshProjectOpenCodeCatalog`: the models OpenCode offers in `cwd`,
+    /// kept apart from the home catalog and other projects. Project config
+    /// can add local models and agents. Failures are logged.
+    pub fn refresh_project(&self, cwd: &str) -> BoxFuture<'static, ()> {
+        let mut inflight = self.project_inflight.lock();
+        if let Some(running) = inflight.get(cwd) {
+            return running.clone().boxed();
+        }
+        let (done, finished) = oneshot::channel::<()>();
+        let shared: Inflight = finished.map(|_| ()).boxed().shared();
+        inflight.insert(cwd.to_string(), shared.clone());
+        drop(inflight);
+
+        let children = self.children.clone();
+        let catalog = self.catalog.clone();
+        let slot = self.project_inflight.clone();
+        let cwd = cwd.to_string();
+        self.spawner.spawn(
+            async move {
+                match discover_open_code_models(&children, Some(&cwd)).await {
+                    Ok(models) => {
+                        catalog.set_project_harness_models(HarnessId::Opencode, &cwd, models)
+                    }
+                    Err(error) => log::debug!("[monocode] opencode project catalog {error:#}"),
+                }
+                slot.lock().remove(&cwd);
+                let _ = done.send(());
+            }
+            .boxed(),
+        );
+        shared.boxed()
     }
 
     /// `refreshOpenCodeCatalog`. Failures are logged, as in TypeScript. The

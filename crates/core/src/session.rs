@@ -292,7 +292,9 @@ pub fn new_session(
             preferred.as_str()
         }
     };
-    let resolved = env.catalog.resolve_model(harness, Some(model));
+    let resolved = env
+        .catalog
+        .resolve_model_in(harness, Some(model), Some(cwd));
     let mut session = Session::blank(id, harness, resolved.id.clone(), cwd);
     session.model_settings = env.preferred_model_settings(&resolved, model_settings);
     session.runtime_mode = runtime_mode.unwrap_or(DEFAULT_RUNTIME_MODE);
@@ -389,7 +391,9 @@ pub fn retarget_session_to_project(env: &ModelEnv<'_>, session: &Session, cwd: &
     let carries_seed =
         model.as_deref() == Some(session.model.as_str()) && harness == session.harness;
     let model = model.unwrap_or_else(|| env.preferred_model_id(harness));
-    let resolved = env.catalog.resolve_model(harness, Some(&model));
+    let resolved = env
+        .catalog
+        .resolve_model_in(harness, Some(&model), Some(cwd));
     let mut next = session.clone();
     next.cwd = cwd.to_string();
     next.harness = harness;

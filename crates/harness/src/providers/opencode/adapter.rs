@@ -1807,7 +1807,7 @@ fn handle_transcript_event(
             // not the rebuilt context. Keep the previous meter value until a
             // real turn reports the post-compaction window level.
             if role == Some("assistant") && !hidden {
-                emit_context(s, &live.catalog, info);
+                emit_context(s, &live.catalog, &live.cwd, info);
             }
         }
         "message.removed" => {
@@ -2003,7 +2003,7 @@ pub fn open_code_agent_for_turn(
 /// `emitContext`. OpenCode reports tokens per assistant message but not the
 /// window, so the window comes from the catalog entry for the model that
 /// produced it.
-fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record>) {
+fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, cwd: &str, info: Option<&Record>) {
     let used = context_used_from_message_info(info);
     let metrics = turn_metrics_from_message_info(info);
     let message_id = string_field(info, "id");
@@ -2062,7 +2062,7 @@ fn emit_context(s: &mut LiveState, catalog: &SharedCatalog, info: Option<&Record
     ) {
         (Some(provider_id), Some(model_id)) => catalog
             .read()
-            .model_context_window(&format!("opencode:{provider_id}/{model_id}")),
+            .model_context_window_in(&format!("opencode:{provider_id}/{model_id}"), Some(cwd)),
         _ => None,
     };
     s.emit(HarnessEvent::Context {
@@ -3133,6 +3133,15 @@ impl HarnessAdapter for OpenCodeAdapter {
 
     fn refresh_catalog(&self) -> BoxFuture<'_, Result<()>> {
         let refresh = self.inner.refresher.refresh();
+        async move {
+            refresh.await;
+            Ok(())
+        }
+        .boxed()
+    }
+
+    fn refresh_project_catalog(&self, cwd: String) -> BoxFuture<'_, Result<()>> {
+        let refresh = self.inner.text.refresh_project_catalog(&cwd);
         async move {
             refresh.await;
             Ok(())

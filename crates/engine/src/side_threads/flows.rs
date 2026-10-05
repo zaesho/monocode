@@ -317,10 +317,11 @@ impl SideThreads {
         )
     }
 
-    /// `mergeModelSettings(resolveModel(harness, model), settings)`.
-    fn merged_settings(&self, target: &ModelTarget) -> ModelSettings {
+    /// `mergeModelSettings(resolveModel(harness, model, cwd), settings)`,
+    /// against the catalog of the source's execution directory.
+    fn merged_settings(&self, target: &ModelTarget, cwd: &str) -> ModelSettings {
         let catalog = self.config().catalog.read();
-        let model = catalog.resolve_model(target.harness, Some(&target.model));
+        let model = catalog.resolve_model_in(target.harness, Some(&target.model), Some(cwd));
         catalog.merge_model_settings(&model, Some(&target.model_settings))
     }
 
@@ -366,7 +367,7 @@ impl SideThreads {
         let session = Session {
             worktree_cwd: source.worktree_cwd.clone(),
             branch: source.branch.clone(),
-            model_settings: self.merged_settings(target),
+            model_settings: self.merged_settings(target, cwd),
             title: format_session_title(harness, SECOND_OPINION_TITLE),
             ..self.new_session(harness, &source.cwd, &target.model, source.runtime_mode)
         };
@@ -411,7 +412,7 @@ impl SideThreads {
         let session = Session {
             worktree_cwd: source.worktree_cwd.clone(),
             branch: source.branch.clone(),
-            model_settings: self.merged_settings(target),
+            model_settings: self.merged_settings(target, cwd),
             title: format_session_title(harness, title),
             handoff_card: Some(build_handoff_composer_card(
                 from,
@@ -613,7 +614,11 @@ impl SideThreads {
                 } else {
                     &selected_model
                 };
-                let resolved = catalog.resolve_model(request_harness, Some(id));
+                let resolved = catalog.resolve_model_in(
+                    request_harness,
+                    Some(id),
+                    Some(session_work_cwd(source)),
+                );
                 let prefs = load_model_prefs(&config.kv);
                 catalog.preferred_model_settings(
                     &resolved,

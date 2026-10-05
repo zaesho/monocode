@@ -445,7 +445,7 @@ impl HarnessUpdateHost for AccountsAdapter {
     fn dismiss_updates(&self, _: &mut App) {
         self.dismissed.set(true);
     }
-    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<()> {
+    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<String> {
         let children = AppServices::global(cx).children.clone();
         cx.background_executor().spawn(async move {
             children

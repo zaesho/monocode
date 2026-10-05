@@ -16,6 +16,8 @@ pub(super) struct FakeUpdates {
     pub announced: RefCell<Vec<HarnessId>>,
     pub dismissed: Cell<usize>,
     pub updater_installs: Cell<bool>,
+    /// What an updater that installs nothing prints.
+    pub update_instructions: RefCell<String>,
     listeners: RefCell<Vec<Listener>>,
 }
 
@@ -27,6 +29,7 @@ impl Default for FakeUpdates {
             announced: RefCell::default(),
             dismissed: Cell::new(0),
             updater_installs: Cell::new(true),
+            update_instructions: RefCell::default(),
             listeners: RefCell::default(),
         }
     }
@@ -55,11 +58,12 @@ impl HarnessUpdateHost for FakeUpdates {
         self.dismissed.set(self.dismissed.get() + 1);
     }
 
-    fn update_cli(&self, _: HarnessId, _: &mut App) -> HostTask<()> {
+    fn update_cli(&self, _: HarnessId, _: &mut App) -> HostTask<String> {
         if self.updater_installs.get() {
             *self.installed.borrow_mut() = "2.1.285 (Claude Code)".into();
+            return Task::ready(Ok("Updated".into()));
         }
-        Task::ready(Ok(()))
+        Task::ready(Ok(self.update_instructions.borrow().clone()))
     }
 
     fn installed_version(&self, _: HarnessId, _: &mut App) -> HostTask<Option<String>> {
@@ -133,4 +137,21 @@ fn reports_an_updater_that_left_the_old_version_and_can_be_dismissed(cx: &mut Te
     assert_eq!(host.dismissed.get(), 1);
     assert!(notice.read_with(cx, |notice, _| notice.updates().is_empty()));
     assert!(!exists(cx, "status:Harness updates"));
+}
+
+#[gpui::test]
+fn shows_package_manager_instructions_when_the_installed_version_is_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let host = Rc::new(FakeUpdates::default());
+    host.updater_installs.set(false);
+    *host.update_instructions.borrow_mut() =
+        "Claude is managed by Homebrew. Run brew upgrade claude-code.".into();
+    let (notice, cx) = mount_notice(cx, host.clone());
+    click(cx, "button:Update:claude");
+    assert_eq!(
+        notice.read_with(cx, |notice, _| notice.row(HarnessId::Claude)),
+        RowState::Failed("Claude is managed by Homebrew. Run brew upgrade claude-code.".into())
+    );
+    assert!(host.refreshed.borrow().is_empty());
 }

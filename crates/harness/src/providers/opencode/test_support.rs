@@ -431,8 +431,8 @@ impl ChildBackend for FakeBackend {
         _command: String,
         _provider: HarnessId,
         _binary_path: Option<String>,
-    ) -> ChildFuture<()> {
-        ready(Ok(()))
+    ) -> ChildFuture<String> {
+        ready(Ok(String::new()))
     }
 
     fn home_dir(&self) -> ChildFuture<String> {

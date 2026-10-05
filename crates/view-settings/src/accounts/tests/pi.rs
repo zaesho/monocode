@@ -67,7 +67,10 @@ fn clears_old_usage_on_provider_changes_and_ignores_late_responses(cx: &mut Test
     let (footer, cx) = show(cx, host.clone(), "pi:anthropic/claude-sonnet-4-6");
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(pi_quota(PiUsageProvider::OpenaiCodex, 32.)));
+        .push_back(PiAnswer::Now(Box::new(pi_quota(
+            PiUsageProvider::OpenaiCodex,
+            32.,
+        ))));
     switch(&footer, cx, "pi:openai-codex/gpt-5.4", "pi-session");
     assert!(exists(cx, "text:32% 5h"));
     let _ = finish_old.send(pi_quota(PiUsageProvider::Anthropic, 99.));
@@ -103,15 +106,18 @@ fn clears_quotas_on_failed_refresh_and_can_recover_after_a_pi_login(cx: &mut Tes
     assert!(exists(cx, "text:24% 5h"));
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(unavailable(
+        .push_back(PiAnswer::Now(Box::new(unavailable(
             "Sign in through Pi, then refresh usage.",
-        )));
+        ))));
     click(cx, "button:Refresh Pi usage");
     assert!(!exists(cx, "text:24% 5h"));
     assert!(exists(cx, "text:not connected"));
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(pi_quota(PiUsageProvider::Anthropic, 12.)));
+        .push_back(PiAnswer::Now(Box::new(pi_quota(
+            PiUsageProvider::Anthropic,
+            12.,
+        ))));
     click(cx, "button:Refresh Pi usage");
     assert!(exists(cx, "text:12% 5h"));
 }
@@ -129,7 +135,10 @@ fn isolates_a_to_b_to_a_and_same_provider_session_changes(cx: &mut TestAppContex
     switch(&footer, cx, "pi:openai-codex/gpt", "b");
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(pi_quota(PiUsageProvider::Anthropic, 17.)));
+        .push_back(PiAnswer::Now(Box::new(pi_quota(
+            PiUsageProvider::Anthropic,
+            17.,
+        ))));
     switch(&footer, cx, "pi:anthropic/claude", "a");
     let _ = finish_old.send(pi_quota(PiUsageProvider::Anthropic, 99.));
     draw(cx);
@@ -137,7 +146,10 @@ fn isolates_a_to_b_to_a_and_same_provider_session_changes(cx: &mut TestAppContex
     assert!(!exists(cx, "text:99% 5h"));
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(pi_quota(PiUsageProvider::Anthropic, 8.)));
+        .push_back(PiAnswer::Now(Box::new(pi_quota(
+            PiUsageProvider::Anthropic,
+            8.,
+        ))));
     switch(&footer, cx, "pi:anthropic/claude", "c");
     assert!(exists(cx, "text:8% 5h"));
     assert_eq!(host.pi_fetches.borrow().len(), 4);
@@ -153,7 +165,10 @@ fn refreshes_on_native_window_focus_after_the_minimum_interval(cx: &mut TestAppC
     host.now.set(NOW + 5 * 60_000);
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(pi_quota(PiUsageProvider::Anthropic, 13.)));
+        .push_back(PiAnswer::Now(Box::new(pi_quota(
+            PiUsageProvider::Anthropic,
+            13.,
+        ))));
     cx.deactivate_window();
     cx.update(|window, _| window.activate_window());
     draw(cx);
@@ -171,7 +186,7 @@ fn polls_only_while_visible_and_retries_unavailable_credentials(cx: &mut TestApp
     host.visible.set(true);
     host.pi_answers
         .borrow_mut()
-        .push_back(PiAnswer::Now(unavailable("Sign in through Pi.")));
+        .push_back(PiAnswer::Now(Box::new(unavailable("Sign in through Pi."))));
     let pi = footer.read_with(cx, |footer, _| footer.pi_usage().cloned().unwrap());
     pi.update(cx, |pi, cx| pi.visibility_changed(cx));
     draw(cx);

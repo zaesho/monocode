@@ -344,7 +344,7 @@ impl ChildBackend for FileBackend {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()> {
+    ) -> ChildFuture<String> {
         self.fake.update_cli(command, provider, binary_path)
     }
     fn home_dir(&self) -> ChildFuture<String> {

@@ -191,7 +191,7 @@ pub trait ChildBackend: Send + Sync {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()>;
+    ) -> ChildFuture<String>;
     /// `homeDir()` on the machine running the child.
     fn home_dir(&self) -> ChildFuture<String>;
     /// `hasHeadlessChildBackend`: true for a headless host's backend.
@@ -990,7 +990,9 @@ impl Children {
 
     /// `updateHarnessCli`: run the CLI's own self-update against the binary
     /// MonoCode uses.
-    pub async fn update_harness_cli(&self, provider: HarnessId) -> Result<()> {
+    /// `updateHarnessCli`: the updater's output, which may say how to update
+    /// when the CLI cannot update itself.
+    pub async fn update_harness_cli(&self, provider: HarnessId) -> Result<String> {
         let resolved = self.resolve_binary(provider).await?;
         let binary_path = self.inner.backend.runtime_binary_path(provider);
         self.inner
@@ -1039,7 +1041,7 @@ static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").
 
 /// Runs a harness CLI's self-update (`monocode_integrations::harness_updates::harness_update`).
 pub type CliUpdater =
-    Arc<dyn Fn(String, String, Option<String>) -> Result<(), String> + Send + Sync>;
+    Arc<dyn Fn(String, String, Option<String>) -> Result<String, String> + Send + Sync>;
 
 /// Settings for [`HostChildBackend`].
 #[derive(Clone, Default)]
@@ -1267,7 +1269,7 @@ impl ChildBackend for HostChildBackend {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()> {
+    ) -> ChildFuture<String> {
         let updater = self.options.updater.clone();
         blocking(move || match updater {
             Some(update) => update(command, provider.as_str().to_string(), binary_path),

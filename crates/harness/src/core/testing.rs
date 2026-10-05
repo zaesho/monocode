@@ -133,8 +133,8 @@ impl ChildBackend for Fake {
         _command: String,
         _provider: HarnessId,
         _binary_path: Option<String>,
-    ) -> ChildFuture<()> {
-        done(())
+    ) -> ChildFuture<String> {
+        done(String::new())
     }
     fn home_dir(&self) -> ChildFuture<String> {
         done("/home/alice".into())

@@ -322,18 +322,18 @@ impl OpenCodeClient {
         session_from(value)
     }
 
-    /// `abortSession`. Failures are ignored.
-    pub async fn abort_session(&self, session_id: &str) {
-        let _ = self
-            .request(
-                "POST",
-                &format!("/session/{}/abort", enc(session_id)),
-                RequestOptions {
-                    body: json_body(&Empty {}),
-                    ..Default::default()
-                },
-            )
-            .await;
+    /// `abortSession`. A cancel reports a failure, so it is returned.
+    pub async fn abort_session(&self, session_id: &str) -> Result<()> {
+        self.request(
+            "POST",
+            &format!("/session/{}/abort", enc(session_id)),
+            RequestOptions {
+                body: json_body(&Empty {}),
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn revert_session(&self, session_id: &str, message_id: &str) -> Result<()> {

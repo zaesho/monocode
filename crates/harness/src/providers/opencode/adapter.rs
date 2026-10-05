@@ -288,6 +288,8 @@ impl LiveState {
 
 /// `Live`: one thread's server, session, and stream state.
 struct Live {
+    /// The MonoCode thread this server belongs to.
+    thread_id: String,
     client: OpenCodeClient,
     open_code_session_id: String,
     cwd: String,
@@ -331,6 +333,12 @@ struct Threads {
     live_by_thread: HashMap<String, Arc<Live>>,
     resume_by_thread: HashMap<String, Resume>,
     cancelled_threads: HashSet<String>,
+    /// How many starts are in flight per thread. A cancel during a start
+    /// must reach the prompt that start was for.
+    opening_threads: HashMap<String, usize>,
+    /// `lifecycleByThread`: starts, cancels, and stops of one thread run one
+    /// at a time.
+    lifecycle_by_thread: HashMap<String, Arc<smol::lock::Mutex<()>>>,
 }
 
 /// What the server watch saw before the client connected.
@@ -419,6 +427,36 @@ impl OpenCodeAdapter {
             .cloned()
     }
 
+    /// `withLifecycle`: run `action` after every earlier start, cancel, or
+    /// stop of the thread.
+    async fn with_lifecycle<T>(&self, session_id: &str, action: impl Future<Output = T>) -> T {
+        let lock = self
+            .inner
+            .threads
+            .lock()
+            .lifecycle_by_thread
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        let _held = lock.lock().await;
+        action.await
+    }
+
+    /// `canRunQueuedOperation`: `Ok(false)` after a cancel, and an error when
+    /// the stream or server ended before the operation's turn came.
+    fn can_run_queued_operation(&self, live: &Arc<Live>) -> Result<bool> {
+        if live.with(|s| s.cancelled) {
+            return Ok(false);
+        }
+        let current = self
+            .live(&live.thread_id)
+            .is_some_and(|current| Arc::ptr_eq(&current, live));
+        if !current || live.with(|s| s.mute_updates) {
+            bail!("OpenCode session ended before this operation could start. Retry the request.");
+        }
+        Ok(true)
+    }
+
     fn take_cancelled(&self, session_id: &str) -> bool {
         self.inner
             .threads
@@ -460,6 +498,7 @@ impl OpenCodeAdapter {
             .ensure_live_or_forget_cancel(&input.session, &on_event)
             .await?;
         if self.take_cancelled(&session_id) {
+            self.stop_owned_live(&session_id, &live).await;
             return Ok(());
         }
         live.with(|s| {
@@ -468,10 +507,9 @@ impl OpenCodeAdapter {
             s.planning = input.session.intent == Some(TurnIntent::Plan);
         });
         let turn = async {
-            live.with(|s| {
-                s.cancelled = false;
-                s.mute_updates = false;
-            });
+            if !self.can_run_queued_operation(&live)? {
+                return Ok(());
+            }
             match self.run_turn(&live, &input, on_accepted).await {
                 Err(_) if live.with(|s| s.cancelled) => Ok(()),
                 result => result,
@@ -488,15 +526,15 @@ impl OpenCodeAdapter {
     ) -> Result<()> {
         let live = self.ensure_live_or_forget_cancel(&input, &on_event).await?;
         if self.take_cancelled(&input.session_id) {
+            self.stop_owned_live(&input.session_id, &live).await;
             return Ok(());
         }
         let model = self.parsed_model(&input.model)?;
         live.with(|s| s.on_event = on_event);
         let compaction = async {
-            live.with(|s| {
-                s.cancelled = false;
-                s.mute_updates = false;
-            });
+            if !self.can_run_queued_operation(&live)? {
+                return Ok(());
+            }
             match run_compaction(&live, &model).await {
                 Err(_) if live.with(|s| s.cancelled) => Ok(()),
                 result => result,
@@ -515,15 +553,22 @@ impl OpenCodeAdapter {
             .ensure_live_or_forget_cancel(&input.session, &on_event)
             .await?;
         if self.take_cancelled(&input.session.session_id) {
+            self.stop_owned_live(&input.session.session_id, &live).await;
             return Ok(RewindLastTurnResult { submitted: false });
         }
         live.with(|s| s.on_event = on_event);
         // Wait for queued operations. A failed one is not this edit's error.
         drop(live.turns.lock().await);
+        if !self.can_run_queued_operation(&live)? {
+            return Ok(RewindLastTurnResult { submitted: false });
+        }
         if live.with(|s| s.active_turn) {
             bail!("Stop the current turn before editing the last message");
         }
         let message_id = latest_open_code_user_message_id(&live).await?;
+        if !self.can_run_queued_operation(&live)? {
+            return Ok(RewindLastTurnResult { submitted: false });
+        }
         live.client
             .revert_session(&live.open_code_session_id, &message_id)
             .await?;
@@ -613,41 +658,94 @@ impl OpenCodeAdapter {
         }
     }
 
-    /// `cancelOpenCodeTurn`.
+    /// `cancelOpenCodeTurn`. A cancel during startup also reaches the prompt
+    /// that startup was for.
     async fn cancel_open_code_turn(&self, session_id: &str) -> Result<()> {
-        let Some(live) = self.live(session_id) else {
-            self.inner
-                .threads
-                .lock()
-                .cancelled_threads
-                .insert(session_id.to_string());
-            return Ok(());
+        {
+            let mut threads = self.inner.threads.lock();
+            if threads.opening_threads.contains_key(session_id) {
+                threads.cancelled_threads.insert(session_id.to_string());
+            }
+        }
+        self.with_lifecycle(session_id, self.cancel_live(session_id))
+            .await
+    }
+
+    /// `cancelLive`: abort the turn, then close the stream and kill the
+    /// server, so nothing the cancelled turn started can reach the next one.
+    async fn cancel_live(&self, session_id: &str) -> Result<()> {
+        let live = {
+            let mut threads = self.inner.threads.lock();
+            match threads.live_by_thread.remove(session_id) {
+                Some(live) => live,
+                None => {
+                    // A repeated cancel of an idle, resumable thread has
+                    // nothing to cancel and must not cancel the next prompt.
+                    if threads.resume_by_thread.contains_key(session_id)
+                        && !threads.opening_threads.contains_key(session_id)
+                    {
+                        return Ok(());
+                    }
+                    threads.cancelled_threads.insert(session_id.to_string());
+                    return Ok(());
+                }
+            }
         };
         live.with(|s| {
             s.cancelled = true;
             s.mute_updates = true;
             s.resolve_pending();
         });
-        live.client.abort_session(&live.open_code_session_id).await;
-        live.with(|s| {
-            finish_active_turn(
-                s,
-                vec![
-                    HarnessEvent::MessageCompleted,
-                    HarnessEvent::ReasoningCompleted,
-                ],
-            )
-        });
-        Ok(())
+        let failure = live
+            .client
+            .abort_session(&live.open_code_session_id)
+            .await
+            .err();
+        if let Some(error) = &failure {
+            live.with(|s| {
+                s.emit(HarnessEvent::SessionError {
+                    message: format!("Could not confirm OpenCode cancellation: {error}"),
+                })
+            });
+        }
+        live.client.close_events(session_id).await;
+        self.inner.children.unwatch_child(session_id);
+        let _ = self.inner.children.kill_child(session_id).await;
+        live.with(|s| finish_active_turn(s, completion_events()));
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// `stopOpenCodeSession`: kill the server but keep resume state.
     async fn stop_open_code_session(&self, session_id: &str) {
-        let live = {
-            let mut threads = self.inner.threads.lock();
-            threads.cancelled_threads.remove(session_id);
-            threads.live_by_thread.remove(session_id)
-        };
+        self.inner
+            .threads
+            .lock()
+            .cancelled_threads
+            .remove(session_id);
+        self.with_lifecycle(session_id, self.stop_live(session_id))
+            .await;
+    }
+
+    /// `stopOwnedLive`: stop `live` unless another server already replaced
+    /// it.
+    async fn stop_owned_live(&self, session_id: &str, live: &Arc<Live>) {
+        self.with_lifecycle(session_id, async {
+            let owned = self
+                .live(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, live));
+            if owned {
+                self.stop_live(session_id).await;
+            }
+        })
+        .await;
+    }
+
+    /// `stopLive`.
+    async fn stop_live(&self, session_id: &str) {
+        let live = self.inner.threads.lock().live_by_thread.remove(session_id);
         if let Some(live) = live {
             live.with(|s| {
                 s.mute_updates = true;
@@ -657,7 +755,7 @@ impl OpenCodeAdapter {
                     let _ = turn.done.send(Ok(()));
                 }
             });
-            live.client.abort_session(&live.open_code_session_id).await;
+            let _ = live.client.abort_session(&live.open_code_session_id).await;
             live.client.close_events(session_id).await;
         } else {
             // A stream or server that ended on its own already dropped
@@ -694,8 +792,36 @@ impl OpenCodeAdapter {
         );
     }
 
-    /// `ensureLive`.
+    /// `ensureLive`: start or reuse the thread's server, one lifecycle step
+    /// at a time.
     async fn ensure_live(
+        &self,
+        input: &HarnessSessionInput,
+        on_event: &EventSink,
+    ) -> Result<Arc<Live>> {
+        let session_id = &input.session_id;
+        *self
+            .inner
+            .threads
+            .lock()
+            .opening_threads
+            .entry(session_id.clone())
+            .or_insert(0) += 1;
+        let result = self
+            .with_lifecycle(session_id, self.start_live(input, on_event))
+            .await;
+        let mut threads = self.inner.threads.lock();
+        if let Some(count) = threads.opening_threads.get_mut(session_id) {
+            *count -= 1;
+            if *count == 0 {
+                threads.opening_threads.remove(session_id);
+            }
+        }
+        result
+    }
+
+    /// `startLive`.
+    async fn start_live(
         &self,
         input: &HarnessSessionInput,
         on_event: &EventSink,
@@ -707,7 +833,12 @@ impl OpenCodeAdapter {
         // mode or a Plan turn starts a new server instead of patching rules.
         if let Some(existing) = existing.as_ref().filter(|live| {
             live.cwd == input.cwd
-                && live.with(|s| s.runtime_mode == input.runtime_mode && s.planning == planning)
+                && live.with(|s| {
+                    !s.mute_updates
+                        && !s.cancelled
+                        && s.runtime_mode == input.runtime_mode
+                        && s.planning == planning
+                })
         }) {
             existing.with(|s| s.on_event = on_event.clone());
             return Ok(existing.clone());
@@ -720,7 +851,7 @@ impl OpenCodeAdapter {
                     .resume_by_thread
                     .remove(session_id);
             }
-            self.stop_open_code_session(session_id).await;
+            self.stop_live(session_id).await;
         }
 
         let resume = {
@@ -798,7 +929,7 @@ impl OpenCodeAdapter {
         {
             Ok(live) => Ok(live),
             Err(error) => {
-                self.stop_open_code_session(session_id).await;
+                self.stop_live(session_id).await;
                 Err(error)
             }
         }
@@ -832,11 +963,21 @@ impl OpenCodeAdapter {
                         ChildEvent::Exit(code) => code,
                     };
                     start.lock().exited = Some(code);
-                    inner.threads.lock().live_by_thread.remove(&session_id);
+                    let live = live_ref.lock().clone();
+                    if let Some(live) = &live {
+                        let mut threads = inner.threads.lock();
+                        // A replacement server may already own the thread.
+                        if threads
+                            .live_by_thread
+                            .get(&session_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, live))
+                        {
+                            threads.live_by_thread.remove(&session_id);
+                        }
+                    }
                     let ended = HarnessEvent::SessionEnded {
                         code: code.map(i64::from),
                     };
-                    let live = live_ref.lock().clone();
                     match live {
                         Some(live) => live.with(|s| {
                             if !s.mute_updates {
@@ -896,6 +1037,7 @@ impl OpenCodeAdapter {
         }
 
         let live = Arc::new(Live {
+            thread_id: input.session_id.clone(),
             client,
             open_code_session_id: session.id.clone(),
             cwd: input.cwd.clone(),
@@ -973,15 +1115,25 @@ impl OpenCodeAdapter {
         // prompt_async has no response body to await; the SSE stream is its
         // only completion channel. Reusing a Live after this point accepts the
         // next prompt but can never observe it, which looks like a dead thread.
-        self.inner.threads.lock().live_by_thread.remove(session_id);
         let failed = live.with(|s| {
             let failed = s.turn.take();
             s.mute_updates = true;
             s.resolve_pending();
             failed
         });
-        self.inner.children.unwatch_child(session_id);
-        let _ = self.inner.children.kill_child(session_id).await;
+        // Remove the dead server under the lifecycle lock, and only if it
+        // still owns the thread, so a replacement never starts beside it.
+        self.with_lifecycle(session_id, async {
+            let owned = self
+                .live(session_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, live));
+            if owned {
+                self.inner.threads.lock().live_by_thread.remove(session_id);
+                self.inner.children.unwatch_child(session_id);
+                let _ = self.inner.children.kill_child(session_id).await;
+            }
+        })
+        .await;
         match failed {
             Some(turn) => {
                 let _ = turn.done.send(Err(message));

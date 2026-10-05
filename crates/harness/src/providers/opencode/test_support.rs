@@ -24,9 +24,10 @@ use crate::core::task::{SharedSpawner, SmolSpawner};
 
 type Handler = Arc<dyn Fn(&HttpRequest) -> (u16, String) + Send + Sync>;
 
-/// An exec reply a test queued.
+/// An exec reply a test queued: output now, or once a sender answers.
 enum ExecOnce {
     Output(String),
+    Pending(oneshot::Receiver<String>),
 }
 
 /// The agents `opencode agent list` prints by default.
@@ -218,6 +219,17 @@ impl FakeHost {
             .lock()
             .exec_once
             .push_back(ExecOnce::Output(output.into()));
+    }
+
+    /// The next exec call waits until the returned sender answers.
+    pub fn exec_once_later(&self) -> oneshot::Sender<String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .state
+            .lock()
+            .exec_once
+            .push_back(ExecOnce::Pending(rx));
+        tx
     }
 
     /// The managed config the last server started with.
@@ -427,6 +439,9 @@ impl ChildBackend for FakeBackend {
         state.exec_calls.push(request);
         match state.exec_once.pop_front() {
             Some(ExecOnce::Output(output)) => ready(Ok(output)),
+            Some(ExecOnce::Pending(reply)) => {
+                async move { reply.await.map_err(|_| "dropped".to_string()) }.boxed()
+            }
             None => ready(Ok(output)),
         }
     }

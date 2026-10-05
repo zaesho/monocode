@@ -2243,3 +2243,152 @@ fn rewinds_the_visible_request_before_internal_messages() {
         });
     }
 }
+
+// Cancel and stop lifecycle.
+
+fn cancel(h: &Harness) -> smol::Task<anyhow::Result<()>> {
+    let adapter = h.adapter.clone();
+    smol::spawn(async move { adapter.cancel_turn(THREAD.into()).await })
+}
+
+#[test]
+fn reports_a_failed_abort_and_kills_the_owned_server() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let done = h.start_turn().await;
+        let handler = h.default_handler();
+        h.host.respond_with(move |request| {
+            if request.url.contains("/abort") {
+                return (500, "Abort rejected".into());
+            }
+            handler(request)
+        });
+        let error = cancel(&h).await.unwrap_err();
+        assert!(error.to_string().contains("Abort rejected"));
+        done.await.unwrap();
+        assert!(h.host.kills().contains(&THREAD.to_string()));
+        assert!(h.events().contains(&HarnessEvent::SessionError {
+            message: "Could not confirm OpenCode cancellation: Abort rejected".into()
+        }));
+    });
+}
+
+#[test]
+fn kills_the_server_and_releases_the_turn_if_closing_its_stream_fails() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let done = h.start_turn().await;
+        h.host.fail_next_sse_close("Stream close rejected");
+        cancel(&h).await.unwrap();
+        done.await.unwrap();
+        assert!(h.host.kills().contains(&THREAD.to_string()));
+    });
+}
+
+#[test]
+fn cancels_a_resumed_session_during_startup_before_submitting_a_prompt() {
+    smol::block_on(async {
+        let h = Harness::new();
+        h.adapter.bind_session(THREAD, ROOT, "/repo", None);
+        let version = h.host.exec_once_later();
+        let done = h.turn();
+        wait_for("version lookup", || !h.host.exec_calls().is_empty()).await;
+        let cancelled = cancel(&h);
+        smol::Timer::after(Duration::from_millis(20)).await;
+        version.send("opencode 1.14.19".into()).unwrap();
+        cancelled.await.unwrap();
+        done.await.unwrap();
+        assert_eq!(h.prompts(), 0);
+        assert!(h.host.kills().contains(&THREAD.to_string()));
+    });
+}
+
+#[test]
+fn opens_a_fresh_stream_after_cancellation_even_if_the_old_stream_ends() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        cancel(&h).await.unwrap();
+        done.await.unwrap();
+        h.sse_end();
+        let next = h.turn();
+        wait_for("replacement server", || h.host.spawns().len() == 2).await;
+        wait_for("next prompt", || h.prompts() == 2).await;
+        h.idle(ROOT);
+        next.await.unwrap();
+    });
+}
+
+#[test]
+fn serializes_concurrent_startup_before_running_both_queued_prompts() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let first = h.turn();
+        let second = h.turn();
+        wait_for("first prompt", || h.prompts() == 1).await;
+        assert_eq!(h.host.spawns().len(), 1);
+        h.idle(ROOT);
+        first.await.unwrap();
+        wait_for("queued prompt", || h.prompts() == 2).await;
+        h.idle(ROOT);
+        second.await.unwrap();
+        assert_eq!(h.host.spawns().len(), 1);
+    });
+}
+
+#[test]
+fn does_not_submit_queued_turns_compaction_or_rewind_after_cancellation() {
+    smol::block_on(async {
+        let h = Harness::new();
+        let done = h.start_turn().await;
+        let queued_turn = h.turn();
+        let queued_compaction = compact(&h);
+        let queued_rewind = rewind(&h);
+        smol::Timer::after(Duration::from_millis(20)).await;
+        cancel(&h).await.unwrap();
+        done.await.unwrap();
+        queued_turn.await.unwrap();
+        queued_compaction.await.unwrap();
+        assert!(!queued_rewind.await.unwrap().submitted);
+        assert_eq!(h.prompts(), 1);
+        assert!(
+            !h.host
+                .http_calls()
+                .iter()
+                .any(|call| call.url.contains("/summarize") || call.url.contains("/revert"))
+        );
+    });
+}
+
+#[test]
+fn rejects_a_queued_operation_on_an_ended_stream_before_it_submits() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        let queued = h.turn();
+        smol::Timer::after(Duration::from_millis(20)).await;
+        h.sse_end();
+        assert!(done.await.is_err());
+        assert_eq!(
+            queued.await.unwrap_err().to_string(),
+            "OpenCode session ended before this operation could start. Retry the request."
+        );
+        assert_eq!(h.prompts(), 1);
+    });
+}
+
+#[test]
+fn does_not_carry_repeated_idle_cancellation_into_the_next_prompt() {
+    smol::block_on(async {
+        let mut h = Harness::new();
+        let done = h.start_turn().await;
+        cancel(&h).await.unwrap();
+        done.await.unwrap();
+        cancel(&h).await.unwrap();
+        let next = h.turn();
+        wait_for("next prompt", || h.prompts() == 2).await;
+        assert!(!settled(&next).await);
+        h.idle(ROOT);
+        next.await.unwrap();
+    });
+}

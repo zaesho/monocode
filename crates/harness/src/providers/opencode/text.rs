@@ -193,7 +193,9 @@ impl OpenCodeText {
         // `abortTextPromptRace`: on abort, stop the server's turn, then reject.
         let result = with_text_prompt_abort(
             input.signal.as_ref(),
-            move || async move { client.abort_session(&session_id).await },
+            move || async move {
+                let _ = client.abort_session(&session_id).await;
+            },
             session.client.prompt(&prompt, timeout),
         )
         .await?;
@@ -383,7 +385,7 @@ impl OpenCodeText {
     async fn drop_live(&self) {
         let current = self.inner.live.lock().take();
         if let Some(current) = current {
-            current.client.abort_session(&current.session_id).await;
+            let _ = current.client.abort_session(&current.session_id).await;
             current.client.close_events(TEXT_CHILD_ID).await;
         }
         let children = &self.inner.children;

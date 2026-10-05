@@ -919,7 +919,15 @@ async fn removes_a_draft_and_discards_a_draft_only_session(cx: &mut TestAppConte
             .backend
             .commands()
             .iter()
-            .any(|command| command.contains("delete"))
+            .any(|command| command == "session_discard_draft")
+    );
+    // A discard is not a delete, so the id stays usable.
+    assert!(
+        !fixture
+            .backend
+            .commands()
+            .iter()
+            .any(|command| command == "session_delete")
     );
     cx.executor()
         .advance_clock(crate::runtime::sessions::PERSIST_DEBOUNCE);

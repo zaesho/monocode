@@ -356,6 +356,17 @@ impl SessionBackend for FakeBackend {
         )
     }
 
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        self.call(
+            "session_discard_draft",
+            serde_json::json!({ "sessionId": session_id }),
+            move |state| {
+                state.records.remove(&session_id);
+                Ok(())
+            },
+        )
+    }
+
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()> {
         self.call(
             "session_set_archived",

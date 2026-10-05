@@ -1616,11 +1616,13 @@ impl SessionWriter {
         })
     }
 
+    /// `discardDraftSessionRecord`: `session_discard_draft`, which keeps the
+    /// open session id usable for its next request, unlike a delete.
     pub fn discard_draft_session_record(&self, session_id: &str) -> Task<Result<(), String>> {
         let backend = self.backend.clone();
         let id = session_id.to_string();
         self.enqueue(QueueKey::Session(session_id.to_string()), move || {
-            backend.delete(id, Vec::new())
+            backend.discard_draft(id)
         })
     }
 

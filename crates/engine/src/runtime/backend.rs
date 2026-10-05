@@ -46,6 +46,9 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn cancel_search(&self, search_owner: String) -> StoreFuture<()>;
     /// `session_delete`.
     fn delete(&self, session_id: String, image_paths: Vec<String>) -> StoreFuture<()>;
+    /// `session_discard_draft`: drop a transient draft record. The id stays
+    /// usable, and settled history or provider execution is refused.
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()>;
     /// `session_set_archived`.
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()>;
     /// `session_set_pinned`.
@@ -316,6 +319,13 @@ impl SessionBackend for StoreBackend {
                 session_id,
                 image_paths,
             )
+        })
+    }
+
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        let events = self.events.clone();
+        self.run(move |store| {
+            session_store::session_discard_draft(store, events.as_ref(), session_id)
         })
     }
 

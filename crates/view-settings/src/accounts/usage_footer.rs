@@ -49,6 +49,8 @@ pub struct UsageFooterSession {
     pub model: Option<String>,
     pub auth_required: bool,
     pub provider_account_id: Option<String>,
+    /// The remote machine the session runs on. `None` is this computer.
+    pub environment_id: Option<String>,
 }
 
 impl UsageFooterSession {
@@ -59,9 +61,13 @@ impl UsageFooterSession {
             model: None,
             auth_required: false,
             provider_account_id: None,
+            environment_id: None,
         }
     }
 }
+
+/// Shown instead of this computer's usage while a remote session is active.
+const REMOTE_USAGE_UNAVAILABLE: &str = "Usage is unavailable for remote sessions";
 
 /// The footer's data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +241,15 @@ impl UsageFooter {
         self.props.providers.contains(&provider)
     }
 
+    /// True while the active session runs on another machine. The usage
+    /// this computer can read belongs to the local accounts, not that one.
+    fn remote_session(&self) -> bool {
+        self.props
+            .session
+            .as_ref()
+            .is_some_and(|session| session.environment_id.is_some())
+    }
+
     /// The account a provider's chip shows: the conversation's own, else the
     /// project's choice.
     fn account_id(&self, provider: RateLimitProvider, cx: &App) -> String {
@@ -264,6 +279,9 @@ impl UsageFooter {
     /// The snapshot a chip shows (`useCachedRateLimits`, or the removed
     /// account state).
     fn limits(&self, provider: RateLimitProvider, cx: &App) -> ProviderRateLimits {
+        if self.remote_session() {
+            return unavailable_rate_limits(provider, REMOTE_USAGE_UNAVAILABLE, self.now);
+        }
         let account_id = self.account_id(provider, cx);
         if matches!(
             provider,
@@ -284,6 +302,9 @@ impl UsageFooter {
     /// The accounts the footer loads and refreshes, as `(provider, account)`.
     fn targets(&self, cx: &App) -> Vec<(RateLimitProvider, String)> {
         let mut targets = Vec::new();
+        if self.remote_session() {
+            return targets;
+        }
         for provider in [RateLimitProvider::Claude, RateLimitProvider::Codex] {
             if !self.wants(provider) {
                 continue;

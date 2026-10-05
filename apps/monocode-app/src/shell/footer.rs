@@ -21,6 +21,8 @@ impl Shell {
                         model: Some(session.model),
                         auth_required: false,
                         provider_account_id: session.provider_account_id,
+                        environment_id: monocode_layout::paths::parse_remote_path(&session.cwd)
+                            .map(|remote| remote.environment_id),
                     }),
                 project: Some(workspace.sidebar_cwd(cx)),
                 terminals: workspace.running_terminals(cx),

@@ -871,6 +871,11 @@ impl Children {
         })
     }
 
+    /// The executable the user configured for `provider`, if any.
+    pub fn runtime_binary_path(&self, provider: HarnessId) -> Option<String> {
+        self.inner.backend.runtime_binary_path(provider)
+    }
+
     /// `updateHarnessCli`: run the CLI's own self-update against the binary
     /// MonoCode uses.
     pub async fn update_harness_cli(&self, provider: HarnessId) -> Result<()> {

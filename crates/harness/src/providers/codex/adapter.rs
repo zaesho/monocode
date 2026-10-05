@@ -12,6 +12,7 @@ use monocode_core::harness_event::{
 };
 use monocode_core::user_question::UserQuestionReply;
 
+use crate::core::context_transfer::{ContextTransferCapabilities, ContextTransferInput};
 use crate::core::register::HarnessContext;
 use crate::core::registry::{
     AcceptedHook, AdapterCapabilities, EventSink, GeneratedPrContent, HarnessAdapter,
@@ -131,6 +132,27 @@ impl HarnessAdapter for CodexAdapter {
         on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>> {
         Box::pin(self.sessions.send_turn(input, on_event, on_accepted))
+    }
+
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        Some(ContextTransferCapabilities {
+            native_messages: true,
+            resumed_append: true,
+            explicit_acceptance: false,
+        })
+    }
+
+    fn send_turn_with_context(
+        &self,
+        input: SendTurnInput,
+        transfer: ContextTransferInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(
+            self.sessions
+                .send_turn_with_context(input, Some(transfer), on_event, on_accepted),
+        )
     }
 
     fn compact_context(

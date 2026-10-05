@@ -149,6 +149,7 @@ fn speaks_stream_json_with_stdio_permissions_like_the_agent_sdk() {
         "--permission-prompt-tool",
         "stdio",
         "--forward-subagent-text",
+        "--replay-user-messages",
         "--include-partial-messages",
         "--setting-sources=user,project,local",
     ] {
@@ -189,6 +190,7 @@ fn skips_permissions_and_mcp_for_isolated_text_sessions() {
     assert_eq!(settings_arg(&args)["disableAllHooks"], json!(true));
     assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
     assert!(!args.iter().any(|arg| arg == "--forward-subagent-text"));
+    assert!(!args.iter().any(|arg| arg == "--replay-user-messages"));
     assert!(!args.iter().any(|arg| arg == "--tools"));
 }
 
@@ -238,6 +240,15 @@ fn adds_bypass_flag_for_full_access() {
 // describe("buildClaudeUserMessage")
 
 #[test]
+fn names_a_request_with_its_uuid_only_when_given() {
+    let named = build_claude_user_message("Run once", &[], None, Some("request-1")).unwrap();
+    assert_eq!(named["uuid"], "request-1");
+    assert_eq!(named["parent_tool_use_id"], Value::Null);
+    let plain = build_claude_user_message("Run once", &[], None, None).unwrap();
+    assert!(plain.get("uuid").is_none());
+}
+
+#[test]
 fn embeds_vision_images_as_base64_source_blocks() {
     let message = build_claude_user_message(
         "look",
@@ -250,6 +261,7 @@ fn embeds_vision_images_as_base64_source_blocks() {
             data: Some("AQIDBA==".into()),
             ..Default::default()
         }],
+        None,
         None,
     )
     .unwrap();
@@ -1408,7 +1420,7 @@ mod file_attachments {
     }
 
     fn claude_content(text: &str, attachments: &[Attachment]) -> Vec<Value> {
-        let message = build_claude_user_message(text, attachments, None).unwrap();
+        let message = build_claude_user_message(text, attachments, None, None).unwrap();
         user_message_content(&message).to_vec()
     }
 
@@ -1524,7 +1536,7 @@ mod file_attachments {
             path: None,
             ..document()
         }];
-        let error = build_claude_user_message("Review", &files, None).unwrap_err();
+        let error = build_claude_user_message("Review", &files, None, None).unwrap_err();
         assert!(error.contains("report.pdf"), "{error}");
         assert!(error.contains("no local file path"), "{error}");
     }

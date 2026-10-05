@@ -54,6 +54,9 @@ struct FakeState {
     spawn_places: Vec<(String, Option<ChildAccount>)>,
     /// Holds binary resolution until the test sends or drops the gate.
     binary_gate: Option<async_channel::Receiver<()>>,
+    /// Holds the next user-message write open until the test sends its
+    /// outcome. The line is recorded at once.
+    user_write_gate: Option<async_channel::Receiver<Result<(), String>>>,
 }
 
 /// The `vi.mock("../../core/child")` of the TypeScript test.
@@ -101,7 +104,18 @@ impl ClaudeChildIo for FakeIo {
         if let Some(error) = state.reject_writes.pop_front() {
             return async move { Err(anyhow!(error)) }.boxed();
         }
+        let user =
+            serde_json::from_str::<Value>(&line).is_ok_and(|message| message["type"] == "user");
         state.sent.push(line);
+        if user && let Some(gate) = state.user_write_gate.take() {
+            return async move {
+                gate.recv()
+                    .await
+                    .unwrap_or(Ok(()))
+                    .map_err(|error| anyhow!(error))
+            }
+            .boxed();
+        }
         async { Ok(()) }.boxed()
     }
 
@@ -183,6 +197,8 @@ struct TurnOptions {
     provider_account_id: Option<String>,
     model: Option<&'static str>,
     text: Option<&'static str>,
+    /// The conversation id Claude reports at startup. Defaults to `sess_1`.
+    provider_session_id: Option<&'static str>,
 }
 
 type Turn = smol::Task<Result<()>>;
@@ -292,11 +308,12 @@ impl Harness {
             attachments: Some(Vec::new()),
         };
         let sessions = self.sessions.clone();
-        smol::spawn(async move { sessions.send_turn(input, sink).await })
+        smol::spawn(async move { sessions.send_turn(input, sink, None).await })
     }
 
     /// `startTurn`: a first turn through the initialize handshake.
     fn start_turn(&self, session_id: &str, options: TurnOptions) -> (Events, Turn) {
+        let provider_session_id = options.provider_session_id.unwrap_or("sess_1");
         let (events, turn) = self.send(session_id, options);
         self.wait_for(
             || {
@@ -306,13 +323,34 @@ impl Harness {
             },
             "initialize",
         );
-        self.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
+        self.emit(
+            json!({ "type": "system", "subtype": "init", "session_id": provider_session_id }),
+        );
         self.emit(json!({
             "type": "control_response",
             "response": { "subtype": "success", "request_id": "monocode_2" },
         }));
         self.wait_for(|| self.user_count() > 0, "user prompt");
+        let uuid = self
+            .parse()
+            .into_iter()
+            .find(|message| message["type"] == "user")
+            .map(|message| message["uuid"].clone())
+            .unwrap_or(Value::Null);
+        self.replay_user(&uuid, provider_session_id);
         (events, turn)
+    }
+
+    /// `replayUser`: Claude's echo of a submitted request.
+    fn replay_user(&self, uuid: &Value, provider_session_id: &str) {
+        self.emit(json!({
+            "type": "user",
+            "uuid": uuid,
+            "isReplay": true,
+            "session_id": provider_session_id,
+            "parent_tool_use_id": null,
+            "message": { "role": "user", "content": [{ "type": "text", "text": "echoed input" }] },
+        }));
     }
 
     /// Acknowledge the latest process's `initialize` once it has asked.
@@ -1285,7 +1323,13 @@ fn starts_a_new_conversation_when_the_saved_one_does_not_exist() {
 fn fails_the_turn_and_starts_a_new_conversation_next_time() {
     let h = Harness::new();
     h.sessions.bind_session("s1", "gone", "/repo", None);
-    let (events, turn) = h.start_turn("s1", TurnOptions::default());
+    let (events, turn) = h.start_turn(
+        "s1",
+        TurnOptions {
+            provider_session_id: Some("gone"),
+            ..Default::default()
+        },
+    );
     assert!(contains_all(&h.spawned()[0], &["--resume", "gone"]));
     h.emit(missing_conversation_result());
     let _ = finish(turn);
@@ -1317,6 +1361,7 @@ fn resumes_a_legacy_thread_when_the_missing_account_resolves_to_default() {
         "s1",
         TurnOptions {
             provider_account_id: Some("default".into()),
+            provider_session_id: Some("legacy-session"),
             ..Default::default()
         },
     );
@@ -3022,7 +3067,7 @@ fn passes_an_explicit_thinking_off_to_claude() {
     let sessions = h.sessions.clone();
     let events = Events::default();
     let sink = events.sink();
-    let turn = smol::spawn(async move { sessions.send_turn(input, sink).await });
+    let turn = smol::spawn(async move { sessions.send_turn(input, sink, None).await });
     h.wait_for(|| h.spawned().len() == 1, "Claude process");
     h.ack_init();
     h.wait_for(|| h.user_count() == 1, "user prompt");
@@ -3295,6 +3340,7 @@ fn restarts_in_build_mode_after_an_autonomous_plan() {
         },
     );
     h.wait_for(|| h.spawned().len() == 2, "Build process");
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "sess_1" }));
     h.ack_init();
     h.wait_for(|| h.user_count() == 2, "build prompt");
     h.result("sess_1");
@@ -3675,4 +3721,512 @@ fn names_a_branch_under_the_selected_account() {
     assert_eq!(smol::block_on(branch).as_deref(), Some("fix-login"));
     let places = h.io.state.lock().spawn_places.clone();
     assert_eq!(places[0].1.as_ref().unwrap().id, "account-work");
+}
+
+// describe("claude current request acceptance")
+
+struct Transfer {
+    events: Events,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    delivered: Arc<std::sync::atomic::AtomicUsize>,
+    turn: Turn,
+}
+
+impl Transfer {
+    fn accepted(&self) -> usize {
+        self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn delivered(&self) -> usize {
+        self.delivered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `initializingTransfer`: a resumed turn that carries shared history,
+/// waiting on initialize.
+fn initializing_transfer(h: &Harness) -> Transfer {
+    use crate::core::context_transfer::{
+        ContextTransferInput, DeliveredHook, prepare_context_transfer_input,
+    };
+    use monocode_core::block::Block;
+    use monocode_core::portable_context::{PortableContextOptions, build_portable_context};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    h.sessions
+        .bind_session("s1", "expected-native", "/repo", None);
+    let mut history = Session::blank("history", HarnessId::Codex, "codex:gpt", "/repo");
+    history.blocks = vec![Block::new(
+        "earlier",
+        BlockRole::User,
+        "Retain the earlier request.",
+    )];
+    let events = Events::default();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let on_delivered: DeliveredHook = {
+        let delivered = delivered.clone();
+        Arc::new(move |_| {
+            delivered.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }.boxed()
+        })
+    };
+    let capabilities = Some(super::adapter::CLAUDE_CONTEXT_TRANSFER);
+    let count = accepted.clone();
+    let prepared = prepare_context_transfer_input(
+        SendTurnInput {
+            session: HarnessSessionInput {
+                session_id: "s1".into(),
+                cwd: "/repo".into(),
+                model: "claude:sonnet-5".into(),
+                model_settings: Some(ModelSettings::new()),
+                provider_account_id: None,
+                runtime_mode: RuntimeMode::Supervised,
+                intent: None,
+                controls_agents: None,
+                app_access: None,
+            },
+            text: "Current request".into(),
+            attachments: Some(Vec::new()),
+        },
+        Some(ContextTransferInput {
+            context: build_portable_context(&history, &PortableContextOptions::default()).unwrap(),
+            fallback_context: None,
+            on_delivered: Some(on_delivered),
+        }),
+        capabilities,
+        events.sink(),
+        Some(Arc::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        })),
+        Arc::new(SmolSpawner),
+    );
+    let sessions = h.sessions.clone();
+    let turn = smol::spawn(async move {
+        sessions
+            .send_turn(prepared.input, prepared.on_event, prepared.on_accepted)
+            .await
+    });
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    Transfer {
+        events,
+        accepted,
+        delivered,
+        turn,
+    }
+}
+
+impl Harness {
+    /// `confirmIdentity`: acknowledge initialize, then report the resumed id.
+    fn confirm_identity(&self) {
+        self.emit(json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "monocode_2" },
+        }));
+        self.emit(json!({
+            "type": "system", "subtype": "commands_changed", "session_id": "expected-native",
+        }));
+    }
+
+    fn response(&self, text: &str) {
+        self.emit(json!({
+            "type": "stream_event",
+            "session_id": "expected-native",
+            "event": { "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } },
+        }));
+    }
+
+    fn first_user_uuid(&self) -> Value {
+        self.parse()
+            .into_iter()
+            .find(|message| message["type"] == "user")
+            .map(|message| message["uuid"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    fn hold_user_write(&self) -> async_channel::Sender<Result<(), String>> {
+        let (release, gate) = async_channel::bounded(1);
+        self.io.state.lock().user_write_gate = Some(gate);
+        release
+    }
+}
+
+fn delta_texts(events: &Events) -> Vec<String> {
+    events
+        .all()
+        .into_iter()
+        .filter_map(|event| match event {
+            HarnessEvent::MessageDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+const DIFFERENT: &str = "different provider conversation";
+
+#[test]
+fn denies_a_startup_plan_before_any_request_and_rejects_a_different_conversation() {
+    let h = Harness::new();
+    let run = initializing_transfer(&h);
+    h.emit(json!({
+        "type": "control_request",
+        "request_id": "startup-plan",
+        "request": { "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "input": { "plan": "# Startup plan" } },
+    }));
+    h.wait_for(
+        || h.response_for("startup-plan").is_some(),
+        "startup plan reply",
+    );
+    assert_eq!(h.user_count(), 0);
+    assert!(
+        !run.events
+            .any(|event| matches!(event, HarnessEvent::Plan { .. }))
+    );
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "different-native" }));
+    let error = finish(run.turn).unwrap_err();
+    assert!(error.to_string().contains(DIFFERENT), "{error}");
+    assert_eq!(run.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(run.delivered.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn ignores_startup_output_and_does_not_accept_a_result_only_refusal() {
+    let h = Harness::new();
+    let run = initializing_transfer(&h);
+    h.emit(json!({
+        "type": "assistant",
+        "session_id": "expected-native",
+        "message": { "content": [
+            { "type": "text", "text": "Startup response" },
+            { "type": "tool_use", "id": "startup-tool", "name": "Read", "input": { "file_path": "/repo/old.ts" } },
+        ] },
+    }));
+    assert!(!run.events.any(|event| matches!(
+        event,
+        HarnessEvent::MessageDelta { .. } | HarnessEvent::ToolStarted { .. }
+    )));
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() > 0, "user prompt");
+    h.emit(json!({
+        "type": "result", "subtype": "error_during_execution", "is_error": true,
+        "errors": ["Usage limit reached"], "session_id": "expected-native",
+    }));
+    let _ = finish(run.turn);
+    assert!(
+        run.events
+            .any(|event| matches!(event, HarnessEvent::SessionError { .. }))
+    );
+    assert_eq!(run.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(run.delivered.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn holds_a_matching_replay_until_the_write_lands_and_accepts_once() {
+    let h = Harness::new();
+    let release = h.hold_user_write();
+    let run = initializing_transfer(&h);
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() == 1, "pending user write");
+    h.replay_user(&h.first_user_uuid(), "expected-native");
+    h.response("Current response");
+    assert!(delta_texts(&run.events).is_empty());
+    assert_eq!(run.accepted(), 0);
+    smol::block_on(release.send(Ok(()))).unwrap();
+    h.wait_for(|| run.accepted() == 1, "accepted request");
+    h.response("Follow-up response");
+    h.replay_user(&h.first_user_uuid(), "expected-native");
+    h.result("expected-native");
+    let accepted = run.accepted.clone();
+    let delivered = run.delivered.clone();
+    let events = run.events.clone();
+    finish(run.turn).unwrap();
+    h.response("Background response after the completed input");
+    let texts = delta_texts(&events);
+    assert!(texts.iter().any(|text| text == "Current response"));
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "Background response after the completed input")
+    );
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    h.wait_for(
+        || delivered.load(std::sync::atomic::Ordering::SeqCst) == 1,
+        "inline receipt",
+    );
+}
+
+#[test]
+fn ignores_unrelated_and_child_echoes_until_the_parent_replay() {
+    let h = Harness::new();
+    let run = initializing_transfer(&h);
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() > 0, "user prompt");
+    let uuid = h.first_user_uuid();
+    for fields in [
+        json!({ "uuid": uuid::Uuid::new_v4().to_string(), "isReplay": true, "parent_tool_use_id": null }),
+        json!({ "uuid": uuid, "isReplay": true, "parent_tool_use_id": "child-tool" }),
+        json!({ "uuid": uuid, "isReplay": false, "parent_tool_use_id": null }),
+        json!({ "uuid": uuid, "isReplay": true }),
+    ] {
+        let mut record = json!({
+            "type": "user", "session_id": "expected-native",
+            "message": { "role": "user", "content": [] },
+        });
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        h.emit(record);
+    }
+    h.response("Output without a current acknowledgment");
+    assert_eq!(run.accepted(), 0);
+    h.replay_user(&uuid, "expected-native");
+    h.replay_user(&uuid, "expected-native");
+    assert_eq!(run.accepted(), 1);
+    h.wait_for(|| run.delivered() == 1, "inline receipt");
+    h.result("expected-native");
+    finish(run.turn).unwrap();
+}
+
+#[test]
+fn does_not_reuse_an_earlier_acknowledgment_for_the_next_turn() {
+    let h = Harness::new();
+    let (_, first) = h.start_turn("s1", TurnOptions::default());
+    let old_uuid = h.first_user_uuid();
+    h.result("sess_1");
+    finish(first).unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    let input = SendTurnInput {
+        session: HarnessSessionInput {
+            session_id: "s1".into(),
+            cwd: "/repo".into(),
+            model: "claude:claude-sonnet-5".into(),
+            model_settings: Some(ModelSettings::new()),
+            provider_account_id: None,
+            runtime_mode: RuntimeMode::Supervised,
+            intent: None,
+            controls_agents: None,
+            app_access: None,
+        },
+        text: "Next request".into(),
+        attachments: Some(Vec::new()),
+    };
+    let sessions = h.sessions.clone();
+    let turn = smol::spawn(async move {
+        sessions
+            .send_turn(
+                input,
+                Arc::new(|_| {}),
+                Some(Arc::new(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+            )
+            .await
+    });
+    h.wait_for(|| h.user_count() == 2, "next user prompt");
+    let uuid = h
+        .parse()
+        .into_iter()
+        .rfind(|message| message["type"] == "user")
+        .map(|message| message["uuid"].clone())
+        .unwrap();
+    assert_ne!(uuid, old_uuid);
+    h.replay_user(&old_uuid, "sess_1");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    h.replay_user(&uuid, "sess_1");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    h.result("sess_1");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn does_not_accept_unrelated_output_held_during_the_write() {
+    let h = Harness::new();
+    let release = h.hold_user_write();
+    let run = initializing_transfer(&h);
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() == 1, "pending user write");
+    h.response("Unrelated startup output");
+    smol::block_on(release.send(Ok(()))).unwrap();
+    h.wait_for(
+        || !delta_texts(&run.events).is_empty(),
+        "held output delivery",
+    );
+    assert_eq!(run.accepted(), 0);
+    h.emit(json!({
+        "type": "result", "subtype": "error_during_execution", "is_error": true,
+        "errors": ["Current request failed"], "session_id": "expected-native",
+    }));
+    let _ = finish(run.turn);
+    assert_eq!(run.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(run.delivered.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn discards_held_evidence_when_the_user_write_fails() {
+    let h = Harness::new();
+    let release = h.hold_user_write();
+    let run = initializing_transfer(&h);
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() == 1, "pending user write");
+    h.replay_user(&h.first_user_uuid(), "expected-native");
+    h.response("Current response");
+    smol::block_on(release.send(Err("Broken pipe".into()))).unwrap();
+    let error = finish(run.turn).unwrap_err();
+    assert!(error.to_string().contains("Broken pipe"));
+    assert!(delta_texts(&run.events).is_empty());
+    assert_eq!(run.accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(run.delivered.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// `initializingTurn`: a turn waiting on initialize, resuming
+/// `provider_session_id` when given.
+fn initializing_turn(h: &Harness, provider_session_id: Option<&str>) -> (Events, Turn) {
+    if let Some(id) = provider_session_id {
+        h.sessions.bind_session("s1", id, "/repo", None);
+    }
+    let (events, turn) = h.send(
+        "s1",
+        TurnOptions {
+            text: Some("Current request"),
+            ..Default::default()
+        },
+    );
+    h.wait_for(
+        || {
+            h.parse()
+                .iter()
+                .any(|m| m["request"]["subtype"] == "initialize")
+        },
+        "initialize",
+    );
+    (events, turn)
+}
+
+fn bound_to(events: &Events, id: &str) -> bool {
+    events.any(|event| {
+        matches!(event, HarnessEvent::SessionProviderBound { provider_session_id } if provider_session_id == id)
+    })
+}
+
+#[test]
+fn waits_for_the_resumed_identity_after_initialize_and_retries_cleanly() {
+    let h = Harness::new();
+    let (events, turn) = initializing_turn(&h, Some("expected-native"));
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_2" },
+    }));
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(h.user_count(), 0);
+    h.emit(json!({ "type": "system", "subtype": "commands_changed", "session_id": "different-native" }));
+    let error = finish(turn).unwrap_err();
+    assert!(error.to_string().contains(DIFFERENT), "{error}");
+    assert!(!bound_to(&events, "different-native"));
+
+    h.clear_sent();
+    let (_, retry) = h.start_turn(
+        "s1",
+        TurnOptions {
+            provider_session_id: Some("expected-native"),
+            ..Default::default()
+        },
+    );
+    assert!(contains_all(
+        h.spawned().last().unwrap(),
+        &["--resume", "expected-native"]
+    ));
+    h.result("expected-native");
+    finish(retry).unwrap();
+}
+
+#[test]
+fn accepts_a_matching_commands_record_before_system_init_on_resume() {
+    let h = Harness::new();
+    let (_, turn) = initializing_turn(&h, Some("expected-native"));
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() > 0, "user prompt");
+    h.result("expected-native");
+    finish(turn).unwrap();
+}
+
+#[test]
+fn rejects_a_later_mismatch_before_releasing_the_resumed_request() {
+    let h = Harness::new();
+    let (events, turn) = initializing_turn(&h, Some("expected-native"));
+    h.emit(
+        json!({ "type": "system", "subtype": "commands_changed", "session_id": "expected-native" }),
+    );
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "different-native" }));
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_2" },
+    }));
+    let error = finish(turn).unwrap_err();
+    assert!(error.to_string().contains(DIFFERENT), "{error}");
+    assert!(!bound_to(&events, "different-native"));
+    assert_eq!(h.user_count(), 0);
+}
+
+#[test]
+fn fails_an_active_resumed_turn_when_the_parent_identity_changes() {
+    let h = Harness::new();
+    let (events, turn) = initializing_turn(&h, Some("expected-native"));
+    h.confirm_identity();
+    h.wait_for(|| h.user_count() > 0, "user prompt");
+    h.response("Accepted response");
+    h.emit(json!({
+        "type": "stream_event", "session_id": "child-native", "parent_tool_use_id": "child-tool",
+        "event": { "type": "message_start" },
+    }));
+    h.emit(json!({ "type": "system", "subtype": "hook_started", "session_id": "hook-native" }));
+    std::thread::sleep(Duration::from_millis(30));
+    assert!(!events.any(|event| matches!(event, HarnessEvent::SessionError { .. })));
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "different-native" }));
+    let error = finish(turn).unwrap_err();
+    assert!(error.to_string().contains(DIFFERENT), "{error}");
+    assert!(!bound_to(&events, "different-native"));
+    assert!(events.any(|event| matches!(
+        event,
+        HarnessEvent::SessionError { message } if message.contains(DIFFERENT)
+    )));
+}
+
+#[test]
+fn rejects_an_unconfirmed_resume_at_the_initialize_timeout() {
+    let h = Harness::new();
+    let (_, turn) = initializing_turn(&h, Some("expected-native"));
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_2" },
+    }));
+    let error = smol::block_on(async {
+        crate::core::task::timeout(Duration::from_secs(10), turn)
+            .await
+            .expect("turn did not settle")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("did not confirm"), "{error}");
+    assert_eq!(h.user_count(), 0);
+}
+
+#[test]
+fn rejects_a_mismatched_identity_reported_before_initialize_completes() {
+    let h = Harness::new();
+    let (_, turn) = initializing_turn(&h, Some("expected-native"));
+    h.emit(json!({ "type": "system", "subtype": "init", "session_id": "different-native" }));
+    h.emit(json!({
+        "type": "control_response",
+        "response": { "subtype": "success", "request_id": "monocode_2" },
+    }));
+    let error = finish(turn).unwrap_err();
+    assert!(error.to_string().contains(DIFFERENT), "{error}");
+    assert_eq!(h.user_count(), 0);
 }

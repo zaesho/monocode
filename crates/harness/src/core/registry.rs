@@ -29,6 +29,9 @@ use monocode_core::harness_event::{
 };
 use monocode_core::user_question::UserQuestionReply;
 
+use super::context_transfer::{
+    ContextTransferCapabilities, ContextTransferInput, prepare_context_transfer_input,
+};
 use super::native_commands::NativeCommandProvider;
 use super::session_title::GeneratedSessionTitle;
 use super::task::{AbortSignal, BoxFuture, SharedSpawner};
@@ -179,6 +182,25 @@ pub trait HarnessAdapter: Send + Sync {
         on_event: EventSink,
         on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>>;
+
+    /// `contextTransferCapabilities`: how this adapter takes shared history
+    /// from another provider. `None` means attributed text only.
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        None
+    }
+
+    /// `sendTurn` with shared history for an adapter whose capabilities set
+    /// `native_messages`. The registry gives every other adapter the history
+    /// as text in `input`.
+    fn send_turn_with_context(
+        &self,
+        input: SendTurnInput,
+        _transfer: ContextTransferInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.send_turn(input, on_event, on_accepted)
+    }
 
     /// Trigger provider-owned compaction outside the normal user-turn path.
     fn compact_context(
@@ -749,6 +771,21 @@ impl HarnessRegistry {
         on_event: EventSink,
         on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'static, Result<()>> {
+        self.send_harness_turn_with_context(harness, input, None, on_event, on_accepted)
+    }
+
+    /// `sendHarnessTurn` with the shared history of a provider switch. The
+    /// turn goes through `prepareContextTransferInput`, so acceptance is
+    /// reported once and an adapter without native import gets the history
+    /// as text.
+    pub fn send_harness_turn_with_context(
+        &self,
+        harness: HarnessId,
+        input: SendTurnInput,
+        transfer: Option<ContextTransferInput>,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> BoxFuture<'static, Result<()>> {
         let registry = self.clone();
         let session_id = input.session.session_id.clone();
         self.queue_session_operation(&session_id.clone(), async move {
@@ -778,7 +815,31 @@ impl HarnessRegistry {
                 &session_id,
                 registry.inner.options.ambient_events.clone(),
             );
-            let result = adapter.send_turn(input, on_event, on_accepted).await;
+            let prepared = prepare_context_transfer_input(
+                input,
+                transfer,
+                adapter.context_transfer_capabilities(),
+                on_event,
+                on_accepted,
+                registry.inner.spawner.clone(),
+            );
+            let result = match prepared.transfer {
+                Some(transfer) => {
+                    adapter
+                        .send_turn_with_context(
+                            prepared.input,
+                            transfer,
+                            prepared.on_event,
+                            prepared.on_accepted,
+                        )
+                        .await
+                }
+                None => {
+                    adapter
+                        .send_turn(prepared.input, prepared.on_event, prepared.on_accepted)
+                        .await
+                }
+            };
             ended.end();
             registry.inner.state.lock().active_turns.remove(&session_id);
             if let Some(control) = &control {
@@ -787,6 +848,14 @@ impl HarnessRegistry {
             registry.schedule_idle_park(harness, &session_id);
             result
         })
+    }
+
+    /// `canResumeHarnessWithContext`: the adapter can resume a saved native
+    /// conversation and append only the history it lacks.
+    pub fn can_resume_harness_with_context(&self, id: HarnessId) -> bool {
+        self.get_harness(id)
+            .and_then(|adapter| adapter.context_transfer_capabilities())
+            .is_some_and(|capabilities| capabilities.resumed_append)
     }
 
     /// `canCompactHarnessContext`.

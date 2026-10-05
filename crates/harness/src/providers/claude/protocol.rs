@@ -238,11 +238,13 @@ pub fn parse_json_line(line: &str) -> Option<Record> {
 }
 
 /// `buildClaudeUserMessage`. Fails like `attachmentPathText` when an
-/// attachment has no local path.
+/// attachment has no local path. `uuid` names the request, so Claude's replay
+/// of it can confirm acceptance.
 pub fn build_claude_user_message(
     text: &str,
     attachments: &[Attachment],
     effort: Option<&str>,
+    uuid: Option<&str>,
 ) -> Result<Value, String> {
     let text = apply_claude_prompt_effort_prefix(&prompt_text(text, attachments), effort);
     let mut content = Vec::new();
@@ -257,12 +259,16 @@ pub fn build_claude_user_message(
             }
         }
     }
-    Ok(json!({
+    let mut message = json!({
         "type": "user",
         "session_id": "",
         "parent_tool_use_id": null,
         "message": { "role": "user", "content": content },
-    }))
+    });
+    if let Some(uuid) = uuid {
+        message["uuid"] = Value::String(uuid.to_string());
+    }
+    Ok(message)
 }
 
 /// `(message.message as { content: unknown[] }).content`.
@@ -335,6 +341,8 @@ pub fn build_claude_spawn_args(input: &ClaudeSpawnOptions) -> Vec<String> {
     if !input.isolated {
         // Foreground subagents only report their prose with this flag.
         args.push("--forward-subagent-text".into());
+        // Claude echoes each user message back, which confirms acceptance.
+        args.push("--replay-user-messages".into());
         args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
     }
     if input.include_partial_messages != Some(false) {

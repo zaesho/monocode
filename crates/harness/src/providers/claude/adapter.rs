@@ -13,6 +13,7 @@ use monocode_core::harness_event::{
 use monocode_core::models::AgentModel;
 use monocode_core::user_question::UserQuestionReply;
 
+use crate::core::context_transfer::ContextTransferCapabilities;
 use crate::core::register::HarnessContext;
 use crate::core::registry::{
     AcceptedHook, AdapterCapabilities, CatalogScope, EventSink, GeneratedPrContent, HarnessAdapter,
@@ -30,6 +31,14 @@ use super::io::{ChildrenIo, SharedChildIo};
 use super::session::{ClaudeSessionOptions, ClaudeSessions};
 use super::text::ClaudeText;
 use super::title::generate_claude_session_title;
+
+/// Claude takes shared history as text, resumes its own conversation, and
+/// confirms acceptance through the replay of each request.
+pub const CLAUDE_CONTEXT_TRANSFER: ContextTransferCapabilities = ContextTransferCapabilities {
+    native_messages: false,
+    resumed_append: true,
+    explicit_acceptance: true,
+};
 
 /// What the app supplies that [`HarnessContext`] does not carry: the
 /// `monocode.claudeHooks` setting and the git reads behind commit and pull
@@ -155,9 +164,13 @@ impl HarnessAdapter for ClaudeAdapter {
         &self,
         input: SendTurnInput,
         on_event: EventSink,
-        _on_accepted: Option<AcceptedHook>,
+        on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.sessions.send_turn(input, on_event))
+        Box::pin(self.sessions.send_turn(input, on_event, on_accepted))
+    }
+
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        Some(CLAUDE_CONTEXT_TRANSFER)
     }
 
     fn compact_context(

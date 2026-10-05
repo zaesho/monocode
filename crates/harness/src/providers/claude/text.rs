@@ -274,9 +274,13 @@ impl ClaudeText {
         );
 
         let result = async {
-            let message =
-                build_claude_user_message(&input.prompt, &[], settings.prompt_effort.as_deref())
-                    .map_err(|error| anyhow!(error))?;
+            let message = build_claude_user_message(
+                &input.prompt,
+                &[],
+                settings.prompt_effort.as_deref(),
+                None,
+            )
+            .map_err(|error| anyhow!(error))?;
             self.inner
                 .io
                 .write_child(TEXT_CHILD_ID, serde_json::to_string(&message)?)

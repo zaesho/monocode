@@ -38,7 +38,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use crate::core::provider_accounts::same_provider_account_id;
-use crate::core::registry::EventSink;
+use crate::core::registry::{AcceptedHook, EventSink};
 use crate::core::task::{SharedSpawner, sleep, timeout};
 
 use super::elicitation::{elicitation_questions, elicitation_response};
@@ -206,6 +206,45 @@ struct TurnWaiter {
     resolve: oneshot::Sender<Result<(), String>>,
 }
 
+/// `TurnSubmission`: one user request written to Claude. It counts as
+/// accepted only after the write succeeded and Claude replayed the request
+/// with the same uuid. Turn events wait until the write lands.
+struct TurnSubmission {
+    uuid: String,
+    written: bool,
+    acknowledged: bool,
+    accepted: bool,
+    on_accepted: Option<AcceptedHook>,
+    pending_events: Vec<HarnessEvent>,
+}
+
+/// `resumeIdentity`: the conversation `--resume` named. Claude must report
+/// the same id before the session counts as initialized.
+struct ResumeIdentity {
+    expected: String,
+    confirmed: bool,
+}
+
+const RESUMED_DIFFERENT_CONVERSATION: &str = "Claude resumed a different provider conversation. Retry with a fresh conversation and shared history.";
+const RESUME_NOT_CONFIRMED: &str = "Claude did not confirm the resumed provider conversation before initialization finished. Retry with a fresh conversation and shared history.";
+const RESUME_PENDING: &str = "Claude has not confirmed the resumed provider conversation. Retry after initialization finishes.";
+
+/// Events that reach the sink whether or not a request was submitted:
+/// session lifecycle, status, context, and usage limits.
+fn passes_submission_gate(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::SessionStarted
+            | HarnessEvent::SessionEnded { .. }
+            | HarnessEvent::SessionError { .. }
+            | HarnessEvent::SessionProviderBound { .. }
+            | HarnessEvent::SessionConfigChanged { .. }
+            | HarnessEvent::Status { .. }
+            | HarnessEvent::Context { .. }
+            | HarnessEvent::UsageLimited { .. }
+    )
+}
+
 /// `ScheduledTask`: a job Claude scheduled with CronCreate, which wakes it
 /// for a turn of its own. Times are epoch ms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,6 +305,11 @@ struct Live {
     provider_planning: bool,
     settings_key: String,
     on_event: EventSink,
+    /// The request being written and acknowledged. Interior mutability lets
+    /// `emit` hold turn events until the write lands.
+    submission: Mutex<Option<TurnSubmission>>,
+    /// A user request reached this child, so later output belongs to it.
+    has_submitted_input: bool,
     // Ui ids only grow, so key order is insertion order.
     approvals: BTreeMap<i64, PendingApproval>,
     questions: BTreeMap<i64, PendingQuestion>,
@@ -316,6 +360,11 @@ struct Live {
     init_request_id: String,
     /// Why initialization failed, for a wait that starts after the failure.
     init_error: Option<String>,
+    /// Claude acknowledged `initialize`. A resume also waits for the id.
+    init_ready: bool,
+    resume_identity: Option<ResumeIdentity>,
+    /// Claude reported a different conversation than `--resume` named.
+    identity_error: Option<String>,
     /// The child was stopped or exited. Late output and queued sends for it
     /// are dropped.
     closed: bool,
@@ -555,8 +604,62 @@ static SEPARATORS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[_-]+").unwra
 impl Live {
     /// Queue an event for the turn's sink. It is delivered when this
     /// session's lock is released.
+    ///
+    /// `forwardTurnEvent`: turn output waits until the request's write
+    /// lands, and output before the first request (startup) is dropped.
     fn emit(&self, event: HarnessEvent) {
+        if !passes_submission_gate(&event) {
+            let mut submission = self.submission.lock();
+            match submission.as_mut() {
+                None if !self.has_submitted_input || self.mute_updates => return,
+                Some(submission) if !submission.written => {
+                    submission.pending_events.push(event);
+                    return;
+                }
+                _ => {}
+            }
+        }
         self.outbox.push(&self.on_event, event);
+    }
+
+    /// `acceptSubmittedInput`: report acceptance once the write landed and
+    /// Claude replayed the request. Compaction never accepts a request.
+    fn accept_submitted_input(&mut self) {
+        if self.manual_compaction || self.cancelled || self.mute_updates {
+            return;
+        }
+        let hook = {
+            let mut submission = self.submission.lock();
+            let Some(submission) = submission.as_mut().filter(|submission| {
+                submission.written && submission.acknowledged && !submission.accepted
+            }) else {
+                return;
+            };
+            submission.accepted = true;
+            submission.on_accepted.clone()
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// `handleUser`'s acknowledgement check: Claude's replay of the parent
+    /// request with our uuid.
+    fn note_replay(&mut self, rec: &Record) {
+        let replayed = rec.get("isReplay") == Some(&Value::Bool(true))
+            && rec.get("parent_tool_use_id") == Some(&Value::Null);
+        let uuid = string_field(Some(rec), "uuid");
+        let matched = replayed
+            && self
+                .submission
+                .lock()
+                .as_mut()
+                .filter(|submission| Some(submission.uuid.as_str()) == uuid)
+                .map(|submission| submission.acknowledged = true)
+                .is_some();
+        if matched {
+            self.accept_submitted_input();
+        }
     }
 
     /// `bindConversation`: Claude saved the conversation. Reports the binding
@@ -960,6 +1063,7 @@ impl Live {
             self.note_subagent_results(rec);
             return;
         }
+        self.note_replay(rec);
         let results = tool_results_from_user_message(rec);
         // Claude Code hands finished-task notices over with the next tool
         // result, so Claude has read them and no extra turn is coming for them.
@@ -2009,9 +2113,18 @@ impl Live {
         }
     }
 
-    // `markInitialized`.
+    // `markInitialized`. A resumed conversation also waits for Claude to
+    // report the id it resumed.
     fn mark_initialized(&mut self) {
-        if self.initialized {
+        if self.initialized || self.identity_error.is_some() {
+            return;
+        }
+        self.init_ready = true;
+        if self
+            .resume_identity
+            .as_ref()
+            .is_some_and(|identity| !identity.confirmed)
+        {
             return;
         }
         self.initialized = true;
@@ -2045,7 +2158,9 @@ impl Live {
         let tool_name = control.tool_name.clone().unwrap_or_else(|| "tool".into());
         let input = control.input.clone();
 
-        if self.cancelled || self.mute_updates {
+        // Startup output before any request has no user behind it.
+        let unrequested = self.submission.lock().is_none() && !self.has_submitted_input;
+        if self.cancelled || self.mute_updates || unrequested {
             let write = self.write_json(&build_control_response(
                 &control.request_id,
                 to_claude_permission_result(ApprovalDecision::Deny, &input),
@@ -2515,8 +2630,13 @@ impl ClaudeSessions {
         Ok(Some(cell))
     }
 
-    /// `sendClaudeTurn`.
-    pub async fn send_turn(&self, input: SendTurnInput, on_event: EventSink) -> Result<()> {
+    /// `sendClaudeTurn`. `on_accepted` runs once Claude replays the request.
+    pub async fn send_turn(
+        &self,
+        input: SendTurnInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> Result<()> {
         let thread_id = input.session.session_id.clone();
         let epoch = self.epoch(&thread_id);
         let Some(cell) = self
@@ -2542,7 +2662,15 @@ impl ClaudeSessions {
             .and_then(|settings| settings.get("effort"))
             .cloned();
         let attachments = input.attachments.clone().unwrap_or_default();
-        match run_turn(&cell, &input.text, &attachments, effort.as_deref()).await {
+        match run_turn(
+            &cell,
+            &input.text,
+            &attachments,
+            effort.as_deref(),
+            on_accepted,
+        )
+        .await
+        {
             Err(_) if cell.lock().cancelled => Ok(()),
             result => result,
         }
@@ -2581,7 +2709,7 @@ impl ClaudeSessions {
             live.manual_compaction = true;
             live.compaction_confirmed = false;
         }
-        let result = match run_turn(&cell, "/compact", &[], None).await {
+        let result = match run_turn(&cell, "/compact", &[], None, None).await {
             Ok(()) if !cell.lock().compaction_confirmed => {
                 Err(anyhow!("Claude Code did not confirm context compaction"))
             }
@@ -2612,6 +2740,7 @@ impl ClaudeSessions {
             &input.text,
             input.attachments.as_deref().unwrap_or(&[]),
             effort,
+            None,
         )
         .map_err(|error| anyhow!(error))?;
         if user_message_content(&message).is_empty() {
@@ -2737,6 +2866,7 @@ impl ClaudeSessions {
             live.fail_init("Claude Code stopped");
             live.deny_all_pending();
             live.active_turn = false;
+            *live.submission.lock() = None;
             if let Some(turn) = live.turn.take() {
                 let _ = turn.resolve.send(Ok(()));
             }
@@ -2968,6 +3098,8 @@ impl ClaudeSessions {
                 provider_planning: planning,
                 settings_key,
                 on_event,
+                submission: Mutex::new(None),
+                has_submitted_input: false,
                 approvals: BTreeMap::new(),
                 questions: BTreeMap::new(),
                 visible_question_id: None,
@@ -2996,6 +3128,12 @@ impl ClaudeSessions {
                 initialized: false,
                 init_request_id: String::new(),
                 init_error: None,
+                init_ready: false,
+                resume_identity: resume.as_ref().map(|resume| ResumeIdentity {
+                    expected: resume.session_id.clone(),
+                    confirmed: false,
+                }),
+                identity_error: None,
                 closed: false,
                 started: false,
                 outstanding_results: 0,
@@ -3191,7 +3329,12 @@ async fn wait_for_init(cell: &LiveRef, wait: Duration) -> Result<()> {
         Some(Ok(Err(error))) => Err(anyhow!(error)),
         Some(Err(_)) => Err(anyhow!("Claude Code stopped")),
         None => {
-            cell.lock().init_done = None;
+            let mut live = cell.lock();
+            live.init_done = None;
+            if live.init_ready && live.resume_identity.is_some() {
+                live.init_error = Some(RESUME_NOT_CONFIRMED.into());
+                return Err(anyhow!(RESUME_NOT_CONFIRMED));
+            }
             Err(anyhow!("Claude Code initialization timed out"))
         }
     }
@@ -3203,9 +3346,25 @@ async fn run_turn(
     text: &str,
     attachments: &[Attachment],
     effort: Option<&str>,
+    on_accepted: Option<AcceptedHook>,
 ) -> Result<()> {
-    let message =
-        build_claude_user_message(text, attachments, effort).map_err(|error| anyhow!(error))?;
+    {
+        let live = cell.lock();
+        if let Some(error) = &live.identity_error {
+            bail!("{error}");
+        }
+        if live
+            .resume_identity
+            .as_ref()
+            .is_some_and(|identity| !identity.confirmed)
+            && !live.initialized
+        {
+            bail!(RESUME_PENDING);
+        }
+    }
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let message = build_claude_user_message(text, attachments, effort, Some(&uuid))
+        .map_err(|error| anyhow!(error))?;
     if user_message_content(&message).is_empty() {
         return Ok(());
     }
@@ -3238,19 +3397,64 @@ async fn run_turn(
         live.turn = Some(TurnWaiter { token, resolve });
         live.active_turn = true;
         live.settle_pending_turn();
+        *live.submission.lock() = Some(TurnSubmission {
+            uuid: uuid.clone(),
+            written: false,
+            acknowledged: false,
+            accepted: false,
+            on_accepted,
+            pending_events: Vec::new(),
+        });
         (done, live.write_json(&message))
+    };
+    let current = |live: &Live| {
+        live.submission
+            .lock()
+            .as_ref()
+            .is_some_and(|submission| submission.uuid == uuid)
     };
 
     let outcome = match write.await {
         Ok(()) => {
-            cell.lock().settle_pending_turn();
-            // A dropped resolver means the session went away without a verdict.
-            done.await.unwrap_or(Ok(())).map_err(|error| anyhow!(error))
+            // `None` waits for the turn's verdict.
+            let failed = {
+                let mut live = cell.lock();
+                if let Some(error) = live.identity_error.clone() {
+                    Some(anyhow!(error))
+                } else {
+                    if current(&live) && !live.cancelled && !live.mute_updates {
+                        let held = live
+                            .submission
+                            .lock()
+                            .as_mut()
+                            .map(|submission| {
+                                submission.written = true;
+                                std::mem::take(&mut submission.pending_events)
+                            })
+                            .unwrap_or_default();
+                        live.has_submitted_input = true;
+                        live.accept_submitted_input();
+                        for event in held {
+                            live.emit(event);
+                        }
+                    }
+                    live.settle_pending_turn();
+                    None
+                }
+            };
+            match failed {
+                Some(error) => Err(error),
+                // A dropped resolver means the session went away without a verdict.
+                None => done.await.unwrap_or(Ok(())).map_err(|error| anyhow!(error)),
+            }
         }
         Err(error) => Err(error),
     };
     let mut live = cell.lock();
     live.turn = None;
+    if current(&live) {
+        *live.submission.lock() = None;
+    }
     match outcome {
         Err(_) if live.cancelled => Ok(()),
         Err(error) => {
@@ -3273,6 +3477,8 @@ struct Rebind {
     tasks: Option<RetainedTasks>,
     /// A conversation Claude saved, to resume next time.
     resume: Option<Resume>,
+    /// Claude resumed the wrong conversation: stop this child.
+    stop: bool,
 }
 
 /// `handleLine`.
@@ -3287,6 +3493,28 @@ fn handle_line(inner: &Inner, thread_id: &str, cell: &LiveRef, line: &str) {
             return;
         }
         handle_record(&mut live, &rec, &mut rebind);
+    }
+    if rebind.stop {
+        {
+            let mut globals = inner.globals.lock();
+            if globals
+                .live_by_thread
+                .get(thread_id)
+                .is_some_and(|current| Arc::ptr_eq(current, cell))
+            {
+                globals.live_by_thread.remove(thread_id);
+            }
+        }
+        inner.io.unwatch_child(thread_id);
+        let io = inner.io.clone();
+        let thread_id = thread_id.to_string();
+        inner.spawner.spawn(
+            async move {
+                let _ = io.kill_child(&thread_id).await;
+            }
+            .boxed(),
+        );
+        return;
     }
     if !rebind.forget && rebind.tasks.is_none() && rebind.resume.is_none() {
         return;
@@ -3309,6 +3537,11 @@ fn handle_line(inner: &Inner, thread_id: &str, cell: &LiveRef, line: &str) {
 /// `showsSavedConversation`: lines Claude only sends after it has saved the
 /// user's prompt.
 fn shows_saved_conversation(rec: &Record) -> bool {
+    // `--replay-user-messages` echoes the request as it arrives, before
+    // Claude has necessarily written the conversation.
+    if rec.get("isReplay") == Some(&Value::Bool(true)) {
+        return false;
+    }
     match string_field(Some(rec), "type") {
         Some("result") => string_field(Some(rec), "subtype") == Some("success"),
         Some("assistant" | "user" | "stream_event") => true,
@@ -3364,6 +3597,34 @@ fn handle_record(live: &mut Live, rec: &Record, rebind: &mut Rebind) {
             return;
         }
         // After startup the result ends the running turn with its error.
+    }
+
+    if live.identity_error.is_some() {
+        return;
+    }
+    if !missing
+        && !live.mute_updates
+        && let Some(session_id) = session_id_from_message(rec)
+        && let Some(identity) = &mut live.resume_identity
+    {
+        if session_id != identity.expected {
+            live.identity_error = Some(RESUMED_DIFFERENT_CONVERSATION.into());
+            live.fail_init(RESUMED_DIFFERENT_CONVERSATION);
+            if let Some(turn) = live.turn.take() {
+                let _ = turn
+                    .resolve
+                    .send(Err(RESUMED_DIFFERENT_CONVERSATION.into()));
+            }
+            live.closed = true;
+            rebind.stop = true;
+            return;
+        }
+        if !identity.confirmed {
+            identity.confirmed = true;
+            if live.init_ready {
+                live.mark_initialized();
+            }
+        }
     }
 
     let mut switched = false;

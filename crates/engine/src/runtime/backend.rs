@@ -108,7 +108,9 @@ fn unsupported<T: Send + 'static>(what: &str) -> StoreFuture<T> {
 
 /// The `session_checkpoint_*` commands.
 pub trait CheckpointBackend: Send + Sync + 'static {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()>;
+    /// `isolated` marks a worker that owns its checkout, so every later
+    /// change there counts as its own.
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()>;
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()>;
     fn capture(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()>;
     fn status(&self, session_id: String, cwd: String) -> StoreFuture<CheckpointStatus>;
@@ -117,6 +119,7 @@ pub trait CheckpointBackend: Send + Sync + 'static {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult>;
     fn cleanup_safe(&self, session_id: String, cwd: String) -> StoreFuture<bool>;
     fn forget(&self, session_id: String) -> StoreFuture<()>;
@@ -373,8 +376,10 @@ impl SessionBackend for StoreBackend {
 }
 
 impl CheckpointBackend for StoreBackend {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()> {
-        self.checkpoint(move |store| checkpoint::session_checkpoint_ensure(store, session_id, cwd))
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()> {
+        self.checkpoint(move |store| {
+            checkpoint::session_checkpoint_ensure(store, session_id, cwd, isolated)
+        })
     }
 
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()> {
@@ -398,9 +403,10 @@ impl CheckpointBackend for StoreBackend {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult> {
         self.checkpoint(move |store| {
-            checkpoint::session_checkpoint_apply(store, session_id, from_cwd, to_cwd)
+            checkpoint::session_checkpoint_apply(store, session_id, from_cwd, to_cwd, write_scopes)
         })
     }
 

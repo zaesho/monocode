@@ -317,7 +317,7 @@ async fn integrate_worker(
         return Err("The worker or lead branch moved while this task was running. The worker worktree was kept for manual review.".into());
     }
     let applied = checkpoints
-        .apply(&task.session_id, &from_cwd, &lead_checkout)
+        .apply(&task.session_id, &from_cwd, &lead_checkout, None)
         .await?;
     Ok(WorkerIntegration {
         files: applied.files,
@@ -374,7 +374,7 @@ async fn cleanup_worker(
         // Re-verify immediately before destructive cleanup. The operation is
         // idempotent, so this also finishes a partially applied integration.
         checkpoints
-            .apply(&task.session_id, &path, &lead_checkout)
+            .apply(&task.session_id, &path, &lead_checkout, None)
             .await?;
     }
     let sessions = cx.update(|cx| Engine::sessions(cx));

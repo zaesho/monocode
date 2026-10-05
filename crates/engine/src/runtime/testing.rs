@@ -473,12 +473,12 @@ fn empty_status() -> CheckpointStatus {
 }
 
 impl CheckpointBackend for FakeBackend {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()> {
-        self.call(
-            "session_checkpoint_ensure",
-            serde_json::json!({ "sessionId": session_id, "cwd": cwd }),
-            |_| Ok(()),
-        )
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()> {
+        let mut args = serde_json::json!({ "sessionId": session_id, "cwd": cwd });
+        if isolated {
+            args["isolated"] = serde_json::Value::Bool(true);
+        }
+        self.call("session_checkpoint_ensure", args, |_| Ok(()))
     }
 
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()> {
@@ -510,17 +510,16 @@ impl CheckpointBackend for FakeBackend {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult> {
-        self.call(
-            "session_checkpoint_apply",
-            serde_json::json!({ "sessionId": session_id, "fromCwd": from_cwd, "toCwd": to_cwd }),
-            |_| {
-                Ok(CheckpointApplyResult {
-                    files: Vec::new(),
-                    already_applied: 0,
-                })
-            },
-        )
+        let mut args =
+            serde_json::json!({ "sessionId": session_id, "fromCwd": from_cwd, "toCwd": to_cwd });
+        if let Some(scopes) = write_scopes {
+            args["writeScopes"] = serde_json::json!(scopes);
+        }
+        self.call("session_checkpoint_apply", args, |_| {
+            Ok(CheckpointApplyResult::default())
+        })
     }
 
     fn cleanup_safe(&self, session_id: String, cwd: String) -> StoreFuture<bool> {

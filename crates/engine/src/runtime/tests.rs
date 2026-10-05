@@ -1558,7 +1558,7 @@ async fn checkpoints_run_in_order_per_session(cx: &mut TestAppContext) {
     let gate = t.backend.hold_next("session_checkpoint_prepare");
     let prepare = checkpoints.prepare("s1", CWD, vec!["a".into()]);
     let capture = checkpoints.capture("s1", CWD, vec!["a".into()]);
-    let other = checkpoints.ensure("s2", CWD);
+    let other = checkpoints.ensure("s2", CWD, false);
     cx.run_until_parked();
     // Different sessions run concurrently; s1's capture waits for its prepare.
     let mut started = t.backend.commands();

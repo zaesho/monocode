@@ -8,7 +8,7 @@
 //!
 //! Views other crates build plug into slots: the connections page, the MCP
 //! settings page, the skills page, the worktrees page, the project
-//! notification card, and the provider accounts card.
+//! notification card, the provider accounts card, and the CLI updates card.
 
 use std::rc::Rc;
 
@@ -416,6 +416,8 @@ pub struct SettingsHosts {
     pub project_notifications: Option<ViewSlot>,
     /// `ProviderAccountsSettings`, the first card on the Providers page.
     pub accounts: Option<ViewSlot>,
+    /// `HarnessUpdatesGroup`, the CLI updates card on the Providers page.
+    pub harness_updates: Option<ViewSlot>,
     /// `WindowControls` on Windows and Linux.
     pub window_controls: Option<ViewSlot>,
 }
@@ -436,6 +438,7 @@ impl Default for SettingsHosts {
             worktrees: None,
             project_notifications: None,
             accounts: None,
+            harness_updates: None,
             window_controls: None,
         }
     }

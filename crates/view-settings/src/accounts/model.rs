@@ -710,9 +710,145 @@ pub fn compare_semver(left: &str, right: &str) -> i64 {
     0
 }
 
+/// `HarnessVersionCheck`: one harness compared with its newest release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum HarnessVersionCheck {
+    Current {
+        harness: HarnessId,
+        installed: String,
+        latest: String,
+    },
+    Behind {
+        harness: HarnessId,
+        installed: String,
+        latest: String,
+    },
+    /// The CLI or its feed gave no version, or a lookup failed.
+    Unknown { harness: HarnessId, error: String },
+}
+
+impl HarnessVersionCheck {
+    pub fn harness(&self) -> HarnessId {
+        match self {
+            Self::Current { harness, .. }
+            | Self::Behind { harness, .. }
+            | Self::Unknown { harness, .. } => *harness,
+        }
+    }
+
+    /// The installed and newest versions, unless the check failed.
+    pub fn versions(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Current {
+                installed, latest, ..
+            }
+            | Self::Behind {
+                installed, latest, ..
+            } => Some((installed, latest)),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+/// `pendingHarnessUpdates`: only the harnesses behind their newest release.
+pub fn pending_harness_updates(checks: &[HarnessVersionCheck]) -> Vec<HarnessUpdate> {
+    checks
+        .iter()
+        .filter_map(|check| match check {
+            HarnessVersionCheck::Behind {
+                harness,
+                installed,
+                latest,
+            } => Some(HarnessUpdate {
+                harness: *harness,
+                installed: installed.clone(),
+                latest: latest.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first Cursor build in `output`, a date and commit such as
+/// `2026.09.28-64d2043` (`/\d{4}\.\d{2}\.\d{2}-[0-9a-f]+/`).
+fn cursor_build(output: &str) -> Option<&str> {
+    let bytes = output.as_bytes();
+    let digits = |at: usize, count: usize| {
+        bytes.len() >= at + count && bytes[at..at + count].iter().all(u8::is_ascii_digit)
+    };
+    (0..bytes.len()).find_map(|start| {
+        let date = digits(start, 4)
+            && bytes.get(start + 4) == Some(&b'.')
+            && digits(start + 5, 2)
+            && bytes.get(start + 7) == Some(&b'.')
+            && digits(start + 8, 2)
+            && bytes.get(start + 10) == Some(&b'-');
+        if !date {
+            return None;
+        }
+        let hash = bytes[start + 11..]
+            .iter()
+            .take_while(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            .count();
+        (hash > 0).then(|| &output[start..start + 11 + hash])
+    })
+}
+
+/// `parseHarnessVersion`: the version to compare and display. Cursor keeps
+/// its full build, because two builds can share a date.
+pub fn parse_harness_version(harness: HarnessId, output: &str) -> Option<String> {
+    if harness == HarnessId::Cursor
+        && let Some(build) = cursor_build(output)
+    {
+        return Some(build.to_string());
+    }
+    parse_version(output)
+}
+
+/// `isHarnessVersionBehind`: true when `installed` is older than `latest`. A
+/// Cursor build from the same day as the feed but with another commit is
+/// behind, since the feed names the newest build.
+pub fn is_harness_version_behind(harness: HarnessId, installed: &str, latest: &str) -> bool {
+    let order = compare_semver(latest, installed);
+    if order != 0 {
+        return order > 0;
+    }
+    harness == HarnessId::Cursor && installed != latest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_and_compares_cursor_builds() {
+        let cursor = HarnessId::Cursor;
+        assert_eq!(
+            parse_harness_version(cursor, "2026.09.28-64d2043").as_deref(),
+            Some("2026.09.28-64d2043")
+        );
+        assert_eq!(
+            parse_harness_version(HarnessId::Grok, "grok 1.0.46 (4220f3b224a6) [stable]")
+                .as_deref(),
+            Some("1.0.46")
+        );
+        assert!(is_harness_version_behind(
+            cursor,
+            "2026.09.28-9a7762b",
+            "2026.09.28-64d2043"
+        ));
+        assert!(!is_harness_version_behind(
+            cursor,
+            "2026.10.01-1111111",
+            "2026.09.28-64d2043"
+        ));
+        assert!(!is_harness_version_behind(
+            HarnessId::Grok,
+            "1.0.46",
+            "1.0.46"
+        ));
+    }
 
     const NOW: i64 = 1_790_000_000_000;
     const HOUR: i64 = 3_600_000;

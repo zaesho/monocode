@@ -17,7 +17,7 @@ use monocode_layout::tab_groups::tab_group_color;
 use monocode_settings::display_prefs::{MASK_EMAILS_DEFAULT, SHOW_REMAINING_USAGE_DEFAULT};
 
 use super::model::{
-    CodexRateLimitResetOutcome, DEFAULT_PROVIDER_ACCOUNT_ID, HarnessUpdate, PiUsageProvider,
+    CodexRateLimitResetOutcome, DEFAULT_PROVIDER_ACCOUNT_ID, HarnessVersionCheck, PiUsageProvider,
     ProviderAccount, ProviderAccountIdentity, ProviderRateLimits, RateLimitProvider,
     idle_rate_limits, now_ms, pi_billing_provider,
 };
@@ -289,12 +289,25 @@ pub trait NotificationsHost {
     }
 }
 
-/// `HarnessUpdateNotice`.
+/// `HarnessUpdateNotice` and the CLI updates card in Settings.
 pub trait HarnessUpdateHost {
-    /// `checkForHarnessUpdates`: the launch check, claimed once per app
-    /// launch by whichever window asks first.
-    fn check_for_updates(&self, _cx: &mut App) -> Task<Vec<HarnessUpdate>> {
+    /// `claimLaunchHarnessUpdateCheck`: true for the first caller per app
+    /// launch, and false once the notice was dismissed.
+    fn claim_launch_check(&self, _cx: &mut App) -> bool {
+        false
+    }
+
+    /// `checkHarnessVersions` over every installed harness with a release
+    /// feed, after probing which CLIs are installed. `force` re-runs a probe
+    /// that is still fresh.
+    fn check_versions(&self, _force: bool, _cx: &mut App) -> Task<Vec<HarnessVersionCheck>> {
         Task::ready(Vec::new())
+    }
+
+    /// `isPickerProviderVisible`: the launch notice offers only harnesses
+    /// shown in the model picker.
+    fn is_picker_visible(&self, _harness: HarnessId, _cx: &App) -> bool {
+        true
     }
 
     /// Dismissing the notice, for this run only (`launchCheck =

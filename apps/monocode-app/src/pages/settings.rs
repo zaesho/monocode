@@ -135,6 +135,9 @@ impl SettingsWindow {
             project_notifications: Some(
                 monocode_view_settings::accounts::project_notifications_slot(accounts.clone()),
             ),
+            harness_updates: Some(monocode_view_settings::accounts::harness_updates_slot(
+                accounts.clone(),
+            )),
             accounts: Some(monocode_view_settings::accounts::accounts_slot(accounts)),
             window_controls: None,
         };

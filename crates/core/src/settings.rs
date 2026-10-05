@@ -442,6 +442,7 @@ pub fn settings_index(platform: Platform) -> Vec<SettingsEntry> {
         entry("diff-view", S::Chat, "Diff view", "unified editor review changes working tree"),
         entry("empty-session-games", S::Chat, "Empty session games", "pacman snake arcade grid fun"),
         entry("agent-clis", S::Providers, "Agent CLIs", "codex opencode cursor grok pi omp fx hermes antigravity binary path"),
+        entry("harness-updates", S::Providers, "CLI updates", "update upgrade version outdated latest release claude codex cursor grok opencode pi omp fx"),
         entry("provider-accounts", S::Providers, "Provider accounts", "account sign in login rename remove delete credentials profile usage limit quota exhausted"),
         entry("show-remaining-usage", S::Providers, "Show remaining usage", "usage limit meter bar left used quota percent"),
         entry("mask-emails", S::Providers, "Mask account emails", "email privacy blur hide screenshot account"),

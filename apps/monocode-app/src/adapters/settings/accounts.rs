@@ -13,6 +13,7 @@ use monocode_engine::attention::{
     Attention, KvLocalStore, NativeRateLimitFetcher, RateLimitFetcher,
 };
 use monocode_harness::core::auth::{HarnessLogin, supports_harness_login};
+use monocode_harness::core::availability::HarnessAvailabilityProbe;
 use monocode_harness::core::child::BinaryPathChoice;
 use monocode_harness::core::provider_accounts as accounts;
 use monocode_layout::tab_groups;
@@ -403,44 +404,58 @@ impl NotificationsHost for AccountsAdapter {
 }
 
 impl HarnessUpdateHost for AccountsAdapter {
-    fn check_for_updates(&self, cx: &mut App) -> Task<Vec<HarnessUpdate>> {
+    fn claim_launch_check(&self, _: &mut App) -> bool {
+        !self.dismissed.get()
+            && monocode_engine::attention::harness_updates::claim_launch_harness_update_check()
+    }
+    fn check_versions(&self, force: bool, cx: &mut App) -> Task<Vec<HarnessVersionCheck>> {
         use monocode_engine::attention::harness_updates::{
-            HarnessUpdateDeps, UPDATABLE_HARNESSES, claim_launch_harness_update_check,
-            fetch_latest_harness_version, find_harness_updates,
+            HarnessUpdateDeps, UPDATABLE_HARNESSES, check_harness_versions,
+            fetch_latest_harness_version,
         };
-        if self.dismissed.get() || !claim_launch_harness_update_check() {
-            return Task::ready(Vec::new());
-        }
         let services = AppServices::global(cx);
-        let settings =
-            monocode_settings::load_app_settings(&services.kv, monocode_core::Platform::current());
+        let probe = HarnessAvailabilityProbe::new(
+            services.registry.clone(),
+            services.children.clone(),
+            services.availability.clone(),
+        );
+        let availability = services.availability.clone();
         let children = services.children.clone();
         let executor = cx.background_executor().clone();
-        let harnesses = UPDATABLE_HARNESSES
-            .into_iter()
-            .filter(|h| !settings.models.hidden_picker_providers.contains(h))
-            .collect();
-        let deps = HarnessUpdateDeps {
-            harnesses,
-            installed_version: Box::new(move |id| {
-                let children = children.clone();
-                async move {
-                    children
-                        .inspect_harness_binary(id, BinaryPathChoice::Runtime)
-                        .await
-                        .map(|v| v.version)
-                        .map_err(|e| e.to_string())
-                }
-                .boxed()
-            }),
-            latest_version: Box::new(move |id| {
-                executor
-                    .spawn(async move { fetch_latest_harness_version(id) })
+        let probed = executor.spawn(probe.probe_harness_availability(force));
+        cx.foreground_executor().spawn(async move {
+            probed.await;
+            let deps = HarnessUpdateDeps {
+                harnesses: UPDATABLE_HARNESSES
+                    .into_iter()
+                    .filter(|id| availability.is_harness_available(*id))
+                    .collect(),
+                installed_version: Box::new(move |id| {
+                    let children = children.clone();
+                    async move {
+                        children
+                            .inspect_harness_binary(id, BinaryPathChoice::Runtime)
+                            .await
+                            .map(|v| v.version)
+                            .map_err(|e| e.to_string())
+                    }
                     .boxed()
-            }),
-        };
-        cx.foreground_executor()
-            .spawn(async move { convert(find_harness_updates(deps).await) })
+                }),
+                latest_version: Box::new(move |id| {
+                    executor
+                        .spawn(async move { fetch_latest_harness_version(id) })
+                        .boxed()
+                }),
+            };
+            convert(check_harness_versions(deps).await)
+        })
+    }
+    fn is_picker_visible(&self, harness: HarnessId, cx: &App) -> bool {
+        let settings = monocode_settings::load_app_settings(
+            &AppServices::global(cx).kv,
+            monocode_core::Platform::current(),
+        );
+        !settings.models.hidden_picker_providers.contains(&harness)
     }
     fn dismiss_updates(&self, _: &mut App) {
         self.dismissed.set(true);

@@ -1,11 +1,13 @@
 //! Usage chips, provider accounts, and notification controls. Ports of
 //! src/app/shell/UsageProviderChip.tsx, UsageFooter.tsx, and PiUsage.tsx,
 //! src/features/providers/ui (HarnessUpdateNotice, ProviderAccountUsage,
-//! ProviderAccountSubtitle), src/features/notifications/ui
+//! ProviderAccountSubtitle), src/features/providers/model
+//! (harnessUpdateActions), src/features/notifications/ui
 //! (ProjectNotificationSettings, NotificationMuteControl,
 //! NotificationMuteDatePicker, notificationMuteActions), the
-//! ProviderAccountsSettings card in SettingsView.tsx, and the pieces they
-//! draw with (ProviderSignInPanel, DateTimePicker, the project mascots).
+//! ProviderAccountsSettings and HarnessUpdatesGroup cards in
+//! SettingsView.tsx, and the pieces they draw with (ProviderSignInPanel,
+//! DateTimePicker, the project mascots).
 //!
 //! The views take plain data shaped like the engine's attention package
 //! ([`model`], [`notification_model`]) and reach the app through the traits
@@ -14,6 +16,8 @@
 pub mod account_usage;
 pub mod date_time_picker;
 pub mod harness_update_notice;
+pub mod harness_update_store;
+pub mod harness_updates_card;
 pub mod host;
 pub mod mascot;
 pub mod model;
@@ -30,6 +34,8 @@ pub mod usage_chip;
 pub mod usage_footer;
 
 pub use harness_update_notice::{HarnessUpdateNotice, HarnessUpdateNoticeEvent};
+pub use harness_update_store::HarnessUpdateStore;
+pub use harness_updates_card::HarnessUpdatesCard;
 pub use host::{
     HarnessUpdateHost, NoopAccountsHost, NotificationsHost, OnChange, ProjectAppearance, UsageHost,
 };
@@ -37,7 +43,7 @@ pub use mute_control::{MuteControlEvent, NotificationMuteControl, NotificationMu
 pub use pi_usage::PiUsage;
 pub use project_notifications::{ProjectNotificationProps, ProjectNotificationSettings};
 pub use provider_accounts::{AccountEditor, ProviderAccountsSettings};
-pub use slots::{accounts_slot, project_notifications_slot};
+pub use slots::{accounts_slot, harness_updates_slot, project_notifications_slot};
 pub use usage_chip::{AccountView, ChipActions, ChipProps, Presentation, UsageProviderChip};
 pub use usage_footer::{UsageFooter, UsageFooterCallbacks, UsageFooterProps, UsageFooterSession};
 

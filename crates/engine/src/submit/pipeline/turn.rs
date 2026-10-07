@@ -101,6 +101,7 @@ pub(crate) async fn drive<T>(
 }
 
 /// `preparePrompt` with the prompt hooks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare(
     text: &str,
     harness: HarnessId,
@@ -357,7 +358,7 @@ impl TurnRun {
         if let (Some(proposal_id), Some(proposal)) = (&self.proposal_id, &mut state.proposal) {
             let settings = cx
                 .update(|cx| self.peers.orchestration.discover_settings(cx))
-                .await;
+                .await?;
             if !self.gen_current(cx) {
                 return Ok(None);
             }

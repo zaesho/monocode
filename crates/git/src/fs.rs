@@ -821,7 +821,7 @@ fn git_info_uncached(root: &Path) -> GitInfo {
     }
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffStats {
     pub files: i64,
@@ -835,7 +835,7 @@ pub fn git_diff_stats(cwd: String) -> GitDiffStats {
     git_diff_stats_for(&expand_home(&cwd))
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitChangedFile {
     pub path: String,
@@ -847,7 +847,7 @@ pub struct GitChangedFile {
     pub unstaged: bool,
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitDiffIndex {
     pub branch: Option<String>,
@@ -874,7 +874,7 @@ pub fn git_diff_files(cwd: String) -> GitDiffIndex {
     git_diff_files_for(&expand_home(&cwd))
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitFileDiff {
     pub path: String,
@@ -895,14 +895,14 @@ pub fn git_file_diff(cwd: String, relative: String, staged: bool) -> Result<GitF
 const GIT_HISTORY_DEFAULT: u32 = 200;
 const GIT_HISTORY_MAX: u32 = 500;
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistoryRef {
     pub name: String,
     pub kind: String,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistoryCommit {
     pub sha: String,
@@ -915,7 +915,7 @@ pub struct GitHistoryCommit {
     pub head: bool,
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistory {
     pub head: Option<String>,
@@ -1020,7 +1020,7 @@ pub fn git_sync(cwd: String) -> Result<(), String> {
     git_sync_changes_for(&expand_home(&cwd))
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitRangeContext {
     pub base: String,
@@ -1076,21 +1076,21 @@ pub fn git_pr_create(
     )
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubLabel {
     pub name: String,
     pub color: String,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubAssignee {
     pub login: String,
     pub avatar_url: String,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHubWorkItem {
     pub kind: String,
@@ -1522,7 +1522,7 @@ fn github_check_details_with(
     Ok(details)
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitBranches {
     pub current: Option<String>,
@@ -1530,7 +1530,7 @@ pub struct GitBranches {
     pub branches: Vec<GitBranchEntry>,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct GitBranchEntry {
     pub name: String,
@@ -2234,7 +2234,7 @@ fn git_commit_file_diff_for(root: &Path, sha: &str, relative: &str) -> Result<Gi
 
 fn git_stage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    git_checked(root, &["add", "--", &relative])
+    git_checked(root, &["--literal-pathspecs", "add", "--", &relative])
 }
 
 fn git_stage_contents_for(root: &Path, relative: &str, contents: &[u8]) -> Result<(), String> {
@@ -2309,7 +2309,16 @@ fn git_hash_object(root: &Path, relative: &str, contents: &[u8]) -> Result<Strin
 
 fn git_unstage_file_for(root: &Path, relative: &str) -> Result<(), String> {
     let relative = resolve_repo_path(root, relative)?;
-    git_checked(root, &["restore", "--staged", "--", &relative])
+    git_checked(
+        root,
+        &[
+            "--literal-pathspecs",
+            "restore",
+            "--staged",
+            "--",
+            &relative,
+        ],
+    )
 }
 
 fn git_discard_file_for(root: &Path, relative: &str) -> Result<(), String> {
@@ -4899,7 +4908,11 @@ pub fn read_file_preview(
             return Err("Binary file".into());
         }
         if line.len() > 200 {
-            line.truncate(199);
+            let mut end = 199;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
             line.push('…');
         }
         lines.push(line);
@@ -5485,10 +5498,14 @@ pub fn reveal_path(path: String) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
         // explorer.exe returns 1 even when it opened the folder.
         let path_str = path.to_string_lossy().replace('/', "\\");
+        // `.arg` would wrap the whole `/select,...` switch in quotes when the
+        // path has spaces; explorer ignores a quoted switch and opens its
+        // default folder instead. Only the path itself may be quoted.
         Command::new("explorer")
-            .arg(format!("/select,{path_str}"))
+            .raw_arg(format!("/select,\"{path_str}\""))
             .spawn()
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -5528,6 +5545,18 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn file_preview_truncates_multibyte_lines_without_panicking() {
+        let dir = tmp("unicode-preview");
+        let path = dir.0.join("source.txt");
+        let line = format!("{}{}", "a".repeat(198), "界".repeat(4));
+        std::fs::write(&path, format!("{line}\nsecond\n")).unwrap();
+        let preview = read_file_preview(path.to_string_lossy().into_owned(), 2, None).unwrap();
+        assert!(preview[0].ends_with('…'));
+        assert!(line.starts_with(preview[0].trim_end_matches('…')));
+        assert_eq!(preview[1], "second");
+    }
 
     #[test]
     fn claude_shell_commands_match_only_requested_bash_tool_ids() {
@@ -6757,6 +6786,124 @@ mod tests {
             .unwrap();
         assert!(!unstaged.staged);
         assert!(unstaged.unstaged);
+    }
+
+    #[test]
+    fn git_stage_and_unstage_directory() {
+        let dir = tmp("git-stage-directory");
+        std::fs::create_dir_all(dir.0.join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.0.join("src-other")).unwrap();
+        if !init_git_commit(
+            &dir.0,
+            &[
+                ("src/app.ts", "before\n"),
+                ("src/nested/deleted.ts", "delete me\n"),
+                ("src-other/app.ts", "before\n"),
+                ("ready.txt", "before\n"),
+                (".gitignore", "src/ignored.txt\n"),
+            ],
+        ) {
+            return;
+        }
+        std::fs::write(dir.0.join("src/app.ts"), "after\n").unwrap();
+        std::fs::remove_dir_all(dir.0.join("src/nested")).unwrap();
+        std::fs::create_dir_all(dir.0.join("src/added")).unwrap();
+        std::fs::write(dir.0.join("src/added/new.ts"), "new\n").unwrap();
+        std::fs::write(dir.0.join("src/ignored.txt"), "ignored\n").unwrap();
+        std::fs::write(dir.0.join("src-other/app.ts"), "outside\n").unwrap();
+        std::fs::write(dir.0.join("ready.txt"), "ready\n").unwrap();
+        git_stage_file_for(&dir.0, "ready.txt").unwrap();
+
+        git_stage_file_for(&dir.0, "src").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 5);
+        for file in &index.files {
+            let in_folder = file.relative.starts_with("src/");
+            assert_eq!(file.staged, in_folder || file.relative == "ready.txt");
+            assert_eq!(file.unstaged, file.relative == "src-other/app.ts");
+        }
+
+        git_unstage_file_for(&dir.0, "src").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 5);
+        for file in &index.files {
+            assert_eq!(file.staged, file.relative == "ready.txt");
+            assert_eq!(file.unstaged, file.relative != "ready.txt");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("src/app.ts")).unwrap(),
+            "after\n"
+        );
+        assert!(!dir.0.join("src/nested").exists());
+    }
+
+    #[test]
+    fn git_stage_and_unstage_deleted_directory() {
+        let dir = tmp("git-stage-deleted-directory");
+        std::fs::create_dir_all(dir.0.join("deleted/nested")).unwrap();
+        if !init_git_commit(&dir.0, &[("deleted/nested/file.ts", "before\n")]) {
+            return;
+        }
+        std::fs::remove_dir_all(dir.0.join("deleted")).unwrap();
+        git_stage_file_for(&dir.0, "deleted").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 1);
+        assert!(index.files[0].staged);
+        assert!(!index.files[0].unstaged);
+
+        git_unstage_file_for(&dir.0, "deleted").unwrap();
+        let index = git_diff_index_for(&dir.0);
+        assert_eq!(index.files.len(), 1);
+        assert!(!index.files[0].staged);
+        assert!(index.files[0].unstaged);
+        assert!(!dir.0.join("deleted").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_stage_and_unstage_literal_directory_names() {
+        for folder in ["*", "folder?", "[ab]", ":(glob)*"] {
+            let dir = tmp("git-stage-literal-directory");
+            for directory in [folder, "a", "folderx"] {
+                std::fs::create_dir(dir.0.join(directory)).unwrap();
+            }
+            let inside = format!("{folder}/inside.txt");
+            let tracked = [
+                inside.as_str(),
+                "a/other.txt",
+                "folderx/other.txt",
+                "ready.txt",
+            ];
+            let initial: Vec<_> = tracked.iter().map(|path| (*path, "before\n")).collect();
+            if !init_git_commit(&dir.0, &initial) {
+                return;
+            }
+            for path in tracked {
+                std::fs::write(dir.0.join(path), "after\n").unwrap();
+            }
+            std::fs::write(dir.0.join("private.txt"), "unrelated untracked data\n").unwrap();
+            let staged_paths = || {
+                git_run(&dir.0, &["diff", "--cached", "--name-only", "-z"])
+                    .unwrap()
+                    .split('\0')
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+
+            git_stage_file_for(&dir.0, "ready.txt").unwrap();
+            git_stage_file_for(&dir.0, folder).unwrap();
+            let mut expected = vec![inside.clone(), "ready.txt".to_string()];
+            expected.sort();
+            assert_eq!(staged_paths(), expected, "stage folder {folder}");
+
+            git_unstage_file_for(&dir.0, folder).unwrap();
+            assert_eq!(staged_paths(), vec!["ready.txt"], "unstage folder {folder}");
+            assert_eq!(
+                std::fs::read_to_string(dir.0.join(&inside)).unwrap(),
+                "after\n"
+            );
+        }
     }
 
     #[test]

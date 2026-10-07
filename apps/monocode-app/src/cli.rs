@@ -28,7 +28,8 @@ usage: monocode-app [--data-dir <dir>] [--open-session <id>] [--view <name>]
   --screenshot <path>    Writes the first settled frame as a PNG and exits.
                          Needs a build with --features screenshot.
   --settle-ms <ms>       Screenshot only: how long to redraw before the
-                         capture. Default: 900, or 2500 for engine views.
+                         capture. Default: 900, or 2500 for engine views and
+                         the skill manager.
   --backdrop <color>     Screenshot only: the color the transparent window is
                          composited over, standing in for the blurred desktop.
                          Default: #5f5560. `none` keeps the alpha channel.
@@ -40,6 +41,7 @@ pub struct Args {
     pub view: String,
     pub theme: Option<String>,
     pub size: (f32, f32),
+    pub size_override: bool,
     pub ui_scale: Option<f32>,
     pub screenshot: Option<PathBuf>,
     pub backdrop: Option<[u8; 3]>,
@@ -48,6 +50,7 @@ pub struct Args {
     pub skills_home: Option<PathBuf>,
     pub open_session: Option<String>,
     pub settle_ms: Option<u64>,
+    pub urls: Vec<String>,
 }
 
 impl Default for Args {
@@ -56,6 +59,7 @@ impl Default for Args {
             view: "shell".into(),
             theme: None,
             size: (1280.0, 800.0),
+            size_override: false,
             ui_scale: None,
             screenshot: None,
             backdrop: Some([0x5f, 0x55, 0x60]),
@@ -64,6 +68,7 @@ impl Default for Args {
             skills_home: None,
             open_session: None,
             settle_ms: None,
+            urls: Vec::new(),
         }
     }
 }
@@ -107,7 +112,10 @@ impl Args {
                     }
                     out.theme = Some(theme);
                 }
-                "--size" => out.size = parse_size(&value("--size")?)?,
+                "--size" => {
+                    out.size = parse_size(&value("--size")?)?;
+                    out.size_override = true;
+                }
                 "--ui-scale" => {
                     let scale: f32 = value("--ui-scale")?
                         .parse()
@@ -136,6 +144,7 @@ impl Args {
                     print!("{USAGE}");
                     std::process::exit(0);
                 }
+                other if other.starts_with("monocode://") => out.urls.push(other.to_string()),
                 other => bail!("unknown argument {other}\n\n{USAGE}"),
             }
         }
@@ -197,14 +206,27 @@ mod tests {
         assert!(parse(&["--theme", "sepia"]).is_err());
         assert!(parse(&["--backdrop", "#12"]).is_err());
         assert!(parse(&["--nope"]).is_err());
-        assert!(parse(&["--skills-home", "relative/skills"]).is_err());
+        assert!(parse(&["--skills-home", "relative/home"]).is_err());
         assert!(parse(&["--skills-home"]).is_err());
     }
 
     #[test]
-    fn accepts_an_isolated_skill_home_with_spaces() {
-        let path = std::env::temp_dir().join("MonoCode skill preview");
-        let args = parse(&["--skills-home", path.to_str().unwrap()]).unwrap();
-        assert_eq!(args.skills_home, Some(path));
+    fn isolated_preview_flags_preserve_native_window_and_url_options() {
+        let home = std::env::temp_dir().join("skill preview home");
+        let home = home.to_string_lossy();
+        let args = parse(&[
+            "--skills-home",
+            &home,
+            "--size",
+            "900x600",
+            "monocode://pair?fixture",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.skills_home.as_deref(),
+            Some(std::path::Path::new(home.as_ref()))
+        );
+        assert!(args.size_override);
+        assert_eq!(args.urls, vec!["monocode://pair?fixture"]);
     }
 }

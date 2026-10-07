@@ -815,6 +815,81 @@ async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
     assert_eq!(steers[0].text, "also check tests");
 }
 
+/// Queue output from the running turn without letting its flush run.
+fn queue_output(id: &str, text: &str, cx: &mut App) {
+    Engine::sessions(cx).update(cx, |sessions, cx| {
+        sessions.enqueue_event(id, HarnessEvent::MessageDelta { text: text.into() }, cx);
+    });
+}
+
+fn busy_with_a_turn(id: &str, cx: &mut TestAppContext) {
+    let mut session = Session {
+        busy: Some(true),
+        ..chat(id, HarnessId::Codex)
+    };
+    session.blocks = vec![Block::new("u1", BlockRole::User, "start")];
+    insert(session, cx);
+}
+
+#[gpui::test]
+async fn puts_output_that_already_arrived_before_a_submitted_message(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    busy_with_a_turn("s", cx);
+    let accepted = cx.update(|cx| {
+        queue_output("s", "partial reply", cx);
+        fixture.submit.update(cx, |submit, cx| {
+            submit.on_submit(
+                "s",
+                "also check tests",
+                Vec::new(),
+                SubmitOptions::default(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(accepted);
+    assert_eq!(
+        texts(&session("s", cx)),
+        [
+            (BlockRole::User, "start".to_string()),
+            (BlockRole::Assistant, "partial reply".to_string()),
+            (BlockRole::User, "also check tests".to_string()),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut TestAppContext) {
+    use crate::orchestration::engine_host::EngineHost;
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::peers::NoPeers;
+
+    let fixture = setup(cx);
+    busy_with_a_turn("s", cx);
+    let host = Rc::new(EngineHost {
+        control: None,
+        harness_host: None,
+        owner: String::new(),
+        peers: Rc::new(NoPeers),
+    });
+    let steer = cx.update(|cx| {
+        queue_output("s", "partial reply", cx);
+        host.steer("s", "also check tests", cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(steer.now_or_never(), Some(Ok(())));
+    assert_eq!(
+        texts(&session("s", cx)),
+        [
+            (BlockRole::User, "start".to_string()),
+            (BlockRole::Assistant, "partial reply".to_string()),
+            (BlockRole::User, "also check tests".to_string()),
+        ]
+    );
+    assert_eq!(fixture.codex.calls.lock().steers.len(), 1);
+}
+
 #[gpui::test]
 async fn says_so_when_a_harness_cannot_take_a_follow_up(cx: &mut TestAppContext) {
     let fixture = setup(cx);
@@ -928,10 +1003,19 @@ async fn removes_a_draft_and_discards_a_draft_only_session(cx: &mut TestAppConte
         })
     });
     let draft_id = session("s", cx).blocks[0].id.clone();
+    cx.update(|cx| {
+        let sessions = Engine::sessions(cx);
+        assert_eq!(sessions.read(cx).pending_persist(), &["s"]);
+    });
     let removed = cx.update(|cx| {
         fixture
             .submit
             .update(cx, |submit, cx| submit.remove_draft("s", &draft_id, cx))
+    });
+    cx.update(|cx| {
+        let sessions = Engine::sessions(cx);
+        assert!(sessions.read(cx).pending_persist().is_empty());
+        assert_eq!(sessions.read(cx).last_persisted("s"), None);
     });
     cx.run_until_parked();
     assert!(removed);
@@ -943,6 +1027,9 @@ async fn removes_a_draft_and_discards_a_draft_only_session(cx: &mut TestAppConte
             .iter()
             .any(|command| command.contains("delete"))
     );
+    cx.executor()
+        .advance_clock(crate::runtime::sessions::PERSIST_DEBOUNCE);
+    assert!(fixture.backend.record("s").is_none());
 }
 
 #[gpui::test]
@@ -1339,6 +1426,65 @@ async fn creates_the_selected_worktree_on_the_first_send(cx: &mut TestAppContext
 }
 
 struct Lead;
+
+#[cfg(feature = "orchestration")]
+#[gpui::test]
+async fn missing_worker_models_fail_before_sending_a_planning_turn(cx: &mut TestAppContext) {
+    use crate::orchestration::testing::FakeStore;
+    use crate::orchestration::{NoPeers, Orchestration, OrchestrationConfig};
+
+    const ERROR: &str = "No worker models are available, or the model catalog is too large. Check your connected harnesses.";
+
+    let fixture = setup(cx);
+    cx.update(|cx| {
+        fixture.submit.update(cx, |submit, _| {
+            submit.config.is_harness_available = Arc::new(|_| false);
+        });
+        Orchestration::init(
+            OrchestrationConfig {
+                storage: FakeStore::new(),
+                control: None,
+                harness_host: None,
+                owner: "planning-qualification".into(),
+                kv: fixture.kv.clone(),
+                peers: Rc::new(NoPeers),
+            },
+            cx,
+        );
+    });
+    insert(chat("s", HarnessId::Codex), cx);
+    let (outcomes, on_settled) = recorder();
+    assert!(submit(
+        &fixture,
+        "s",
+        "Prepare the work",
+        SubmitOptions {
+            intent: Some(TurnIntent::Orchestrate),
+            on_settled: Some(on_settled),
+            ..SubmitOptions::default()
+        },
+        cx,
+    ));
+    assert!(
+        fixture.codex.calls.lock().sends.is_empty(),
+        "worker discovery must fail before calling the lead provider"
+    );
+    assert_eq!(outcomes.borrow().len(), 1);
+    assert_eq!(outcomes.borrow()[0].status, ControlStatus::Failed);
+    assert_eq!(outcomes.borrow()[0].error.as_deref(), Some(ERROR));
+    let current = session("s", cx);
+    assert_eq!(current.busy, Some(false));
+    let proposal = current
+        .blocks
+        .iter()
+        .find_map(|block| block.orchestration.as_ref())
+        .expect("the failed proposal stays visible");
+    assert_eq!(
+        proposal.status,
+        monocode_core::orchestration::OrchestrationProposalStatus::Invalid
+    );
+    assert_eq!(proposal.error.as_deref(), Some(ERROR));
+}
 
 impl SubmitOrchestrationHooks for Lead {
     fn submission_error(&self, session_id: &str, _managed: bool, _cx: &App) -> Option<String> {

@@ -17,8 +17,8 @@ use monocode_core::Session;
 use monocode_layout::project_return::{ProjectReturnMemory, reconcile_project_return};
 use monocode_layout::project_terminal::{DockSide, ProjectTerminalDock};
 use monocode_layout::workspace_snapshot::{
-    WorkspaceSnapshot, collect_workspace_snapshot, hydrate_workspace_snapshot_value,
-    parse_project_return_targets, parse_workspace_snapshot,
+    WorkspaceSnapshot, collect_workspace_snapshot, collect_workspace_snapshot_keeping,
+    hydrate_workspace_snapshot_value, parse_project_return_targets, parse_workspace_snapshot,
 };
 use monocode_layout::{WorkspaceTab, leaf_ids, new_tab};
 use serde_json::{Value, json};
@@ -40,6 +40,9 @@ pub struct Mirror {
     pub docks: Vec<ProjectTerminalDock>,
     pub last_dock_side: Option<DockSide>,
     pub project_return: ProjectReturnMemory,
+    /// Tabs the saved workspace leaves out: tabs of a worktree workspace,
+    /// since the app reopens on each project's default workspace.
+    pub dropped_tab_ids: HashSet<String>,
     /// This window saves the workspace snapshot. A window opened by a
     /// window transfer does not.
     pub autosave: bool,
@@ -47,6 +50,9 @@ pub struct Mirror {
     pub hidden: bool,
     /// A full page (settings, search, inbox) covers the workspace.
     pub covered: bool,
+    /// The mounted Inbox Ask conversation in this window.
+    pub inbox_session_id: Option<String>,
+    pub inbox_visible: bool,
 }
 
 type Windows = Rc<RefCell<Vec<Weak<RefCell<Mirror>>>>>;
@@ -143,7 +149,7 @@ pub(crate) fn snapshot_value(mirror: &Mirror, sessions: &[Session]) -> Value {
         sessions,
         &mirror.active_tab_id,
     );
-    let snapshot = collect_workspace_snapshot(
+    let snapshot = collect_workspace_snapshot_keeping(
         &mirror.tabs,
         sessions,
         &mirror.active_tab_id,
@@ -151,6 +157,7 @@ pub(crate) fn snapshot_value(mirror: &Mirror, sessions: &[Session]) -> Value {
         &memory,
         &mirror.docks,
         mirror.last_dock_side,
+        &|tab| !mirror.dropped_tab_ids.contains(&tab.id),
     );
     serde_json::to_value(snapshot).unwrap_or(Value::Null)
 }
@@ -170,9 +177,12 @@ pub fn mirror_from_layout(layout: &Value, project_cwd: &str) -> Option<Mirror> {
         },
         docks: snapshot.project_terminals,
         last_dock_side: snapshot.last_dock_side,
+        dropped_tab_ids: HashSet::new(),
         autosave: true,
         hidden: false,
         covered: false,
+        inbox_session_id: None,
+        inbox_visible: false,
     })
 }
 
@@ -185,8 +195,12 @@ impl WorkspaceHooks for WorkspaceHooksImpl {
     fn is_foreground(&self, session_id: &str, _cx: &App) -> bool {
         self.mirrors().iter().any(|mirror| {
             let mirror = mirror.borrow();
-            if mirror.hidden || mirror.covered {
+            if mirror.hidden {
                 return false;
+            }
+            if mirror.covered {
+                return mirror.inbox_visible
+                    && mirror.inbox_session_id.as_deref() == Some(session_id);
             }
             let Some(tab) = mirror
                 .tabs
@@ -208,8 +222,6 @@ impl WorkspaceHooks for WorkspaceHooksImpl {
                     .is_some_and(|agent| agent.session_id == session_id)
             })
         })
-        // TODO(port): the open Inbox Ask counted as foreground too; the
-        // inbox package does not report it yet.
     }
 
     fn tab_session_ids(&self, _cx: &App) -> Vec<String> {

@@ -10,7 +10,7 @@
 //! channels. [`Children`] is the handle providers use, with the same
 //! functions `child.ts` exported.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
@@ -37,7 +37,7 @@ pub struct ChildAccount {
 }
 
 /// The arguments of `harness_spawn`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SpawnRequest {
     pub session_id: String,
     pub command: String,
@@ -46,6 +46,25 @@ pub struct SpawnRequest {
     pub account: Option<ChildAccount>,
     pub binary_provider: Option<HarnessId>,
     pub binary_path: Option<String>,
+    /// Per-process overrides. Debug output includes names only.
+    pub environment: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for SpawnRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<_> = self.environment.keys().collect();
+        names.sort();
+        f.debug_struct("SpawnRequest")
+            .field("session_id", &self.session_id)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("account", &self.account)
+            .field("binary_provider", &self.binary_provider)
+            .field("binary_path", &self.binary_path)
+            .field("environment_names", &names)
+            .finish()
+    }
 }
 
 /// The arguments of `harness_exec`.
@@ -59,13 +78,32 @@ pub struct ExecRequest {
 }
 
 /// The input of `harnessHttp`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct HttpRequest {
     pub url: String,
     pub method: String,
     pub headers: Option<HashMap<String, String>>,
     pub body: Option<String>,
     pub timeout_ms: Option<i64>,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<_> = self
+            .headers
+            .as_ref()
+            .into_iter()
+            .flat_map(|headers| headers.keys())
+            .collect();
+        names.sort();
+        f.debug_struct("HttpRequest")
+            .field("url", &self.url)
+            .field("method", &self.method)
+            .field("header_names", &names)
+            .field("body_bytes", &self.body.as_ref().map(String::len))
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
 }
 
 /// The result of `harnessHttp`.
@@ -207,6 +245,12 @@ struct RouterState {
     line_buffer: HashMap<String, VecDeque<String>>,
     sse_watchers: HashMap<String, async_channel::Sender<SseEvent>>,
     sse_buffer: HashMap<String, VecDeque<String>>,
+    /// Ids this router spawned or opened and has not stopped. Only these may
+    /// buffer while unwatched. Output for any other id, such as a killed
+    /// generation's late lines, would sit in a buffer until the router clears
+    /// and then replay into the next child that reuses the id.
+    owned_children: HashSet<String>,
+    owned_sse: HashSet<String>,
     live_pid: HashMap<String, u32>,
     pending_exit: HashMap<String, Vec<(Option<i32>, u32)>>,
 }
@@ -227,13 +271,24 @@ fn push_bounded(map: &mut HashMap<String, VecDeque<String>>, session_id: &str, i
 }
 
 /// The bridge: routes harness events to the session that owns them. Lines
-/// for a session with no watcher wait in a buffer of [`MAX_BUFFERED`].
+/// for an owned session with no watcher wait in a buffer of
+/// [`MAX_BUFFERED`]. Lines for any other session are dropped.
 #[derive(Default)]
 pub struct ChildRouter {
     state: Mutex<RouterState>,
 }
 
 impl ChildRouter {
+    #[cfg(test)]
+    pub(crate) fn watched_children(&self) -> usize {
+        self.state.lock().watchers.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watched_streams(&self) -> usize {
+        self.state.lock().sse_watchers.len()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -245,7 +300,9 @@ impl ChildRouter {
             let _ = watcher.try_send(ChildEvent::Stdout(line));
             return;
         }
-        push_bounded(&mut state.line_buffer, session_id, line);
+        if state.owned_children.contains(session_id) {
+            push_bounded(&mut state.line_buffer, session_id, line);
+        }
     }
 
     /// `harness-stderr`. Dropped when nobody watches the session.
@@ -290,7 +347,9 @@ impl ChildRouter {
             let _ = watcher.try_send(SseEvent::Data(data));
             return;
         }
-        push_bounded(&mut state.sse_buffer, session_id, data);
+        if state.owned_sse.contains(session_id) {
+            push_bounded(&mut state.sse_buffer, session_id, data);
+        }
     }
 
     /// `harness-sse-end`.
@@ -316,6 +375,7 @@ impl ChildRouter {
         let mut state = self.state.lock();
         state.watchers.remove(session_id);
         state.line_buffer.remove(session_id);
+        state.owned_children.remove(session_id);
         state.pending_exit.remove(session_id);
     }
 
@@ -335,6 +395,20 @@ impl ChildRouter {
         let mut state = self.state.lock();
         state.sse_watchers.remove(session_id);
         state.sse_buffer.remove(session_id);
+        state.owned_sse.remove(session_id);
+    }
+
+    /// `ownedChildren.add`: a child this router is about to spawn.
+    fn own_child(&self, session_id: &str) {
+        self.state
+            .lock()
+            .owned_children
+            .insert(session_id.to_string());
+    }
+
+    /// `ownedSse.add`: a stream this router is about to open.
+    fn own_sse(&self, session_id: &str) {
+        self.state.lock().owned_sse.insert(session_id.to_string());
     }
 
     fn clear_pid(&self, session_id: &str) {
@@ -576,27 +650,32 @@ impl Children {
         account: Option<ChildAccount>,
         binary_provider: Option<HarnessId>,
     ) -> Result<()> {
-        self.inner.router.clear_pid(session_id);
-        let binary_path = binary_provider
-            .and_then(|provider| self.binary_path_for(provider, &BinaryPathChoice::Runtime));
-        let pid = self
-            .inner
-            .backend
-            .spawn(SpawnRequest {
-                session_id: session_id.to_string(),
-                command: command.to_string(),
-                args,
-                cwd: cwd.to_string(),
-                account,
-                binary_provider,
-                binary_path,
-            })
-            .await
-            .map_err(err)?;
+        self.spawn_request(SpawnRequest {
+            session_id: session_id.to_string(),
+            command: command.to_string(),
+            args,
+            cwd: cwd.to_string(),
+            account,
+            binary_provider,
+            ..Default::default()
+        })
+        .await
+    }
+
+    pub async fn spawn_request(&self, mut request: SpawnRequest) -> Result<()> {
+        self.inner.router.clear_pid(&request.session_id);
+        self.inner.router.own_child(&request.session_id);
+        if request.binary_path.is_none() {
+            request.binary_path = request
+                .binary_provider
+                .and_then(|provider| self.binary_path_for(provider, &BinaryPathChoice::Runtime));
+        }
+        let session_id = request.session_id.clone();
+        let pid = self.inner.backend.spawn(request).await.map_err(err)?;
         if pid == 0 {
             return Ok(());
         }
-        self.inner.router.spawned(session_id, pid);
+        self.inner.router.spawned(&session_id, pid);
         Ok(())
     }
 
@@ -724,6 +803,7 @@ impl Children {
         url: &str,
         headers: Option<HashMap<String, String>>,
     ) -> Result<()> {
+        self.inner.router.own_sse(session_id);
         self.inner
             .backend
             .sse_open(session_id.to_string(), url.to_string(), headers)
@@ -960,7 +1040,7 @@ impl ChildBackend for HostChildBackend {
         let options = self.options.clone();
         blocking(move || {
             let account = request.account.as_ref().map(host_account).transpose()?;
-            host::harness_spawn(
+            host::harness_spawn_with_env(
                 &host,
                 &options.data_dir,
                 options.control.as_deref(),
@@ -971,6 +1051,7 @@ impl ChildBackend for HostChildBackend {
                 account,
                 request.binary_provider.map(|id| id.as_str().to_string()),
                 request.binary_path,
+                request.environment,
             )
         })
     }

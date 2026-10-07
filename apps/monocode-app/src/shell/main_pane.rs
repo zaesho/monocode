@@ -27,23 +27,19 @@ impl Shell {
             .workspace
             .as_ref()
             .and_then(|workspace| workspace.read(cx).active_tab().cloned());
-        let body: AnyElement = if let Some(manager) = &self.skill_manager {
-            manager.clone().into_any_element()
-        } else {
-            match tab {
-                Some(tab) => {
-                    let split = leaf_ids(&tab.layout).len() > 1;
-                    self.sync_pane_focus(&tab, window, cx);
-                    self.render_node(&tab.layout, &tab, split, window, cx)
-                }
-                None => div()
-                    .flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .child(spinner("workspace-loading").color(theme.content(0.45)))
-                    .into_any_element(),
+        let body: AnyElement = match tab {
+            Some(tab) => {
+                let split = leaf_ids(&tab.layout).len() > 1;
+                self.sync_pane_focus(&tab, window, cx);
+                self.render_node(&tab.layout, &tab, split, window, cx)
             }
+            None => div()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(spinner("workspace-loading").color(theme.content(0.45)))
+                .into_any_element(),
         };
         div()
             .id("main-pane")

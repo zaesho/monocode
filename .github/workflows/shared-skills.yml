@@ -65,6 +65,7 @@ jobs:
       - run: cargo test -p monocode-app --lib skills_runtime::tests --features screenshot --locked -j 2
       - run: cargo test -p monocode-app --bin monocode-app cli::tests --features screenshot --locked -j 2
       - run: cargo test -p monocode-app --bin monocode-app skill_manager::tests --features screenshot --locked -j 2
+      - run: cargo test -p monocode-app --bin monocode-app skill_completion_tests --features screenshot --locked -j 2
       - run: cargo build -p monocode-app --bin monocode-app --features screenshot --locked -j 2
       - name: Record preview platform
         run: uname -m > target/debug/preview-architecture.txt

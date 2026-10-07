@@ -17,7 +17,7 @@ use gpui::{
 
 use crate::fade::{FadeGate, Pacer, RevealTimeline};
 use crate::highlight;
-use crate::parse::{Document, IncrementalParser};
+use crate::parse::{Document, IncrementalParser, ParseOptions};
 use crate::prepare::{PreparedBlock, prepare_block};
 use crate::render::{CodeState, Frame, ImageResolver, LayoutCache, Registry, render_blocks};
 use crate::selection::{self, ElementKey, Point, Selection};
@@ -212,6 +212,19 @@ impl MarkdownView {
         self.pacer.is_revealing(self.received.len()) || self.timeline.is_fading(Instant::now())
     }
 
+    /// Show each newline inside a block as a line break, as a document does,
+    /// instead of reflowing it into a space. Notes and Markdown files turn
+    /// this on; agent replies leave it off (`hardBreaks` on `AgentMarkdown`).
+    pub fn set_hard_breaks(&mut self, hard_breaks: bool, cx: &mut Context<Self>) {
+        let options = ParseOptions { hard_breaks };
+        if self.parser.options() != options {
+            // An empty parser reads as a changed source, so the next frame
+            // parses the shown text again with the new options.
+            self.parser = IncrementalParser::with_options(options);
+            cx.notify();
+        }
+    }
+
     /// Turn off fades for this view, on top of [`App::reduce_motion`].
     pub fn set_reduced_motion(&mut self, reduced: bool, cx: &mut Context<Self>) {
         if self.reduced_motion != reduced {
@@ -283,6 +296,11 @@ impl MarkdownView {
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_diagram_source(&mut self, key: ElementKey, cx: &mut Context<Self>) {
+        self.code.toggle_diagram_source(key);
         cx.notify();
     }
 
@@ -406,6 +424,20 @@ impl Render for MarkdownView {
             render_blocks(&self.prepared, &self.layout, &mut frame)
         };
         self.code.retain_blocks(self.prepared.len());
+        for job in std::mem::take(&mut self.code.diagram_jobs) {
+            cx.spawn(async move |this, cx| {
+                let job = cx
+                    .background_executor()
+                    .spawn(async move { job.run() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.code.finish_diagram(job);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         for job in std::mem::take(&mut self.code.jobs) {
             let job = job.into_send();
             cx.spawn(async move |this, cx| {

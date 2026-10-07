@@ -84,6 +84,43 @@ fn update<R>(
 }
 
 #[gpui::test]
+fn matches_intl_saved_note_ties_without_changing_recency(cx: &mut TestAppContext) {
+    let mut fixtures: Vec<_> = ["filez", "fileé", "filee", "file.a", "file-a", "file_a"]
+        .into_iter()
+        .map(|id| Note {
+            id: id.into(),
+            ..stored()
+        })
+        .collect();
+    fixtures.push(Note {
+        id: "newest".into(),
+        updated_at: 2,
+        ..stored()
+    });
+    let t = setup(cx, fixtures);
+    for locale in ["en", "fr", "ja", "ar"] {
+        monocode_locale::with_locale(locale, || {
+            let saved = t.fake.note("filee");
+            update(&t, cx, |notes, cx| notes.on_saved(&saved, cx));
+            let ids = t.notes.read_with(cx, |notes, _| {
+                notes
+                    .notes()
+                    .iter()
+                    .map(|note| note.id.clone())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                ids,
+                [
+                    "newest", "file_a", "file-a", "file.a", "filee", "fileé", "filez"
+                ]
+            );
+        })
+        .unwrap();
+    }
+}
+
+#[gpui::test]
 fn refreshes_an_open_note_after_an_operator_write(cx: &mut TestAppContext) {
     let t = setup(cx, vec![stored()]);
     t.fake.set_note(Note {
@@ -352,6 +389,34 @@ fn caches_the_listing_and_shares_one_in_flight(cx: &mut TestAppContext) {
         t.notes
             .read_with(cx, |notes, _| notes.peek_notes().is_some())
     );
+}
+
+/// "shows a preloaded note immediately while refreshing in the background".
+#[gpui::test]
+fn shows_a_preloaded_note_at_once_while_refreshing(cx: &mut TestAppContext) {
+    init_test_engine(cx);
+    let fake = FakeNotes::with(vec![stored()]);
+    let backend: Arc<dyn NotesBackend> = fake.clone();
+    let notes = cx.new(|cx| Notes::new(backend, cx));
+    drop(notes.update(cx, |notes, cx| notes.load_notes(false, cx)));
+    cx.run_until_parked();
+    let hold = fake.hold_next("notes_list");
+    fake.set_note(Note {
+        title: "Updated plan".into(),
+        ..stored()
+    });
+    notes.update(cx, |notes, cx| notes.open_page(cx));
+    cx.run_until_parked();
+    notes.read_with(cx, |notes, _| {
+        assert!(!notes.is_loading());
+        assert_eq!(notes.selected_id(), Some("note-project-test"));
+        assert_eq!(notes.selected().unwrap().title, "Plan");
+    });
+    hold.release();
+    cx.run_until_parked();
+    notes.read_with(cx, |notes, _| {
+        assert_eq!(notes.selected().unwrap().title, "Updated plan")
+    });
 }
 
 #[gpui::test]

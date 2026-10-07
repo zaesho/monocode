@@ -126,6 +126,7 @@ pub struct SkillManagerPage {
     cwd: PathBuf,
     embedded: bool,
     beside_rail: bool,
+    settings_slot: bool,
     focus: FocusHandle,
     filter: Entity<InputState>,
     import_path: Entity<InputState>,
@@ -289,6 +290,7 @@ impl SkillManagerPage {
             cwd,
             embedded,
             beside_rail,
+            settings_slot: false,
             focus: cx.focus_handle(),
             filter,
             import_path,
@@ -326,6 +328,7 @@ impl SkillManagerPage {
         self.error = None;
         self.notice = None;
         let cwd = self.cwd.clone();
+        let requested_cwd = cwd.clone();
         let request = self.discovery_request(cx);
         let generation_sink =
             AppServices::try_global(cx).map(|services| services.skill_generation.clone());
@@ -366,6 +369,10 @@ impl SkillManagerPage {
             }
             this.update(cx, |this, cx| {
                 this.busy = None;
+                if this.cwd != requested_cwd {
+                    this.operate(Operation::Refresh, cx);
+                    return;
+                }
                 match result {
                     Ok(result) => {
                         this.snapshot = result.snapshot;
@@ -461,6 +468,16 @@ impl SkillManagerPage {
 
     fn selected_source(&self) -> Option<PathBuf> {
         selected_document_path(&self.snapshot, &self.selection)
+    }
+
+    fn set_project(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        let cwd = resolve_cwd(cwd);
+        if self.cwd != cwd {
+            self.cwd = cwd;
+            self.snapshot.candidates.clear();
+            self.operate(Operation::Refresh, cx);
+            cx.notify();
+        }
     }
 
     fn load_document(&mut self, cx: &mut Context<Self>) {
@@ -600,7 +617,7 @@ impl SkillManagerPage {
                     icon_button("close-skill-manager", IconName::X)
                         .tooltip("Close skills")
                         .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(crate::shell::OpenSettings), cx)
+                            window.dispatch_action(Box::new(crate::shell::keymap::OpenSettings), cx)
                         }),
                 )
             })
@@ -1324,11 +1341,11 @@ impl Render for SkillManagerPage {
                     && !event.keystroke.modifiers.modified()
                 {
                     cx.stop_propagation();
-                    window.dispatch_action(Box::new(crate::shell::OpenSettings), cx);
+                    window.dispatch_action(Box::new(crate::shell::keymap::OpenSettings), cx);
                 }
             }))
             .child(probe)
-            .child(header)
+            .when(!self.settings_slot, |el| el.child(header))
             .child(toolbar)
             .child(
                 div()
@@ -1349,11 +1366,7 @@ pub fn page(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<SkillManagerPage> {
-    let cwd = if cwd.is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        PathBuf::from(cwd)
-    };
+    let cwd = resolve_cwd(cwd);
     let (manager, home) = if let Some(services) = AppServices::try_global(cx) {
         (services.skills.clone(), services.skill_home.clone())
     } else if let Some(options) = cx.try_global::<StartupOptions>() {
@@ -1382,6 +1395,33 @@ pub fn page(
         )
     };
     cx.new(|cx| SkillManagerPage::new(manager, home, cwd, embedded, beside_rail, window, cx))
+}
+
+fn resolve_cwd(cwd: &str) -> PathBuf {
+    if cwd.is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        PathBuf::from(cwd)
+    }
+}
+
+pub fn settings_slot(
+    context: &monocode_view_settings::settings::SlotContext,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyView {
+    let view = page(&context.cwd, false, true, window, cx);
+    view.update(cx, |page, cx| {
+        page.settings_slot = true;
+        if let Some(live) = &context.live {
+            page._subscriptions.push(cx.observe(live, |page, live, cx| {
+                let cwd = live.read(cx).0.cwd.clone();
+                page.set_project(&cwd, cx);
+            }));
+        }
+        cx.notify();
+    });
+    view.into()
 }
 
 pub fn build(window: &mut Window, cx: &mut App) -> AnyView {

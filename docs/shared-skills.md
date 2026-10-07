@@ -1,6 +1,6 @@
 # Shared skills
 
-Open Settings in the native app, or press `cmd-,`, to open the Skill Manager.
+Open Settings in the GPUI app, or press `cmd-,`, then select Skills.
 
 Import a folder containing `SKILL.md`. MonoCode copies the complete folder into its library and records the original location. Importing the same name and content again reuses its entry. A different bundle with the same name causes a conflict. Rename the skill before importing that bundle.
 
@@ -20,6 +20,10 @@ Sharing uses these directories on the local host:
 Named Claude and Codex accounts also receive copies in their resolved configuration directory's `skills` folder before a provider launches. Later Apply and Stop sharing operations include those account copies. Removing an account retires its export targets before deleting its profile.
 
 An unmanaged destination or an externally edited copy appears as a conflict. MonoCode preserves it. Open that location to review the copy. Repair sharing restores missing managed copies and retries export failures. It does not overwrite conflicts. Stop sharing removes unchanged managed copies and keeps unmanaged or edited copies.
+
+The applied preview shows the saved revision. Editing the source does not change that preview until you apply edits. Settings follows the selected project when it discovers existing skills.
+
+Skill library errors appear in Settings and the provider launch log. Ordinary provider launches continue. Account removal stops if MonoCode cannot retire the account's export records.
 
 Provider statuses describe files on this host. They do not prove that a provider has loaded a skill or that its scripts and tools are available. Antigravity has no default export until its personal runtime location is verified. Remote hosts keep their own skill directories. This version manages local exports.
 

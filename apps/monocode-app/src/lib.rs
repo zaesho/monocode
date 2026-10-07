@@ -7,8 +7,6 @@ pub mod attention_platform;
 pub mod boot;
 pub mod bridge;
 pub mod data_dir;
-pub mod history;
-pub mod projects;
 pub mod provider_hooks;
 pub mod session_factory;
 pub mod skills_runtime;

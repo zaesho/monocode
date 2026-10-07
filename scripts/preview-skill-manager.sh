@@ -3,18 +3,31 @@ set -euo pipefail
 
 # Run the real manager with disposable skills and app data.
 monocode_preview_repo="$(cd "$(dirname "$0")/.." && pwd)"
-monocode_preview_root="$(mktemp -d "${TMPDIR:-/tmp}/monocode-skill-manager-preview.XXXXXX")"
+if [[ -n "${MONOCODE_PREVIEW_ROOT:-}" ]]; then
+    monocode_preview_root="$MONOCODE_PREVIEW_ROOT"
+    mkdir "$monocode_preview_root"
+else
+    monocode_preview_root="$(mktemp -d "${TMPDIR:-/tmp}/monocode-skill-manager-preview.XXXXXX")"
+fi
 monocode_preview_library_target="${MONOCODE_PREVIEW_LIBRARY_TARGET:-${TMPDIR:-/tmp}/monocode-skill-manager-library-target}"
 monocode_preview_binary="${MONOCODE_PREVIEW_BINARY:-$monocode_preview_repo/target/debug/monocode-app}"
 monocode_preview_manage="${MONOCODE_PREVIEW_MANAGE:-$monocode_preview_library_target/debug/examples/manage}"
 
 python3 - "$monocode_preview_root" <<'PY'
 from pathlib import Path
+import json
 import sys
 
 root = Path(sys.argv[1])
 for directory in ["data", "home", "project", "sources"]:
     (root / directory).mkdir()
+(root / "data" / "local-storage.json").write_text(json.dumps({
+    "version": 1,
+    "items": {
+        "monocode.settingsSection": "skills",
+        "monocode.projectRailOpen": "false",
+    },
+}))
 
 skills = {
     "release-check": (
@@ -72,5 +85,5 @@ if [[ ! -x "$monocode_preview_binary" ]]; then
 fi
 
 cd "$monocode_preview_root/project"
-exec "$monocode_preview_binary" --view skills-manager \
+exec "$monocode_preview_binary" --view page-settings \
     --data-dir "$monocode_preview_root/data" --skills-home "$monocode_preview_root/home" "$@"

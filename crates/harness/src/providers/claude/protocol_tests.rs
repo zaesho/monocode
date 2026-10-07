@@ -319,6 +319,127 @@ fn reads_tool_use_content_blocks() {
     );
 }
 
+// describe("advisor consults")
+
+#[test]
+fn reads_an_advisor_call_from_the_stream_and_the_snapshot() {
+    let start = rec(json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {} },
+        },
+    }));
+    assert_eq!(
+        advisor_call_from_event(&start).as_deref(),
+        Some("srvtoolu_1")
+    );
+    let snapshot = rec(json!({
+        "type": "assistant",
+        "message": { "id": "msg_1", "content": [
+            { "type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {} },
+            { "type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search", "input": { "query": "q" } },
+            { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {} },
+        ] },
+    }));
+    let uses = assistant_tool_uses(&snapshot);
+    assert_eq!(
+        uses.iter()
+            .map(|tool| (tool.id.as_str(), tool.server, tool.is_advisor()))
+            .collect::<Vec<_>>(),
+        [
+            ("srvtoolu_1", true, true),
+            ("srvtoolu_2", true, false),
+            ("toolu_1", false, false),
+        ]
+    );
+    assert_eq!(
+        message_id_from_stream_start(&rec(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "msg_1", "content": [] } },
+        })))
+        .as_deref(),
+        Some("msg_1")
+    );
+}
+
+#[test]
+fn reads_the_three_advisor_result_types() {
+    let snapshot = rec(json!({
+        "type": "assistant",
+        "message": { "content": [
+            { "type": "advisor_tool_result", "tool_use_id": "a",
+              "content": { "type": "advisor_result", "text": "Check the fallback.", "stop_reason": "end_turn" } },
+            { "type": "advisor_tool_result", "tool_use_id": "b",
+              "content": { "type": "advisor_redacted_result", "encrypted_content": "EvwD" } },
+            { "type": "advisor_tool_result", "tool_use_id": "c",
+              "content": { "type": "advisor_tool_result_error", "error_code": "max_uses_exceeded" } },
+            { "type": "text", "text": "Done." },
+        ] },
+    }));
+    assert_eq!(
+        assistant_advisor_results(&snapshot),
+        vec![
+            ClaudeAdvisorResult {
+                tool_use_id: "a".into(),
+                outcome: ClaudeAdvisorOutcome::Advice("Check the fallback.".into()),
+            },
+            ClaudeAdvisorResult {
+                tool_use_id: "b".into(),
+                outcome: ClaudeAdvisorOutcome::Redacted,
+            },
+            ClaudeAdvisorResult {
+                tool_use_id: "c".into(),
+                outcome: ClaudeAdvisorOutcome::Error("max_uses_exceeded".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn reads_the_advisor_model_from_message_delta_iterations() {
+    let delta = rec(json!({
+        "type": "stream_event",
+        "event": {
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "input_tokens": 4, "output_tokens": 54, "iterations": [
+                { "type": "message", "input_tokens": 2, "output_tokens": 26 },
+                { "type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 39219, "output_tokens": 128 },
+                { "type": "message", "input_tokens": 2, "output_tokens": 28 },
+            ] },
+        },
+    }));
+    assert_eq!(
+        advisor_usages_from_message_delta(&delta),
+        vec![ClaudeAdvisorUsage {
+            model: Some("claude-fable-5-1".into()),
+            input_tokens: 39219,
+            output_tokens: 128,
+        }]
+    );
+    assert!(
+        advisor_usages_from_message_delta(&rec(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "m" } },
+        })))
+        .is_empty()
+    );
+}
+
+#[test]
+fn skips_advisor_iterations_when_reading_context() {
+    let result = rec(json!({
+        "type": "result",
+        "usage": { "iterations": [
+            { "type": "message", "input_tokens": 2, "cache_read_input_tokens": 37639, "output_tokens": 28 },
+            { "type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 39219, "output_tokens": 128 },
+        ] },
+    }));
+    assert_eq!(context_from_result(&result).unwrap().used, Some(37669));
+}
+
 // describe("usage limits")
 
 #[test]

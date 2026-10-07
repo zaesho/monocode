@@ -1079,12 +1079,22 @@ pub fn assistant_message_id(rec: &Record) -> Option<String> {
     owned(string_field(record_field(Some(rec), "message"), "id"))
 }
 
-/// One `tool_use` block of an assistant message.
+/// One `tool_use` or `server_tool_use` block of an assistant message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeToolUse {
     pub id: String,
     pub name: String,
     pub input: Record,
+    /// The API ran this call itself (`server_tool_use`), such as `advisor`.
+    pub server: bool,
+}
+
+impl ClaudeToolUse {
+    /// A call to the advisor server tool, which MonoCode shows as an
+    /// interjection rather than a tool row.
+    pub fn is_advisor(&self) -> bool {
+        self.server && self.name == ADVISOR_TOOL_NAME
+    }
 }
 
 /// `assistantToolUses`.
@@ -1093,18 +1103,147 @@ pub fn assistant_tool_uses(rec: &Record) -> Vec<ClaudeToolUse> {
         .iter()
         .filter_map(|block| {
             let row = as_record(block)?;
-            if type_of(row) != Some("tool_use") {
-                return None;
-            }
+            let server = match type_of(row) {
+                Some("tool_use") => false,
+                Some("server_tool_use") => true,
+                _ => return None,
+            };
             Some(ClaudeToolUse {
                 id: string_field(Some(row), "id")?.to_string(),
                 name: string_field(Some(row), "name")?.to_string(),
                 input: record_field(Some(row), "input")
                     .cloned()
                     .unwrap_or_default(),
+                server,
             })
         })
         .collect()
+}
+
+/// Name of Claude Code's advisor server tool.
+pub const ADVISOR_TOOL_NAME: &str = "advisor";
+
+fn is_advisor_call(row: &Record) -> bool {
+    type_of(row) == Some("server_tool_use")
+        && string_field(Some(row), "name") == Some(ADVISOR_TOOL_NAME)
+}
+
+/// Id of an advisor call the stream opened with `content_block_start`.
+pub fn advisor_call_from_event(rec: &Record) -> Option<String> {
+    let event = record_field(Some(rec), "event")?;
+    if type_of(event) != Some("content_block_start") {
+        return None;
+    }
+    let block = record_field(Some(event), "content_block")?;
+    if !is_advisor_call(block) {
+        return None;
+    }
+    owned(string_field(Some(block), "id"))
+}
+
+/// Provider id of the message a `message_start` stream event opens.
+pub fn message_id_from_stream_start(rec: &Record) -> Option<String> {
+    let event = record_field(Some(rec), "event")?;
+    if type_of(event) != Some("message_start") {
+        return None;
+    }
+    owned(string_field(record_field(Some(event), "message"), "id"))
+}
+
+/// What one advisor consult returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeAdvisorOutcome {
+    /// Plaintext advice (`advisor_result`).
+    Advice(String),
+    /// Advice the provider encrypted (`advisor_redacted_result`).
+    Redacted,
+    /// The consult failed (`advisor_tool_result_error`) with this code.
+    Error(String),
+    /// A result type this version does not know, or empty advice.
+    Unknown,
+}
+
+/// One `advisor_tool_result` block of an assistant message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeAdvisorResult {
+    pub tool_use_id: String,
+    pub outcome: ClaudeAdvisorOutcome,
+}
+
+/// Advisor results an assistant message carries. Claude Code puts them in
+/// the assistant content, not in a user `tool_result`.
+pub fn assistant_advisor_results(rec: &Record) -> Vec<ClaudeAdvisorResult> {
+    message_content(rec)
+        .iter()
+        .filter_map(|block| {
+            let row = as_record(block)?;
+            if type_of(row) != Some("advisor_tool_result") {
+                return None;
+            }
+            let content = record_field(Some(row), "content");
+            let outcome = match content.and_then(type_of) {
+                Some("advisor_result") => match string_field(content, "text") {
+                    Some(text) if !text.trim().is_empty() => {
+                        ClaudeAdvisorOutcome::Advice(text.to_string())
+                    }
+                    _ => ClaudeAdvisorOutcome::Unknown,
+                },
+                Some("advisor_redacted_result") => ClaudeAdvisorOutcome::Redacted,
+                Some("advisor_tool_result_error") => ClaudeAdvisorOutcome::Error(
+                    string_field(content, "error_code")
+                        .unwrap_or("unknown")
+                        .to_string(),
+                ),
+                _ => ClaudeAdvisorOutcome::Unknown,
+            };
+            Some(ClaudeAdvisorResult {
+                tool_use_id: string_field(Some(row), "tool_use_id")?.to_string(),
+                outcome,
+            })
+        })
+        .collect()
+}
+
+/// One `advisor_message` entry of `usage.iterations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeAdvisorUsage {
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+fn is_advisor_iteration(entry: &Record) -> bool {
+    type_of(entry) == Some("advisor_message")
+}
+
+/// The `advisor_message` entries of a `usage` record, in order.
+pub fn advisor_usages(usage: Option<&Record>) -> Vec<ClaudeAdvisorUsage> {
+    usage
+        .and_then(|usage| usage.get("iterations"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(as_record)
+        .filter(|entry| is_advisor_iteration(entry))
+        .map(|entry| ClaudeAdvisorUsage {
+            model: owned(string_field(Some(entry), "model")),
+            input_tokens: number_field(Some(entry), "input_tokens") as i64,
+            output_tokens: number_field(Some(entry), "output_tokens") as i64,
+        })
+        .collect()
+}
+
+/// Advisor usage from a `message_delta` stream event. The stream's assistant
+/// records name no advisor model, so this is the first place it shows up.
+pub fn advisor_usages_from_message_delta(rec: &Record) -> Vec<ClaudeAdvisorUsage> {
+    let Some(event) = record_field(Some(rec), "event") else {
+        return Vec::new();
+    };
+    if type_of(event) != Some("message_delta") {
+        return Vec::new();
+    }
+    advisor_usages(record_field(Some(event), "usage"))
 }
 
 /// One `tool_result` block of a user message.
@@ -1472,11 +1611,17 @@ pub struct ClaudeContextReading {
 /// keeping a model table in sync.
 pub fn context_from_result(rec: &Record) -> Option<ClaudeContextReading> {
     let usage = record_field(Some(rec), "usage");
+    // An advisor consult runs in its own window, so it says nothing about
+    // this one.
     let last = usage
         .and_then(|usage| usage.get("iterations"))
         .and_then(Value::as_array)
-        .and_then(|iterations| iterations.last())
-        .and_then(as_record);
+        .and_then(|iterations| {
+            iterations
+                .iter()
+                .filter_map(as_record)
+                .rfind(|entry| !is_advisor_iteration(entry))
+        });
     let used = context_used_from_usage(last.or(usage));
 
     let mut window: Option<f64> = None;

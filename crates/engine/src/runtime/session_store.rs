@@ -717,6 +717,15 @@ fn sanitize_interjection(value: Option<&Value>) -> Option<Value> {
     {
         next["severity"] = Value::String(severity.into());
     }
+    let model = trimmed_str(rec, "model");
+    if !model.is_empty() {
+        next["model"] = Value::String(model.into());
+    }
+    // A restarted app is no longer waiting on a running consult, so only a
+    // settled status is worth keeping.
+    if let Some(status @ ("completed" | "failed")) = rec.get("status").and_then(Value::as_str) {
+        next["status"] = Value::String(status.into());
+    }
     Some(next)
 }
 
@@ -1980,6 +1989,26 @@ mod tests {
             json!({ "customType": "advisor", "severity": "blocker" })
         );
         assert!(saved[1].get("interjection").is_none());
+    }
+
+    #[test]
+    fn keeps_an_advisor_model_and_settled_status_but_not_a_running_one() {
+        let done = json!({
+            "id": "advisor-srvtoolu_1", "role": "system", "text": "Advice",
+            "interjection": { "customType": "advisor", "model": "claude-fable-5-1", "status": "failed" }
+        });
+        assert_eq!(
+            sanitize_block(&done, false).unwrap()["interjection"],
+            json!({ "customType": "advisor", "model": "claude-fable-5-1", "status": "failed" })
+        );
+        let running = json!({
+            "id": "advisor-srvtoolu_2", "role": "system", "text": "Asking",
+            "interjection": { "customType": "advisor", "status": "running" }
+        });
+        assert_eq!(
+            sanitize_block(&running, false).unwrap()["interjection"],
+            json!({ "customType": "advisor" })
+        );
     }
 
     #[test]

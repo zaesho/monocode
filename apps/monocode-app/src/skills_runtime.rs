@@ -264,7 +264,10 @@ mod tests {
         let report = manager.reconcile(&[]).unwrap();
         let warning = pending_warning(&report).unwrap();
         assert!(warning.contains("Cannot prepare export directory:"));
-        assert!(warning.contains(&blocked.to_string_lossy().to_string()));
+        // The manager reports canonical paths. On Windows the temp directory
+        // can be an 8.3 short path, so compare with the canonical home.
+        let reported = std::fs::canonicalize(&home).unwrap().join(".claude/skills");
+        assert!(warning.contains(&reported.to_string_lossy().to_string()));
         assert_eq!(
             std::fs::read_to_string(blocked).unwrap(),
             "Preserve this file"

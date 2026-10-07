@@ -12,6 +12,7 @@ pub mod attachment;
 pub mod block;
 pub mod btw;
 pub mod context_usage;
+pub mod git_remote;
 pub mod handoff;
 pub mod harness;
 pub mod harness_event;

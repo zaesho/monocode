@@ -22,6 +22,7 @@ import {
   createHostBranch,
   hostBranches,
   switchHostBranch,
+  withRemoteUrl,
 } from "./git-branches";
 import {
   createHostWorktree,
@@ -366,13 +367,17 @@ export function createHostServer(
             };
             break;
           case "projects.list":
-            result = engine.store.projects();
+            result = await Promise.all(
+              engine.store.projects().map(withRemoteUrl),
+            );
             break;
           case "projects.browse":
             result = await browseHostDirectories(params.path);
             break;
           case "projects.open":
-            result = await engine.openProject(String(params.cwd ?? ""));
+            result = await withRemoteUrl(
+              await engine.openProject(String(params.cwd ?? "")),
+            );
             break;
           case "models.list":
             result = await models(params.projectId);

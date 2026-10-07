@@ -34,6 +34,31 @@ pub struct Project {
     pub color: u32,
     pub logo: Option<String>,
     pub mascot: Option<String>,
+    /// The project's folder per machine, when it has more than one.
+    pub locations: Vec<crate::machines::Location>,
+}
+
+impl Project {
+    /// "2 machines" when the project has a folder on more than one machine.
+    pub fn machine_count(&self) -> Option<String> {
+        (self.locations.len() > 1).then(|| format!("{} machines", self.locations.len()))
+    }
+
+    /// The card tooltip: the path, or each machine with its path.
+    pub fn tooltip(&self) -> String {
+        if self.locations.len() < 2 {
+            return self.path.clone();
+        }
+        self.locations
+            .iter()
+            .map(|location| {
+                let path = monocode_layout::paths::parse_remote_path(&location.path)
+                    .map_or_else(|| location.path.clone(), |parts| parts.host_path);
+                format!("{}: {path}", location.machine)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +239,7 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
         )
     });
     let sessions = Engine::sessions(cx).read(cx).all().to_vec();
+    let machines = projects.read(cx).machines().clone();
     let list: Vec<Project> = items
         .into_iter()
         .map(|item| {
@@ -237,23 +263,35 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
                     Some(&seed),
                 )),
                 busy: sessions.iter().any(|session| {
-                    session.is_busy() && same_project_path(&session.cwd, &item.path)
+                    session.is_busy()
+                        && same_project_path(&machines.project_home(&session.cwd), &item.path)
                 }),
+                locations: {
+                    let locations = crate::machines::project_locations(&item.path, cx);
+                    if locations.len() > 1 {
+                        locations
+                    } else {
+                        Vec::new()
+                    }
+                },
                 additions: stats.as_ref().map_or(0, |stats| stats.additions),
                 deletions: stats.as_ref().map_or(0, |stats| stats.deletions),
                 path: item.path,
             }
         })
         .collect();
+    let home = machines.project_home(cwd);
     let active = list
         .iter()
-        .position(|project| same_project_path(&project.path, cwd));
+        .position(|project| same_project_path(&project.path, &home));
     (list, active)
 }
 
 /// The project rail of one window.
 pub struct ProjectRail {
     shell: WeakEntity<Shell>,
+    /// The "+" menu beside Projects, at its click point.
+    add_menu: Option<gpui::Point<gpui::Pixels>>,
     git_watches: std::collections::HashMap<
         String,
         (
@@ -272,8 +310,13 @@ impl ProjectRail {
         if let Some(inbox) = Inbox::try_global(cx) {
             cx.observe(&inbox, |_, _, cx| cx.notify()).detach();
         }
+        if let Some(remote) = monocode_engine::remote::RemoteGlobal::try_global(cx) {
+            let connections = remote.connections.clone();
+            cx.observe(&connections, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             shell,
+            add_menu: None,
             git_watches: Default::default(),
         }
     }
@@ -288,8 +331,11 @@ impl ProjectRail {
         };
         let cwd = shell.read(cx).sidebar_cwd(cx);
         ProjectsGlobal::projects(cx).update(cx, |projects, cx| {
-            let known =
-                monocode_engine::projects::recents::collect_rail_projects(projects.recents(), &cwd);
+            let known = monocode_engine::projects::recents::collect_rail_projects(
+                projects.recents(),
+                &cwd,
+                projects.machines(),
+            );
             let order = monocode_engine::projects::recents::sync_project_rail_order(
                 projects.rail_order(),
                 &known,
@@ -591,6 +637,48 @@ impl ProjectRail {
                 self.shell.clone(),
                 cx,
             ))
+            .children(self.render_add_menu(cx))
+    }
+
+    /// "Open folder…" and "Open folder on a machine…".
+    fn render_add_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.add_menu?;
+        let pick = cx.weak_entity();
+        let dismiss = pick.clone();
+        Some(monocode_ui::widgets::context_menu(
+            position,
+            monocode_ui::widgets::menu(
+                "rail-add-project-menu",
+                [
+                    monocode_ui::widgets::MenuItem::new("folder", "Open folder…").into(),
+                    monocode_ui::widgets::MenuItem::new("machine", "Open folder on a machine…")
+                        .into(),
+                ],
+            )
+            .on_pick(move |id, window, cx| {
+                let id = id.clone();
+                pick.update(cx, |this, cx| {
+                    this.add_menu = None;
+                    cx.notify();
+                    this.shell
+                        .update(cx, |shell, cx| match id.as_ref() {
+                            "folder" => shell.open_project_folder(cx),
+                            _ => shell.show_remote_project_dialog(None, None, window, cx),
+                        })
+                        .ok();
+                })
+                .ok();
+            }),
+            move |_, cx| {
+                dismiss
+                    .update(cx, |this, cx| {
+                        this.add_menu = None;
+                        cx.notify();
+                    })
+                    .ok();
+            },
+            cx,
+        ))
     }
 
     fn render_section_header(
@@ -636,9 +724,10 @@ impl ProjectRail {
                 header = header.child(
                     icon_button("rail-add-project", IconName::Plus)
                         .size(20.)
-                        .tooltip("Add project")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.with_shell(cx, |shell, cx| shell.open_project_folder(cx))
+                        .tooltip("Open project")
+                        .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                            this.add_menu = Some(event.position());
+                            cx.notify();
                         })),
                 );
             }
@@ -663,6 +752,7 @@ impl ProjectRail {
             ),
             logo: None,
             mascot: group.mascot.clone(),
+            locations: Vec::new(),
         };
         let tint = theme.content(0.05);
         div()
@@ -803,6 +893,13 @@ impl ProjectRail {
                     .leading(theme.leading.tight)
                     .child(project.name.clone()),
             )
+            .children(project.machine_count().map(|count| {
+                div()
+                    .flex_none()
+                    .text_px(theme.text.caption)
+                    .text_color(theme.content(0.45))
+                    .child(count)
+            }))
             .child(diff_stat(project.additions, project.deletions).gap(4.))
             .on_drag(
                 RailProjectDrag {
@@ -859,7 +956,7 @@ impl ProjectRail {
                 .text_color(c.content)
                 .hover(move |s| s.bg(hover).opacity(1.0));
         }
-        card.tooltip(tooltip(project.path.clone()))
+        card.tooltip(tooltip(project.tooltip()))
     }
 }
 
@@ -955,7 +1052,29 @@ mod tests {
             color: 0x7dd3fc,
             logo: None,
             mascot: None,
+            locations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_project_on_several_machines_shows_its_count_and_each_folder() {
+        let mut card = project("/work/app");
+        assert_eq!(card.machine_count(), None);
+        assert_eq!(card.tooltip(), "/work/app");
+        card.locations = vec![
+            crate::machines::Location {
+                path: "/work/app".into(),
+                machine: "This Mac".into(),
+                remote: false,
+            },
+            crate::machines::Location {
+                path: "remote://mini/home/me/app".into(),
+                machine: "Mini".into(),
+                remote: true,
+            },
+        ];
+        assert_eq!(card.machine_count().as_deref(), Some("2 machines"));
+        assert_eq!(card.tooltip(), "This Mac: /work/app\nMini: /home/me/app");
     }
 
     #[test]

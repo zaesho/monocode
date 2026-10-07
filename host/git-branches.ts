@@ -120,3 +120,33 @@ export async function createHostBranch(
   await exec("git", ["switch", "-c", branch], options(cwd));
   return hostBranches(cwd);
 }
+
+/**
+ * The URL of the remote that names this repository: `origin`, then
+ * `upstream`, then the first remote by name. Undefined without one.
+ */
+export async function gitRemoteUrl(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await exec("git", ["remote"], options(cwd));
+    const names = stdout
+      .split("\n")
+      .map((name) => name.trim())
+      .filter(Boolean);
+    const name = ["origin", "upstream"].find((preferred) =>
+      names.includes(preferred),
+    ) ?? [...names].sort()[0];
+    if (!name) return undefined;
+    const url = await exec("git", ["remote", "get-url", name], options(cwd));
+    return url.stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A host project with its `remoteUrl`, when it has one. */
+export async function withRemoteUrl<T extends { cwd: string }>(
+  project: T,
+): Promise<T & { remoteUrl?: string }> {
+  const remoteUrl = await gitRemoteUrl(project.cwd);
+  return remoteUrl ? { ...project, remoteUrl } : project;
+}

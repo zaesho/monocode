@@ -764,6 +764,7 @@ fn project_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostProject> {
         id: row.get("id")?,
         cwd: row.get("cwd")?,
         name: row.get("name")?,
+        remote_url: None,
     })
 }
 

@@ -306,6 +306,20 @@ impl WorkspaceDelegate for AppWorkspaceDelegate {
 pub struct AppProjectsHooks;
 
 impl ProjectsHooks for AppProjectsHooks {
+    fn machine_names(&self, cx: &App) -> monocode_engine::projects::MachineNames {
+        RemoteGlobal::try_global(cx)
+            .map(|remote| {
+                remote
+                    .connections
+                    .read(cx)
+                    .machines()
+                    .iter()
+                    .map(|machine| (machine.environment_id.clone(), machine.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn project_return_memory(
         &self,
         cx: &mut App,

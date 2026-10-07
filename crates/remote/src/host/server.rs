@@ -564,9 +564,17 @@ impl HostServer {
         let optional = |value: Option<Value>| value.unwrap_or(Value::Null);
         match method.unwrap_or("") {
             "environment.describe" => to_json(&self.describe(params)),
-            "projects.list" => to_json(&store.projects()?),
+            "projects.list" => to_json(
+                &store
+                    .projects()?
+                    .into_iter()
+                    .map(with_remote_url)
+                    .collect::<Vec<_>>(),
+            ),
             "projects.browse" => to_json(&backend.browse_directories(get("path"))?),
-            "projects.open" => to_json(&backend.open_project(&js::string(get("cwd")))?),
+            "projects.open" => to_json(&with_remote_url(
+                backend.open_project(&js::string(get("cwd")))?,
+            )),
             "models.list" => to_json(&self.models(get("projectId"))?),
             "sessions.list" => self.sessions_list(params),
             "sessions.update" => self.sessions_update(params),
@@ -812,6 +820,34 @@ impl HttpHandler for HostServer {
             Err(message) => error_response(400, &message),
         }
     }
+}
+
+/// A project with `remoteUrl`: the URL of its main git remote, picked the way
+/// the desktop picks it, so the desktop can match clones across machines.
+fn with_remote_url(mut project: HostProject) -> HostProject {
+    project.remote_url = git_remote_url(&project.cwd);
+    project
+}
+
+fn git_remote_url(cwd: &str) -> Option<String> {
+    let run = |args: &[&str]| {
+        exec(
+            "git",
+            args,
+            ExecOptions {
+                cwd: Some(cwd.into()),
+                timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .ok()
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|output| !output.is_empty())
+    };
+    let names = run(&["remote"])?;
+    let names: Vec<&str> = names.lines().collect();
+    let name = monocode_core::git_remote::pick_git_remote(&names)?;
+    run(&["remote", "get-url", &name])
 }
 
 #[cfg(test)]

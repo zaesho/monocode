@@ -155,6 +155,13 @@ impl ProjectsBackend for AppProjectsBackend {
         self.local.resolve_project_location(path, identity)
     }
 
+    fn git_remote_url(&self, cwd: &str) -> Option<String> {
+        if monocode_layout::paths::is_remote_project_path(cwd) {
+            return None;
+        }
+        self.local.git_remote_url(cwd)
+    }
+
     fn save_project_logo(&self, project: &str, source_path: &str) -> Result<String, String> {
         self.local.save_project_logo(project, source_path)
     }

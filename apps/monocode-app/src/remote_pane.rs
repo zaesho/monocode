@@ -946,6 +946,7 @@ mod tests {
                 id: "project".into(),
                 cwd: "/repo".into(),
                 name: "repo".into(),
+                remote_url: None,
             },
         );
         remember_remote_session(&kv, "tab", Some("host-session"));

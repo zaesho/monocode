@@ -44,6 +44,12 @@ pub trait ProjectsHooks {
     /// `setProjectCwd`.
     fn set_project_cwd(&self, _cwd: &str, _cx: &mut App) {}
 
+    /// Paired machine names by environment id, for ordering a project's
+    /// locations.
+    fn machine_names(&self, _cx: &App) -> super::MachineNames {
+        super::MachineNames::new()
+    }
+
     /// The open tabs (`tabsRef.current`).
     fn tabs(&self, _cx: &App) -> Vec<WorkspaceTab> {
         Vec::new()

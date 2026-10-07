@@ -172,3 +172,36 @@ fn lists_machines_to_choose_from_when_there_are_several(cx: &mut TestAppContext)
         params: json!({}),
     }));
 }
+
+#[gpui::test]
+fn link_mode_starts_on_a_machine_the_project_does_not_have_yet(cx: &mut TestAppContext) {
+    let mut second = home_server();
+    second.id = "studio".into();
+    second.name = "Studio".into();
+    second.environment_id = "env-2".into();
+    let fake = fake(vec![home_server(), second]);
+    let (view, cx, events) = render(cx, &fake);
+    view.update(cx, |view, cx| {
+        view.set_link_target(
+            Some(super::RemoteLinkTarget {
+                name: "app".into(),
+                taken: vec!["env".into()],
+            }),
+            cx,
+        )
+    });
+    crate::test_support::draw(cx);
+    assert_eq!(
+        view.read_with(cx, |view, _| view.machine().map(|m| m.id.clone())),
+        Some("studio".into())
+    );
+    view.update(cx, |view, cx| view.set_machine("machine", cx));
+    crate::test_support::draw(cx);
+    view.update(cx, |view, cx| view.open(cx));
+    cx.run_until_parked();
+    assert!(opened(&events).is_empty());
+    view.update(cx, |view, cx| view.set_machine("studio", cx));
+    crate::test_support::draw(cx);
+    click(cx, "button:Open");
+    assert_eq!(opened(&events), vec!["remote://env-2/home/me".to_string()]);
+}

@@ -22,7 +22,7 @@ mod fake;
 #[cfg(test)]
 mod test_support;
 
-pub use add_project::{AddRemoteProjectDialog, AddRemoteProjectEvent};
+pub use add_project::{AddRemoteProjectDialog, AddRemoteProjectEvent, RemoteLinkTarget};
 pub use connections::{ConnectionsEvent, ConnectionsSettings};
 pub use host::{HostTask, RemoteHost, SshBegin, remote_project_key};
 pub use session::{

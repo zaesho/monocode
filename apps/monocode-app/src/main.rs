@@ -15,6 +15,7 @@ mod file_pane;
 mod format;
 mod gallery;
 mod glass;
+mod machines;
 mod pages;
 mod panes;
 mod quick;

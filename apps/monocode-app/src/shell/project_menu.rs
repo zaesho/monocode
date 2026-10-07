@@ -15,6 +15,7 @@ use monocode_layout::{
 };
 use monocode_process::external_editor::ExternalEditor;
 use monocode_ui::{IconName, Theme, u};
+use monocode_view_remote::{AddRemoteProjectDialog, AddRemoteProjectEvent, RemoteLinkTarget};
 use monocode_view_settings::accounts::{
     host::NotificationsHost,
     mute_control::{DatePickerEvent, NotificationMuteDatePicker},
@@ -96,6 +97,32 @@ fn group_submenu(groups: &[ProjectGroup], current: Option<&str>) -> Vec<SubmenuE
         current.is_none(),
     ));
     entries
+}
+
+/// The "Machines" section of a project's menu.
+fn machine_items(locations: &[crate::machines::Location]) -> Vec<TabGroupMenuExtraItem> {
+    let mut items = vec![TabGroupMenuExtraItem::new(
+        "machines:add-remote",
+        "Add on another machine…",
+        IconName::Internet,
+    )];
+    if locations.iter().all(|location| location.remote) {
+        items.push(TabGroupMenuExtraItem::new(
+            "machines:add-local",
+            "Add folder on this computer…",
+            IconName::FolderPlus,
+        ));
+    }
+    for location in locations.iter().skip(1) {
+        let mut unlink = TabGroupMenuExtraItem::new(
+            format!("machines:unlink:{}", location.path),
+            format!("Unlink from {}", location.machine),
+            IconName::Ungroup,
+        );
+        unlink.description = Some(location.path.clone().into());
+        items.push(unlink);
+    }
+    items
 }
 
 impl Shell {
@@ -183,6 +210,10 @@ impl Shell {
                 .map(|action| submenu_item(action.id, action.label.clone(), false))
                 .collect(),
         );
+        let mut machines = machine_items(&crate::machines::project_locations(project, cx));
+        if let Some(first) = machines.first_mut() {
+            first.sep_before = true;
+        }
         let mut extras = vec![
             TabGroupMenuExtraItem::new("background", "Background image", IconName::ImagePlus),
             groups,
@@ -201,13 +232,16 @@ impl Shell {
             ),
             reveal,
             editor,
+        ];
+        extras.extend(machines);
+        extras.extend([
             mute,
             TabGroupMenuExtraItem::new(
                 "notifications-settings",
                 "Notification settings",
                 IconName::Settings,
             ),
-        ];
+        ]);
         if notification_projects::looks_like_project(project) {
             let mut archive =
                 TabGroupMenuExtraItem::new("archive-project", "Archive", IconName::Archive);
@@ -519,6 +553,15 @@ impl Shell {
                 projects.set_group_assignment(project, None, cx)
             }),
             "background" => self.show_project_background(project, window, cx),
+            "machines:add-remote" => {
+                self.show_remote_project_dialog(Some(project.to_string()), None, window, cx)
+            }
+            "machines:add-local" => {
+                crate::machines::add_local_location(project.to_string(), None, cx)
+            }
+            _ if id.starts_with("machines:unlink:") => {
+                crate::machines::unlink_location(&id["machines:unlink:".len()..], cx)
+            }
             "notifications-settings" => {
                 self.open_page(crate::slots::Page::Settings, cx);
                 crate::pages::settings::reveal_project_notifications(project, window, cx);
@@ -699,6 +742,76 @@ impl Shell {
         cx.notify();
     }
 
+    /// The open-folder-on-a-machine dialog. With `link_to`, it adds a folder
+    /// to that project instead of opening a new one.
+    pub fn show_remote_project_dialog(
+        &mut self,
+        link_to: Option<String>,
+        session_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if monocode_engine::remote::RemoteGlobal::try_global(cx).is_none() {
+            return;
+        }
+        let host = Rc::new(crate::adapters::remote::RemoteAdapter::new(cx));
+        let target = link_to.as_ref().map(|home| {
+            let key = project_key(home);
+            let name = ProjectsGlobal::projects(cx)
+                .update(cx, |projects, _| projects.labels().get(&key).cloned())
+                .unwrap_or_else(|| project_name(home));
+            let taken = crate::machines::project_locations(home, cx)
+                .into_iter()
+                .filter(|location| location.remote)
+                .map(|location| {
+                    monocode_engine::projects::project_machines::location_machine(&location.path)
+                })
+                .collect();
+            RemoteLinkTarget { name, taken }
+        });
+        self.project_dialog_return_focus = self
+            .project_menu_return_focus
+            .take()
+            .or_else(|| window.focused(cx));
+        let dialog = cx.new(|cx| {
+            let mut dialog = AddRemoteProjectDialog::new(host, window, cx);
+            dialog.set_link_target(target, cx);
+            dialog
+        });
+        self.project_dialog_subscription = Some(cx.subscribe_in(
+            &dialog,
+            window,
+            move |shell, _, event: &AddRemoteProjectEvent, window, cx| match event {
+                AddRemoteProjectEvent::Cancel => shell.close_project_dialog(window, cx),
+                AddRemoteProjectEvent::OpenConnections => {
+                    shell.open_page(crate::slots::Page::Settings, cx);
+                    window.defer(cx, |window, cx| {
+                        crate::pages::settings::reveal_section(
+                            monocode_core::settings::SettingsSectionId::Connections,
+                            window,
+                            cx,
+                        )
+                    });
+                }
+                AddRemoteProjectEvent::Open(key) => {
+                    shell.close_project_dialog(window, cx);
+                    match &link_to {
+                        Some(home) => {
+                            crate::machines::link_location(home, key, session_id.as_deref(), cx)
+                        }
+                        None => {
+                            ProjectsGlobal::projects(cx)
+                                .update(cx, |projects, cx| projects.remember_project(key, cx));
+                            shell.select_project(key, cx);
+                        }
+                    }
+                }
+            },
+        ));
+        self.project_dialog = Some(dialog.into());
+        cx.notify();
+    }
+
     pub fn open_project_folder(&mut self, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
@@ -784,6 +897,48 @@ impl Render for ProjectMuteDialog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machines_section_offers_unlink_per_member_and_a_local_folder_when_missing() {
+        let location = |path: &str, machine: &str| crate::machines::Location {
+            path: path.into(),
+            machine: machine.into(),
+            remote: path.starts_with("remote://"),
+        };
+        let ids = |items: Vec<TabGroupMenuExtraItem>| {
+            items
+                .into_iter()
+                .map(|item| (item.id.to_string(), item.label.to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(machine_items(&[
+                location("remote://mini/app", "Mini"),
+                location("remote://box/app", "Atlas"),
+            ])),
+            [
+                (
+                    "machines:add-remote".into(),
+                    "Add on another machine…".into()
+                ),
+                (
+                    "machines:add-local".into(),
+                    "Add folder on this computer…".into()
+                ),
+                (
+                    "machines:unlink:remote://box/app".into(),
+                    "Unlink from Atlas".into()
+                ),
+            ]
+        );
+        assert_eq!(
+            ids(machine_items(&[location("/work/app", "This Mac")])),
+            [(
+                "machines:add-remote".to_string(),
+                "Add on another machine…".to_string()
+            )]
+        );
+    }
 
     #[test]
     fn group_menu_marks_the_current_assignment_and_keeps_ungrouped_available() {

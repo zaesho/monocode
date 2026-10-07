@@ -28,6 +28,7 @@ pub mod project_data;
 pub mod project_groups;
 pub mod project_location;
 pub mod project_logos;
+pub mod project_machines;
 pub mod project_mascots;
 pub mod project_open_run;
 pub mod project_sidebar_tab;
@@ -75,6 +76,7 @@ pub use project_chat_background::{
 };
 pub use project_groups::ProjectGroup;
 pub use project_location::{ProjectLocationSync, ProjectNotFoundError};
+pub use project_machines::{MachineNames, ProjectMachines};
 pub use project_open_run::ProjectOpenStep;
 pub use recents::{ArchivedProject, ProjectRailSections, RecentProject};
 
@@ -155,7 +157,7 @@ pub enum ProjectsEvent {
 
 /// Every stored key this entity mirrors. A change from elsewhere (another
 /// package writing the same key) reloads the mirror.
-const WATCHED_KEYS: [&str; 15] = [
+const WATCHED_KEYS: [&str; 16] = [
     recents::KEY,
     recents::RAIL_ORDER_KEY,
     recents::RAIL_PINNED_KEY,
@@ -171,6 +173,7 @@ const WATCHED_KEYS: [&str; 15] = [
     COLLAPSED_KEY,
     project_chat_background::KEY,
     project_sidebar_tab::KEY,
+    project_machines::KEY,
 ];
 
 /// A shared folder lookup (`synchronizeProjectLocation`).
@@ -186,6 +189,8 @@ pub struct Projects {
     pinned: Vec<String>,
     groups: Vec<ProjectGroup>,
     assignments: JsRecord<String>,
+    /// `monocode.projectMachines.v1`: each project's folder per machine.
+    machines: ProjectMachines,
     appearance: TabGroupAppearance,
     backgrounds: ProjectChatBackgrounds,
     /// `projectLocationSyncs`: one folder lookup per project at a time.
@@ -209,6 +214,7 @@ impl Projects {
             pinned: Vec::new(),
             groups: Vec::new(),
             assignments: JsRecord::new(),
+            machines: ProjectMachines::default(),
             appearance: TabGroupAppearance::new(),
             backgrounds: ProjectChatBackgrounds::new(),
             location_syncs: HashMap::new(),
@@ -252,6 +258,7 @@ impl Projects {
         self.pinned = recents::load_pinned_projects(kv);
         self.groups = project_groups::load_project_groups(kv);
         self.assignments = project_groups::load_project_group_assignments(kv, Some(&self.groups));
+        self.machines = project_machines::load(kv);
     }
 
     /// Re-read everything from storage, emitting for what changed.
@@ -263,6 +270,7 @@ impl Projects {
             self.pinned.clone(),
             self.groups.clone(),
             self.assignments.clone(),
+            self.machines.clone(),
         );
         self.load_mirror();
         let archived_changed = before.1 != self.archived;
@@ -270,7 +278,8 @@ impl Projects {
             || before.2 != self.rail_order
             || before.3 != self.pinned
             || before.4 != self.groups
-            || before.5 != self.assignments;
+            || before.5 != self.assignments
+            || before.6 != self.machines;
         if archived_changed {
             cx.emit(ProjectsEvent::ArchivedChanged);
         }
@@ -346,7 +355,13 @@ impl Projects {
 
     /// `projectRailSections` with the stored order and pins.
     pub fn rail_sections(&self, current_cwd: &str) -> ProjectRailSections {
-        recents::project_rail_sections(&self.recents, current_cwd, &self.rail_order, &self.pinned)
+        recents::project_rail_sections(
+            &self.recents,
+            current_cwd,
+            &self.rail_order,
+            &self.pinned,
+            &self.machines,
+        )
     }
 
     /// `projectRailItems`.
@@ -418,6 +433,70 @@ impl Projects {
     pub fn toggle_pin(&mut self, path: &str, cx: &mut Context<Self>) {
         recents::toggle_project_pin(&self.kv, path);
         self.paths_changed(cx);
+    }
+
+    // Machines.
+
+    /// The stored links, unlinked locations, and repository identities.
+    pub fn machines(&self) -> &ProjectMachines {
+        &self.machines
+    }
+
+    /// `projectHome`.
+    pub fn project_home(&self, path: &str) -> String {
+        self.machines.project_home(path)
+    }
+
+    /// `projectLocations`.
+    pub fn project_locations(&self, path: &str, names: &MachineNames) -> Vec<String> {
+        self.machines.project_locations(path, names)
+    }
+
+    /// `linkProjectLocation`. False when the project already has a location
+    /// on the member's machine.
+    pub fn link_location(&mut self, home: &str, member: &str, cx: &mut Context<Self>) -> bool {
+        let linked = project_machines::link_project_location(&self.kv, home, member);
+        self.paths_changed(cx);
+        linked
+    }
+
+    /// `unlinkProjectLocation`.
+    pub fn unlink_location(
+        &mut self,
+        location: &str,
+        names: &MachineNames,
+        cx: &mut Context<Self>,
+    ) {
+        project_machines::unlink_project_location(&self.kv, location, names);
+        self.paths_changed(cx);
+        self.remember_locations(cx);
+    }
+
+    /// `forgetMachineLocation`.
+    pub fn forget_machine_location(
+        &mut self,
+        path: &str,
+        names: &MachineNames,
+        cx: &mut Context<Self>,
+    ) {
+        project_machines::forget_machine_location(&self.kv, path, names);
+        self.paths_changed(cx);
+    }
+
+    /// Cache repository keys from raw remote URLs (empty for none).
+    pub fn remember_identities(&mut self, entries: &[(String, String)], cx: &mut Context<Self>) {
+        if project_machines::remember_identities(&self.kv, entries) {
+            self.paths_changed(cx);
+        }
+    }
+
+    /// The links `autoLinkProjects` makes once identities are known.
+    pub fn apply_auto_links(&mut self, names: &MachineNames, cx: &mut Context<Self>) -> bool {
+        let linked = project_machines::apply_auto_links(&self.kv, &self.recents, names);
+        if linked {
+            self.paths_changed(cx);
+        }
+        linked
     }
 
     // Groups.

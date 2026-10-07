@@ -23,6 +23,10 @@ pub struct RemoteProject {
     pub project_id: String,
     /// The folder's path on the host.
     pub cwd: String,
+    /// The folder's main git remote, as the host's `projects.list` or
+    /// `projects.open` reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -80,19 +84,40 @@ pub fn remote_project_for(kv: &Kv, path: &str) -> Option<RemoteProject> {
 /// `rememberRemoteProject`. The caller announces `REMOTE_PROJECTS_CHANGED`
 /// (`RemoteConnections::remember_remote_project` does).
 pub fn remember_remote_project(kv: &Kv, environment_id: &str, host: &HostProject) -> RemoteProject {
+    let key = remote_project_key(environment_id, &host.cwd);
+    let mut all = read_all(kv);
     let remote = RemoteProject {
-        key: remote_project_key(environment_id, &host.cwd),
+        remote_url: host.remote_url.clone().or_else(|| {
+            all.get(&key)
+                .and_then(project)
+                .and_then(|saved| saved.remote_url)
+        }),
+        key,
         environment_id: environment_id.to_string(),
         project_id: host.id.clone(),
         cwd: host.cwd.clone(),
         extra: Extra::new(),
     };
-    let mut all = read_all(kv);
     if let Ok(value) = serde_json::to_value(&remote) {
         all.insert(remote.key.clone(), value);
         kv.set_item(KEY, &Value::Object(all).to_string());
     }
     remote
+}
+
+/// Save the `remoteUrl` a machine's `projects.list` reported for a saved
+/// project. Returns whether the record changed.
+pub fn set_remote_project_url(kv: &Kv, key: &str, remote_url: &str) -> bool {
+    let mut all = read_all(kv);
+    let Some(Value::Object(record)) = all.get_mut(key) else {
+        return false;
+    };
+    if record.get("remoteUrl").and_then(Value::as_str) == Some(remote_url) {
+        return false;
+    }
+    record.insert("remoteUrl".into(), Value::String(remote_url.into()));
+    kv.set_item(KEY, &Value::Object(all).to_string());
+    true
 }
 
 /// `remoteProjectsOn`: every saved project on one machine.
@@ -138,6 +163,7 @@ mod tests {
                 id: "p1".into(),
                 cwd: "/home/me/repo/".into(),
                 name: "repo".into(),
+                remote_url: None,
             },
         );
         assert_eq!(remote.key, "remote://env/home/me/repo");
@@ -149,5 +175,42 @@ mod tests {
         assert!(remote_projects_on(&kv, "elsewhere").is_empty());
         assert_eq!(read_all(&kv)["other"], json!({ "future": true }));
         assert_eq!(remote_project_for(&kv, "/home/me/repo"), None);
+    }
+
+    #[test]
+    fn keeps_the_remote_url_a_host_reported() {
+        let kv = Kv::in_memory();
+        let host = HostProject {
+            id: "p1".into(),
+            cwd: "/repo".into(),
+            name: "repo".into(),
+            remote_url: Some("git@github.com:a/b.git".into()),
+        };
+        let remote = remember_remote_project(&kv, "env", &host);
+        assert_eq!(remote.remote_url.as_deref(), Some("git@github.com:a/b.git"));
+        let older = HostProject {
+            remote_url: None,
+            ..host
+        };
+        let again = remember_remote_project(&kv, "env", &older);
+        assert_eq!(again.remote_url.as_deref(), Some("git@github.com:a/b.git"));
+        assert!(set_remote_project_url(
+            &kv,
+            &again.key,
+            "https://github.com/a/c"
+        ));
+        assert!(!set_remote_project_url(
+            &kv,
+            &again.key,
+            "https://github.com/a/c"
+        ));
+        assert!(!set_remote_project_url(&kv, "remote://env/missing", "x"));
+        assert_eq!(
+            remote_project_for(&kv, &again.key)
+                .unwrap()
+                .remote_url
+                .as_deref(),
+            Some("https://github.com/a/c")
+        );
     }
 }

@@ -2,6 +2,8 @@
 
 use std::rc::Rc;
 
+use gpui::AnyElement;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Subscription,
@@ -17,7 +19,8 @@ use monocode_engine::{
     workspace::Workspace,
 };
 use monocode_layout::project_return::is_blank_session;
-use monocode_ui::{IconName, Theme, icon, u};
+use monocode_ui::widgets::{MenuEntry, MenuItem, context_menu, menu};
+use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 use monocode_view_composer::composer::Composer;
 use monocode_view_pages::widgets::project_picker::ProjectPicker;
 use monocode_view_scm::ui::{
@@ -53,6 +56,8 @@ pub struct SessionToolbar {
     workspace_picker: Option<Entity<WorkspacePicker>>,
     status: Option<Entity<GitStatus>>,
     watch: Option<GitWatch>,
+    /// The "Run on" menu, at its click point.
+    machine_menu: Option<gpui::Point<gpui::Pixels>>,
     subscriptions: Vec<Subscription>,
 }
 
@@ -79,6 +84,7 @@ impl SessionToolbar {
             workspace_picker: None,
             status: None,
             watch: None,
+            machine_menu: None,
             subscriptions: Vec::new(),
         }
     }
@@ -392,10 +398,216 @@ impl SessionToolbar {
     }
 }
 
+/// What the "Run on" picker shows for one session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MachineChoice {
+    locations: Vec<crate::machines::Location>,
+    current: String,
+    editable: bool,
+}
+
+impl MachineChoice {
+    /// `None` when the project has one folder and no machine is paired.
+    fn new(
+        cwd: &str,
+        locations: Vec<crate::machines::Location>,
+        paired: bool,
+        editable: bool,
+    ) -> Option<Self> {
+        if !looks_like_project(cwd) || (locations.len() < 2 && !paired) {
+            return None;
+        }
+        let names = monocode_engine::projects::MachineNames::new();
+        let current = locations
+            .iter()
+            .find(|location| monocode_layout::paths::same_project_path(&location.path, cwd))
+            .map(|location| location.machine.clone())
+            .unwrap_or_else(|| crate::machines::machine_label(cwd, &names));
+        Some(Self {
+            locations,
+            current,
+            editable,
+        })
+    }
+
+    fn home(&self) -> Option<&str> {
+        self.locations
+            .first()
+            .map(|location| location.path.as_str())
+    }
+
+    fn menu_entries(&self, cwd: &str) -> Vec<MenuEntry> {
+        let mut entries: Vec<MenuEntry> = self
+            .locations
+            .iter()
+            .map(|location| {
+                let path = monocode_layout::paths::parse_remote_path(&location.path)
+                    .map_or_else(|| location.path.clone(), |parts| parts.host_path);
+                MenuItem::new(
+                    format!("location:{}", location.path),
+                    location.machine.clone(),
+                )
+                .description(path)
+                .checked(monocode_layout::paths::same_project_path(
+                    &location.path,
+                    cwd,
+                ))
+                .into()
+            })
+            .collect();
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuItem::new("add-remote", "Add on another machine…").into());
+        if self.locations.iter().all(|location| location.remote) {
+            entries.push(MenuItem::new("add-local", "Add folder on this computer…").into());
+        }
+        entries
+    }
+}
+
+impl SessionToolbar {
+    fn machine_choice(&self, cx: &App) -> Option<MachineChoice> {
+        let state = self.state.as_ref()?;
+        let locations = crate::machines::project_locations(&state.cwd, cx);
+        MachineChoice::new(
+            &state.cwd,
+            locations,
+            crate::machines::has_paired_machine(cx),
+            state.draft && !state.busy,
+        )
+    }
+
+    fn pick_machine(&mut self, id: &str, choice: &MachineChoice, cx: &mut Context<Self>) {
+        self.machine_menu = None;
+        cx.notify();
+        let session_id = self.session_id.clone();
+        let Some(home) = choice.home().map(str::to_string) else {
+            return;
+        };
+        match id {
+            "add-remote" => {
+                use monocode_app::bridge::shell::{ShellRequest, ShellRequests};
+                ShellRequests::send(
+                    ShellRequest::OpenRemoteProject {
+                        link_to: Some(home),
+                        session_id: Some(session_id),
+                    },
+                    cx,
+                );
+            }
+            "add-local" => crate::machines::add_local_location(home, Some(session_id), cx),
+            _ => {
+                if let Some(path) = id.strip_prefix("location:") {
+                    crate::machines::move_blank_session(&session_id, path, cx);
+                }
+            }
+        }
+    }
+
+    /// "Run on": the machine this session runs on. A menu until the first
+    /// message, then a label.
+    fn render_machine_picker(&self, choice: MachineChoice, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let current_remote = self
+            .state
+            .as_ref()
+            .is_some_and(|state| monocode_layout::paths::is_remote_project_path(&state.cwd));
+        let open = self.machine_menu.is_some();
+        let content = theme.colors.content;
+        let mut trigger = div()
+            .id("session-machine-picker")
+            .flex()
+            .flex_none()
+            .h(u(26.))
+            .gap(u(6.))
+            .px(u(8.))
+            .items_center()
+            .rounded(u(theme.radius.md))
+            .text_px(theme.text.label)
+            .text_color(theme.content(0.50))
+            .tooltip(monocode_ui::widgets::tooltip(if choice.editable {
+                "Run on"
+            } else {
+                "Runs on this machine"
+            }))
+            .child(
+                icon(if current_remote {
+                    IconName::Internet
+                } else {
+                    IconName::Monitor
+                })
+                .size(u(13.)),
+            )
+            .child(
+                div()
+                    .medium()
+                    .text_color(theme.content(0.90))
+                    .child(choice.current.clone()),
+            );
+        if choice.editable {
+            let hover = theme.content(0.05);
+            trigger = trigger
+                .when(open, |el| el.bg(theme.colors.selection).text_color(content))
+                .hover(move |s| s.bg(hover).text_color(content))
+                .child(
+                    icon(if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(u(12.))
+                    .text_color(theme.content(0.45)),
+                )
+                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                    this.machine_menu = if this.machine_menu.is_some() {
+                        None
+                    } else {
+                        Some(event.position())
+                    };
+                    cx.notify();
+                }));
+        }
+        let mut root = div().flex_none().child(trigger);
+        if let Some(position) = self.machine_menu.filter(|_| choice.editable) {
+            let cwd = self
+                .state
+                .as_ref()
+                .map(|state| state.cwd.clone())
+                .unwrap_or_default();
+            let pick = cx.weak_entity();
+            let dismiss = pick.clone();
+            let entries = choice.menu_entries(&cwd);
+            root = root.child(context_menu(
+                position,
+                menu("session-machine-menu", entries).on_pick(move |id, _, cx| {
+                    let id = id.to_string();
+                    let choice = choice.clone();
+                    pick.update(cx, |this, cx| this.pick_machine(&id, &choice, cx))
+                        .ok();
+                }),
+                move |_, cx| {
+                    dismiss
+                        .update(cx, |this, cx| {
+                            this.machine_menu = None;
+                            cx.notify();
+                        })
+                        .ok();
+                },
+                cx,
+            ));
+        }
+        root.into_any_element()
+    }
+}
+
 impl Render for SessionToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = Theme::of(cx).content(0.5);
         let mut row = div().flex().min_w_0().items_center().gap(u(6.));
+        if let Some(choice) = self.machine_choice(cx) {
+            row = row.child(self.render_machine_picker(choice, cx));
+        } else {
+            self.machine_menu = None;
+        }
         if self.remote.is_none()
             && let Some(project) = &self.project
         {
@@ -461,4 +673,62 @@ fn select_worktree(
         );
     }
     actions::on_worktree_change(session_id, tree, cx)
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use super::*;
+    use crate::machines::Location;
+
+    fn location(path: &str, machine: &str) -> Location {
+        Location {
+            path: path.into(),
+            machine: machine.into(),
+            remote: path.starts_with("remote://"),
+        }
+    }
+
+    #[test]
+    fn run_on_shows_with_several_folders_or_a_paired_machine() {
+        let single = vec![location("/work/app", "This Mac")];
+        assert_eq!(
+            MachineChoice::new("/work/app", single.clone(), false, true),
+            None
+        );
+        let paired = MachineChoice::new("/work/app", single, true, true).unwrap();
+        assert_eq!(paired.current, "This Mac");
+        assert!(MachineChoice::new("~", Vec::new(), true, true).is_none());
+    }
+
+    #[test]
+    fn run_on_lists_each_folder_checked_and_the_add_actions() {
+        let choice = MachineChoice::new(
+            "remote://mini/home/me/app",
+            vec![
+                location("remote://mini/home/me/app", "Mini"),
+                location("remote://box/srv/app", "Atlas"),
+            ],
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(choice.current, "Mini");
+        let items: Vec<(String, bool)> = choice
+            .menu_entries("remote://mini/home/me/app")
+            .into_iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Item(item) => Some((item.id.to_string(), item.checked)),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("location:remote://mini/home/me/app".into(), true),
+                ("location:remote://box/srv/app".into(), false),
+                ("add-remote".into(), false),
+                ("add-local".into(), false),
+            ]
+        );
+    }
 }

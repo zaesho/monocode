@@ -40,7 +40,9 @@ use crate::runtime::engine::Engine;
 use crate::submit::acceptance::{
     ControlOutcome, SubmissionAcceptance, SubmitError, submit_after_project_sync,
 };
-use crate::submit::edit_last_turn::{EditedResendAttempt, create_edited_resend_attempt};
+use crate::submit::edit_last_turn::{
+    EditedResendAttempt, create_edited_resend_attempt, last_user_turn_block,
+};
 use crate::submit::handoff::{
     append_preparing_handoff, handoff_turn_card, is_preparing_handoff, pending_handoff,
 };
@@ -54,6 +56,18 @@ use crate::submit::paths::{is_equal_or_inside, looks_like_project};
 use crate::submit::prefs::{KvStore, save_recent_model_choice};
 use crate::submit::prompt::compose_note_message;
 use crate::submit::second_opinion::SECOND_OPINION_TITLE;
+use crate::submit::skills::SkillCatalogContext;
+
+fn matching_skill_classification(
+    context: &SkillCatalogContext,
+    classification: Option<&(SkillCatalogContext, bool)>,
+) -> Result<Option<bool>, ()> {
+    match classification {
+        Some((captured, raw)) if captured == context => Ok(Some(*raw)),
+        Some(_) => Err(()),
+        None => Ok(None),
+    }
+}
 
 /// Enqueue one event for a session and flush it now.
 pub(crate) fn report(session_id: &str, event: HarnessEvent, cx: &mut App) {
@@ -124,6 +138,18 @@ impl Submit {
         text: &str,
         attachments: Vec<Attachment>,
         options: SubmitOptions,
+        cx: &mut Context<Self>,
+    ) -> SubmissionAcceptance {
+        self.submit_with_skill_classification(session_id, text, attachments, options, None, cx)
+    }
+
+    fn submit_with_skill_classification(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        options: SubmitOptions,
+        classification: Option<(SkillCatalogContext, bool)>,
         cx: &mut Context<Self>,
     ) -> SubmissionAcceptance {
         let sessions = Engine::sessions(cx);
@@ -332,10 +358,50 @@ impl Submit {
         } else {
             submitted_text.clone()
         };
-        let raw_command = !operator.matched
+        let mut skill_context =
+            crate::submit::skills::SkillCatalogContext::new(current.harness, &initial_work_cwd)
+                .with_session(session_id);
+        if let Some(account) = &provider_account_id {
+            skill_context = skill_context.with_account(account);
+        }
+        let skill_context = (self.config.skill_context)(skill_context);
+        let classified = match matching_skill_classification(
+            &skill_context,
+            classification.as_ref(),
+        ) {
+            Ok(classified) => classified,
+            Err(()) => {
+                session_error(
+                    session_id,
+                    "The skill settings or provider account changed before this request could start. Submit the request again.",
+                    cx,
+                );
+                return SubmissionAcceptance::Ready(false);
+            }
+        };
+        if !operator.matched
+            && classified.is_none()
             && self
                 .skills
-                .is_native_command_prompt(&submitted_text, current.harness);
+                .is_native_command_prompt(&submitted_text, current.harness)
+            && self.skills.peek_skills(&skill_context).is_none()
+        {
+            return self.submit_after_skill_classification(
+                session_id,
+                text,
+                &submitted_text,
+                attachments,
+                options,
+                skill_context,
+                edited,
+                cx,
+            );
+        }
+        let raw_command = !operator.matched
+            && classified.unwrap_or_else(|| {
+                self.skills
+                    .is_native_command_prompt_cached(&submitted_text, &skill_context)
+            });
         let ci_context = options
             .ci_repair
             .as_ref()
@@ -728,12 +794,23 @@ impl Submit {
         let io = self.config.attachment_io.clone();
         let skills = self.skills.clone();
         let peers = self.peers.clone();
+        let skill_context = self.config.skill_context.clone();
+        let account_id = current.provider_account_id.clone();
         cx.spawn(async move |_, cx| {
             let prepared =
                 crate::submit::attachments::prepare_attachments(io.as_ref(), &attachments).await;
-            let prompt =
-                super::turn::prepare(&harness_text, harness, &id, &work_cwd, &skills, &peers, cx)
-                    .await;
+            let prompt = super::turn::prepare(
+                &harness_text,
+                harness,
+                &id,
+                &work_cwd,
+                account_id.as_deref(),
+                &skill_context,
+                &skills,
+                &peers,
+                cx,
+            )
+            .await;
             let text = peers.inbox.ask_prompt(inbox_ask.as_ref(), prompt);
             let steer = registry.steer_harness_turn(
                 harness,
@@ -853,6 +930,68 @@ impl Submit {
             let _ = sender.send(result);
         })
         .detach();
+        acceptance
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_after_skill_classification(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        submitted_text: &str,
+        attachments: Vec<Attachment>,
+        options: SubmitOptions,
+        context: SkillCatalogContext,
+        edited: Option<Rc<EditedResendAttempt>>,
+        cx: &mut Context<Self>,
+    ) -> SubmissionAcceptance {
+        let (turn_generation, edited_target) = {
+            let sessions = Engine::sessions(cx);
+            let sessions = sessions.read(cx);
+            (
+                sessions.turn_gen(session_id),
+                edited.as_ref().and_then(|_| {
+                    sessions
+                        .get(session_id)
+                        .and_then(|session| last_user_turn_block(&session.blocks))
+                        .map(|block| block.id.clone())
+                }),
+            )
+        };
+        let (sender, acceptance) = SubmissionAcceptance::deferred();
+        let id = session_id.to_string();
+        let text = text.to_string();
+        let submitted_text = submitted_text.to_string();
+        let skills = self.skills.clone();
+        cx.spawn(async move |this, cx| {
+            let raw = skills.is_native_command_prompt_in_context(&submitted_text, &context).await;
+            let options_for_error = options.clone();
+            let retried = this.update(cx, |this, cx| {
+                let still_current = {
+                    let sessions = Engine::sessions(cx);
+                    let sessions = sessions.read(cx);
+                    sessions.turn_gen(&id) == turn_generation
+                        && sessions.get(&id).is_some_and(|session| {
+                            edited_target.as_ref().is_none_or(|target| {
+                                last_user_turn_block(&session.blocks)
+                                    .is_some_and(|block| &block.id == target)
+                            })
+                        })
+                };
+                if !still_current {
+                    return SubmissionAcceptance::Ready(false);
+                }
+                this.submit_with_skill_classification(&id, &text, attachments, options, Some((context, raw)), cx)
+            }).unwrap_or(SubmissionAcceptance::Ready(false));
+            let result = retried.resolve().await;
+            if !matches!(result, Ok(true)) {
+                cx.update(|cx| {
+                    reject_edited(edited.as_deref(), &options_for_error, cx);
+                    settle(&options_for_error, ControlOutcome::failed("The chat became unavailable before the request could start. Submit the request again when it is ready."), cx);
+                });
+            }
+            let _ = sender.send(result);
+        }).detach();
         acceptance
     }
 }
@@ -996,5 +1135,41 @@ impl CommitTurn {
             &self.visible,
             Some(&self.cards),
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_classification_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_classification_for_the_current_account_and_library_revision() {
+        let context = SkillCatalogContext::new(HarnessId::Omp, "/repo")
+            .with_session("session")
+            .with_account("work")
+            .with_home("/home")
+            .with_provider_home("omp", "/home/.omp")
+            .with_library_generation(3);
+        let file_classification = (context.clone(), false);
+        assert_eq!(
+            matching_skill_classification(&context, Some(&file_classification)),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            matching_skill_classification(&context, Some(&(context.clone(), true))),
+            Ok(Some(true))
+        );
+        for changed in [
+            context.clone().with_library_generation(4),
+            context.clone().with_account("personal"),
+            context.clone().with_provider_home("omp", "/other/.omp"),
+            context.clone().with_session("other-session"),
+        ] {
+            assert_eq!(
+                matching_skill_classification(&changed, Some(&file_classification)),
+                Err(())
+            );
+        }
+        assert_eq!(matching_skill_classification(&context, None), Ok(None));
     }
 }

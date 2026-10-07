@@ -22,6 +22,12 @@ pub struct ViewEntry {
 
 pub const VIEWS: &[ViewEntry] = &[
     ViewEntry {
+        name: "skills-manager",
+        description: "The shared skill library using local files",
+        engine: false,
+        build: crate::skill_manager::build,
+    },
+    ViewEntry {
         name: "shell",
         description: "The app: project rail, session sidebar, workspace panes",
         engine: true,

@@ -92,10 +92,39 @@ impl ModelSource for CatalogModelSource {
 }
 
 /// `SkillCatalogContext` from the composer's key.
-fn catalog_context(context: &SkillContext) -> SkillCatalogContext {
+fn catalog_context(context: &SkillContext, cx: &App) -> SkillCatalogContext {
     let mut catalog = SkillCatalogContext::new(context.harness, context.cwd.clone());
     if let Some(id) = &context.session_id {
         catalog = catalog.with_session(id.clone());
+    }
+    if monocode_harness::core::provider_accounts::supports_provider_accounts(context.harness) {
+        let account = context
+            .session_id
+            .as_ref()
+            .and_then(|id| {
+                Engine::try_global(cx)?;
+                Engine::sessions(cx)
+                    .read(cx)
+                    .get(id)?
+                    .provider_account_id
+                    .clone()
+            })
+            .or_else(|| {
+                let services = AppServices::try_global(cx)?;
+                Some(
+                    monocode_harness::core::provider_accounts::selected_provider_account_id(
+                        &monocode_engine::submit::prefs::KvStore(services.kv.clone()),
+                        context.harness,
+                        Some(&context.cwd),
+                    ),
+                )
+            });
+        if let Some(account) = account {
+            catalog = catalog.with_account(account);
+        }
+    }
+    if let Some(submit) = Submit::try_global(cx) {
+        catalog = (submit.read(cx).config().skill_context)(catalog);
     }
     catalog
 }
@@ -527,7 +556,7 @@ impl ComposerHost for SessionComposerHost {
         let Some(catalog) = &self.skills else {
             return Vec::new();
         };
-        let context = catalog_context(context);
+        let context = catalog_context(context, cx);
         if let Some(skills) = catalog.peek_skills(&context) {
             return skills.iter().map(picker_skill).collect();
         }
@@ -543,7 +572,7 @@ impl ComposerHost for SessionComposerHost {
         let Some(catalog) = &self.skills else {
             return;
         };
-        let load = catalog.load_skills(&catalog_context(context), refresh);
+        let load = catalog.load_skills(&catalog_context(context, cx), refresh);
         let task = cx.background_spawn(async move {
             load.await;
         });

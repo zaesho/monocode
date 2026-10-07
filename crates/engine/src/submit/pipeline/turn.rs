@@ -101,16 +101,23 @@ pub(crate) async fn drive<T>(
 }
 
 /// `preparePrompt` with the prompt hooks.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare(
     text: &str,
     harness: HarnessId,
     session_id: &str,
     cwd: &str,
+    account_id: Option<&str>,
+    resolve_context: &super::SkillContextResolver,
     skills: &SkillCatalog,
     peers: &SubmitPeers,
     cx: &AsyncApp,
 ) -> String {
-    let context = SkillCatalogContext::new(harness, cwd).with_session(session_id);
+    let mut context = SkillCatalogContext::new(harness, cwd).with_session(session_id);
+    if let Some(account_id) = account_id {
+        context = context.with_account(account_id);
+    }
+    let context = resolve_context(context);
     prepare_prompt(
         text,
         &context,
@@ -458,6 +465,8 @@ impl TurnRun {
                     harness,
                     id,
                     &state.work_cwd,
+                    self.provider_account_id.as_deref(),
+                    &self.config.skill_context,
                     &self.skills,
                     &self.peers,
                     cx,

@@ -264,19 +264,10 @@ mod tests {
         let report = manager.reconcile(&[]).unwrap();
         let warning = pending_warning(&report).unwrap();
         assert!(warning.contains("Cannot prepare export directory:"));
-        // The manager reports canonical paths, which on Windows carry the
-        // `\\?\` prefix, so compare the reported export with the blocked file
-        // after canonicalizing both.
-        let pending = report
-            .statuses
-            .iter()
-            .find(|status| status.export.state == ExportState::Pending)
-            .unwrap();
-        assert!(warning.contains(&pending.export.path.display().to_string()));
-        assert_eq!(
-            std::fs::canonicalize(pending.export.path.parent().unwrap()).unwrap(),
-            std::fs::canonicalize(&blocked).unwrap()
-        );
+        // The manager reports canonical paths. On Windows the temp directory
+        // can be an 8.3 short path, so compare with the canonical home.
+        let reported = std::fs::canonicalize(&home).unwrap().join(".claude/skills");
+        assert!(warning.contains(&reported.to_string_lossy().to_string()));
         assert_eq!(
             std::fs::read_to_string(blocked).unwrap(),
             "Preserve this file"

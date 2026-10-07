@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { isHexColor } from "../../../shared/lib/colorUtils";
-import { HAS_NATIVE_GLASS, IS_MAC } from "../../../platform/tauri/platform";
+import { hslToRgb, isHexColor, type Rgb } from "../../../shared/lib/colorUtils";
+import { IS_LINUX, IS_MAC } from "../../../platform/tauri/platform";
 import { readFlag, writeFlag } from "./storageFlags";
 import { applyUiScale, loadUiScale } from "./uiScale";
 import {
@@ -13,6 +13,7 @@ const THEME_HUE_KEY = "monocode.themeHue";
 const THEME_SATURATION_KEY = "monocode.themeSaturation";
 const THEME_DARK_LIGHTNESS_KEY = "monocode.themeDarkLightness";
 const OPACITY_KEY = "monocode.sidebarOpacity";
+const MAIN_OPACITY_KEY = "monocode.mainOpacity";
 const BLUR_KEY = "monocode.sidebarBlur";
 const PROJECT_RAIL_OPEN_KEY = "monocode.projectRailOpen";
 const SESSION_SIDEBAR_OPEN_KEY = "monocode.sessionSidebarOpen";
@@ -28,11 +29,15 @@ const CHAT_BACKGROUND_EMPTY_OPACITY_KEY = "monocode.chatBackgroundEmptyOpacity";
 const CHAT_BACKGROUND_SESSION_OPACITY_KEY =
   "monocode.chatBackgroundSessionOpacity";
 const CHAT_BACKGROUND_SCOPE_KEY = "monocode.chatBackgroundScope";
+const CHAT_BACKGROUND_BLUR_KEY = "monocode.chatBackgroundBlur";
 const NEW_THREAD_BACKGROUND_EFFECT_KEY = "monocode.newThreadBackgroundEffect";
 const CHANGES_VIEW_KEY = "monocode.changesView";
+const DIFF_PALETTE_KEY = "monocode.diffPalette";
 const SHOW_EXCLUDED_FILES_KEY = "monocode.showExcludedFiles";
 let chatBackgroundRevision = Date.now();
 let nativeGlassReady = false;
+let glassFadeTimer: number | undefined;
+let glassSyncGeneration = 0;
 
 export const CHAT_BACKGROUND_PATH_CHANGE_EVENT =
   "monocode:chat-background-path-change";
@@ -42,11 +47,12 @@ export type ThemePreference = ColorScheme | "system";
 export type TranscriptLayout = "full" | "chat";
 export type ChatBackgroundScope = "empty" | "all";
 export type NewThreadBackgroundEffect =
-  "none" | "dither" | "ascii" | "halftone" | "scanlines";
+  "none" | "dither" | "ascii" | "halftone" | "scanlines" | "gradient-blur";
 export type ChangesView = "list" | "tree";
+export type DiffPalette = "default" | "colorblind" | "high-contrast";
 
 export const NEW_THREAD_BACKGROUND_EFFECTS: readonly NewThreadBackgroundEffect[] =
-  ["none", "dither", "ascii", "halftone", "scanlines"];
+  ["none", "dither", "ascii", "halftone", "scanlines", "gradient-blur"];
 
 export const NEW_THREAD_BACKGROUND_EFFECT_DEFAULT: NewThreadBackgroundEffect =
   "none";
@@ -60,6 +66,7 @@ export const NEW_THREAD_BACKGROUND_EFFECT_LABELS: Record<
   ascii: "ASCII",
   halftone: "Halftone",
   scanlines: "Scanlines",
+  "gradient-blur": "Haze",
 };
 
 export const NEW_THREAD_BACKGROUND_EFFECT_DESCRIPTIONS: Record<
@@ -71,6 +78,7 @@ export const NEW_THREAD_BACKGROUND_EFFECT_DESCRIPTIONS: Record<
   ascii: "Recreates the artwork with colored characters on black.",
   halftone: "Recreates the artwork with colored print dots on black.",
   scanlines: "Adds a pronounced horizontal display-line texture.",
+  "gradient-blur": "Blurs and fades the artwork into the background below.",
 };
 
 export const THEME_PREFERENCE_DEFAULT: ThemePreference = "dark";
@@ -83,6 +91,8 @@ export const SCHEME_CHANGE_EVENT = "monocode:schemechange";
 export const TRANSCRIPT_LAYOUT_DEFAULT: TranscriptLayout = "chat";
 
 export const CHANGES_VIEW_DEFAULT: ChangesView = "list";
+
+export const DIFF_PALETTE_DEFAULT: DiffPalette = "default";
 
 export const TRANSCRIPT_ANCHOR_DEFAULT = true;
 
@@ -123,6 +133,10 @@ export const SIDEBAR_OPACITY_MIN = 0.15;
 export const SIDEBAR_OPACITY_MAX = 1;
 export const SIDEBAR_OPACITY_DEFAULT = 0.85;
 
+export const MAIN_OPACITY_MIN = 0.15;
+export const MAIN_OPACITY_MAX = 1;
+export const MAIN_OPACITY_DEFAULT = 0.85;
+
 export const SIDEBAR_BLUR_MIN = 1;
 export const SIDEBAR_BLUR_MAX = 64;
 export const SIDEBAR_BLUR_DEFAULT = 24;
@@ -131,11 +145,15 @@ export const PROJECT_RAIL_WIDTH_MIN = 180;
 export const PROJECT_RAIL_WIDTH_MAX = 360;
 export const PROJECT_RAIL_WIDTH_DEFAULT = 200;
 
-export const BODY_GLASS_DEFAULT = true;
+export const BODY_GLASS_DEFAULT = !IS_LINUX;
 
 export const CHAT_BACKGROUND_OPACITY_MIN = 0.05;
 export const CHAT_BACKGROUND_OPACITY_MAX = 0.65;
 export const CHAT_BACKGROUND_OPACITY_DEFAULT = 0.24;
+export const CHAT_BACKGROUND_BLUR_MIN = 0;
+export const CHAT_BACKGROUND_BLUR_MAX = 40;
+export const CHAT_BACKGROUND_BLUR_DEFAULT = 0;
+
 export const CHAT_BACKGROUND_EMPTY_OPACITY_DEFAULT =
   CHAT_BACKGROUND_OPACITY_DEFAULT;
 export const CHAT_BACKGROUND_SESSION_OPACITY_DEFAULT =
@@ -296,22 +314,21 @@ export function applyThemeTint(hue: number, saturation: number) {
 
 export function initAppearance() {
   document.documentElement.classList.toggle("is-mac", IS_MAC);
-  document.documentElement.classList.toggle(
-    "has-native-glass",
-    HAS_NATIVE_GLASS,
-  );
   applyAccentColor(loadAccentColor());
   applyThemeTint(loadThemeHue(), loadThemeSaturation());
   applyThemeDarkLightness(loadThemeDarkLightness());
   applyThemePreference(loadThemePreference());
   watchSystemColorScheme();
   applySidebarOpacity(loadSidebarOpacity());
+  applyMainOpacity(loadMainOpacity());
   applySidebarBlur(loadSidebarBlur());
   applyBodyGlass(loadBodyGlass());
   applyChatBackground(loadChatBackgroundPath());
   applyChatBackgroundEmptyOpacity(loadChatBackgroundEmptyOpacity());
   applyChatBackgroundSessionOpacity(loadChatBackgroundSessionOpacity());
   applyChatBackgroundScope(loadChatBackgroundScope());
+  applyChatBackgroundBlur(loadChatBackgroundBlur());
+  applyDiffPalette(loadDiffPalette());
   void applyUiScale(loadUiScale());
 }
 
@@ -370,8 +387,65 @@ export function applyThemePreference(value: ThemePreference): ColorScheme {
   return next;
 }
 
-function syncNativeGlass(scheme: ColorScheme) {
-  void invoke("set_window_glass_enabled", { enabled: scheme === "dark" });
+/** The page colour the native window sits behind while glass is off. */
+function opaqueWindowBackground(): Rgb {
+  const style = getComputedStyle(document.documentElement);
+  const read = (name: string, fallback: number) => {
+    const value = Number.parseFloat(style.getPropertyValue(name));
+    return Number.isFinite(value) ? value : fallback;
+  };
+  return hslToRgb(
+    read("--theme-hue", THEME_HUE_DEFAULT),
+    read("--theme-saturation", THEME_SATURATION_DEFAULT),
+    read("--background-lightness", THEME_DARK_LIGHTNESS_DEFAULT),
+  );
+}
+
+/** How long the page takes to reach opaque, from the same token the CSS uses. */
+function glassFadeMs(): number {
+  const value = getComputedStyle(document.documentElement)
+    .getPropertyValue("--motion-feedback-duration")
+    .trim();
+  const milliseconds = parseFloat(value) * (value.endsWith("ms") ? 1 : 1000);
+  return Number.isFinite(milliseconds) ? Math.max(0, milliseconds) : 0;
+}
+
+/**
+ * `has-native-glass` follows the window, not the platform: Linux can turn glass
+ * off in dark mode too. Whichever side moves second has to wait for the other,
+ * or one of them shows through the gap - so entering glass settles the window
+ * first, and leaving it fades the page first. A call that a newer one has
+ * overtaken is dropped rather than left to settle last.
+ */
+export function syncNativeGlass(scheme: ColorScheme) {
+  const enabled = scheme === "dark" && (!IS_LINUX || loadBodyGlass());
+  const root = document.documentElement;
+  const generation = ++glassSyncGeneration;
+  const setWindow = () =>
+    invoke("set_window_glass_enabled", {
+      enabled,
+      background: opaqueWindowBackground(),
+    }).catch(() => {});
+
+  if (glassFadeTimer !== undefined) {
+    window.clearTimeout(glassFadeTimer);
+    glassFadeTimer = undefined;
+  }
+
+  if (enabled) {
+    void setWindow().finally(() => {
+      if (generation === glassSyncGeneration) {
+        root.classList.add("has-native-glass");
+      }
+    });
+    return;
+  }
+
+  root.classList.remove("has-native-glass");
+  glassFadeTimer = window.setTimeout(() => {
+    glassFadeTimer = undefined;
+    void setWindow();
+  }, glassFadeMs());
 }
 
 /** Applies native transparency once the opaque launch cover can be removed. */
@@ -408,6 +482,30 @@ export function saveSidebarOpacity(value: number) {
 export function applySidebarOpacity(value: number) {
   const next = clamp(value, SIDEBAR_OPACITY_MIN, SIDEBAR_OPACITY_MAX);
   document.documentElement.style.setProperty("--sidebar-opacity", String(next));
+  return next;
+}
+
+/** Before this had its own key, the main pane followed the sidebar value. */
+export function loadMainOpacity(): number {
+  return clamp(
+    readNumber(MAIN_OPACITY_KEY) ??
+      readNumber(OPACITY_KEY) ??
+      MAIN_OPACITY_DEFAULT,
+    MAIN_OPACITY_MIN,
+    MAIN_OPACITY_MAX,
+  );
+}
+
+export function saveMainOpacity(value: number) {
+  writeNumber(
+    MAIN_OPACITY_KEY,
+    clamp(value, MAIN_OPACITY_MIN, MAIN_OPACITY_MAX),
+  );
+}
+
+export function applyMainOpacity(value: number) {
+  const next = clamp(value, MAIN_OPACITY_MIN, MAIN_OPACITY_MAX);
+  document.documentElement.style.setProperty("--main-opacity", String(next));
   return next;
 }
 
@@ -630,6 +728,36 @@ export function applyChatBackgroundSessionOpacity(value: number) {
   );
 }
 
+export function loadChatBackgroundBlur(): number {
+  return Math.round(
+    clamp(
+      readNumber(CHAT_BACKGROUND_BLUR_KEY) ?? CHAT_BACKGROUND_BLUR_DEFAULT,
+      CHAT_BACKGROUND_BLUR_MIN,
+      CHAT_BACKGROUND_BLUR_MAX,
+    ),
+  );
+}
+
+export function saveChatBackgroundBlur(value: number) {
+  writeNumber(
+    CHAT_BACKGROUND_BLUR_KEY,
+    Math.round(
+      clamp(value, CHAT_BACKGROUND_BLUR_MIN, CHAT_BACKGROUND_BLUR_MAX),
+    ),
+  );
+}
+
+/** Zero drops the filter entirely so an unblurred image costs nothing extra. */
+export function applyChatBackgroundBlur(value: number) {
+  const next = Math.round(
+    clamp(value, CHAT_BACKGROUND_BLUR_MIN, CHAT_BACKGROUND_BLUR_MAX),
+  );
+  const root = document.documentElement;
+  root.style.setProperty("--chat-background-blur", `${next}px`);
+  root.classList.toggle("chat-background-blurred", next > 0);
+  return next;
+}
+
 function isChatBackgroundScope(value: unknown): value is ChatBackgroundScope {
   return value === "empty" || value === "all";
 }
@@ -656,6 +784,37 @@ export function applyChatBackgroundScope(value: ChatBackgroundScope) {
     "chat-background-empty-only",
     value === "empty",
   );
+  return value;
+}
+
+function isDiffPalette(value: unknown): value is DiffPalette {
+  return (
+    value === "default" || value === "colorblind" || value === "high-contrast"
+  );
+}
+
+export function loadDiffPalette(): DiffPalette {
+  try {
+    const raw = localStorage.getItem(DIFF_PALETTE_KEY);
+    return isDiffPalette(raw) ? raw : DIFF_PALETTE_DEFAULT;
+  } catch {
+    return DIFF_PALETTE_DEFAULT;
+  }
+}
+
+export function saveDiffPalette(value: DiffPalette) {
+  try {
+    localStorage.setItem(DIFF_PALETTE_KEY, value);
+  } catch {
+    // private mode / quota
+  }
+}
+
+/** Swaps the diff color tokens in index.css via an html class. */
+export function applyDiffPalette(value: DiffPalette) {
+  const root = document.documentElement.classList;
+  root.toggle("diff-palette-colorblind", value === "colorblind");
+  root.toggle("diff-palette-high-contrast", value === "high-contrast");
   return value;
 }
 

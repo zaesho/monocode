@@ -1,6 +1,7 @@
 import { asRecord } from "../../../integrations/harness/providers/codex/codexProtocol";
 
-export type RateLimitProvider = "claude" | "codex" | "opencode";
+export type RateLimitProvider =
+  "claude" | "codex" | "opencode" | "droid" | "grok";
 
 export type RateLimitStatus =
   "idle" | "fetching" | "ok" | "error" | "unavailable";
@@ -45,47 +46,8 @@ export type ProviderRateLimits = {
 export const SESSION_WINDOW_MINUTES = 300;
 export const WEEKLY_WINDOW_MINUTES = 10_080;
 export const MONTHLY_WINDOW_MINUTES = 43_200;
-
-/** Background poll while the window is visible. */
-export const RATE_LIMIT_POLL_MS = 15 * 60 * 1000;
-/** Skip focus/restore and timer refetches until the snapshot is this old. */
-export const RATE_LIMIT_MIN_REFETCH_MS = 5 * 60 * 1000;
-
-export function isRateLimitSnapshotStale(
-  limits: ProviderRateLimits | null | undefined,
-  now: number,
-  minAgeMs = RATE_LIMIT_MIN_REFETCH_MS,
-): boolean {
-  if (!limits || limits.status === "idle") return true;
-  if (limits.status === "unavailable") return false;
-  if (limits.updatedAt <= 0) return true;
-  return now - limits.updatedAt >= minAgeMs;
-}
-
-export function shouldFetchProvider(
-  limits: ProviderRateLimits,
-  input: { force?: boolean; visible: boolean; now?: number },
-): boolean {
-  if (input.force) return true;
-  if (!input.visible) return false;
-  if (limits.status === "unavailable") return false;
-  return isRateLimitSnapshotStale(limits, input.now ?? Date.now());
-}
-
-export function shouldFetchRateLimits(input: {
-  force?: boolean;
-  visible: boolean;
-  claude: ProviderRateLimits;
-  codex: ProviderRateLimits;
-  opencode?: ProviderRateLimits;
-  now?: number;
-}): boolean {
-  return (
-    shouldFetchProvider(input.claude, input) ||
-    shouldFetchProvider(input.codex, input) ||
-    (input.opencode ? shouldFetchProvider(input.opencode, input) : false)
-  );
-}
+export const RATE_LIMIT_POLL_MS = 15 * 60_000;
+export const RATE_LIMIT_MIN_REFETCH_MS = 5 * 60_000;
 
 const WINDOW_DURATION_TOLERANCE_MINUTES = 1;
 
@@ -110,7 +72,10 @@ export function fetchingRateLimits(
 ): ProviderRateLimits {
   if (
     previous &&
-    (previous.session || previous.weekly || previous.monthly || previous.resetCredits)
+    (previous.session ||
+      previous.weekly ||
+      previous.monthly ||
+      previous.resetCredits)
   ) {
     return { ...previous, status: "fetching" };
   }
@@ -149,7 +114,10 @@ export function errorRateLimits(
 ): ProviderRateLimits {
   if (
     previous &&
-    (previous.session || previous.weekly || previous.monthly || previous.resetCredits)
+    (previous.session ||
+      previous.weekly ||
+      previous.monthly ||
+      previous.resetCredits)
   ) {
     return {
       ...previous,
@@ -239,12 +207,27 @@ export function formatRateLimitWindowChipLabel(
 export function rateLimitWindowTooltip(
   window: RateLimitWindow,
   now = Date.now(),
+  showRemaining = false,
 ): string {
-  const used = `${formatUsagePercent(window.usedPercent)} used`;
+  const pct = clampUsedPercent(window.usedPercent);
+  const usage = `${formatUsagePercent(showRemaining ? 100 - pct : pct)} ${showRemaining ? "remaining" : "used"}`;
   if (window.resetsAt == null) {
-    return `${used} · ${formatWindowLabel(window.windowMinutes)} window`;
+    return `${usage} · ${formatWindowLabel(window.windowMinutes)} window`;
   }
-  return `${used} · ${formatResetCountdown(window.resetsAt - now)}`;
+  return `${usage} · ${formatResetCountdown(window.resetsAt - now)}`;
+}
+
+/** When a used-up window resets; the later one when several are spent. */
+export function exhaustedWindowResetAt(
+  limits: ProviderRateLimits,
+): number | null {
+  let latest: number | null = null;
+  for (const window of [limits.session, limits.weekly, limits.monthly]) {
+    if (!window || window.usedPercent < 100 || window.resetsAt == null)
+      continue;
+    latest = Math.max(latest ?? 0, window.resetsAt);
+  }
+  return latest;
 }
 
 export function parseResetTimestamp(value: unknown): number | null {
@@ -333,7 +316,7 @@ export function parseCodexRateLimits(result: unknown): ProviderRateLimits {
     provider: "codex",
     session: mapCodexSnapshot(classified.session, SESSION_WINDOW_MINUTES),
     weekly: mapCodexSnapshot(classified.weekly, WEEKLY_WINDOW_MINUTES),
-    monthly: null,
+    monthly: mapCodexSnapshot(classified.monthly, MONTHLY_WINDOW_MINUTES),
     resetCredits: parseResetCredits(
       rec?.rateLimitResetCredits ?? rec?.rate_limit_reset_credits,
     ),
@@ -362,6 +345,94 @@ export function parseOpencodeGoUsage(result: unknown): ProviderRateLimits {
     error: null,
     status: "ok",
   };
+}
+
+/**
+ * Parse Factory's `/api/billing/limits` payload:
+ * { limits: { standard: { fiveHour: { usedPercent, windowEnd }, weekly, monthly },
+ *             core: {...} } }
+ * Only the standard pool is shown; it is the one Droid gates models on.
+ */
+export function parseDroidUsage(result: unknown): ProviderRateLimits {
+  const standard = asRecord(asRecord(asRecord(result)?.limits)?.standard);
+  return {
+    provider: "droid",
+    session: mapDroidWindow(standard?.fiveHour, SESSION_WINDOW_MINUTES),
+    weekly: mapDroidWindow(standard?.weekly, WEEKLY_WINDOW_MINUTES),
+    monthly: mapDroidWindow(standard?.monthly, MONTHLY_WINDOW_MINUTES),
+    resetCredits: null,
+    updatedAt: Date.now(),
+    error: null,
+    status: "ok",
+  };
+}
+
+function mapDroidWindow(
+  raw: unknown,
+  windowMinutes: number,
+): RateLimitWindow | null {
+  const rec = asRecord(raw);
+  if (!rec) return null;
+  const usedPercent = numberField(rec, "usedPercent");
+  if (usedPercent == null) return null;
+  return {
+    usedPercent: clampUsedPercent(usedPercent),
+    windowMinutes,
+    resetsAt: parseResetTimestamp(rec.windowEnd),
+  };
+}
+
+/**
+ * Parse Grok Build's `_x.ai/billing` ACP result:
+ * { config: { creditUsagePercent, currentPeriod: { type, start, end } } }
+ * Grok reports one credit allowance per billing period, weekly or monthly.
+ */
+export function parseGrokBilling(result: unknown): ProviderRateLimits {
+  const config = asRecord(asRecord(result)?.config);
+  const usedPercent = config ? numberField(config, "creditUsagePercent") : null;
+  const period = asRecord(config?.currentPeriod);
+  const resetsAt =
+    parseResetTimestamp(period?.end) ??
+    parseResetTimestamp(config?.billingPeriodEnd);
+  const monthly = grokPeriodIsMonthly(period, config);
+  const window: RateLimitWindow | null =
+    usedPercent == null
+      ? null
+      : {
+          usedPercent: clampUsedPercent(usedPercent),
+          windowMinutes: monthly
+            ? MONTHLY_WINDOW_MINUTES
+            : WEEKLY_WINDOW_MINUTES,
+          resetsAt,
+        };
+  return {
+    provider: "grok",
+    session: null,
+    weekly: monthly ? null : window,
+    monthly: monthly ? window : null,
+    resetCredits: null,
+    updatedAt: Date.now(),
+    error: null,
+    status: "ok",
+  };
+}
+
+function grokPeriodIsMonthly(
+  period: Record<string, unknown> | null,
+  config: Record<string, unknown> | null,
+): boolean {
+  const type = typeof period?.type === "string" ? period.type : "";
+  if (/MONTHLY/i.test(type)) return true;
+  if (/WEEKLY/i.test(type)) return false;
+  const start =
+    parseResetTimestamp(period?.start) ??
+    parseResetTimestamp(config?.billingPeriodStart);
+  const end =
+    parseResetTimestamp(period?.end) ??
+    parseResetTimestamp(config?.billingPeriodEnd);
+  if (start == null || end == null) return false;
+  // Anything longer than two weeks reads as a monthly allowance.
+  return end - start > 2 * WEEKLY_WINDOW_MINUTES * 60_000;
 }
 
 function mapOpencodeGoWindow(
@@ -452,14 +523,17 @@ function classifyCodexWindows(input: {
 }): {
   session: CodexWindowSnapshot | null;
   weekly: CodexWindowSnapshot | null;
+  monthly: CodexWindowSnapshot | null;
 } {
   let session: CodexWindowSnapshot | null = null;
   let weekly: CodexWindowSnapshot | null = null;
+  let monthly: CodexWindowSnapshot | null = null;
   for (const window of [input.primary, input.secondary]) {
     if (!window) continue;
     const kind = classifyWindowDuration(window.windowDurationMins);
     if (kind === "session" && !session) session = window;
     else if (kind === "weekly" && !weekly) weekly = window;
+    else if (kind === "monthly" && !monthly) monthly = window;
   }
   if (
     !session &&
@@ -475,12 +549,12 @@ function classifyCodexWindows(input: {
   ) {
     weekly = input.secondary;
   }
-  return { session, weekly };
+  return { session, weekly, monthly };
 }
 
 function classifyWindowDuration(
   duration: number | null,
-): "session" | "weekly" | null {
+): "session" | "weekly" | "monthly" | null {
   if (duration == null || !Number.isFinite(duration)) return null;
   if (
     Math.abs(duration - SESSION_WINDOW_MINUTES) <=
@@ -493,6 +567,13 @@ function classifyWindowDuration(
     WINDOW_DURATION_TOLERANCE_MINUTES
   ) {
     return "weekly";
+  }
+  // Free plans get a single 30-day window.
+  if (
+    Math.abs(duration - MONTHLY_WINDOW_MINUTES) <=
+    WINDOW_DURATION_TOLERANCE_MINUTES
+  ) {
+    return "monthly";
   }
   return null;
 }

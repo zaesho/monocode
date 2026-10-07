@@ -20,14 +20,11 @@ import {
 } from "react";
 import {
   coerceModelPickerTab,
-  findModel,
   getModelSnapshot,
   getPickerVisibilitySnapshot,
   isEffortSettingId,
   loadFavoriteModels,
   loadRecentModelChoices,
-  modelsFor,
-  resolveModel,
   saveFavoriteModels,
   showProviderInModelPicker,
   subscribeModels,
@@ -37,27 +34,35 @@ import {
   type ModelSetting,
 } from "../model/models";
 import {
+  isProviderHidden,
+  projectProvidersRevision,
+  subscribeProjectProviders,
+} from "../model/projectProviders";
+import {
   harnessUnavailableHint,
-  hasProbedHarnessAvailability,
-  isHarnessAvailable,
-  probeHarnessAvailability,
   subscribeHarnessAvailability,
   getHarnessAvailabilitySnapshot,
 } from "../../../integrations/harness/core/availability";
-import { refreshHarnessCatalogs } from "../../../integrations/harness/core/registry";
+import { useModelSource, type ModelSource } from "./modelSource";
 import { HARNESSES, HARNESS_TITLE, type HarnessId } from "../model/session";
 import { useLockOverscroll } from "../../../shared/hooks/useLockOverscroll";
 import { LAYER } from "../../../shared/lib/layers";
 import { HarnessIcon } from "./HarnessIcon";
 import { Popover } from "../../../shared/ui/Popover";
 import { MOD } from "../../../platform/tauri/platform";
+import { keybindingPressed } from "../../settings/model/settings";
+import "./ModelPicker.css";
 
 type Props = {
   harness: HarnessId;
   model: string;
   values: Record<string, string>;
+  /** Project whose disabled providers are hidden from the picker. */
+  project?: string;
   /** Hide option rows from the menu when they render as pills beside the picker. */
   hideSettings?: boolean;
+  /** Limit provider tabs for surfaces that only support one harness. */
+  allowedHarnesses?: readonly HarnessId[];
   hotkeys?: boolean;
   onChange: (harness: HarnessId, model: string) => void;
   onSettingsChange: (settings: Record<string, string>) => void;
@@ -119,6 +124,51 @@ function isEffortSetting(setting: ModelSetting): boolean {
   return isEffortSettingId(setting.id);
 }
 
+function effortTileTone(
+  harness: HarnessId,
+  setting: ModelSetting,
+  value: string,
+): "ultra" | "max" | undefined {
+  if (harness !== "codex" || !isEffortSetting(setting)) return undefined;
+  const normalized = value.toLowerCase();
+  return normalized === "ultra"
+    ? "ultra"
+    : normalized === "max"
+      ? "max"
+      : undefined;
+}
+
+const EFFORT_TILE_COLUMNS = 32;
+const EFFORT_TILE_ROWS = 5;
+
+function EffortTileShimmer() {
+  return (
+    <span className="codex-effort-tiles" aria-hidden="true">
+      {Array.from(
+        { length: EFFORT_TILE_COLUMNS * EFFORT_TILE_ROWS },
+        (_, index) => {
+          const column = index % EFFORT_TILE_COLUMNS;
+          const row = Math.floor(index / EFFORT_TILE_COLUMNS);
+          const centerColumn = (EFFORT_TILE_COLUMNS - 1) / 2;
+          const centerRow = (EFFORT_TILE_ROWS - 1) / 2;
+          const distance = Math.hypot(
+            (column - centerColumn) / centerColumn,
+            (row - centerRow) / centerRow,
+          );
+          const filled = (index * 73 + index * index * 19 + 23) % 101 < 65;
+          return (
+            <span
+              key={index}
+              className={`codex-effort-tile${filled ? " codex-effort-tile--filled" : ""}`}
+              style={{ "--tile-distance": distance } as React.CSSProperties}
+            />
+          );
+        },
+      )}
+    </span>
+  );
+}
+
 function effortSetting(model: AgentModel): ModelSetting | undefined {
   return model.settings?.find(
     (setting) => setting.kind === "select" && isEffortSetting(setting),
@@ -172,9 +222,12 @@ function settingValueLabel(
   );
 }
 
-function recentMenuModels(current: AgentModel): AgentModel[] {
+function recentMenuModels(
+  current: AgentModel,
+  source: ModelSource,
+): AgentModel[] {
   const models = loadRecentModelChoices().flatMap((choice) => {
-    const item = findModel(choice.model);
+    const item = source.find(choice.model);
     return item?.harness === choice.harness ? [item] : [];
   });
   if (!models.some((item) => item.id === current.id)) models.push(current);
@@ -208,12 +261,15 @@ export function ModelPicker({
   harness,
   model,
   values,
+  project,
   hideSettings = false,
+  allowedHarnesses,
   hotkeys = false,
   onChange,
   onSettingsChange,
   onClose,
 }: Props) {
+  const source = useModelSource();
   const catalogVersion = useSyncExternalStore(
     subscribeModels,
     getModelSnapshot,
@@ -228,6 +284,11 @@ export function ModelPicker({
     subscribePickerVisibility,
     getPickerVisibilitySnapshot,
     getPickerVisibilitySnapshot,
+  );
+  const projectVersion = useSyncExternalStore(
+    subscribeProjectProviders,
+    projectProvidersRevision,
+    projectProvidersRevision,
   );
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<ModelPickerTab>(harness);
@@ -252,7 +313,7 @@ export function ModelPicker({
   openRef.current = open;
   recentOpenRef.current = recentMenu != null;
 
-  const current = resolveModel(harness, model);
+  const current = source.resolve(harness, model);
   currentRef.current = current;
   const settings = useMemo(() => {
     void catalogVersion;
@@ -285,18 +346,24 @@ export function ModelPicker({
   ]
     .filter(Boolean)
     .join(" · ");
-
   const pickerHarnesses = useMemo(() => {
     void availabilityVersion;
     void visibilityVersion;
-    return HARNESSES.filter((id) =>
-      showProviderInModelPicker(
-        id,
-        isHarnessAvailable(id),
-        hasProbedHarnessAvailability(),
-      ),
+    void projectVersion;
+    return HARNESSES.filter(
+      (id) =>
+        (!allowedHarnesses || allowedHarnesses.includes(id)) &&
+        !isProviderHidden(project, id) &&
+        showProviderInModelPicker(id, source.available(id), source.probed()),
     );
-  }, [availabilityVersion, visibilityVersion]);
+  }, [
+    source,
+    allowedHarnesses,
+    availabilityVersion,
+    visibilityVersion,
+    projectVersion,
+    project,
+  ]);
   const providerKey = pickerHarnesses.join(",");
   const visibleTab = coerceModelPickerTab(tab, (id) =>
     pickerHarnesses.includes(id),
@@ -308,19 +375,19 @@ export function ModelPicker({
     const pool =
       visibleTab === "favorites"
         ? favorites
-            .map((id) => findModel(id))
+            .map((id) => source.find(id))
             .filter(
               (item): item is AgentModel =>
                 item != null && pickerHarnesses.includes(item.harness),
             )
-        : modelsFor(visibleTab);
+        : source.modelsFor(visibleTab);
     if (!needle) return pool;
     return pool.filter((item) =>
       `${item.name} ${HARNESS_TITLE[item.harness]} ${item.provider?.name ?? ""} ${item.provider?.id ?? ""}`
         .toLowerCase()
         .includes(needle),
     );
-  }, [catalogVersion, favorites, providerKey, query, visibleTab]);
+  }, [source, catalogVersion, favorites, providerKey, query, visibleTab]);
 
   const dismiss = (restore: boolean) => {
     setOpen(false);
@@ -340,7 +407,7 @@ export function ModelPicker({
   const openRecentMenu = () => {
     const selected = currentRef.current;
     if (!selected) return;
-    const models = recentMenuModels(selected);
+    const models = recentMenuModels(selected, source);
     const selectedIndex = models.findIndex((item) => item.id === selected.id);
     setOpen(false);
     setSubmenu(null);
@@ -366,8 +433,7 @@ export function ModelPicker({
 
   useEffect(() => {
     if (!open) return;
-    void probeHarnessAvailability();
-    void refreshHarnessCatalogs([current.harness]);
+    source.refresh([current.harness]);
     setTab(
       coerceModelPickerTab(current.harness, (id) =>
         pickerHarnesses.includes(id),
@@ -388,7 +454,7 @@ export function ModelPicker({
 
   useEffect(() => {
     if (!open || visibleTab === "favorites") return;
-    void refreshHarnessCatalogs([visibleTab]);
+    source.refresh([visibleTab]);
   }, [open, visibleTab]);
 
   useEffect(() => {
@@ -425,12 +491,14 @@ export function ModelPicker({
     const onKey = (event: KeyboardEvent) => {
       if (event.isComposing) return;
       const mod = event.metaKey || event.ctrlKey;
-      if (
-        hotkeys &&
+      const defaultSwitch =
         mod &&
         !event.altKey &&
         !event.shiftKey &&
-        (event.key === "." || event.code === "Period")
+        (event.key === "." || event.code === "Period");
+      if (
+        hotkeys &&
+        keybindingPressed("App: Switch Model", event, defaultSwitch)
       ) {
         if (!openRef.current && inBlockingUi(event.target)) return;
         event.preventDefault();
@@ -456,14 +524,14 @@ export function ModelPicker({
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("open_model_picker", onMenu);
     };
-  }, [hotkeys]);
+  }, [hotkeys, source]);
 
   const setSetting = (setting: ModelSetting, value: string) => {
     onSettingsChange({ ...values, [setting.id]: value });
   };
 
   const pickModel = (item: AgentModel) => {
-    if (!isHarnessAvailable(item.harness)) return;
+    if (!source.available(item.harness)) return;
     onChange(item.harness, item.id);
     dismiss(true);
   };
@@ -620,14 +688,14 @@ export function ModelPicker({
           openRecentMenu();
         }}
         onClick={() => togglePicker()}
-        className={`flex h-6.5 max-w-40 items-center gap-1 rounded-md px-1.5 ${
+        className={`flex h-6.5 shrink-0 items-center gap-1 rounded-md px-1.5 ${
           open
             ? "bg-selection text-content"
             : "bg-selection text-content hover:bg-selection-hover"
         }`}
       >
         <HarnessIcon harness={current.harness} className="size-4 shrink-0" />
-        <span className="min-w-0 truncate text-[11px]">{current.name}</span>
+        <span className="whitespace-nowrap text-[11px]">{current.name}</span>
         {triggerEffortLabel ? (
           <span className="shrink-0 text-[11px] text-content/50">
             {triggerEffortLabel}
@@ -804,6 +872,11 @@ export function ModelPicker({
                 const selected =
                   option.value === settingValue(submenu.setting, values);
                 const highlighted = index === activeSetting;
+                const tileTone = effortTileTone(
+                  current.harness,
+                  submenu.setting,
+                  option.value,
+                );
                 return (
                   <button
                     key={option.value}
@@ -817,8 +890,10 @@ export function ModelPicker({
                       highlighted
                         ? "bg-selection text-content"
                         : "text-content hover:bg-content/5"
-                    }`}
+                    } ${tileTone ? "codex-effort-option" : ""}`}
+                    data-effort-tone={tileTone}
                   >
+                    {tileTone ? <EffortTileShimmer /> : null}
                     <span className="min-w-0 flex-1 truncate">
                       {option.label}
                     </span>
@@ -837,6 +912,7 @@ export function ModelPicker({
           {showSubmenu && submenu.kind === "models" ? (
             <ModelFlyout
               anchor={activeRow}
+              autoFocusSearch
               harnesses={pickerHarnesses}
               tab={visibleTab}
               models={visibleModels}
@@ -873,7 +949,7 @@ export function ModelPicker({
           {recentMenu.models.map((item, index) => {
             const selected = item.id === current.id;
             const highlighted = index === recentActive;
-            const disabled = !isHarnessAvailable(item.harness);
+            const disabled = !source.available(item.harness);
             return (
               <button
                 key={item.id}
@@ -940,7 +1016,7 @@ export function ModelControlPills({
     getModelSnapshot,
   );
   void catalogVersion;
-  const current = resolveModel(harness, model);
+  const current = useModelSource().resolve(harness, model);
   const pills = pillSettings(current);
   const effort = pills.find(
     (setting) => setting.kind === "select" && isEffortSetting(setting),
@@ -971,6 +1047,7 @@ export function ModelControlPills({
             values={values}
             onSettingsChange={onSettingsChange}
             onClose={onClose}
+            harness={harness}
             additionalSettings={
               setting.id === effort?.id ? groupedSettings : undefined
             }
@@ -1018,12 +1095,14 @@ function SelectPill({
   values,
   onSettingsChange,
   onClose,
+  harness,
   additionalSettings,
 }: {
   setting: ModelSetting;
   values: Record<string, string>;
   onSettingsChange: (settings: Record<string, string>) => void;
   onClose?: () => void;
+  harness: HarnessId;
   additionalSettings?: ModelSetting[];
 }) {
   const [open, setOpen] = useState(false);
@@ -1142,6 +1221,11 @@ function SelectPill({
                   const selected =
                     option.value === settingValue(menuSetting, values);
                   const highlighted = index === active;
+                  const tileTone = effortTileTone(
+                    harness,
+                    menuSetting,
+                    option.value,
+                  );
                   return (
                     <button
                       key={option.value}
@@ -1154,8 +1238,10 @@ function SelectPill({
                       onClick={() => pick(menuSetting, option.value)}
                       className={`flex h-8 w-full items-center gap-2 rounded-lg px-2 text-left text-[13px] text-content ${
                         highlighted ? "bg-selection" : "hover:bg-content/5"
-                      }`}
+                      } ${tileTone ? "codex-effort-option" : ""}`}
+                      data-effort-tone={tileTone}
                     >
+                      {tileTone ? <EffortTileShimmer /> : null}
                       <span className="min-w-0 flex-1 truncate">
                         {option.label}
                       </span>
@@ -1214,6 +1300,7 @@ function ModelFlyout({
   onPick: (model: AgentModel) => void;
   onToggleFavorite: (id: string) => void;
 }) {
+  const source = useModelSource();
   const lockOverscroll = useLockOverscroll<HTMLDivElement>();
   const activeRef = useRef<HTMLButtonElement>(null);
   const groups = modelGroups(tab, models);
@@ -1221,6 +1308,18 @@ function ModelFlyout({
   useEffect(() => {
     activeRef.current?.scrollIntoView({ block: "nearest" });
   }, [active]);
+
+  // The popover frame starts hidden until its layout effect measures the
+  // anchor, and browsers silently drop focus() on a hidden element. React's
+  // autoFocus fires during that first commit, so defer one frame to focus
+  // once the flyout is on screen.
+  useEffect(() => {
+    if (!autoFocusSearch) return;
+    const frame = requestAnimationFrame(() => {
+      searchRef.current?.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [autoFocusSearch, searchRef]);
 
   const onSearchKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === "ArrowDown") {
@@ -1335,7 +1434,6 @@ function ModelFlyout({
             value={query}
             placeholder="Search models"
             aria-label="Search models"
-            autoFocus={autoFocusSearch}
             className="min-w-0 flex-1 bg-transparent text-[13px] text-content outline-none placeholder:text-content/40"
             onChange={(event) => onQuery(event.target.value)}
             onKeyDown={onSearchKey}
@@ -1352,7 +1450,7 @@ function ModelFlyout({
             <div className="px-2 py-3 text-[12px] text-content/50">
               {tab === "favorites" && !query.trim()
                 ? "No favorite models"
-                : tab !== "favorites" && !isHarnessAvailable(tab)
+                : tab !== "favorites" && !source.available(tab)
                   ? harnessUnavailableHint(tab)
                   : tab === "codex" && !query.trim()
                     ? "Loading Codex models…"
@@ -1374,7 +1472,7 @@ function ModelFlyout({
                   const selected = item.id === currentId;
                   const highlighted = index === active;
                   const favorited = favorites.includes(item.id);
-                  const disabled = !isHarnessAvailable(item.harness);
+                  const disabled = !source.available(item.harness);
                   // Favorites mix harnesses, so every row names its source.
                   // Provider first (OpenCode Go vs OpenCode), else harness.
                   const provenance =

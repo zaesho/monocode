@@ -1,8 +1,33 @@
+import { acceptQuickLaunch } from "./model/quickLaunchSession";
+import { useWorkspaceNavigation } from "./hooks/useWorkspaceNavigation";
+import { useIdleSessionDetach } from "./hooks/useIdleSessionDetach";
+import {
+  cancelScheduledFlush,
+  scheduleHarnessFlush,
+  type ScheduledFlush,
+} from "./model/harnessFlush";
+import {
+  handleAgentApp,
+  type AppSessionListing,
+  type AppSessionPlacement,
+} from "../features/agent-app/model/agentApp";
+import { submitWithSettlement } from "./model/managedSubmission";
+import {
+  submitAfterProjectSync,
+  type SubmissionAcceptance,
+} from "./model/submissionAcceptance";
+import type { CiRepairRequest } from "../features/inbox/model/ciRepair";
+import { ciRepairSessions } from "../features/inbox/model/ciRepairSessions";
+import {
+  rebaseCiRepairs,
+  trackCiRepair,
+} from "../features/inbox/model/ciRepairTracking";
 import { invoke } from "@tauri-apps/api/core";
 import {
   orchestrationCheckoutCwd,
   orchestrationProjectCwd,
   orchestrator,
+  shellPath,
   workspaceIdentity,
   type ControlOutcome,
 } from "../features/orchestration/model/orchestration";
@@ -35,6 +60,8 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask, message } from "@tauri-apps/plugin-dialog";
 import {
+  startTransition,
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -45,6 +72,7 @@ import {
 } from "react";
 import { Sidebar } from "./shell/Sidebar";
 import { ApprovalToasts } from "../features/sessions/ui/ApprovalToasts";
+import { HarnessUpdateNotice } from "../features/providers/ui/HarnessUpdateNotice";
 import { WhatsNewDialog } from "./shell/WhatsNewDialog";
 import { ProviderSignInDialog } from "../features/sessions/ui/ProviderSignInDialog";
 import { TitleBar, type Tab as TitleTab } from "./shell/TitleBar";
@@ -54,6 +82,11 @@ import {
   DeleteSessionDialog,
   type SessionDeleteChoice,
 } from "../features/sessions/ui/DeleteSessionDialog";
+import {
+  type WorktreeFocus,
+  useWorktreeFocus,
+  worktreeFocus,
+} from "../features/source-control/model/worktreeFocus";
 import {
   assertWorktreeFilesClosed,
   createOrchestrationWorktree,
@@ -78,27 +111,34 @@ import { useInboxActivity } from "../features/inbox/hooks/useInboxUnseen";
 import {
   loadProjectRailOpen,
   loadSessionSidebarOpen,
-  loadSidebarTabOrder,
   saveProjectRailOpen,
   saveSessionSidebarOpen,
   type SidebarTabId,
 } from "../features/settings/model/appearance";
+import {
+  loadProjectSidebarTab,
+  saveProjectSidebarTab,
+} from "../features/settings/model/projectSidebarTab";
 import { HAS_NATIVE_GLASS, IS_MAC } from "../platform/tauri/platform";
 import {
   applyUiScale,
   loadUiScale,
   saveUiScale,
   UI_SCALE_DEFAULT,
-  uiScaleCommand,
   zoomInUiScale,
   zoomOutUiScale,
 } from "../features/settings/model/uiScale";
+import { resolveZoomKeybinding } from "../features/settings/model/zoomKeybinding";
+import { resolveAppShortcut } from "../features/settings/model/appShortcuts";
 import { runUpdateFlow } from "./model/updater";
-import { displayAttachments, prepareAttachments } from "../features/sessions/model/attachments";
+import {
+  displayAttachments,
+  prepareAttachments,
+} from "../features/sessions/model/attachments";
 import {
   basename,
   notifyGitChanged,
-  pickFolder,
+  pickFolders,
   type GitFileDiffKind,
   type GitHistoryCommit,
 } from "../platform/tauri/fs";
@@ -112,7 +152,6 @@ import {
 import {
   closeLeaf,
   closeSurfacePanes,
-  editorTabKey,
   findSurfacePane,
   firstLeafId,
   focusedFileTab,
@@ -136,6 +175,9 @@ import {
   newAgentTab,
   openEditorTab,
   openSessionChangesTab,
+  pinEditorFile,
+  openWorkspaceFile,
+  previewWorkspaceFile,
   openTerminalTab,
   removePane,
   resetTabToSession,
@@ -153,7 +195,10 @@ import {
   type SplitDir,
   type WorkspaceTab,
 } from "../features/workspace/model/layout";
-import { releaseNotesForVersion, releaseNotesTitle } from "./model/releaseNotes";
+import {
+  releaseNotesForVersion,
+  releaseNotesTitle,
+} from "./model/releaseNotes";
 import { mergeOrderedSubset, orderByIds } from "../shared/lib/reorder";
 import {
   addTerminalToDock,
@@ -190,6 +235,7 @@ import {
 } from "../features/terminal/model/terminalTab";
 import {
   applyHarnessEvent,
+  applyHarnessEvents,
   appendUser,
   appendSteerUser,
   bindHarnessSession,
@@ -211,10 +257,12 @@ import {
   respondHarnessApproval,
   respondHarnessQuestion,
   keepHarnessQuestionOpen,
+  runHarnessTextPrompt,
   sendHarnessTurn,
   steerHarnessTurn,
   startHarnessBridge,
   stopHarnessSession,
+  stopHarnessTextPrompts,
   stopStreaming,
   pickTextHarness,
   type ApprovalDecision,
@@ -242,6 +290,15 @@ import {
   wrapHandoffPrompt,
 } from "../features/sessions/model/handoff";
 import { requestOutgoingHandoff } from "../features/sessions/model/handoffTurn";
+import {
+  applyBtwHarnessEvent,
+  btwTurnHarness,
+  buildBtwPrompt,
+  replaceBtwThread,
+  sealBtwResponseBlocks,
+  supportsBtwHarness,
+} from "../features/sessions/model/btw";
+
 import { isEditTool } from "../integrations/harness/core/preview";
 import {
   createEditedResendAttempt,
@@ -259,19 +316,28 @@ import {
   sessionCheckpointCleanupSafe,
 } from "../features/sessions/model/checkpoint";
 import { notifyDirsChanged } from "../features/files/model/fileTree";
-import { invalidateWatchedFiles, nudgeWatchedFiles } from "../features/files/model/fileWatch";
-import { type EditorNavigationTarget, type OpenFileFn } from "../features/search/model/search";
+import {
+  invalidateWatchedFiles,
+  nudgeWatchedFiles,
+} from "../features/files/model/fileWatch";
+import {
+  type EditorNavigationTarget,
+  type OpenFileFn,
+} from "../features/search/model/search";
 import {
   mergeModelSettings,
+  nativeModelId,
   preferredModelSettings,
   resolveModel,
   saveLastModelSettings,
   saveRecentModelChoice,
 } from "../features/sessions/model/models";
+
 import {
   buildPlanPrompt,
   isProviderFailureText,
   planTitle,
+  planTurnKey,
   planTurnPrompt,
 } from "../features/sessions/model/plan";
 import {
@@ -296,6 +362,8 @@ import {
   forgetProject,
   lastProjectPath,
   loadRecents,
+  isLocalProject,
+  isRemoteProjectPath,
   looksLikeProject,
   normalizeProjectPath,
   projectRailItems,
@@ -312,13 +380,12 @@ import {
   planWorkspaceTabClose,
   switchSessionInTab,
   workspaceTabCwd,
+  workspaceTabWorktree,
   focusedWorkspaceTabCwd,
 } from "../features/workspace/model/workspaceTabGroups";
 import { applyAddToChatRequest } from "../features/sessions/model/addChatToWorkspace";
-import {
-  ADD_TO_CHAT_EVENT,
-  type AddToChatRequest,
-} from "../features/sessions/model/quoteDraft";
+import { ADD_TO_CHAT_EVENT } from "../features/sessions/model/quoteDraft";
+import type { ChatContextItem } from "../features/sessions/model/chatContext";
 import { createSessionRemover } from "../features/sessions/model/sessionRemoval";
 import { shouldGenerateSessionTitle } from "../features/sessions/model/sessionTitle";
 import {
@@ -337,6 +404,7 @@ import {
   sessionNeedsInput,
   newDefaultSession,
   newSession,
+  retargetSessionToProject,
   removeSessionDraft,
   sessionDisplayTitle,
   sessionDraftBlock,
@@ -344,6 +412,7 @@ import {
   titleFromPrompt,
   type Attachment,
   type Block,
+  type BtwThread,
   type ComposerTurnOptions,
   type HarnessId,
   type LinkedWorkItem,
@@ -353,6 +422,7 @@ import {
   type PlanStatus,
   type SecondOpinionMeta,
   type Session,
+  type UsageLimit,
   type WorkspaceMode,
 } from "../features/sessions/model/session";
 
@@ -361,9 +431,19 @@ import {
   dequeueQueuedMessage,
   queuedMessageForSubmit,
 } from "../features/sessions/model/messageQueue";
+import {
+  USAGE_LIMIT_RESUME_GRACE_MS,
+  usageLimitResumeDue,
+} from "../features/sessions/model/usageLimit";
+import {
+  fetchClaudeRateLimits,
+  fetchCodexRateLimits,
+} from "../features/providers/model/rateLimitsFetch";
+import { exhaustedWindowResetAt } from "../features/providers/model/rateLimits";
 import { dropContextWindow } from "../features/sessions/model/contextUsage";
 import {
   discardDraftSessionRecord,
+  deleteSession,
   getSession,
   listLinkedSessions,
   listSessionsByProject,
@@ -380,12 +460,16 @@ import {
   type SessionSummary,
 } from "../features/sessions/data/sessionStore";
 import { rememberLoadedSession } from "../features/sessions/data/sessionCache";
+import {
+  TranscriptPool,
+  TranscriptPoolOutlet,
+} from "../features/sessions/ui/TranscriptPool";
 import { syncDockBadge } from "../features/notifications/model/dockBadge";
 import { liveAgentsFromSessions } from "../features/sessions/model/liveAgents";
 import { hiddenApprovalNotices } from "../features/notifications/model/approvalToast";
 import { useSessionReminders } from "../features/notifications/hooks/useSessionReminders";
 import { ReminderNotices } from "../features/sessions/ui/ReminderNotices";
-import { nextUnseenFinishedSessions } from "../features/sessions/model/sessionDone";
+import { useUnseenFinishedSessions } from "../features/sessions/hooks/useUnseenFinishedSessions";
 import {
   loadNotificationsEnabled,
   NOTIFICATION_CLICK_EVENT,
@@ -402,6 +486,8 @@ import {
   shouldHandleListNavigation,
   shouldStopFocusedTurnOnEscape,
   tabCommand,
+  tabCommandForKeybinding,
+  tabCommandKeybinding,
 } from "../features/workspace/model/tabKeys";
 import {
   canTabVisitBack,
@@ -414,7 +500,14 @@ import {
   type TabVisitHistory,
 } from "../features/workspace/model/tabVisitHistory";
 import { preparePrompt } from "../features/sessions/model/promptPreparation";
-import { warmNativeSkills, isNativeCommandPrompt } from "../features/skills/model/skills";
+import {
+  consumeOperatorCommand,
+  operatorEnabledInThread,
+} from "../features/sessions/model/operatorCommand";
+import {
+  warmNativeSkills,
+  isNativeCommandPrompt,
+} from "../features/skills/model/skills";
 import { nativeSkillContextForSession } from "../features/sessions/model/sessionSkills";
 import {
   loadSessionFolders,
@@ -424,40 +517,60 @@ import {
 } from "../features/sessions/model/sessionFolders";
 import {
   ADD_NOTE_TO_CHAT_EVENT,
+  NOTES_CHANGED_EVENT,
   composeNoteMessage,
+  loadNotes,
   noteCardMeta,
+  upsertNote,
   type NoteComposerCard,
 } from "../features/notes";
 import {
   claimDueAutomations,
+  listAutomations,
   recoverAutomationRuns,
   updateAutomationRun,
   type Automation,
   type AutomationRun,
 } from "../features/automations/model/automations";
+import { useQuickComposerLaunches } from "../features/quick-composer/hooks/useQuickComposerLaunches";
+import type { QuickLaunch } from "../features/quick-composer/model/quickComposer";
 import { claimInboxAutomationRuns } from "../features/automations/model/automationEvents";
 import {
   SECOND_OPINION_TITLE,
-  buildSecondOpinionCard,
-  buildSecondOpinionPrompt,
+  buildSecondOpinionRequest,
   harnessForTurn,
   turnEditedFiles,
-  turnReport,
   turnUserRequest,
 } from "../features/sessions/model/secondOpinion";
+
 import { PaneTree } from "../features/workspace/ui/PaneTree";
 import { SessionPane } from "../features/sessions/ui/SessionPane";
 import { SessionSurface } from "../features/sessions/ui/SessionSurface";
 import { ProjectTerminalDock } from "../features/terminal/ui/ProjectTerminalDock";
-import { SearchView } from "../features/search/ui/SearchView";
+import { lazySurface } from "../shared/ui/lazySurface";
+import { preloadNavigationWhenIdle } from "./model/preloadNavigation";
 import { requestTranscriptJump } from "../features/sessions/model/transcriptJump";
-import { SettingsView, type SettingsAnchor } from "../features/settings/ui/SettingsView";
+import type { SettingsAnchor } from "../features/settings/ui/SettingsView";
+import {
+  OPEN_CONNECTIONS_EVENT,
+  OPEN_REMOTE_PROJECT_EVENT,
+  REMOTE_HISTORY_UPDATED,
+  cachedRemoteSessionSummary,
+  rememberRemotePendingWorktree,
+  rememberRemoteSession,
+  remotePendingWorktree,
+  remoteTabCwd,
+  remoteSessionFor,
+} from "../features/connections/model/connections";
+import { buildRemotePlan, remoteSessionActions } from "../features/connections/model/remoteSessionActions";
+import { remoteSessionState } from "../features/connections/model/remoteSessionState";
+import { useRemoteTurnUpdates } from "../features/connections/model/remoteTurns";
+import { remotePath, remoteProjectFor } from "../features/connections/model/remoteProjects";
+import type { HostSession } from "../features/connections/model/protocol";
+import { AddRemoteProjectDialog } from "../features/connections/ui/AddRemoteProjectDialog";
 import type { ConnectableInboxSource } from "../features/inbox/model/inboxFilters";
-import { InboxView, LinkedWorkItemPanel } from "../features/inbox/ui/InboxView";
 import type { InboxSessionPortal } from "../features/inbox/ui/InboxDiscussionPanel";
 import { inboxAskKey, inboxAskPrompt } from "../features/inbox/model/inboxAsk";
-import { NotesView } from "../features/notes/ui";
-import { AutomationsView } from "../features/automations/ui/AutomationsView";
 import {
   githubWorkItemThread,
   inboxComposerCard,
@@ -476,22 +589,30 @@ import {
 } from "../features/inbox/model/linkedWorkItemActivity";
 import type { LinkedSessionUpdate } from "../features/inbox/model/linkedSessionUpdates";
 import { markLinkedSessionUpdateSeen } from "../features/inbox/model/linkedSessionSeen";
-import { linearIssueDetails, peekLinearIssueDetails } from "../features/inbox/model/linear";
-import { gitlabWorkItemDetails, peekGitlabWorkItemDetails } from "../features/inbox/model/gitlab";
+import { inboxTrackerDescription } from "../features/inbox/model/inboxContext";
+import {
+  gitlabWorkItemDetails,
+  peekGitlabWorkItemDetails,
+} from "../features/inbox/model/gitlab";
 import {
   azureDevOpsWorkItemDetails,
   peekAzureDevOpsWorkItemDetails,
 } from "../features/inbox/model/azureDevOps";
 import {
   loadCloseToTray,
+  loadAutosave,
   loadCollapsedProjectRailMode,
   loadFileTabMode,
   loadLiveAgentsEnabled,
   loadNotesEnabled,
   loadDiffViewer,
   loadFollowUpBehavior,
+  loadKeybindingOverrides,
   loadSettingsSection,
+  keybindingPressed,
+  matchCustomKeybinding,
   saveSettingsSection,
+  saveAutosave,
   subscribeLiveAgentsEnabled,
   subscribeNotesEnabled,
   type CollapsedProjectRailMode,
@@ -519,10 +640,13 @@ import {
 } from "../features/sessions/model/inFlight";
 import {
   isBlankSession,
-  planProjectReturn,
   reconcileProjectReturn,
   type ProjectReturnMemory,
 } from "../features/projects/model/projectReturn";
+import {
+  planProjectOpenRun,
+  type ProjectOpenStep,
+} from "../features/projects/model/projectOpenRun";
 import {
   collectWorkspaceSnapshot,
   workspaceSnapshotKey,
@@ -543,6 +667,46 @@ import {
   type ResumedWorkspace,
 } from "./model/appLifecycle";
 
+const SearchView = lazySurface(
+  async () => {
+    const module = await import("../features/search/ui/SearchView");
+    return { default: module.SearchView };
+  },
+  { suspense: false },
+);
+const SettingsView = lazySurface(
+  async () => {
+    const module = await import("../features/settings/ui/SettingsView");
+    return { default: module.SettingsView };
+  },
+  { suspense: false },
+);
+const InboxView = lazySurface(
+  async () => {
+    const module = await import("../features/inbox/ui/InboxView");
+    return { default: module.InboxView };
+  },
+  { suspense: false },
+);
+const LinkedWorkItemPanel = lazySurface(async () => {
+  const module = await import("../features/inbox/ui/InboxView");
+  return { default: module.LinkedWorkItemPanel };
+});
+const NotesView = lazySurface(
+  async () => {
+    const module = await import("../features/notes/ui/NotesView");
+    return { default: module.NotesView };
+  },
+  { suspense: false },
+);
+const AutomationsView = lazySurface(
+  async () => {
+    const module = await import("../features/automations/ui/AutomationsView");
+    return { default: module.AutomationsView };
+  },
+  { suspense: false },
+);
+
 type LinkedWorkItemPanelState = {
   item: LinkedWorkItem;
   sessionId: string;
@@ -550,6 +714,9 @@ type LinkedWorkItemPanelState = {
 };
 
 type SubmitOptions = ComposerTurnOptions & {
+  ciRepair?: CiRepairRequest;
+  /** Saved alongside the user turn; does not replace the submitted prompt. */
+  ciContext?: string;
   secondOpinion?: SecondOpinionMeta;
   followUpBehavior?: FollowUpBehavior;
   noteCard?: NoteComposerCard;
@@ -559,6 +726,7 @@ type SubmitOptions = ComposerTurnOptions & {
   buildTarget?: PlanBuildTarget;
   managed?: boolean;
   orchestrationRetry?: OrchestrationProposal;
+  appRequestId?: string;
   onSettled?: (outcome: ControlOutcome) => void;
   /** Generate a fresh title even when this is not the session's first turn. */
   refreshTitle?: boolean;
@@ -571,7 +739,7 @@ type Submit = (
   text: string,
   attachments?: Attachment[],
   options?: SubmitOptions,
-) => boolean;
+) => SubmissionAcceptance;
 
 function withPlanStatus(
   session: Session,
@@ -606,21 +774,6 @@ function setsEqual<T>(a: Set<T>, b: Set<T>): boolean {
     if (!b.has(value)) return false;
   }
   return true;
-}
-
-type ScheduledFlush = { kind: "raf" | "timeout"; id: number };
-
-function cancelScheduledFlush(handle: ScheduledFlush | null) {
-  if (!handle) return;
-  if (handle.kind === "raf") cancelAnimationFrame(handle.id);
-  else clearTimeout(handle.id);
-}
-
-function scheduleHarnessFlush(run: () => void): ScheduledFlush {
-  if (document.hidden) {
-    return { kind: "timeout", id: window.setTimeout(run, 32) };
-  }
-  return { kind: "raf", id: requestAnimationFrame(run) };
 }
 
 function userTurnCards(
@@ -737,6 +890,7 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
       tab.fileFocused === other.fileFocused &&
       tab.blank === other.blank &&
       tab.terminal === other.terminal &&
+      tab.previewFileId === other.previewFileId &&
       tab.groupId === other.groupId
     );
   });
@@ -745,19 +899,34 @@ function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
 // Register capabilities before composer hooks choose their discovery strategy.
 registerBuiltinHarnesses();
 
-export default function App({
-  windowTransfer = null,
-  resumed = null,
-  installedUpdate = null,
-  history: bootHistory = [],
-  historyCwd: bootHistoryCwd = null,
-}: {
+type AppProps = {
   windowTransfer?: WindowTransferPayload | null;
   resumed?: ResumedWorkspace | null;
   installedUpdate?: InstalledUpdate | null;
   history?: SessionSummary[];
   historyCwd?: string | null;
-}) {
+};
+
+/** The worktree a project's workspace currently shows. */
+function currentWorkspace(project: string): string {
+  return worktreeFocus(project)?.path ?? project;
+}
+
+export default function App(props: AppProps) {
+  return (
+    <Suspense fallback={null}>
+      <Workspace {...props} />
+    </Suspense>
+  );
+}
+
+function Workspace({
+  windowTransfer = null,
+  resumed = null,
+  installedUpdate = null,
+  history: bootHistory = [],
+  historyCwd: bootHistoryCwd = null,
+}: AppProps) {
   const [projectCwd, setProjectCwd] = useState(
     () =>
       windowTransfer?.projectCwd ??
@@ -793,8 +962,14 @@ export default function App({
   const [projectTerminals, setProjectTerminals] = useState<ProjectTerminal[]>(
     () => windowTransfer?.projectTerminals ?? resumed?.projectTerminals ?? [],
   );
+  /** Dock side a brand-new project's terminal starts with, persisted in the workspace snapshot. */
+  const [lastDockSide, setLastDockSide] = useState<DockSide | null>(
+    () => resumed?.lastDockSide ?? null,
+  );
+  const lastDockSideRef = useRef(lastDockSide);
+  lastDockSideRef.current = lastDockSide;
   const [projectTerminalFocused, setProjectTerminalFocused] = useState(false);
-  const [activeTabId, setActiveTabId] = useState(
+  const [activeTabId, setActiveTabIdState] = useState(
     () => windowTransfer?.activeTabId ?? resumed?.activeTabId ?? seed.tab.id,
   );
   const [composerFocused, setComposerFocused] = useState(() => {
@@ -821,9 +996,6 @@ export default function App({
   const tabCloseScope = "project" as const;
   const currentProjectDock = findProjectTerminal(projectTerminals, projectCwd);
   const dockVisible = !!currentProjectDock?.open;
-  const [sidebarTab, setSidebarTab] = useState<SidebarTabId>(
-    () => loadSidebarTabOrder()[0] ?? "sessions",
-  );
   const [filesSearchOpen, setFilesSearchOpen] = useState(false);
   const [searchFocusToken, setSearchFocusToken] = useState(0);
   const [searchViewOpen, setSearchViewOpen] = useState(false);
@@ -874,6 +1046,12 @@ export default function App({
   const [collapsedProjectRailMode, setCollapsedProjectRailMode] =
     useState<CollapsedProjectRailMode>(loadCollapsedProjectRailMode);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsReturnViewRef = useRef({
+    search: false,
+    inbox: false,
+    notes: false,
+    automations: false,
+  });
   const [updateNotice, setUpdateNotice] = useState(installedUpdate);
   const [whatsNewVersion, setWhatsNewVersion] = useState<string | null>(null);
   const [providerSignInRequest, setProviderSignInRequest] = useState<{
@@ -920,6 +1098,12 @@ export default function App({
     () => new Map(),
   );
   const [history, setHistory] = useState<SessionSummary[]>(() => bootHistory);
+  const [, refreshRemoteTabTitles] = useState(0);
+  useEffect(() => {
+    const updated = () => refreshRemoteTabTitles((value) => value + 1);
+    window.addEventListener(REMOTE_HISTORY_UPDATED, updated);
+    return () => window.removeEventListener(REMOTE_HISTORY_UPDATED, updated);
+  }, []);
   const [storedLinkedSessions, setStoredLinkedSessions] = useState<
     SessionSummary[]
   >(() => bootHistory.filter((session) => session.linkedWorkItem));
@@ -928,6 +1112,9 @@ export default function App({
    * ref: `sidebarCwd` is derived during render, so the frame that first shows
    * a new project must already know the listing has not arrived yet.
    */
+  const btwRequestsRef = useRef(
+    new Map<string, { sessionId: string; controller: AbortController }>(),
+  );
   const [loadedProjects, setLoadedProjects] = useState<ReadonlySet<string>>(
     () =>
       bootHistoryCwd
@@ -946,6 +1133,8 @@ export default function App({
   >(new Map());
   const linkedWorkItemActivityFetches = useRef(new Map<string, number>());
   const queueDispatchingRef = useRef(new Set<string>());
+  const usageResumingRef = useRef(new Set<string>());
+  const usageResetLookups = useRef(new WeakSet<UsageLimit>());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
   const dirtyFilesRef = useRef(dirtyFiles);
@@ -956,12 +1145,103 @@ export default function App({
   projectTerminalFocusedRef.current = projectTerminalFocused;
   const activeTabIdRef = useRef(activeTabId);
   activeTabIdRef.current = activeTabId;
+
+  const projectWorktree = useWorktreeFocus(projectCwd);
+  /** Tab or session id -> the workspace it was opened or moved in. A tab
+   * belongs to the workspace it was opened in, whatever worktree it runs in:
+   * opening a session, or moving one from its composer, never switches the
+   * workspace. Unpinned tabs (restored ones) group by their own worktree. */
+  // Only the default workspace's tabs were saved, so every restored tab
+  // belongs to it, including one its composer moved to a worktree.
+  const [restoredPins] = useState(
+    () =>
+      new Map(
+        tabs.flatMap((tab) => {
+          const project = workspaceTabCwd(tab, sessions);
+          return project && !isRemoteProjectPath(project)
+            ? [[tab.id, project] as const]
+            : [];
+        }),
+      ),
+  );
+  const workspacePins = useRef(restoredPins);
+  const tabWorkspace = useCallback(
+    (tab: WorkspaceTab, list: readonly Session[]) => {
+      const pinnedTab = workspacePins.current.get(tab.id);
+      if (pinnedTab) return pinnedTab;
+      for (const id of leafIds(tab.layout)) {
+        const pinned = workspacePins.current.get(id);
+        if (pinned) return pinned;
+      }
+      return workspaceTabWorktree(tab, list);
+    },
+    [],
+  );
+  const tabWorktreeOf = useCallback(
+    (tab: WorkspaceTab) => tabWorkspace(tab, sessionsRef.current),
+    [tabWorkspace],
+  );
+  /** Saved tabs: the app reopens on each project's default workspace, so
+   * tabs from other worktrees close with it instead of piling up. */
+  const keepWorkspaceTab = useCallback(
+    (tab: WorkspaceTab) => {
+      const project = workspaceTabCwd(tab, sessionsRef.current);
+      if (!project || isRemoteProjectPath(project)) return true;
+      const workspace = tabWorkspace(tab, sessionsRef.current);
+      return !workspace || sameProjectPath(workspace, project);
+    },
+    [tabWorkspace],
+  );
+
+  const workspaceNavigation = useWorkspaceNavigation({
+    project: projectCwd,
+    activeTabId,
+    tabs,
+    sessions,
+    pins: workspacePins.current,
+    tabWorkspace,
+    moveSession: (id, tree, isCurrent) =>
+      onWorktreeChange(id, tree, false, isCurrent),
+    activateTab: (id) => {
+      if (tabsRef.current.some((tab) => tab.id === id)) {
+        activateTab(id, undefined, "workspace");
+      } else {
+        // A newly created tab has not rendered into tabsRef yet.
+        setActiveTabIdState(id);
+        setComposerFocused(true);
+      }
+    },
+    createTab: (project, focus) => createWorkspaceTab(project, focus),
+  });
+  // Every ordinary tab activation supersedes an unfinished workspace request,
+  // including opening a session in the same tab or selecting a project.
+  const setActiveTabId = useCallback(
+    (id: string) => {
+      workspaceNavigation.cancel();
+      setActiveTabIdState(id);
+    },
+    [workspaceNavigation.cancel],
+  );
+
   const projectCwdRef = useRef(projectCwd);
   projectCwdRef.current = projectCwd;
   const searchViewOpenRef = useRef(searchViewOpen);
   searchViewOpenRef.current = searchViewOpen;
   const inboxViewOpenRef = useRef(inboxViewOpen);
   inboxViewOpenRef.current = inboxViewOpen;
+  const foregroundSurfaceRef = useRef<{
+    workspaceVisible: boolean;
+    inboxSessionId?: string;
+  }>({ workspaceVisible: true });
+  foregroundSurfaceRef.current = {
+    workspaceVisible:
+      !searchViewOpen &&
+      !inboxViewOpen &&
+      !notesViewOpen &&
+      !automationsViewOpen &&
+      !settingsOpen,
+    inboxSessionId: inboxViewOpen ? inboxAskPortal?.sessionId : undefined,
+  };
   const notesViewOpenRef = useRef(notesViewOpen);
   notesViewOpenRef.current = notesViewOpen;
   const automationsViewOpenRef = useRef(automationsViewOpen);
@@ -973,10 +1253,41 @@ export default function App({
   filePickerOpenRef.current = filePickerOpen;
   const whatsNewVersionRef = useRef(whatsNewVersion);
   whatsNewVersionRef.current = whatsNewVersion;
+  useEffect(() => {
+    const liveSessionIds = new Set(sessions.map((session) => session.id));
+    for (const [key, request] of btwRequestsRef.current) {
+      if (liveSessionIds.has(request.sessionId)) continue;
+      request.controller.abort();
+      btwRequestsRef.current.delete(key);
+    }
+  }, [sessions]);
+
+  useEffect(
+    () => () => {
+      for (const request of btwRequestsRef.current.values()) {
+        request.controller.abort();
+      }
+      btwRequestsRef.current.clear();
+      void stopHarnessTextPrompts();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!notesEnabled) setNotesViewOpen(false);
   }, [notesEnabled]);
+
+  useEffect(
+    () =>
+      preloadNavigationWhenIdle([
+        InboxView.preload,
+        LinkedWorkItemPanel.preload,
+        AutomationsView.preload,
+        listAutomations,
+        ...(notesEnabled ? [NotesView.preload, loadNotes] : []),
+      ]),
+    [notesEnabled],
+  );
 
   const projectReturnRef = useRef<ProjectReturnMemory>(
     resumed?.projectReturnMemory ?? new Map(),
@@ -1016,6 +1327,7 @@ export default function App({
   const sessionLoadEpochs = useRef(new Map<string, number>());
   const openingSessionIds = useRef(new Set<string>());
   const activeSessionPrefetch = useRef<Promise<Session | null> | null>(null);
+  const [transcriptPool] = useState(() => new TranscriptPool());
   // Tokens arrive many times per frame; apply them once so React/markdown aren't
   // recomputed for every delta.
   const harnessQueued = useRef(new Map<string, HarnessEvent[]>());
@@ -1058,7 +1370,7 @@ export default function App({
     const prev = sessionsRef.current;
     const next = prev.map((session) => {
       const events = batches.get(session.id);
-      return events ? events.reduce(applyHarnessEvent, session) : session;
+      return events ? applyHarnessEvents(session, events) : session;
     });
     if (!next.some((session, index) => session !== prev[index])) return;
     sessionsRef.current = next;
@@ -1095,7 +1407,7 @@ export default function App({
       const prev = sessionsRef.current;
       const next = prev.map((session) =>
         session.id === sessionId
-          ? events.reduce(applyHarnessEvent, session)
+          ? applyHarnessEvents(session, events)
           : session,
       );
       if (!next.some((session, index) => session !== prev[index])) return;
@@ -1121,8 +1433,33 @@ export default function App({
       const events = queued.get(sessionId);
       if (events) events.push(event);
       else queued.set(sessionId, [event]);
+      const tab = tabsRef.current.find(
+        (entry) => entry.id === activeTabIdRef.current,
+      );
+      const foreground =
+        !document.hidden &&
+        // Inbox owns its session surfaces outside the workspace tab tree.
+        (foregroundSurfaceRef.current.inboxSessionId === sessionId ||
+          (foregroundSurfaceRef.current.workspaceVisible &&
+            !!tab &&
+            (leafIds(tab.layout).includes(sessionId) ||
+              tab.editorPanes.some((pane) =>
+                pane.files.some(
+                  (file) =>
+                    file.id === pane.activeFileId &&
+                    file.agent?.sessionId === sessionId,
+                ),
+              ))));
+      // A visible stream must not wait for a background-only timer.
+      if (foreground && harnessFlush.current?.kind === "timeout") {
+        cancelScheduledFlush(harnessFlush.current);
+        harnessFlush.current = null;
+      }
       if (!harnessFlush.current) {
-        harnessFlush.current = scheduleHarnessFlush(flushHarnessEvents);
+        harnessFlush.current = scheduleHarnessFlush(
+          flushHarnessEvents,
+          foreground,
+        );
       }
     },
     [applyApprovalEvent, flushHarnessEvents],
@@ -1141,6 +1478,7 @@ export default function App({
         readProjectReturnMemory(),
         "unload",
         projectTerminalsRef.current,
+        lastDockSideRef.current ?? undefined,
       ).finally(() => {
         void reapWindowRuntime(
           sessionsRef.current,
@@ -1220,8 +1558,8 @@ export default function App({
 
   useEffect(() => {
     const openSessionForAddToChat = (event: Event) => {
-      const detail = (event as CustomEvent<AddToChatRequest>).detail;
-      if (!detail?.text) return;
+      const item = (event as CustomEvent<ChatContextItem>).detail;
+      if (!item) return;
 
       const result = applyAddToChatRequest({
         sessions: sessionsRef.current,
@@ -1230,8 +1568,7 @@ export default function App({
         projectCwd: projectCwdRef.current,
         fallbackCwd: sessionDefaults?.cwd,
         defaultRuntimeMode: sessionDefaults?.runtimeMode,
-        text: detail.text,
-        mode: detail.mode,
+        item,
       });
       if (!result) return;
 
@@ -1264,6 +1601,25 @@ export default function App({
     activeFile?.projectCwd ?? activeFile?.cwd ?? active?.cwd ?? projectCwd;
   const sidebarCwdRef = useRef(sidebarCwd);
   sidebarCwdRef.current = sidebarCwd;
+  const [sidebarTabSelection, setSidebarTabSelection] = useState<{
+    project: string;
+    tab: SidebarTabId;
+  }>(() => ({
+    project: pathKey(sidebarCwd),
+    tab: loadProjectSidebarTab(sidebarCwd),
+  }));
+  const sidebarTab =
+    sidebarTabSelection.project === pathKey(sidebarCwd)
+      ? sidebarTabSelection.tab
+      : loadProjectSidebarTab(sidebarCwd);
+  const setSidebarTab = useCallback((tab: SidebarTabId, project?: string) => {
+    const cwd = project ?? sidebarCwdRef.current;
+    saveProjectSidebarTab(cwd, tab);
+    setSidebarTabSelection({
+      project: pathKey(cwd),
+      tab: tab === "inbox" ? "sessions" : tab,
+    });
+  }, []);
   const sidebarCwdKey =
     sidebarCwd && sidebarCwd !== "~" ? normalizeProjectPath(sidebarCwd) : null;
   const historyFailed =
@@ -1278,14 +1634,24 @@ export default function App({
     activeFile?.cwd ?? (active ? sessionWorkCwd(active) : sidebarCwd);
   const gitCwdBranches = useProjectBranches(
     gitCwd,
-    Boolean(gitCwd) && gitCwd !== "~",
+    Boolean(gitCwd) && gitCwd !== "~" && !isRemoteProjectPath(sidebarCwd),
   );
   const explorerRootLabel =
     active?.worktreeCwd && sameProjectPath(gitCwd, sessionWorkCwd(active))
       ? active.branch || gitCwdBranches?.current || undefined
       : undefined;
-  const gitCwdRef = useRef(gitCwd);
-  gitCwdRef.current = gitCwd;
+  const remoteFilesProject = remoteProjectFor(sidebarCwd);
+  const filesCwd = remoteFilesProject
+    ? isRemoteProjectPath(gitCwd)
+      ? gitCwd
+      : remotePath(
+          remoteFilesProject.environmentId,
+          remoteTabCwd(sidebarCwd, active?.id) ??
+            (gitCwd && gitCwd !== sidebarCwd ? gitCwd : remoteFilesProject.cwd),
+        )
+    : gitCwd;
+  const gitCwdRef = useRef(filesCwd);
+  gitCwdRef.current = filesCwd;
   const projectBranches = useProjectBranches(
     sidebarCwd,
     Boolean(sidebarCwd) && sidebarCwd !== "~",
@@ -1323,7 +1689,9 @@ export default function App({
     if (
       active?.harness === "claude" ||
       active?.harness === "codex" ||
-      active?.harness === "opencode"
+      active?.harness === "opencode" ||
+      active?.harness === "droid" ||
+      active?.harness === "grok"
     ) {
       return [active.harness];
     }
@@ -1334,6 +1702,7 @@ export default function App({
     return {
       id: active.id,
       harness: active.harness,
+      model: active.model,
       authRequired: latestTurnNeedsHarnessLogin(active.blocks),
       providerAccountId:
         active.providerAccountId ??
@@ -1341,7 +1710,7 @@ export default function App({
           ? DEFAULT_PROVIDER_ACCOUNT_ID
           : undefined),
     };
-  }, [active?.id, active?.harness, active?.blocks, active?.providerAccountId]);
+  }, [active?.id, active?.harness, active?.model, active?.blocks, active?.providerAccountId]);
   const activeProviderSignInRequest = useMemo(() => {
     if (
       !active ||
@@ -1423,23 +1792,11 @@ export default function App({
   useEffect(() => {
     if (loadNotificationsEnabled()) void probeNotificationPermission();
   }, []);
-  const busyForDoneRef = useRef(busySessionIds);
-  const focusedForDoneRef = useRef(activeSessionId);
-  const unseenFinishedRef = useRef<Set<string>>(new Set());
-  if (
-    busyForDoneRef.current !== busySessionIds ||
-    focusedForDoneRef.current !== activeSessionId
-  ) {
-    unseenFinishedRef.current = nextUnseenFinishedSessions({
-      previousBusyIds: busyForDoneRef.current,
-      busyIds: busySessionIds,
-      previousUnseenIds: unseenFinishedRef.current,
-      focusedSessionId: activeSessionId,
-    });
-    busyForDoneRef.current = busySessionIds;
-    focusedForDoneRef.current = activeSessionId;
-  }
-  const unseenFinishedIds = unseenFinishedRef.current;
+  const unseenFinishedIds = useUnseenFinishedSessions(
+    sessions,
+    busySessionIds,
+    activeSessionId,
+  );
 
   const liveAgents = useMemo(
     () =>
@@ -1454,6 +1811,7 @@ export default function App({
     [sessions, activeTabId, tabs, composerFocused],
   );
   const [reminderNoticesHeight, setReminderNoticesHeight] = useState(0);
+  const [harnessUpdateHeight, setHarnessUpdateHeight] = useState(0);
 
   useEffect(() => {
     syncDockBadge(sessions);
@@ -1491,11 +1849,28 @@ export default function App({
 
   useEffect(() => {
     const onVisible = () => {
-      if (!document.hidden) flushHarnessEvents();
+      // Flush on hiding too: WebKit can suspend a pending animation frame,
+      // leaving the last output stranded until another event or activation.
+      flushHarnessEvents();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [flushHarnessEvents]);
+
+  useLayoutEffect(() => {
+    // A newly selected chat catches up before paint, even if its output was
+    // waiting on the background cadence. Draft/composer input stays immediate.
+    flushHarnessEvents();
+  }, [
+    activeTabId,
+    inboxViewOpen,
+    inboxAskPortal?.sessionId,
+    searchViewOpen,
+    notesViewOpen,
+    automationsViewOpen,
+    settingsOpen,
+    flushHarnessEvents,
+  ]);
 
   useEffect(() => {
     let unlistenClose: (() => void) | undefined;
@@ -1507,6 +1882,8 @@ export default function App({
       () => projectTerminalsRef.current,
       readProjectReturnMemory,
       flushHarnessEvents,
+      () => lastDockSideRef.current,
+      keepWorkspaceTab,
     );
     void getCurrentWindow()
       .onCloseRequested((event) => {
@@ -1533,6 +1910,8 @@ export default function App({
           readProjectReturnMemory(),
           "unload",
           projectTerminalsRef.current,
+          lastDockSideRef.current ?? undefined,
+          keepWorkspaceTab,
         ).finally(() => {
           void (toTray ? hideCurrentWindow() : closeCurrentWindow());
         });
@@ -1544,7 +1923,7 @@ export default function App({
       releaseQuit();
       unlistenClose?.();
     };
-  }, [flushHarnessEvents, readProjectReturnMemory]);
+  }, [flushHarnessEvents, keepWorkspaceTab, readProjectReturnMemory]);
 
   const refreshHistory = useCallback(async (cwd: string) => {
     if (!cwd || cwd === "~") return;
@@ -1603,6 +1982,9 @@ export default function App({
     )
       return;
     const fingerprint = persistFingerprint(session);
+    // Leaving a session flushes it. An unchanged one would still rewrite and
+    // re-diff its whole transcript under the store lock, stalling the next load.
+    if (lastPersisted.current.get(session.id) === fingerprint) return;
     void upsertSession(session)
       .then((summary) => {
         if (!summary) return;
@@ -1718,6 +2100,8 @@ export default function App({
         activeTabId,
       }),
       projectTerminals,
+      lastDockSide ?? undefined,
+      keepWorkspaceTab,
     );
     const key = workspaceSnapshotKey(snapshot);
     if (workspaceSyncKey.current === key) return;
@@ -1732,7 +2116,11 @@ export default function App({
     activeTabId,
     projectCwd,
     projectTerminals,
+    lastDockSide,
     windowTransfer,
+    keepWorkspaceTab,
+    projectWorktree?.path,
+    workspaceNavigation.revision,
   ]);
 
   useEffect(() => {
@@ -1764,102 +2152,69 @@ export default function App({
   // Tabs are views. Hidden idle sessions drop their child. A visible session
   // keeps its child for a few minutes after a turn so follow-ups stay instant,
   // then parks it and resumes on the next prompt.
-  useEffect(() => {
-    const visibleIds = openSessionIds(tabs);
-    // Inbox owns these panes independently of project tabs. Keep their drafts
-    // and attachments mounted when the panel closes or switches items.
-    for (const session of sessions) {
-      if (session.inboxAsk) visibleIds.add(session.id);
-    }
-    // Internal workers stay attached to the lead, even while idle between
-    // turns. They must not be discarded merely because they have no tab.
-    for (const session of sessions) {
-      if (
-        session.orchestrationLeadId &&
-        (visibleIds.has(session.orchestrationLeadId) ||
-          orchestrationRuns.some(
-            (run) =>
-              run.leadId === session.orchestrationLeadId &&
-              ["active", "paused"].includes(run.status),
-          ))
-      )
-        visibleIds.add(session.id);
-    }
-    for (const sessionId of visibleIds) {
-      openingSessionIds.current.delete(sessionId);
-      loadedSessionCache.current.delete(sessionId);
-    }
-    const keepUnseen = liveAgentsEnabled;
-    const idleDetached = sessions.filter(
-      (session) =>
-        !visibleIds.has(session.id) &&
-        !session.busy &&
-        !openingSessionIds.current.has(session.id) &&
-        !(keepUnseen && unseenFinishedRef.current.has(session.id)),
-    );
-    if (idleDetached.length === 0) return;
-    for (const session of idleDetached) {
-      if (skipForgetSessionIds.current.has(session.id)) continue;
-      if (shouldPersistSession(session)) {
-        rememberLoadedSession(loadedSessionCache.current, session);
+  useIdleSessionDetach({
+    sessions,
+    sessionsRef,
+    tabs,
+    tabsRef,
+    orchestrationRuns,
+    liveAgentsEnabled,
+    unseenFinishedIds,
+    openingSessionIds,
+    loadedSessionCache,
+    skipForgetSessionIds,
+    persistSession,
+    setSessions,
+  });
+
+  const activateTab = useCallback(
+    (
+      id: string,
+      paneId?: string,
+      reason: "session" | "workspace" = "session",
+    ) => {
+      const tab = tabsRef.current.find((entry) => entry.id === id);
+      const nextFocusedId =
+        tab &&
+        paneId &&
+        (leafIds(tab.layout).includes(paneId) ||
+          tab.editorPanes.some((entry) => entry.id === paneId) ||
+          (tab.terminalPanes ?? []).some((entry) => entry.id === paneId))
+          ? paneId
+          : tab?.focusedId;
+
+      if (reason === "workspace") setActiveTabIdState(id);
+      else setActiveTabId(id);
+      if (tab && nextFocusedId && nextFocusedId !== tab.focusedId) {
+        setTabs((prev) =>
+          prev.map((entry) =>
+            entry.id === id
+              ? { ...entry, focusedId: nextFocusedId, diffFocused: false }
+              : entry,
+          ),
+        );
       }
-      persistSession(session);
-      for (const harness of sessionChildHarnesses(session)) {
-        void forgetHarnessSession(harness, session.id);
-      }
-    }
-    setSessions((prev) =>
-      prev.filter(
-        (session) =>
-          visibleIds.has(session.id) ||
-          session.busy ||
-          openingSessionIds.current.has(session.id) ||
-          (keepUnseen && unseenFinishedRef.current.has(session.id)) ||
-          skipForgetSessionIds.current.has(session.id),
-      ),
-    );
-  }, [sessions, tabs, persistSession, liveAgentsEnabled, orchestrationRuns]);
 
-  const activateTab = useCallback((id: string, paneId?: string) => {
-    const tab = tabsRef.current.find((entry) => entry.id === id);
-    const nextFocusedId =
-      tab &&
-      paneId &&
-      (leafIds(tab.layout).includes(paneId) ||
-        tab.editorPanes.some((entry) => entry.id === paneId) ||
-        (tab.terminalPanes ?? []).some((entry) => entry.id === paneId))
-        ? paneId
-        : tab?.focusedId;
-
-    setActiveTabId(id);
-    if (tab && nextFocusedId && nextFocusedId !== tab.focusedId) {
-      setTabs((prev) =>
-        prev.map((entry) =>
-          entry.id === id
-            ? { ...entry, focusedId: nextFocusedId, diffFocused: false }
-            : entry,
-        ),
-      );
-    }
-
-    if (tab) {
-      const focusedTab = nextFocusedId
-        ? { ...tab, focusedId: nextFocusedId }
-        : tab;
-      const cwd = focusedWorkspaceTabCwd(focusedTab, sessionsRef.current);
-      if (cwd && looksLikeProject(cwd)) {
-        const normalized = normalizeProjectPath(cwd);
-        if (!sameProjectPath(normalized, projectCwdRef.current)) {
-          setProjectCwd(normalized);
-          setRecents(rememberProject(normalized));
+      if (tab) {
+        const focusedTab = nextFocusedId
+          ? { ...tab, focusedId: nextFocusedId }
+          : tab;
+        const cwd = focusedWorkspaceTabCwd(focusedTab, sessionsRef.current);
+        if (cwd && looksLikeProject(cwd)) {
+          const normalized = normalizeProjectPath(cwd);
+          if (!sameProjectPath(normalized, projectCwdRef.current)) {
+            setProjectCwd(normalized);
+            setRecents(rememberProject(normalized));
+          }
         }
       }
-    }
-    setComposerFocused(
-      !!nextFocusedId &&
-        sessionsRef.current.some((session) => session.id === nextFocusedId),
-    );
-  }, []);
+      setComposerFocused(
+        !!nextFocusedId &&
+          sessionsRef.current.some((session) => session.id === nextFocusedId),
+      );
+    },
+    [],
+  );
 
   const commitTabVisit = useCallback((history: TabVisitHistory) => {
     tabVisitRef.current = history;
@@ -1884,19 +2239,30 @@ export default function App({
   }, [activeTabId, commitTabVisit, tabs]);
 
   /** `cwd` scopes group inheritance: a tab from another project starts alone. */
+  const insertBeside = useCallback(
+    (
+      prev: WorkspaceTab[],
+      tab: WorkspaceTab,
+      anchorId: string | undefined,
+      cwd?: string,
+    ) =>
+      insertTabBesideActive(prev, tab, anchorId, (id) =>
+        id === tab.id ? (cwd ? projectName(cwd) : undefined) : projectOfTab(id),
+      ),
+    [projectOfTab],
+  );
+
+  const insertBesideActive = useCallback(
+    (prev: WorkspaceTab[], tab: WorkspaceTab, cwd?: string) =>
+      insertBeside(prev, tab, activeTabIdRef.current, cwd),
+    [insertBeside],
+  );
+
   const appendTab = useCallback(
     (tab: WorkspaceTab, cwd?: string) => {
-      setTabs((prev) =>
-        insertTabBesideActive(prev, tab, activeTabIdRef.current, (id) =>
-          id === tab.id
-            ? cwd
-              ? projectName(cwd)
-              : undefined
-            : projectOfTab(id),
-        ),
-      );
+      setTabs((prev) => insertBesideActive(prev, tab, cwd));
     },
-    [projectOfTab],
+    [insertBesideActive],
   );
 
   const onSelectProviderAccount = useCallback(
@@ -1949,13 +2315,35 @@ export default function App({
     setWhatsNewVersion(document.source.version);
   }, []);
 
+  const createWorkspaceTab = useCallback(
+    (cwd: string, focus?: WorktreeFocus) => {
+      const session = {
+        ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+        ...(focus && !sameProjectPath(focus.path, cwd)
+          ? { worktreeCwd: focus.path, branch: focus.branch ?? undefined }
+          : {}),
+      };
+      const tab = newTab(session.id);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, cwd);
+      return tab.id;
+    },
+    [appendTab, sessionDefaults?.runtimeMode],
+  );
+
   const onNew = useCallback(() => {
     setSearchViewOpen(false);
     setInboxViewOpen(false);
     setNotesViewOpen(false);
     setAutomationsViewOpen(false);
     const cwd = active?.cwd ?? sessionDefaults?.cwd ?? projectCwd;
-    const session = newDefaultSession(cwd, sessionDefaults?.runtimeMode);
+    const focus = worktreeFocus(cwd);
+    const session = {
+      ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+      ...(focus && pathKey(focus.path) !== pathKey(cwd)
+        ? { worktreeCwd: focus.path, branch: focus.branch ?? undefined }
+        : {}),
+    };
     const tab = newTab(session.id);
     setSessions((prev) => [...prev, session]);
     appendTab(tab, cwd);
@@ -1970,17 +2358,47 @@ export default function App({
     projectCwd,
   ]);
 
+  const onSelectRemoteSession = useCallback(
+    (project: string, remoteSessionId: string) => {
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      const existing = tabsRef.current
+        .map((tab) => ({
+          tab,
+          shellId: leafIds(tab.layout).find(
+            (shellId) => remoteSessionFor(shellId) === remoteSessionId,
+          ),
+        }))
+        .find(({ shellId }) => shellId);
+      if (existing) {
+        activateTab(existing.tab.id, existing.shellId);
+        return;
+      }
+      // Reserve a dedicated tab immediately. An apparently blank remote tab
+      // may hold composer text or a create/upload that the host has not accepted.
+      const session = newDefaultSession(project, sessionDefaults?.runtimeMode);
+      const tab = newTab(session.id);
+      rememberRemoteSession(session.id, remoteSessionId);
+      setSessions((prev) => [...prev, session]);
+      appendTab(tab, project);
+      setActiveTabId(tab.id);
+    },
+    [activateTab, appendTab, sessionDefaults?.runtimeMode],
+  );
+
   const onStartInboxItem = useCallback(
     async (item: InboxItem, body?: string) => {
       const start = (description?: string) => {
         setInboxViewOpen(false);
         setNotesViewOpen(false);
         setAutomationsViewOpen(false);
-        setSidebarTab("sessions");
         const cwd =
           item.projectPath || active?.cwd || sessionDefaults?.cwd || projectCwd;
+        setSidebarTab("sessions", cwd);
         const ref =
-          item.provider === "linear"
+          item.provider === "linear" || item.provider === "jira"
             ? item.identifier?.trim() || `#${item.number}`
             : `#${item.number}`;
         const linkedWorkItem = linkedWorkItemFromInboxItem(item);
@@ -1997,24 +2415,7 @@ export default function App({
         setComposerFocused(true);
       };
 
-      if (item.provider !== "linear") {
-        start();
-        return;
-      }
-      if (!item.id) {
-        throw new Error("Missing Linear issue");
-      }
-      if (body !== undefined) {
-        start(body);
-        return;
-      }
-      const cached = peekLinearIssueDetails(item.id);
-      if (cached) {
-        start(cached.body);
-        return;
-      }
-      const details = await linearIssueDetails(item.id);
-      start(details.body);
+      start(await inboxTrackerDescription(item, body));
     },
     [
       active?.cwd,
@@ -2032,7 +2433,6 @@ export default function App({
       setInboxViewOpen(false);
       setNotesViewOpen(false);
       setAutomationsViewOpen(false);
-      setSidebarTab("sessions");
       const cwd =
         (card.sourceCwd && looksLikeProject(card.sourceCwd)
           ? card.sourceCwd
@@ -2040,6 +2440,7 @@ export default function App({
         active?.cwd ||
         sessionDefaults?.cwd ||
         projectCwd;
+      setSidebarTab("sessions", cwd);
       const title = card.title.trim();
       const session = {
         ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
@@ -2162,7 +2563,7 @@ export default function App({
     (cwd: string) => {
       const workdir = cwd || projectCwdRef.current;
       const projectPath = projectCwdRef.current;
-      if (!looksLikeProject(projectPath)) return false;
+      if (!isLocalProject(projectPath)) return false;
       setProjectTerminals((prev) => {
         const existing = findProjectTerminal(prev, projectPath);
         const file = newTerminalFile(
@@ -2171,7 +2572,14 @@ export default function App({
           projectPath,
         );
         if (!existing) {
-          return [...prev, createProjectTerminal(projectPath, file)];
+          return [
+            ...prev,
+            createProjectTerminal(
+              projectPath,
+              file,
+              lastDockSideRef.current ?? "bottom",
+            ),
+          ];
         }
         return mapProjectTerminal(prev, projectPath, (dock) =>
           addTerminalToDock(dock, file),
@@ -2186,6 +2594,7 @@ export default function App({
   const onOpenTerminal = useCallback(
     (cwd: string, asWorkspaceTab = false, occupySessionId?: string) => {
       const workdir = cwd || gitCwd;
+      if (!isLocalProject(projectCwdRef.current) || !isLocalProject(workdir)) return;
       if (openProjectTerminal(workdir)) return;
 
       if (asWorkspaceTab || !activeTab) {
@@ -2263,7 +2672,7 @@ export default function App({
   );
 
   const onToggleProjectTerminal = useCallback(() => {
-    if (!looksLikeProject(projectCwd)) return;
+    if (!isLocalProject(projectCwd)) return;
     const dock = findProjectTerminal(projectTerminalsRef.current, projectCwd);
     if (!dock) {
       openProjectTerminal(gitCwd);
@@ -2289,6 +2698,7 @@ export default function App({
   }, []);
 
   const onProjectTerminalSide = useCallback((side: DockSide) => {
+    setLastDockSide(side);
     setProjectTerminals((prev) =>
       mapProjectTerminal(prev, projectCwdRef.current, (dock) =>
         withDockSide(dock, side, {
@@ -2458,6 +2868,7 @@ export default function App({
         sessions: sessionsRef.current,
         closingTabId: id,
         scope: tabCloseScope,
+        worktreeOf: tabWorktreeOf,
       });
       if (closePlan.action === "keep") return;
       const closing = current[index];
@@ -2483,6 +2894,8 @@ export default function App({
         );
         for (const sessionId of gone) {
           persistSession(sessionsRef.current.find((s) => s.id === sessionId));
+          rememberRemoteSession(sessionId);
+          rememberRemotePendingWorktree(sessionId);
         }
         setDirtyFiles((prev) => {
           const updated = new Set(prev);
@@ -2544,6 +2957,8 @@ export default function App({
           persistSession(
             sessionsRef.current.find((session) => session.id === sessionId),
           );
+          rememberRemoteSession(sessionId);
+          rememberRemotePendingWorktree(sessionId);
         }
         setDirtyFiles((prev) => {
           const next = new Set(prev);
@@ -2631,6 +3046,7 @@ export default function App({
               sessions: sessionsRef.current,
               closingTabId: tab.id,
               scope: tabCloseScope,
+              worktreeOf: tabWorktreeOf,
             });
             if (closePlan.action === "close") {
               onCloseTab(
@@ -2801,14 +3217,38 @@ export default function App({
 
       const finishClear = () => {
         persistSession(oldSession);
+        for (const shellId of leafIds(tab.layout)) {
+          rememberRemoteSession(shellId);
+          rememberRemotePendingWorktree(shellId);
+        }
 
-        const session = newSession(
-          oldSession.harness,
-          oldSession.cwd,
-          oldSession.model,
-          oldSession.runtimeMode,
-          oldSession.modelSettings,
-        );
+        // The blank replacement stays in the tab's worktree, so clearing the
+        // last tab there does not switch the workspace back to the project.
+        const workspace = tabWorkspace(tab, sessionsRef.current);
+        const focus = worktreeFocus(oldSession.cwd);
+        const session = {
+          ...newSession(
+            oldSession.harness,
+            oldSession.cwd,
+            oldSession.model,
+            oldSession.runtimeMode,
+            oldSession.modelSettings,
+          ),
+          ...(workspace && !sameProjectPath(workspace, oldSession.cwd)
+            ? {
+                worktreeCwd: workspace,
+                branch:
+                  (focus && sameProjectPath(focus.path, workspace)
+                    ? focus.branch
+                    : undefined) ??
+                  (oldSession.worktreeCwd &&
+                  sameProjectPath(oldSession.worktreeCwd, workspace)
+                    ? oldSession.branch
+                    : undefined) ??
+                  undefined,
+              }
+            : {}),
+        };
 
         setSessions((prev) => [...prev, session]);
         setDirtyFiles((prev) => {
@@ -2846,6 +3286,27 @@ export default function App({
     [tabs, persistSession, refreshHistory, sidebarCwd],
   );
 
+  const onRemoteSessionDeleted = useCallback(
+    (remoteSessionId: string) => {
+      const tab = tabsRef.current.find((entry) =>
+        leafIds(entry.layout).some(
+          (shellId) => remoteSessionFor(shellId) === remoteSessionId,
+        ),
+      );
+      if (!tab) return;
+      const closePlan = planWorkspaceTabClose({
+        tabs: tabsRef.current,
+        sessions: sessionsRef.current,
+        closingTabId: tab.id,
+        scope: tabCloseScope,
+        worktreeOf: tabWorktreeOf,
+      });
+      if (closePlan.action === "keep") onClearTabSession(tab.id);
+      else onCloseTab(tab.id);
+    },
+    [onClearTabSession, onCloseTab, tabCloseScope],
+  );
+
   const onCloseAllTabs = useCallback(() => {
     const tab = tabsRef.current.find(
       (entry) => entry.id === activeTabIdRef.current,
@@ -2874,6 +3335,7 @@ export default function App({
           sessions: sessionsRef.current,
           closingTabId: tab.id,
           scope: tabCloseScope,
+          worktreeOf: tabWorktreeOf,
         });
         if (closePlan.action === "close") {
           onCloseTab(tab.id);
@@ -3003,6 +3465,7 @@ export default function App({
           sessions: sessionsRef.current,
           closingTabId: activeTab.id,
           scope: tabCloseScope,
+          worktreeOf: tabWorktreeOf,
         });
         if (closePlan.action === "keep") onClearTabSession(activeTab.id);
         else onCloseTab(activeTab.id);
@@ -3045,6 +3508,7 @@ export default function App({
         sessions: sessionsRef.current,
         closingTabId: id,
         scope: tabCloseScope,
+        worktreeOf: tabWorktreeOf,
       });
       if (closePlan.action === "keep" && id === activeTabIdRef.current) {
         onClosePane();
@@ -3055,13 +3519,45 @@ export default function App({
     [onClosePane, onCloseTab, tabCloseScope],
   );
 
+  /** Open tabs per workspace in the sidebar's project, keyed by worktree
+   * path, so the switcher can show what each worktree still has open. */
+  const worktreeTabStats = useMemo(() => {
+    const stats = new Map<string, { tabs: number; busy: boolean }>();
+    if (!sidebarCwd || sidebarCwd === "~" || isRemoteProjectPath(sidebarCwd))
+      return stats;
+    for (const tab of filterTabsForProject(tabs, sessions, sidebarCwd)) {
+      const workspace = tabWorkspace(tab, sessions) ?? sidebarCwd;
+      const key = pathKey(workspace);
+      const entry = stats.get(key) ?? { tabs: 0, busy: false };
+      entry.tabs += 1;
+      entry.busy ||= leafIds(tab.layout).some(
+        (id) => sessions.find((session) => session.id === id)?.busy,
+      );
+      stats.set(key, entry);
+    }
+    return stats;
+  }, [tabs, sessions, sidebarCwd, tabWorkspace, workspaceNavigation.revision]);
   const deckProjectTabs = useMemo(() => {
     // A projectless session belongs to no project, so it stands on its own
     // rather than trailing the last project's tabs.
     const active = tabs.find((tab) => tab.id === activeTabId);
     if (active && !workspaceTabCwd(active, sessions)) return [active];
-    return filterTabsForProject(tabs, sessions, projectCwd);
-  }, [activeTabId, tabs, sessions, projectCwd]);
+    // Each worktree keeps its own tabs; the others stay open, just hidden.
+    const worktree = projectWorktree?.path ?? projectCwd;
+    return filterTabsForProject(tabs, sessions, projectCwd).filter((tab) => {
+      if (tab.id === activeTabId) return true;
+      const workspace = tabWorkspace(tab, sessions);
+      return !workspace || sameProjectPath(workspace, worktree);
+    });
+  }, [
+    activeTabId,
+    tabs,
+    sessions,
+    projectCwd,
+    projectWorktree?.path,
+    tabWorkspace,
+    workspaceNavigation.revision,
+  ]);
 
   const onNext = useCallback(() => {
     const index = deckProjectTabs.findIndex((t) => t.id === activeTabId);
@@ -3121,6 +3617,11 @@ export default function App({
 
   const onFocusPane = useCallback(
     (paneId: string) => {
+      if (
+        tabsRef.current.find((tab) => tab.id === activeTabIdRef.current)
+          ?.focusedId !== paneId
+      )
+        workspaceNavigation.cancel();
       setProjectTerminalFocused(false);
       if (inboxAskPortal?.sessionId === paneId) {
         setComposerFocused(true);
@@ -3145,6 +3646,7 @@ export default function App({
       path?: string,
       session?: { sessionId: string; cwd: string },
       changeKind?: GitFileDiffKind,
+      pin = false,
     ) => {
       void (async () => {
         const diffCwd = session?.cwd ?? gitCwdRef.current;
@@ -3166,6 +3668,7 @@ export default function App({
                 session.sessionId,
                 resolved,
                 diffProjectCwd,
+                pin,
               );
             }
             if (loadDiffViewer() === "unified") {
@@ -3181,10 +3684,11 @@ export default function App({
             return openEditorTab(
               tab,
               newFileTab(resolved, diffCwd, true, changeKind, diffProjectCwd),
+              { pin },
             );
           }),
         );
-        setSidebarTab("changes");
+        setSidebarTab("changes", diffProjectCwd);
         setComposerFocused(false);
       })();
     },
@@ -3192,12 +3696,13 @@ export default function App({
   );
 
   const onOpenWorkingTreeDiff = useCallback(
-    (path: string, kind?: GitFileDiffKind) => onOpenDiff(path, undefined, kind),
+    (path: string, kind?: GitFileDiffKind, pin?: boolean) =>
+      onOpenDiff(path, undefined, kind, pin),
     [onOpenDiff],
   );
 
-  /** Stack every working-tree change in one review, whatever the diff-view setting. */
-  const onOpenAllChanges = useCallback(() => {
+  /** Stack one section's working-tree changes in one review, whatever the diff-view setting. */
+  const onOpenAllChanges = useCallback((kind: GitFileDiffKind) => {
     setTabs((prev) =>
       prev.map((tab) =>
         tab.id === activeTabId
@@ -3205,7 +3710,7 @@ export default function App({
               tab,
               gitCwdRef.current,
               undefined,
-              undefined,
+              kind,
               sidebarCwdRef.current,
             )
           : tab,
@@ -3215,7 +3720,7 @@ export default function App({
   }, [activeTabId]);
 
   const onOpenCommit = useCallback(
-    (commit: GitHistoryCommit) => {
+    (commit: GitHistoryCommit, pin?: boolean) => {
       setTabs((prev) =>
         prev.map((tab) =>
           tab.id === activeTabId
@@ -3228,6 +3733,7 @@ export default function App({
                   subject: commit.subject,
                 },
                 sidebarCwdRef.current,
+                pin,
               )
             : tab,
         ),
@@ -3455,6 +3961,7 @@ export default function App({
           restored.providerSessionId,
           sessionWorkCwd(restored),
           restored.providerAccountId,
+          restored.blocks,
         );
       }
       lastPersisted.current.set(restored.id, persistFingerprint(restored));
@@ -3590,11 +4097,8 @@ export default function App({
               ? candidate
               : await invoke<string>("default_cwd");
           const description =
-            item.provider === "linear" && item.id
-              ? (
-                  peekLinearIssueDetails(item.id) ??
-                  (await linearIssueDetails(item.id))
-                ).body
+            item.provider === "linear" || item.provider === "jira"
+              ? await inboxTrackerDescription(item)
               : item.provider === "gitlab" &&
                   (item.kind === "issue" || item.kind === "pr")
                 ? (
@@ -3657,21 +4161,27 @@ export default function App({
       removingSessionIds.current.add(id);
       try {
         await stopSessionForRemoval(id);
+        const stopped =
+          sessionsRef.current.find((session) => session.id === id) ?? current;
         await Promise.all(
-          sessionChildHarnesses(current).map((harness) =>
+          sessionChildHarnesses(stopped).map((harness) =>
             forgetHarnessSession(harness, id),
           ),
         );
+        const imagePaths = stopped.blocks.flatMap((block) =>
+          block.role === "image" && block.image ? [block.image.path] : [],
+        );
+        await deleteSession(id, imagePaths);
         const fresh = {
           ...newSession(
-            current.harness,
-            current.cwd,
-            current.model,
-            current.runtimeMode,
-            current.modelSettings,
+            stopped.harness,
+            stopped.cwd,
+            stopped.model,
+            stopped.runtimeMode,
+            stopped.modelSettings,
           ),
-          title: current.title,
-          inboxAsk: current.inboxAsk,
+          title: stopped.title,
+          inboxAsk: stopped.inboxAsk,
         };
         const next = sessionsRef.current.map((session) =>
           session.id === id ? fresh : session,
@@ -3698,6 +4208,7 @@ export default function App({
 
   const onSelectHistorySession = useCallback(
     async (sessionId: string) => {
+      workspaceNavigation.cancel();
       let session = await ensureOpenSession(sessionId);
       if (!session || session.inboxAsk) return;
       const parentId =
@@ -3708,6 +4219,8 @@ export default function App({
         session = await ensureOpenSession(parentId);
         if (!session) return;
       }
+      if (looksLikeProject(session.cwd))
+        setProjectCwd(normalizeProjectPath(session.cwd));
       const linkedUpdate = linkedSessionUpdatesRef.current.get(session.id);
       if (focusOpenSession(session.id)) {
         if (linkedUpdate) revealLinkedSessionUpdate(session.id, linkedUpdate);
@@ -3743,7 +4256,7 @@ export default function App({
       setAutomationsViewOpen(false);
       setSettingsOpen(false);
       setFilePickerOpen(false);
-      setSidebarTab("sessions");
+      setSidebarTab("sessions", session.cwd);
       setProjectCwd(session.cwd);
       setRecents(rememberProject(session.cwd));
       await onSelectHistorySession(sessionId);
@@ -4052,6 +4565,7 @@ export default function App({
               pending.fromProviderSessionId,
               sessionWorkCwd(session),
               pending.fromProviderAccountId,
+              session.blocks,
             );
           }
         }
@@ -4501,6 +5015,35 @@ export default function App({
     [onRemoveHistorySession],
   );
 
+  const sessionIdsInTitleTab = useCallback((tabId: string): string[] => {
+    const tab = tabsRef.current.find((entry) => entry.id === tabId);
+    if (!tab) return [];
+    const openSessionIds = new Set(
+      sessionsRef.current.map((session) => session.id),
+    );
+    return leafIds(tab.layout).filter((id) => openSessionIds.has(id));
+  }, []);
+
+  const onArchiveTitleTab = useCallback(
+    (tabId: string) => {
+      const sessionIds = sessionIdsInTitleTab(tabId);
+      void onArchiveHistorySessions(sessionIds, true);
+    },
+    [onArchiveHistorySessions, sessionIdsInTitleTab],
+  );
+
+  const onDeleteTitleTab = useCallback(
+    (tabId: string) => {
+      const sessionIds = sessionIdsInTitleTab(tabId);
+      if (sessionIds.length === 1) {
+        void onDeleteHistorySession(sessionIds[0]);
+      } else if (sessionIds.length > 1) {
+        void onDeleteHistorySessions(sessionIds);
+      }
+    },
+    [onDeleteHistorySession, onDeleteHistorySessions, sessionIdsInTitleTab],
+  );
+
   const onFocusDir = useCallback(
     (dir: FocusDir) => {
       if (!activeTab) return;
@@ -4563,19 +5106,23 @@ export default function App({
       setProjectCwd(normalized);
       setRecents(rememberProject(normalized));
       setSessions((prev) =>
-        prev.map((s) =>
-          s.id === sessionId
-            ? {
-                ...s,
-                cwd: normalized,
-                branch: undefined,
-                worktreeCwd: undefined,
-                worktreeRemoved: undefined,
-                workspaceMode: undefined,
-                worktreeBase: undefined,
-              }
-            : s,
-        ),
+        prev.map((s) => {
+          if (s.id !== sessionId) return s;
+          // A blank session moving into a project adopts its provider defaults;
+          // a conversation keeps its own provider.
+          const base = isBlankSession(s)
+            ? retargetSessionToProject(s, normalized)
+            : s;
+          return {
+            ...base,
+            cwd: normalized,
+            branch: undefined,
+            worktreeCwd: undefined,
+            worktreeRemoved: undefined,
+            workspaceMode: undefined,
+            worktreeBase: undefined,
+          };
+        }),
       );
       // The session's project just moved in place; a group only holds tabs that
       // share one project, so drop this tab out if it no longer matches.
@@ -4671,7 +5218,13 @@ export default function App({
   );
 
   const onWorktreeChange = useCallback(
-    async (sessionId: string, tree: Worktree) => {
+    async (
+      sessionId: string,
+      tree: Worktree,
+      fromComposer = false,
+      isCurrent: () => boolean = () => true,
+    ) => {
+      if (!isCurrent()) return;
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       if (
         !current ||
@@ -4712,6 +5265,7 @@ export default function App({
       pendingPersist.current.delete(sessionId);
       try {
         const listed = await listWorktrees(current.cwd);
+        if (!isCurrent()) return;
         const target = listed.worktrees.find(
           (entry) =>
             pathKey(entry.path) === pathKey(tree.path) && !entry.missing,
@@ -4737,6 +5291,11 @@ export default function App({
           // Leave the original conversation, checkpoints, and live provider
           // context attached to the files they describe.
           const tab = newTab(selected.id);
+          if (fromComposer)
+            workspacePins.current.set(
+              selected.id,
+              currentWorkspace(source.cwd),
+            );
           sessionsRef.current = [...sessionsRef.current, selected];
           setSessions(sessionsRef.current);
           appendTab(tab, selected.cwd);
@@ -4745,8 +5304,10 @@ export default function App({
           return;
         }
         await flushSessionCheckpoint(sessionId);
+        if (!isCurrent()) return;
         for (const harness of sessionChildHarnesses(source)) {
           await forgetHarnessSession(harness, sessionId);
+          if (!isCurrent()) return;
         }
         const latest = sessionsRef.current.find((s) => s.id === sessionId);
         if (
@@ -4760,10 +5321,17 @@ export default function App({
           );
         }
         const next = sessionInWorktree(latest, target);
+        if (fromComposer)
+          workspacePins.current.set(
+            sessionId,
+            currentWorkspace(latest.cwd),
+          );
+        else workspacePins.current.delete(sessionId);
         if (latest.worktreeRemoved)
           await keepSessionChanges(sessionId, target.path);
         pendingPersist.current.delete(sessionId);
         if (shouldPersistSession(next)) await upsertSession(next);
+        if (!isCurrent()) return;
         invalidateLoadedSession(sessionId);
         sessionsRef.current = sessionsRef.current.map((s) =>
           s.id === sessionId ? next : s,
@@ -4779,74 +5347,115 @@ export default function App({
     [appendTab, invalidateLoadedSession, refreshHistory],
   );
 
-  const onSelectProject = useCallback(
-    (path: string) => {
-      setSearchViewOpen(false);
-      setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      setAutomationsViewOpen(false);
-      const normalized = normalizeProjectPath(path);
-      if (!looksLikeProject(normalized)) return;
+  const onComposerWorktreeChange = useCallback(
+    (sessionId: string, tree: Worktree) =>
+      onWorktreeChange(sessionId, tree, true),
+    [onWorktreeChange],
+  );
 
-      const activeWorkspace = tabsRef.current.find(
-        (entry) => entry.id === activeTabIdRef.current,
-      );
-      const current = activeWorkspace
-        ? sessionsRef.current.find(
-            (session) => session.id === activeWorkspace.focusedId,
-          )
-        : undefined;
-      const decision = planProjectReturn({
+  const onSelectWorkspace = useCallback(
+    (focus?: WorktreeFocus) => {
+      setProjectCwd(sidebarCwdRef.current);
+      workspaceNavigation.selectWorkspace(sidebarCwdRef.current, focus);
+    },
+    [workspaceNavigation.selectWorkspace],
+  );
+
+  /**
+   * Open a run of folders from one snapshot, committed in a single transition.
+   *
+   * Planning per folder from refs would read state React has not rendered yet,
+   * so the whole run is planned first and applied here in selection order.
+   */
+  const openProjects = useCallback(
+    (paths: readonly string[]) => {
+      const steps = planProjectOpenRun({
         memory: readProjectReturnMemory(),
         tabs: tabsRef.current,
         sessions: sessionsRef.current,
         activeTabId: activeTabIdRef.current,
-        projectPath: normalized,
+        paths,
       });
-      switch (decision.action) {
-        case "keep":
-          setProjectCwd(normalized);
-          setRecents(rememberProject(normalized));
-          return;
-        case "reuse-blank":
-          onCwdChange(decision.sessionId, normalized);
-          return;
-        case "activate":
-          setProjectCwd(normalized);
-          setRecents(rememberProject(normalized));
-          activateTab(decision.tabId, decision.paneId);
-          return;
-        case "create":
-          break;
-        default: {
-          const exhaustive: never = decision;
-          return exhaustive;
-        }
+      const last = steps[steps.length - 1];
+      if (!last) return;
+
+      // After the early return, not before it. `pickFolders` hands back an
+      // empty list when the picker is dismissed, and every path failing
+      // `looksLikeProject` comes out the same way — so closing these first
+      // meant cancelling a folder picker shut whatever the user had open.
+      // Nothing below opens a project without also leaving one of these views.
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+
+      // At most one folder can take the blank session, and it keeps the
+      // retargeting rules `onCwdChange` already owns.
+      const blank = steps.find(
+        (step): step is Extract<ProjectOpenStep, { action: "reuse-blank" }> =>
+          step.action === "reuse-blank",
+      );
+      if (blank) onCwdChange(blank.sessionId, blank.path);
+
+      const created = steps.filter(
+        (step): step is Extract<ProjectOpenStep, { action: "create" }> =>
+          step.action === "create",
+      );
+      if (created.length > 0) {
+        setSessions((prev) => [...prev, ...created.map((step) => step.session)]);
+        // Each tab sits beside the one before it in the run, so the folders keep
+        // their selection order.
+        setTabs((prev) =>
+          created.reduce(
+            (tabs, step) =>
+              insertBeside(tabs, step.tab, step.besideTabId, step.path),
+            prev,
+          ),
+        );
       }
 
-      const seed = current ?? sessionsRef.current[0];
-      const session = newSession(
-        seed?.harness ?? "claude",
-        normalized,
-        seed?.model,
-        seed?.runtimeMode,
-        seed?.modelSettings,
-      );
-      const tab = newTab(session.id);
-      setProjectCwd(normalized);
-      setRecents(rememberProject(normalized));
-      setSessions((prev) => [...prev, session]);
-      appendTab(tab, normalized);
-      setActiveTabId(tab.id);
-      setComposerFocused(true);
+      // The folder chosen last ends up focused.
+      switch (last.action) {
+        case "create":
+          setProjectCwd(last.path);
+          setActiveTabId(last.tab.id);
+          setComposerFocused(true);
+          break;
+        case "activate":
+          setProjectCwd(last.path);
+          activateTab(last.tabId, last.paneId);
+          break;
+        case "keep":
+          setProjectCwd(last.path);
+          break;
+        case "reuse-blank":
+          // `onCwdChange` already moved to it.
+          break;
+      }
+      // Every project opened is remembered, the one chosen last most recently.
+      for (const step of steps) setRecents(rememberProject(step.path));
     },
-    [activateTab, appendTab, onCwdChange, readProjectReturnMemory],
+    [activateTab, insertBeside, onCwdChange, readProjectReturnMemory],
+  );
+
+  const onSelectProject = useCallback(
+    (path: string) => {
+      workspaceNavigation.cancel();
+      openProjects([path]);
+      workspaceNavigation.selectProject(path);
+    },
+    [
+      openProjects,
+      workspaceNavigation.cancel,
+      workspaceNavigation.selectProject,
+    ],
   );
 
   const pickProject = useCallback(async () => {
-    const path = await pickFolder();
-    if (path) onSelectProject(path);
-  }, [onSelectProject]);
+    // Several folders can be taken at once; each opens as its own project, and
+    // the last one selected ends up focused.
+    openProjects(await pickFolders());
+  }, [openProjects]);
 
   const onPlaceSessionInFolder = useCallback(
     (sessionId: string, target: SessionFolderTarget) => {
@@ -4863,7 +5472,13 @@ export default function App({
       }
       saveSessionFolders(
         source.cwd,
-        placeSessionInFolder(folders, sessionId, target),
+        placeSessionInFolder(
+          folders,
+          isRemoteProjectPath(source.cwd)
+            ? (remoteSessionFor(sessionId) ?? sessionId)
+            : sessionId,
+          target,
+        ),
       );
     },
     [],
@@ -4876,7 +5491,14 @@ export default function App({
       const remaining = options.purgeData
         ? forgetProject(normalized)
         : archiveProject(normalized);
-      if (options.purgeData) forgetProjectLocation(normalized);
+      if (options.purgeData) {
+        forgetProjectLocation(normalized);
+        setSidebarTabSelection((current) =>
+          sameProjectPath(current.project, normalized)
+            ? { project: "~", tab: loadProjectSidebarTab("~") }
+            : current,
+        );
+      }
       setRecents(remaining);
 
       const tabs = tabsRef.current;
@@ -5015,6 +5637,7 @@ export default function App({
   const applyProjectLocationChange = useCallback(
     async (from: string, to: string) => {
       await rebaseProjectSessions(from, to);
+      rebaseCiRepairs(from, to);
 
       const nextSessions = sessionsRef.current.map((session) =>
         sameProjectPath(session.cwd, from) ? { ...session, cwd: to } : session,
@@ -5064,6 +5687,11 @@ export default function App({
       projectTerminalsRef.current = nextDocks;
       setProjectTerminals(nextDocks);
       rebaseProjectData(from, to);
+      setSidebarTabSelection((current) =>
+        sameProjectPath(current.project, from)
+          ? { ...current, project: pathKey(to) }
+          : current,
+      );
       setRecents(replaceProjectPath(from, to));
       onFileMoved(from, to);
       notifyDirsChanged();
@@ -5077,7 +5705,10 @@ export default function App({
     for (const tab of tabsRef.current) {
       for (const pane of tab.editorPanes) {
         for (const file of pane.files) {
-          if (isFilesystemTab(file) && isEqualOrInside(file.path, path)) {
+          if (
+            isFilesystemTab(file) &&
+            isEqualOrInside(file.path, path)
+          ) {
             dropped.add(file.id);
           }
         }
@@ -5114,29 +5745,31 @@ export default function App({
           undefined,
           fileProjectCwd,
         );
+        const pin = !!options?.pin;
         if (loadFileTabMode() === "workspace") {
-          const key = editorTabKey(file);
-          const existing = tabsRef.current
-            .flatMap((entry) =>
-              entry.editorPanes.map((pane) => ({ entry, pane })),
-            )
-            .find(({ pane }) =>
-              pane.files.some((open) => editorTabKey(open) === key),
-            );
-          if (existing) {
-            setTabs((prev) =>
-              prev.map((entry) =>
-                entry.id === existing.entry.id
-                  ? openEditorTab(entry, file)
-                  : entry,
-              ),
-            );
-            activateTab(existing.entry.id, existing.pane.id);
-          } else {
-            const next = newEditorWorkspaceTab(file);
-            appendTab(next, fileProjectCwd);
-            setActiveTabId(next.id);
-          }
+          // Built once: the updater may run twice in StrictMode.
+          const created = newEditorWorkspaceTab(
+            pin ? file : { ...file, preview: true },
+          );
+          let target: { tabId: string; paneId?: string } | undefined;
+          // Select inside the updater, not from `tabsRef`: two opens resuming
+          // before a render would otherwise both miss the preview and append
+          // twice. flushSync runs the updater now so `target` is set below.
+          flushSync(() => {
+            setTabs((prev) => {
+              const result = openWorkspaceFile(
+                prev,
+                file,
+                created,
+                (tabs, tab) => insertBesideActive(tabs, tab, fileProjectCwd),
+                pin,
+              );
+              target = result;
+              return result.tabs;
+            });
+          });
+          if (target?.paneId) activateTab(target.tabId, target.paneId);
+          else if (target) setActiveTabId(target.tabId);
           setProjectTerminalFocused(false);
           setComposerFocused(false);
           if (navigation) {
@@ -5157,6 +5790,7 @@ export default function App({
             );
             return openEditorTab(entry, file, {
               split: focusedSession?.blocks.length === 0 ? "left" : "right",
+              pin,
             });
           }),
         );
@@ -5171,7 +5805,7 @@ export default function App({
         setComposerFocused(false);
       })();
     },
-    [activateTab, appendTab],
+    [activateTab, insertBesideActive],
   );
 
   const onOpenPlan = useCallback(
@@ -5201,15 +5835,27 @@ export default function App({
     [activeTabId],
   );
 
-  const onFileDirtyChange = useCallback((fileId: string, dirty: boolean) => {
-    setDirtyFiles((prev) => {
-      if (prev.has(fileId) === dirty) return prev;
-      const next = new Set(prev);
-      if (dirty) next.add(fileId);
-      else next.delete(fileId);
-      return next;
+  const onPinFile = useCallback((fileId: string) => {
+    setTabs((prev) => {
+      const next = prev.map((tab) => pinEditorFile(tab, fileId));
+      return next.some((tab, index) => tab !== prev[index]) ? next : prev;
     });
   }, []);
+
+  const onFileDirtyChange = useCallback(
+    (fileId: string, dirty: boolean) => {
+      // An edited preview must not be replaced by the next click.
+      if (dirty) onPinFile(fileId);
+      setDirtyFiles((prev) => {
+        if (prev.has(fileId) === dirty) return prev;
+        const next = new Set(prev);
+        if (dirty) next.add(fileId);
+        else next.delete(fileId);
+        return next;
+      });
+    },
+    [onPinFile],
+  );
 
   /** The editor reports 0 as it unmounts, so closed tabs drop out on their own. */
   const onFileErrorCountChange = useCallback(
@@ -5314,10 +5960,17 @@ export default function App({
   );
 
   const onSaveDraft = useCallback(
-    (sessionId: string, text: string, attachments: Attachment[] = []) => {
+    (
+      sessionId: string,
+      text: string,
+      attachments: Attachment[] = [],
+      appRequestId?: string,
+    ) => {
       const current = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
+      if (current && remoteProjectFor(current.cwd))
+        return !!remoteSessionActions(sessionId)?.saveDraft(text, attachments);
       if (
         !current ||
         current.busy ||
@@ -5350,6 +6003,7 @@ export default function App({
                     text,
                     ...(attachments.length > 0 ? { attachments } : {}),
                     draft: true,
+                    ...(appRequestId ? { appRequestId } : {}),
                   },
                 ],
               }
@@ -5396,14 +6050,20 @@ export default function App({
     [invalidateLoadedSession],
   );
 
-  const onSubmit = useCallback(
+  const submitSession = useCallback(
     (
       sessionId: string,
       text: string,
       attachments: Attachment[] = [],
       options?: SubmitOptions,
-    ) => {
+    ): SubmissionAcceptance => {
+      const remote = sessionsRef.current.find((session) => session.id === sessionId);
+      if (remote && remoteProjectFor(remote.cwd))
+        return !!remoteSessionActions(sessionId)?.submit(text, attachments, options);
       if (editedResends.isActive(sessionId)) return false;
+      // Output already received belongs before the submitted user message.
+      // Flush before reading the session too, since pending errors can settle it.
+      flushHarnessEvents();
       const controlError = orchestrator.submissionError(
         sessionId,
         options?.managed,
@@ -5432,10 +6092,20 @@ export default function App({
       }
       if (
         removingSessionIds.current.has(sessionId) ||
-        switchingWorktrees.current.has(sessionId)
+        switchingWorktrees.current.has(sessionId) ||
+        workspaceNavigation.isSwitching(sessionId)
       )
         return false;
       const storedCurrent = sessionsRef.current.find((s) => s.id === sessionId);
+      if (options?.appRequestId && storedCurrent?.busy) return false;
+      if (
+        options?.ciRepair &&
+        storedCurrent &&
+        (storedCurrent.busy ||
+          storedCurrent.pendingSwitch ||
+          isPreparingHandoff(storedCurrent))
+      )
+        return false;
       if (
         !storedCurrent ||
         storedCurrent.worktreeRemoved ||
@@ -5543,10 +6213,34 @@ export default function App({
         return false;
       }
       const submittedText = intent === "build" ? "Build approved plan" : text;
-      const rawCommand = isNativeCommandPrompt(submittedText, current.harness);
-      const harnessText = rawCommand
-        ? submittedText
-        : composeNoteMessage(noteCard, submittedText);
+      const operatorCommand = consumeOperatorCommand(submittedText);
+      if (
+        operatorCommand.matched &&
+        (intent !== "default" ||
+          current.orchestrationLeadId ||
+          current.inboxAsk ||
+          orchestrator.run(sessionId))
+      ) {
+        enqueueHarnessEvent(sessionId, {
+          type: "status",
+          text: "Use /operator from a regular session turn, outside an orchestration run.",
+        });
+        flushHarnessEvents();
+        return false;
+      }
+      const operatorAccess =
+        operatorCommand.matched || operatorEnabledInThread(current.blocks);
+      const promptText = operatorCommand.matched
+        ? operatorCommand.text.trim() ||
+          "Explain what you can do in MonoCode with the app CLI."
+        : submittedText;
+      const rawCommand =
+        !operatorCommand.matched &&
+        isNativeCommandPrompt(submittedText, current.harness);
+      const ciContext = options?.ciRepair?.prompt ?? options?.ciContext;
+      const harnessText =
+        options?.ciRepair?.prompt ??
+        (rawCommand ? submittedText : composeNoteMessage(noteCard, promptText));
 
       const pendingSwitch =
         current.pendingSwitch && current.pendingSwitch.from !== current.harness
@@ -5554,12 +6248,30 @@ export default function App({
           : null;
 
       if (current.busy && !pendingSwitch) {
+        if (
+          operatorCommand.matched &&
+          options?.queuedMessageId &&
+          options.followUpBehavior === "steer"
+        ) {
+          enqueueHarnessEvent(sessionId, {
+            type: "status",
+            text: "/operator starts a new turn after the current turn finishes.",
+          });
+          flushHarnessEvents();
+          return false;
+        }
         const followUpBehavior =
           current.worktreePreparing ||
           intent === "plan" ||
-          intent === "orchestrate"
+          intent === "orchestrate" ||
+          operatorCommand.matched
             ? "queue"
-            : (options?.followUpBehavior ?? loadFollowUpBehavior());
+            : // The agent has yielded and only background work is left, which
+              // may never end (a dev server). Queuing would park the message
+              // behind it, so hand it to the agent now.
+              current.backgroundTasks?.length
+              ? "steer"
+              : (options?.followUpBehavior ?? loadFollowUpBehavior());
         if (followUpBehavior === "queue") {
           setSessions((prev) =>
             prev.map((s) =>
@@ -5670,22 +6382,29 @@ export default function App({
             () => projectLocationSyncs.current.delete(key),
           );
         }
-        void sync
-          .then(async (location) => {
-            if (!location) {
-              throw new Error(
-                `Project folder not found: ${displayPath(current.cwd)}. Reopen the folder to reconnect it.`,
-              );
+        return submitAfterProjectSync({
+          cwd: current.cwd,
+          sync,
+          applyLocationChange: applyProjectLocationChange,
+          submit: async () => {
+            const accepted = await submitAfterProjectSyncRef.current(
+              sessionId,
+              text,
+              attachments,
+              { ...options, projectLocationReady: true },
+            );
+            if (!accepted) {
+              editedResend?.reject();
+              options?.onSettled?.({
+                status: "failed",
+                text: "",
+                error:
+                  "The chat became unavailable before the request could start. Try again when it is ready.",
+              });
             }
-            if (location.moved) {
-              await applyProjectLocationChange(current.cwd, location.path);
-            }
-            submitAfterProjectSyncRef.current(sessionId, text, attachments, {
-              ...options,
-              projectLocationReady: true,
-            });
-          })
-          .catch((error: unknown) => {
+            return accepted;
+          },
+          onError: (error: unknown) => {
             const message =
               error instanceof Error
                 ? error.message
@@ -5701,8 +6420,8 @@ export default function App({
               text: "",
               error: message,
             });
-          });
-        return true;
+          },
+        });
       }
 
       const gen = (turnGen.current.get(sessionId) ?? 0) + 1;
@@ -5740,20 +6459,29 @@ export default function App({
         !current.inboxCard &&
         !current.noteCard &&
         placeholderTitle
-          ? titleFromPrompt(submittedText, current.harness, attachments)
+          ? titleFromPrompt(
+              operatorCommand.matched ? promptText : submittedText,
+              current.harness,
+              attachments,
+            )
           : current.title;
       const visible = displayAttachments(attachments);
       const card =
         options?.secondOpinion ??
         (handoffCard ? handoffTurnCard(handoffCard) : undefined);
-      const visibleText =
-        card?.kind === "handoff"
+      const visibleText = operatorCommand.matched
+        ? promptText
+        : card?.kind === "handoff"
           ? submittedText
           : card
             ? SECOND_OPINION_TITLE
             : submittedText;
       const cards = {
         ...(rawCommand ? undefined : userTurnCards(noteCard, card)),
+        ...(ciContext ? { ciContext } : {}),
+        ...(operatorCommand.matched ? { monocode: true } : {}),
+        ...(intent === "plan" || intent === "orchestrate" ? { intent } : {}),
+        ...(options?.appRequestId ? { appRequestId: options.appRequestId } : {}),
         // The orchestrator writes these turns, not the user; hide them.
         ...(options?.managed ? { internal: true } : {}),
       };
@@ -5773,7 +6501,9 @@ export default function App({
             const draftRemoved = draftBlock
               ? {
                   ...s,
-                  blocks: s.blocks.filter((block) => block.id !== draftBlock.id),
+                  blocks: s.blocks.filter(
+                    (block) => block.id !== draftBlock.id,
+                  ),
                 }
               : s;
             const selected = options?.buildTarget
@@ -5783,12 +6513,16 @@ export default function App({
             let next: Session = {
               ...selected,
               providerAccountId,
+              usageLimit: undefined,
               worktreePreparing: createDraftWorktree
                 ? true
                 : selected.worktreePreparing,
-              inboxCard: rawCommand ? s.inboxCard : undefined,
-              noteCard: rawCommand ? s.noteCard : undefined,
-              handoffCard: rawCommand ? s.handoffCard : undefined,
+              inboxCard:
+                rawCommand || options?.ciRepair ? s.inboxCard : undefined,
+              noteCard:
+                rawCommand || options?.ciRepair ? s.noteCard : undefined,
+              handoffCard:
+                rawCommand || options?.ciRepair ? s.handoffCard : undefined,
             };
             if (editedResend) {
               next = editedResend.replace(next);
@@ -5863,7 +6597,9 @@ export default function App({
           }),
         );
       };
-      if (!options?.resendEdited) flushSync(commitSubmittedTurn);
+      if (!options?.resendEdited) {
+        flushSync(commitSubmittedTurn);
+      }
 
       const launchTitleGeneration = (workCwd: string) => {
         if (
@@ -5977,6 +6713,10 @@ export default function App({
             false,
           );
           workCwd = tree.path;
+          workspacePins.current.set(
+            sessionId,
+            currentWorkspace(current.cwd),
+          );
           if (proposalDraft)
             proposalDraft = { ...proposalDraft, checkoutCwd: tree.path };
           setSessions((prev) =>
@@ -6065,10 +6805,7 @@ export default function App({
           }
           if (turnGen.current.get(sessionId) !== gen) return;
           const latest = sessionsRef.current.find((s) => s.id === sessionId);
-          const brief = chooseHandoffBrief(
-            agentText,
-            buildDeterministicHandoff(latest ?? current, text),
-          );
+          const brief = chooseHandoffBrief(agentText, latest ?? current, text);
           await forgetHarnessSession(pendingSwitch.from, sessionId);
           if (turnGen.current.get(sessionId) !== gen) return;
           wrap = { from: pendingSwitch.from, to: current.harness, text: brief };
@@ -6083,7 +6820,7 @@ export default function App({
           );
         };
 
-        const planEventKey = `turn:${gen}`;
+        const planEventKey = planTurnKey(gen);
         let nativePlanSeen = false;
         let providerFailureSeen = false;
         const routePlanEvent = (event: HarnessEvent): HarnessEvent | null => {
@@ -6155,12 +6892,16 @@ export default function App({
         const recoverEditedResend = () => {
           if (!editedResend || editedResend.isAccepted()) return;
           pendingEditedEvents.length = 0;
+          const previous = sessionsRef.current.find(
+            (session) => session.id === sessionId,
+          );
+          const recovered = previous
+            ? editedResend.recoverAfterFailure(previous)
+            : undefined;
           flushSync(() => {
             setSessions((prev) =>
               prev.map((session) =>
-                session.id === sessionId
-                  ? editedResend.recoverAfterFailure(session)
-                  : session,
+                session.id === sessionId && recovered ? recovered : session,
               ),
             );
           });
@@ -6199,10 +6940,7 @@ export default function App({
           const earlier = queuedHandoff
             ? userMessagesAfterHandoff(current)
             : [];
-          if (
-            editedResend &&
-            canRewindHarnessLastTurn(current.harness)
-          ) {
+          if (editedResend && canRewindHarnessLastTurn(current.harness)) {
             try {
               await rewindHarnessLastTurn({
                 harness: current.harness,
@@ -6261,30 +6999,36 @@ export default function App({
               providerAccountId,
               runtimeMode: current.runtimeMode,
               intent: intent === "orchestrate" ? "plan" : intent,
-              // A lead drives the control CLI over loopback; without this the
-              // harness sandbox denies the socket and it cannot supervise.
-              controlsAgents: orchestrator.run(sessionId)?.status === "active",
+              // A /operator user turn enables app access for this thread;
+              // orchestration leads retain their separate control access.
+              controlsAgents:
+                operatorAccess ||
+                orchestrator.run(sessionId)?.status === "active",
+              appAccess: operatorAccess,
               text,
               attachments: turnAttachments,
               ...(editedResend ? { onAccepted: acceptEditedResend } : {}),
               onEvent: routeTurnEvent,
             });
-          await sendTurn(
-            orchestrator.prompt(
-              sessionId,
-              inboxAskPrompt(
-                rawCommand ? undefined : current.inboxAsk,
-                wrap && !rawCommand
-                  ? wrapHandoffPrompt(
-                      wrap.text,
-                      wrap.from,
-                      turnPrompt.trim() || CONTINUE_PROMPT,
-                      earlier,
-                    )
-                  : turnPrompt,
-              ),
+          let sendText = orchestrator.prompt(
+            sessionId,
+            inboxAskPrompt(
+              rawCommand ? undefined : current.inboxAsk,
+              wrap && !rawCommand
+                ? wrapHandoffPrompt(
+                    wrap.text,
+                    wrap.from,
+                    turnPrompt.trim() || CONTINUE_PROMPT,
+                    earlier,
+                  )
+                : turnPrompt,
             ),
           );
+          if (operatorCommand.matched) {
+            const cli = `${shellPath(await invoke<string>("app_cli_path"))} app`;
+            sendText += `\n\n<monocode_app>\nThe user's Operator command enables app access in this thread, including later turns without the command. You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read and continue other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run \`${cli} --help\` for exact commands and JSON fields, then use it as needed for the user's request. When reading another session, start with its latest two or three user/assistant exchanges. Request older exchanges with nextBefore or a larger excerpt only if needed. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>`;
+          }
+          await sendTurn(sendText);
           acceptEditedResend();
           if (proposalDraft && !providerFailureSeen) {
             completedProposal = await completeOrRepairOrchestrationProposal(
@@ -6461,7 +7205,21 @@ export default function App({
       flushHarnessEvents,
     ],
   );
-  submitAfterProjectSyncRef.current = onSubmit;
+  submitAfterProjectSyncRef.current = submitSession;
+  // Interactive callers use the immediate result to clear their composer. The
+  // queued-launch receiver uses submitSession to await the actual acceptance.
+  const onSubmit = useCallback(
+    (...args: Parameters<Submit>): boolean => {
+      // Reject before async preparation can make the composer clear its draft.
+      if (workspaceNavigation.isSwitching(args[0])) return false;
+      const result = submitSession(...args);
+      if (typeof result === "boolean") return result;
+      // Deferred errors have already been displayed by submitAfterProjectSync.
+      void result.catch(() => undefined);
+      return true;
+    },
+    [submitSession],
+  );
 
   const automationSessionReservations = useRef(new Set<string>());
   const automationRecoveryRef = useRef<Promise<void> | null>(null);
@@ -6480,6 +7238,7 @@ export default function App({
       const releaseReservation = () => {
         if (!reservationId) return;
         automationSessionReservations.current.delete(reservationId);
+        reservationId = undefined;
       };
       try {
         const eventRun = run.trigger === "event";
@@ -6574,14 +7333,23 @@ export default function App({
           setInboxViewOpen(false);
           setNotesViewOpen(false);
           setAutomationsViewOpen(false);
-          setSidebarTab("sessions");
+          setSidebarTab("sessions", session.cwd);
         }
 
         await updateAutomationRun(run.id, "running", {
           sessionId: session.id,
         });
-        const accepted = onSubmit(session.id, prompt, [], {
-          refreshTitle: eventRun,
+        // From here the settlement callback owns reservation cleanup, including
+        // a rejected submission that never starts an agent turn.
+        releaseAfterSettle = true;
+        await submitWithSettlement({
+          submit: (onSettled) =>
+            submitSession(session.id, prompt, [], {
+              refreshTitle: eventRun,
+              onSettled,
+            }),
+          rejectionMessage:
+            "The selected agent session could not start this run.",
           onSettled: (outcome) => {
             const status =
               outcome.status === "completed"
@@ -6597,14 +7365,6 @@ export default function App({
               .finally(releaseReservation);
           },
         });
-        if (!accepted) {
-          await updateAutomationRun(run.id, "failed", {
-            sessionId: session.id,
-            error: "The selected agent session could not start this run.",
-          });
-        } else {
-          releaseAfterSettle = true;
-        }
       } catch (reason: unknown) {
         await updateAutomationRun(run.id, "failed", {
           error: reason instanceof Error ? reason.message : String(reason),
@@ -6614,7 +7374,78 @@ export default function App({
         if (!releaseAfterSettle) releaseReservation();
       }
     },
-    [appendTab, focusOpenSession, onSubmit],
+    [appendTab, focusOpenSession, submitSession],
+  );
+
+  const launchQuickSession = useCallback(
+    (launch: QuickLaunch, deliveryId: string, placement?: AppSessionPlacement) =>
+      acceptQuickLaunch(launch, deliveryId, {
+        getSessions: () => sessionsRef.current,
+        updateSessions: (update) => {
+          sessionsRef.current = update(sessionsRef.current);
+          // Compose with submission's queued transcript updates.
+          setSessions(update);
+        },
+        appendTab,
+        placeSession: (sessionId, target, cwd) => {
+          const anchor = sessionsRef.current.find(
+            (session) => session.id === target.besideSessionId,
+          );
+          const tab = tabsRef.current.find((entry) =>
+            leafIds(entry.layout).includes(target.besideSessionId),
+          );
+          if (!anchor || !sameProjectPath(anchor.cwd, cwd) || !tab)
+            throw new Error("The target session must be open in this project");
+          const nextTabs = tabsRef.current.map((entry) =>
+            entry.id === tab.id
+              ? {
+                  ...entry,
+                  layout: splitPane(
+                    entry.layout,
+                    target.besideSessionId,
+                    target.direction,
+                    sessionId,
+                  ),
+                  focusedId: launch.reveal ? sessionId : entry.focusedId,
+                  diffFocused: launch.reveal ? false : entry.diffFocused,
+                }
+              : entry,
+          );
+          tabsRef.current = nextTabs;
+          setTabs(nextTabs);
+          return tab.id;
+        },
+        setProjectCwd,
+        setRecents,
+        revealTab: (id, cwd) => {
+          setActiveTabId(id);
+          setComposerFocused(false);
+          setSearchViewOpen(false);
+          setInboxViewOpen(false);
+          setNotesViewOpen(false);
+          setAutomationsViewOpen(false);
+          setSidebarTab("sessions", cwd);
+        },
+        submit: submitSession,
+        saveDraft: (id, prompt, attachments, requestId) =>
+          flushSync(() =>
+            onSaveDraft(id, prompt, attachments, requestId),
+          ),
+      }, placement),
+    [appendTab, submitSession, onSaveDraft],
+  );
+  useQuickComposerLaunches(launchQuickSession);
+  const launchQuickSessionRef = useRef(launchQuickSession);
+  launchQuickSessionRef.current = launchQuickSession;
+  const submitSessionRef = useRef(submitSession);
+  submitSessionRef.current = submitSession;
+  const saveDraftRef = useRef(onSaveDraft);
+  saveDraftRef.current = onSaveDraft;
+  const ensureOpenSessionRef = useRef(ensureOpenSession);
+  ensureOpenSessionRef.current = ensureOpenSession;
+
+  const appReceipts = useRef(
+    new Map<string, { signature: string; promise: Promise<unknown> }>(),
   );
 
   const ensureAutomationRecovery = useCallback(() => {
@@ -6699,6 +7530,7 @@ export default function App({
     (sessionId: string, blockId: string, text: string) => {
       setSessions((prev) =>
         prev.map((session) => {
+          if (remoteProjectFor(session.cwd)) return session;
           if (session.id !== sessionId || session.busy) return session;
           return {
             ...session,
@@ -6736,6 +7568,10 @@ export default function App({
       const session = sessionsRef.current.find(
         (entry) => entry.id === sessionId,
       );
+      if (session && remoteProjectFor(session.cwd)) {
+        buildRemotePlan(sessionId, blockId, target);
+        return;
+      }
       const block = session?.blocks.find((entry) => entry.id === blockId);
       if (
         !session ||
@@ -6919,6 +7755,118 @@ export default function App({
     [onSubmit],
   );
 
+  const onUsageLimitDismiss = useCallback((sessionId: string) => {
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId && session.usageLimit
+          ? { ...session, usageLimit: undefined }
+          : session,
+      ),
+    );
+  }, []);
+
+  const onUsageLimitResumeAtReset = useCallback(
+    (sessionId: string, enabled: boolean) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId && session.usageLimit
+            ? {
+                ...session,
+                usageLimit: { ...session.usageLimit, resumeAtReset: enabled },
+              }
+            : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const onUsageLimitResume = useCallback(
+    (sessionId: string) => {
+      const session = sessionsRef.current.find(
+        (entry) => entry.id === sessionId,
+      );
+      if (!session?.usageLimit || session.busy) return;
+      onUsageLimitDismiss(sessionId);
+      onSubmit(sessionId, CONTINUE_PROMPT);
+    },
+    [onSubmit, onUsageLimitDismiss],
+  );
+
+  const [usageLimitTick, setUsageLimitTick] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    const timers: number[] = [];
+    const scheduled = new Set<string>();
+    let nextCheck = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      const limit = session.usageLimit;
+      if (!limit?.resumeAtReset || limit.resetsAt == null) continue;
+      if (!usageLimitResumeDue(session, now)) {
+        nextCheck = Math.min(
+          nextCheck,
+          limit.resetsAt + USAGE_LIMIT_RESUME_GRACE_MS - now,
+        );
+        continue;
+      }
+      if (usageResumingRef.current.has(session.id)) continue;
+      usageResumingRef.current.add(session.id);
+      scheduled.add(session.id);
+      timers.push(
+        window.setTimeout(() => {
+          usageResumingRef.current.delete(session.id);
+          const latest = sessionsRef.current.find(
+            (entry) => entry.id === session.id,
+          );
+          if (latest && usageLimitResumeDue(latest, Date.now())) {
+            onUsageLimitResume(session.id);
+          }
+        }, 0),
+      );
+    }
+    if (Number.isFinite(nextCheck)) {
+      // Re-check every minute at most: timers drift while the machine sleeps.
+      timers.push(
+        window.setTimeout(
+          () => setUsageLimitTick((tick) => tick + 1),
+          Math.max(1_000, Math.min(nextCheck, 60_000)),
+        ),
+      );
+    }
+    return () => {
+      for (const timer of timers) window.clearTimeout(timer);
+      for (const id of scheduled) usageResumingRef.current.delete(id);
+    };
+  }, [onUsageLimitResume, sessions, usageLimitTick]);
+
+  // The stream does not always say when the limit resets; ask the provider.
+  useEffect(() => {
+    for (const session of sessions) {
+      const limit = session.usageLimit;
+      if (!limit || limit.resetsAt != null) continue;
+      if (usageResetLookups.current.has(limit)) continue;
+      const fetchLimits =
+        session.harness === "claude"
+          ? fetchClaudeRateLimits
+          : session.harness === "codex"
+            ? fetchCodexRateLimits
+            : undefined;
+      if (!fetchLimits) continue;
+      usageResetLookups.current.add(limit);
+      void fetchLimits(session.providerAccountId).then((limits) => {
+        const resetsAt = exhaustedWindowResetAt(limits);
+        if (resetsAt == null) return;
+        setSessions((prev) =>
+          prev.map((entry) =>
+            entry.id === session.id && entry.usageLimit === limit
+              ? { ...entry, usageLimit: { ...limit, resetsAt } }
+              : entry,
+          ),
+        );
+      });
+    }
+  }, [sessions]);
+
   const openSessionBeside = useCallback(
     (
       sourceId: string,
@@ -6968,13 +7916,11 @@ export default function App({
       const { harness, model, modelSettings } = target;
       const cwd = sessionWorkCwd(source);
       const from = harnessForTurn(source.blocks, turn, source.harness);
-      const userRequest = turnUserRequest(turn);
-      const files = turnEditedFiles(turn, cwd);
-      const prompt = buildSecondOpinionPrompt({
+      const request = buildSecondOpinionRequest({
         from,
-        userRequest,
-        report: turnReport(turn),
-        files,
+        to: harness,
+        turn,
+        cwd,
       });
       const session = {
         ...newSession(harness, source.cwd, model, source.runtimeMode),
@@ -6987,16 +7933,597 @@ export default function App({
         title: formatSessionTitle(harness, SECOND_OPINION_TITLE),
       };
       openSessionBeside(sourceId, session, source.cwd);
-      onSubmit(session.id, prompt, [], {
-        secondOpinion: buildSecondOpinionCard({
-          from,
-          to: harness,
-          userRequest,
-          files,
-        }),
-      });
+      onSubmit(session.id, request.prompt, [], request.options);
     },
     [onSubmit, openSessionBeside],
+  );
+  const updateBtwThread = useCallback(
+    (
+      sessionId: string,
+      userBlockId: string,
+      threadId: string,
+      update: (thread: BtwThread | undefined) => BtwThread | undefined,
+    ): Session | undefined => {
+      const previous = sessionsRef.current;
+      let updatedSession: Session | undefined;
+      const next = previous.map((session) => {
+        if (session.id !== sessionId) return session;
+        const blockIndex = session.blocks.findIndex(
+          (block) => block.id === userBlockId && block.role === "user",
+        );
+        if (blockIndex < 0) return session;
+        const block = session.blocks[blockIndex];
+        const current = block.btwThreads?.find(
+          (thread) => thread.id === threadId,
+        );
+        const nextThread = update(current);
+        if (!nextThread) return session;
+        const nextBlock = current
+          ? replaceBtwThread(block, nextThread)
+          : {
+              ...block,
+              btwThreads: [...(block.btwThreads ?? []), nextThread],
+            };
+        const blocks = session.blocks.slice();
+        blocks[blockIndex] = nextBlock;
+        updatedSession = { ...session, blocks };
+        return updatedSession;
+      });
+      if (!updatedSession) return undefined;
+      sessionsRef.current = next;
+      setSessions(next);
+      persistSession(updatedSession);
+      return updatedSession;
+    },
+    [persistSession],
+  );
+
+  const removeBtwThread = useCallback(
+    (
+      sessionId: string,
+      userBlockId: string,
+      threadId: string,
+    ): Session | undefined => {
+      const previous = sessionsRef.current;
+      let updatedSession: Session | undefined;
+      const next = previous.map((session) => {
+        if (session.id !== sessionId) return session;
+        const blockIndex = session.blocks.findIndex(
+          (block) => block.id === userBlockId && block.role === "user",
+        );
+        if (blockIndex < 0) return session;
+        const block = session.blocks[blockIndex];
+        const threads = block.btwThreads ?? [];
+        if (!threads.some((thread) => thread.id === threadId)) return session;
+        const nextThreads = threads.filter((thread) => thread.id !== threadId);
+        const nextBlock = {
+          ...block,
+          btwThreads: nextThreads.length > 0 ? nextThreads : undefined,
+        };
+        const blocks = session.blocks.slice();
+        blocks[blockIndex] = nextBlock;
+        updatedSession = { ...session, blocks };
+        return updatedSession;
+      });
+      if (!updatedSession) return undefined;
+      sessionsRef.current = next;
+      setSessions(next);
+      persistSession(updatedSession);
+      return updatedSession;
+    },
+    [persistSession],
+  );
+
+  const runBtwRequest = useCallback(
+    (input: {
+      sessionId: string;
+      userBlockId: string;
+      source: Session;
+      thread: BtwThread;
+      harness: HarnessId;
+    }) => {
+      const harness = input.harness;
+      if (!supportsBtwHarness(harness)) return;
+      const cwd = sessionWorkCwd(input.source);
+      const model = nativeModelId(
+        input.thread.model ?? input.source.model,
+      ).trim();
+      if (!cwd || cwd === "~") {
+        updateBtwThread(
+          input.sessionId,
+          input.userBlockId,
+          input.thread.id,
+          (thread) =>
+            thread
+              ? {
+                  ...thread,
+                  status: "error",
+                  updatedAt: Date.now(),
+                  error:
+                    "A project working directory is required for this question.",
+                }
+              : undefined,
+        );
+        return;
+      }
+      if (!model && harness === "codex") {
+        updateBtwThread(
+          input.sessionId,
+          input.userBlockId,
+          input.thread.id,
+          (thread) =>
+            thread
+              ? {
+                  ...thread,
+                  status: "error",
+                  updatedAt: Date.now(),
+                  error: "The selected Codex model is unavailable.",
+                }
+              : undefined,
+        );
+        return;
+      }
+
+      let prompt: string;
+      try {
+        prompt = buildBtwPrompt({
+          blocks: input.source.blocks,
+          thread: input.thread,
+          cwd,
+        });
+      } catch (error) {
+        updateBtwThread(
+          input.sessionId,
+          input.userBlockId,
+          input.thread.id,
+          (thread) =>
+            thread
+              ? {
+                  ...thread,
+                  status: "error",
+                  updatedAt: Date.now(),
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "The completed turn is no longer available.",
+                }
+              : undefined,
+        );
+        return;
+      }
+
+      const key = `${input.sessionId}:${input.thread.id}`;
+      btwRequestsRef.current.get(key)?.controller.abort();
+      const controller = new AbortController();
+      btwRequestsRef.current.set(key, {
+        sessionId: input.sessionId,
+        controller,
+      });
+
+      const userMessageId =
+        input.thread.messages[input.thread.messages.length - 1]?.id ??
+        input.thread.id;
+      const responseModel = model || input.source.model;
+
+      void runHarnessTextPrompt({
+        harness,
+        cwd,
+        providerAccountId: input.source.providerAccountId,
+        model: model || undefined,
+        modelSettings: input.thread.modelSettings ?? input.source.modelSettings,
+        threadId: input.thread.providerThreadId,
+        onThreadId: (providerThreadId) => {
+          if (controller.signal.aborted) return;
+          updateBtwThread(
+            input.sessionId,
+            input.userBlockId,
+            input.thread.id,
+            (thread) =>
+              thread && thread.providerThreadId !== providerThreadId
+                ? {
+                    ...thread,
+                    providerThreadId,
+                    updatedAt: Date.now(),
+                  }
+                : thread,
+          );
+        },
+        onEvent: (event) => {
+          if (controller.signal.aborted) return;
+          updateBtwThread(
+            input.sessionId,
+            input.userBlockId,
+            input.thread.id,
+            (thread) =>
+              thread?.status === "running"
+                ? {
+                    ...thread,
+                    updatedAt: Date.now(),
+                    pendingBlocks: applyBtwHarnessEvent(
+                      thread.pendingBlocks ?? [],
+                      event,
+                      harness,
+                      responseModel,
+                      userMessageId,
+                    ),
+                  }
+                : undefined,
+          );
+        },
+        intent: "plan",
+        prompt,
+        signal: controller.signal,
+      })
+        .then((output) => {
+          if (controller.signal.aborted) return;
+          const text = output.trim();
+          if (!text) {
+            throw new Error(
+              `${HARNESS_TITLE[harness]} returned an empty side answer.`,
+            );
+          }
+          updateBtwThread(
+            input.sessionId,
+            input.userBlockId,
+            input.thread.id,
+            (thread) => {
+              if (!thread) return undefined;
+              const pendingBlocks = thread.pendingBlocks ?? [];
+              const blocks =
+                pendingBlocks.length > 0
+                  ? sealBtwResponseBlocks(
+                      pendingBlocks,
+                      harness,
+                      responseModel,
+                      userMessageId,
+                    )
+                  : undefined;
+              return {
+                ...thread,
+                status: "ready",
+                updatedAt: Date.now(),
+                pendingBlocks: undefined,
+                messages: [
+                  ...thread.messages,
+                  {
+                    id: crypto.randomUUID(),
+                    role: "assistant",
+                    text,
+                    createdAt: Date.now(),
+                    ...(blocks?.length ? { blocks } : {}),
+                  },
+                ],
+                error: undefined,
+              };
+            },
+          );
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) return;
+          const message =
+            error instanceof Error
+              ? error.message
+              : `${HARNESS_TITLE[harness]} could not answer this side question.`;
+          updateBtwThread(
+            input.sessionId,
+            input.userBlockId,
+            input.thread.id,
+            (thread) =>
+              thread
+                ? {
+                    ...thread,
+                    status: "error",
+                    updatedAt: Date.now(),
+                    pendingBlocks: undefined,
+                    error: message,
+                  }
+                : undefined,
+          );
+        })
+        .finally(() => {
+          if (btwRequestsRef.current.get(key)?.controller === controller) {
+            btwRequestsRef.current.delete(key);
+          }
+        });
+    },
+    [updateBtwThread],
+  );
+
+  const onBtwSubmit = useCallback(
+    (
+      sessionId: string,
+      turn: Block[],
+      threadId: string,
+      messageId: string,
+      text: string,
+      model?: string,
+      modelSettings?: Record<string, string>,
+    ) => {
+      const source = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      const sourceUserId = turn.find((block) => block.role === "user")?.id;
+      const sourceEndBlockId = turn[turn.length - 1]?.id;
+      const turnHarness = source
+        ? harnessForTurn(source.blocks, turn, source.harness)
+        : undefined;
+      const turnModel = turn.find((block) => block.role === "user")?.turnModel
+        ?.id;
+      const sourceBlockEarly = source?.blocks.find(
+        (block) => block.id === sourceUserId && block.role === "user",
+      );
+      const existingEarly = sourceBlockEarly?.btwThreads?.find(
+        (thread) => thread.id === threadId,
+      );
+      const requestHarness = source
+        ? supportsBtwHarness(turnHarness)
+          ? turnHarness
+          : (existingEarly?.harness ??
+            btwTurnHarness(source.blocks, turn, source.harness))
+        : undefined;
+      if (
+        !source ||
+        !supportsBtwHarness(requestHarness) ||
+        source.worktreeRemoved ||
+        !sourceUserId ||
+        !sourceEndBlockId
+      ) {
+        return false;
+      }
+      const sourceBlock = sourceBlockEarly;
+      if (!sourceBlock) return false;
+      const existing = existingEarly;
+      const selectedModel =
+        model?.trim() ||
+        existing?.model ||
+        turnModel ||
+        nativeModelId(source.model).trim();
+      const selectedModelSettings =
+        modelSettings ??
+        existing?.modelSettings ??
+        preferredModelSettings(
+          resolveModel(requestHarness!, selectedModel || source.model),
+          source.modelSettings,
+        );
+      if (existing?.status === "running") return false;
+      if (existing && existing.sourceEndBlockId !== sourceEndBlockId) {
+        return false;
+      }
+      const now = Date.now();
+      const thread: BtwThread = existing
+        ? {
+            ...existing,
+            harness: existing.harness ?? turnHarness,
+            model: selectedModel || undefined,
+            modelSettings: selectedModelSettings,
+            status: "running",
+            updatedAt: now,
+            error: undefined,
+            pendingBlocks: [],
+            messages: [
+              ...existing.messages,
+              { id: messageId, role: "user", text, createdAt: now },
+            ],
+          }
+        : {
+            id: threadId,
+            sourceEndBlockId,
+            createdAt: now,
+            updatedAt: now,
+            status: "running",
+            pendingBlocks: [],
+            harness: requestHarness,
+            ...(selectedModel ? { model: selectedModel } : {}),
+            modelSettings: selectedModelSettings,
+            messages: [{ id: messageId, role: "user", text, createdAt: now }],
+          };
+      const updated = updateBtwThread(
+        sessionId,
+        sourceUserId,
+        threadId,
+        () => thread,
+      );
+      if (!updated) return false;
+      runBtwRequest({
+        sessionId,
+        userBlockId: sourceUserId,
+        source,
+        thread,
+        harness: thread.harness ?? requestHarness!,
+      });
+      return true;
+    },
+    [runBtwRequest, updateBtwThread],
+  );
+
+  const onBtwModelChange = useCallback(
+    (
+      sessionId: string,
+      turn: Block[],
+      threadId: string,
+      model: string,
+      modelSettings: Record<string, string>,
+    ) => {
+      const source = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      const sourceUserId = turn.find((block) => block.role === "user")?.id;
+      const turnHarness = source
+        ? harnessForTurn(source.blocks, turn, source.harness)
+        : undefined;
+      const nextModel = model.trim();
+      const sourceBlock = source?.blocks.find(
+        (block) => block.id === sourceUserId && block.role === "user",
+      );
+      const threadHarness = source
+        ? (sourceBlock?.btwThreads?.find((thread) => thread.id === threadId)
+            ?.harness ??
+          btwTurnHarness(source.blocks, turn, source.harness) ??
+          turnHarness)
+        : undefined;
+      if (
+        !source ||
+        !supportsBtwHarness(threadHarness) ||
+        source.worktreeRemoved ||
+        !sourceUserId ||
+        !nextModel
+      ) {
+        return;
+      }
+      updateBtwThread(sessionId, sourceUserId, threadId, (thread) =>
+        thread
+          ? {
+              ...thread,
+              model: nextModel,
+              modelSettings,
+              updatedAt: Date.now(),
+            }
+          : undefined,
+      );
+    },
+    [updateBtwThread],
+  );
+
+  const onBtwDelete = useCallback(
+    (sessionId: string, turn: Block[], threadId: string) => {
+      const source = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      const sourceUserId = turn.find((block) => block.role === "user")?.id;
+      const turnHarness = source
+        ? harnessForTurn(source.blocks, turn, source.harness)
+        : undefined;
+      const sourceBlock = source?.blocks.find(
+        (block) => block.id === sourceUserId && block.role === "user",
+      );
+      const threadHarness = source
+        ? (sourceBlock?.btwThreads?.find((thread) => thread.id === threadId)
+            ?.harness ??
+          btwTurnHarness(source.blocks, turn, source.harness) ??
+          turnHarness)
+        : undefined;
+      if (
+        !source ||
+        !supportsBtwHarness(threadHarness) ||
+        source.worktreeRemoved ||
+        !sourceUserId
+      ) {
+        return;
+      }
+      const requestKey = `${sessionId}:${threadId}`;
+      btwRequestsRef.current.get(requestKey)?.controller.abort();
+      btwRequestsRef.current.delete(requestKey);
+      removeBtwThread(sessionId, sourceUserId, threadId);
+    },
+    [removeBtwThread],
+  );
+
+  // Stopping keeps whatever the side answer had streamed, like stopping a
+  // main turn, and leaves the thread ready for the next question.
+  const onBtwStop = useCallback(
+    (sessionId: string, turn: Block[], threadId: string) => {
+      const sourceUserId = turn.find((block) => block.role === "user")?.id;
+      if (!sourceUserId) return;
+      const key = `${sessionId}:${threadId}`;
+      btwRequestsRef.current.get(key)?.controller.abort();
+      btwRequestsRef.current.delete(key);
+      updateBtwThread(sessionId, sourceUserId, threadId, (thread) => {
+        if (!thread || thread.status !== "running") return thread;
+        const harness = thread.harness;
+        const userMessageId =
+          thread.messages[thread.messages.length - 1]?.id ?? thread.id;
+        const pending = thread.pendingBlocks ?? [];
+        const blocks =
+          pending.length > 0 && harness
+            ? sealBtwResponseBlocks(
+                pending,
+                harness,
+                thread.model ?? "",
+                userMessageId,
+              )
+            : [];
+        const text = blocks
+          .filter((block) => block.role === "assistant")
+          .map((block) => block.text)
+          .join("\n\n")
+          .trim();
+        const now = Date.now();
+        return {
+          ...thread,
+          status: "ready",
+          updatedAt: now,
+          pendingBlocks: undefined,
+          error: undefined,
+          messages: blocks.length
+            ? [
+                ...thread.messages,
+                {
+                  id: crypto.randomUUID(),
+                  role: "assistant",
+                  text,
+                  createdAt: now,
+                  blocks,
+                },
+              ]
+            : thread.messages,
+        };
+      });
+    },
+    [updateBtwThread],
+  );
+
+  const onBtwRetry = useCallback(
+    (sessionId: string, turn: Block[], threadId: string) => {
+      const source = sessionsRef.current.find(
+        (session) => session.id === sessionId,
+      );
+      const sourceUserId = turn.find((block) => block.role === "user")?.id;
+      const turnHarness = source
+        ? harnessForTurn(source.blocks, turn, source.harness)
+        : undefined;
+      const sourceBlock = source?.blocks.find(
+        (block) => block.id === sourceUserId && block.role === "user",
+      );
+      const existing = sourceBlock?.btwThreads?.find(
+        (thread) => thread.id === threadId,
+      );
+      const threadHarness = source
+        ? (existing?.harness ??
+          btwTurnHarness(source.blocks, turn, source.harness) ??
+          turnHarness)
+        : undefined;
+      if (
+        !source ||
+        !supportsBtwHarness(threadHarness) ||
+        source.worktreeRemoved ||
+        !sourceUserId
+      ) {
+        return;
+      }
+      if (!sourceBlock || !existing || existing.status !== "error") return;
+      const thread: BtwThread = {
+        ...existing,
+        status: "running",
+        updatedAt: Date.now(),
+        error: undefined,
+        pendingBlocks: [],
+      };
+      const updated = updateBtwThread(
+        sessionId,
+        sourceUserId,
+        threadId,
+        () => thread,
+      );
+      if (!updated) return;
+      runBtwRequest({
+        sessionId,
+        userBlockId: sourceUserId,
+        source: updated,
+        thread,
+        harness: thread.harness ?? threadHarness!,
+      });
+    },
+    [runBtwRequest, updateBtwThread],
   );
 
   const onHandoff = useCallback(
@@ -7070,6 +8597,8 @@ export default function App({
       const current = sessionsRef.current.find(
         (session) => session.id === sessionId,
       );
+      if (current && remoteProjectFor(current.cwd))
+        return remoteSessionActions(sessionId)?.compact() ?? false;
       if (!current || current.busy || current.worktreeRemoved) return false;
       if (!canCompactHarnessContext(current.harness)) {
         const unsupported = sessionsRef.current.map((session) =>
@@ -7151,6 +8680,11 @@ export default function App({
 
   const onStop = useCallback(
     (sessionId: string, managed = false) => {
+      const remote = sessionsRef.current.find((s) => s.id === sessionId);
+      if (remote && remoteProjectFor(remote.cwd)) {
+        remoteSessionActions(sessionId)?.stop();
+        return;
+      }
       if (!managed) {
         const stopping = orchestrator.stopForSession(sessionId);
         if (stopping) {
@@ -7240,6 +8774,10 @@ export default function App({
     (sessionId: string, requestId: number, decision: ApprovalDecision) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session || session.worktreeRemoved) return;
+      if (remoteProjectFor(session.cwd)) {
+        remoteSessionActions(sessionId)?.approve(requestId, decision);
+        return;
+      }
       respondHarnessApproval(session.harness, sessionId, requestId, decision);
     },
     [],
@@ -7249,6 +8787,10 @@ export default function App({
     (sessionId: string, requestId: number, reply: UserQuestionReply) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
       if (!session || session.worktreeRemoved) return;
+      if (remoteProjectFor(session.cwd)) {
+        remoteSessionActions(sessionId)?.answer(requestId, reply);
+        return;
+      }
       respondHarnessQuestion(session.harness, sessionId, requestId, reply);
     },
     [],
@@ -7257,6 +8799,7 @@ export default function App({
   const onQuestionInteraction = useCallback(
     (sessionId: string, requestId: number) => {
       const session = sessionsRef.current.find((s) => s.id === sessionId);
+      if (session && remoteProjectFor(session.cwd)) return;
       if (session && !session.worktreeRemoved)
         keepHarnessQuestionOpen(session.harness, sessionId, requestId);
     },
@@ -7427,6 +8970,7 @@ export default function App({
             worker.providerSessionId,
             sessionWorkCwd(worker),
             worker.providerAccountId,
+            worker.blocks,
           );
         await upsertSession(worker);
         const next = [...sessionsRef.current, worker];
@@ -7578,13 +9122,26 @@ export default function App({
         return true;
       },
       submit: (id, text, done) => {
-        // Commit the new turn before the scheduler or confirmation updates
-        // another session snapshot in the same event loop.
-        flushSync(() =>
-          onSubmit(id, text, [], { managed: true, onSettled: done }),
-        );
+        void submitWithSettlement({
+          submit: (onSettled) => {
+            let acceptance: SubmissionAcceptance = false;
+            // Commit an immediate turn before another scheduler update. A
+            // deferred submission flushes its own turn after synchronization.
+            flushSync(() => {
+              acceptance = submitSession(id, text, [], {
+                managed: true,
+                onSettled,
+              });
+            });
+            return acceptance;
+          },
+          onSettled: done,
+          rejectionMessage:
+            "The selected agent session could not accept this turn.",
+        }).catch(console.error);
       },
       steer: async (id, text) => {
+        flushHarnessEvents();
         const session = sessionsRef.current.find((entry) => entry.id === id);
         if (!session) throw new Error("This agent is no longer available");
         if (!session.busy)
@@ -7642,7 +9199,7 @@ export default function App({
         }
       },
     });
-  }, [checkOpenWorktreeFiles, onSubmit, onStop]);
+  }, [checkOpenWorktreeFiles, submitSession, onStop, flushHarnessEvents]);
 
   useEffect(() => {
     orchestrator.sync();
@@ -7651,18 +9208,206 @@ export default function App({
   useEffect(() => {
     const listening = listen<{
       id: string;
+      namespace: string;
       sessionId: string;
       requestId: string;
       action: string;
       input: Record<string, unknown>;
     }>("monocode-control-request", ({ payload }) => {
-      void orchestrator
-        .handle(
-          payload.sessionId,
+      const handle = async () => {
+        if (payload.namespace === "control") {
+          return orchestrator.handle(
+            payload.sessionId,
+            payload.requestId,
+            payload.action,
+            payload.input,
+          );
+        }
+        if (payload.namespace !== "app")
+          throw new Error("Unknown CLI namespace");
+        const source = sessionsRef.current.find(
+          (session) => session.id === payload.sessionId,
+        );
+        if (
+          !source ||
+          source.inboxAsk ||
+          source.orchestrationLeadId ||
+          orchestrator.run(source.id)
+        )
+          throw new Error("This session cannot use the MonoCode app CLI");
+        const key = `${source.id}:${payload.requestId}`;
+        const signature = JSON.stringify([payload.action, payload.input]);
+        const previous = appReceipts.current.get(key);
+        if (previous) {
+          if (previous.signature !== signature)
+            throw new Error("Request ID was already used with different input");
+          return previous.promise;
+        }
+        const promise = handleAgentApp(
+          source,
           payload.requestId,
           payload.action,
           payload.input,
-        )
+          {
+            start: async (launch, id, placement) => {
+              const open = sessionsRef.current.find(
+                (session) => session.id === id,
+              );
+              const stored = open ? null : await getSession(id);
+              const existing = open ?? stored;
+              const previous = existing?.blocks.find(
+                (block) => block.appRequestId === id,
+              );
+              if (previous) {
+                if (
+                  previous.text !== launch.prompt ||
+                  (!launch.draft && !!previous.draft)
+                )
+                  throw new Error(
+                    "Request ID was already used for another session launch",
+                  );
+                return;
+              }
+              if (
+                existing?.blocks.some(
+                  (block) => block.role === "user" && !block.draft,
+                )
+              )
+                return;
+              if (existing && sessionDraftBlock(existing))
+                throw new Error("Session ID already has a different draft");
+              await launchQuickSessionRef.current(launch, id, placement);
+            },
+            sessions: async (cwd): Promise<AppSessionListing[]> => {
+              const stored = await listSessionsByProject(cwd);
+              const byId = new Map<string, AppSessionListing>();
+              for (const session of stored) {
+                if (session.orchestrationLeadId) continue;
+                byId.set(session.id, {
+                  id: session.id,
+                  title: session.title,
+                  harness: session.harness,
+                  model: session.model,
+                  busy: false,
+                  hasDraft: !!session.draft,
+                });
+              }
+              for (const session of sessionsRef.current) {
+                if (
+                  session.orchestrationLeadId ||
+                  !sameProjectPath(session.cwd, cwd)
+                )
+                  continue;
+                byId.set(session.id, {
+                  id: session.id,
+                  title: session.title,
+                  harness: session.harness,
+                  model: session.model,
+                  busy: !!session.busy,
+                  hasDraft: !!sessionDraftBlock(session),
+                });
+              }
+              return [...byId.values()];
+            },
+            session: async (id) => {
+              const target =
+                sessionsRef.current.find((session) => session.id === id) ??
+                (await getSession(id));
+              return target &&
+                !target.orchestrationLeadId &&
+                sameProjectPath(target.cwd, source.cwd)
+                ? target
+                : null;
+            },
+            send: async (id, prompt, requestId) => {
+              const target = await ensureOpenSessionRef.current(id);
+              if (
+                !target ||
+                target.orchestrationLeadId ||
+                !sameProjectPath(target.cwd, source.cwd) ||
+                orchestrator.run(id)
+              )
+                throw new Error("Session is unavailable in this project");
+              const previous = target.blocks.find(
+                (block) => block.appRequestId === requestId,
+              );
+              if (previous) {
+                if (previous.text !== prompt)
+                  throw new Error(
+                    "Request ID was already used with another prompt",
+                  );
+                if (previous.draft)
+                  throw new Error("Request ID belongs to an unsent draft");
+                return { alreadySubmitted: true };
+              }
+              if (target.busy)
+                throw new Error("Session is busy; try again when it finishes");
+              if (sessionDraftBlock(target))
+                throw new Error(
+                  "Session already has a draft; send or remove it first",
+                );
+              const accepted = await submitSessionRef.current(id, prompt, [], {
+                appRequestId: requestId,
+              });
+              if (!accepted)
+                throw new Error("Session could not accept the follow-up");
+              return { alreadySubmitted: false };
+            },
+            draft: async (id, prompt, requestId) => {
+              const target = await ensureOpenSessionRef.current(id);
+              if (
+                !target ||
+                target.orchestrationLeadId ||
+                !sameProjectPath(target.cwd, source.cwd) ||
+                orchestrator.run(id)
+              )
+                throw new Error("Session is unavailable in this project");
+              const previous = target.blocks.find(
+                (block) => block.appRequestId === requestId,
+              );
+              if (previous) {
+                if (previous.text !== prompt)
+                  throw new Error(
+                    "Request ID was already used with another prompt",
+                  );
+                return { alreadySaved: true, draft: !!previous.draft };
+              }
+              if (target.busy)
+                throw new Error("Session is busy; try again when it finishes");
+              if (sessionDraftBlock(target))
+                throw new Error(
+                  "Session already has a draft; send or remove it first",
+                );
+              const saved = flushSync(() =>
+                saveDraftRef.current(id, prompt, [], requestId),
+              );
+              if (!saved) throw new Error("Session could not accept a draft");
+              return { alreadySaved: false, draft: true };
+            },
+            worktrees: (cwd) => listWorktrees(cwd),
+            createWorktree: (cwd, branch, base, existing) =>
+              createWorktree(cwd, branch, base, existing),
+            notes: () => invoke("notes_list"),
+            note: (id) => invoke("notes_get", { id }),
+            saveNote: async (note) => {
+              const saved = await upsertNote(note);
+              window.dispatchEvent(new Event(NOTES_CHANGED_EVENT));
+              return saved;
+            },
+          },
+        );
+        appReceipts.current.set(key, { signature, promise });
+        void promise.catch(() => {
+          if (appReceipts.current.get(key)?.promise === promise)
+            appReceipts.current.delete(key);
+        });
+        if (appReceipts.current.size > 256) {
+          const first = appReceipts.current.keys().next().value;
+          if (first) appReceipts.current.delete(first);
+        }
+        return promise;
+      };
+      void handle()
         .then(
           (result) =>
             invoke("control_reply", {
@@ -7960,6 +9705,10 @@ export default function App({
       (a, b) => b.updatedAt - a.updatedAt || a.id.localeCompare(b.id),
     );
   }, [history, sessions, storedLinkedSessions]);
+  const repairSessions = useMemo(
+    () => ciRepairSessions(history, sessions),
+    [history, sessions],
+  );
   const openProjectSessions = useMemo(
     () =>
       sessions
@@ -8042,13 +9791,16 @@ export default function App({
   }, []);
 
   const onOpenSearch = useCallback(() => {
-    setFilePickerOpen(false);
-    setSettingsOpen(false);
-    setInboxViewOpen(false);
-    setNotesViewOpen(false);
-    setAutomationsViewOpen(false);
-    setSearchViewOpen(true);
-    setSearchViewFocusToken((token) => token + 1);
+    workspaceNavigation.cancel();
+    startTransition(() => {
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      setSearchViewOpen(true);
+      setSearchViewFocusToken((token) => token + 1);
+    });
   }, []);
 
   const onLeaveSearch = useCallback(() => {
@@ -8056,12 +9808,15 @@ export default function App({
   }, []);
 
   const onOpenInbox = useCallback(() => {
-    setFilePickerOpen(false);
-    setSettingsOpen(false);
-    setSearchViewOpen(false);
-    setNotesViewOpen(false);
-    setAutomationsViewOpen(false);
-    setInboxViewOpen(true);
+    workspaceNavigation.cancel();
+    startTransition(() => {
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setSearchViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(false);
+      setInboxViewOpen(true);
+    });
   }, []);
 
   const onOpenLinkedWorkItem = useCallback(
@@ -8103,20 +9858,81 @@ export default function App({
   const onOpenInboxSession = useCallback(
     (sessionId: string) => {
       setInboxViewOpen(false);
-      setSidebarTab("sessions");
+      const cwd =
+        sessionsRef.current.find((session) => session.id === sessionId)?.cwd ??
+        history.find((session) => session.id === sessionId)?.cwd;
+      setSidebarTab("sessions", cwd);
       void onSelectHistorySession(sessionId);
     },
-    [onSelectHistorySession],
+    [history, onSelectHistorySession],
+  );
+
+  const onRepairChecks = useCallback(
+    async (item: InboxItem, request: CiRepairRequest, sessionId?: string) => {
+      const cwd = item.projectPath;
+      if (!cwd) throw new Error("Choose a local project for this PR first.");
+      let session = sessionId ? await ensureOpenSession(sessionId) : undefined;
+      if (
+        sessionId &&
+        (!session ||
+          session.inboxAsk ||
+          session.orchestrationLeadId ||
+          !sameProjectPath(session.cwd, cwd))
+      ) {
+        throw new Error("Choose a chat from this project.");
+      }
+      if (
+        session &&
+        (session.busy || session.pendingSwitch || isPreparingHandoff(session))
+      ) {
+        throw new Error(
+          "This chat is busy. Choose another chat or start a new one.",
+        );
+      }
+      if (!session) {
+        session = {
+          ...newDefaultSession(cwd, sessionDefaults?.runtimeMode),
+          title: `Fix CI #${item.number}: ${item.title}`,
+          linkedWorkItem: linkedWorkItemFromInboxItem(item) ?? undefined,
+        };
+        const next = [...sessionsRef.current, session];
+        sessionsRef.current = next;
+        setSessions(next);
+      }
+      const repairSessionId = session.id;
+      trackCiRepair(cwd, request, repairSessionId, (settle) =>
+        onSubmit(repairSessionId, request.text, [], {
+          ciRepair: request,
+          noteCard: undefined,
+          handoffCard: undefined,
+          onSettled: (outcome) => settle(outcome.status),
+        }),
+      );
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setSearchViewOpen(false);
+      setSidebarTab("sessions", cwd);
+      await onSelectHistorySession(session.id);
+    },
+    [
+      ensureOpenSession,
+      onSubmit,
+      onSelectHistorySession,
+      sessionDefaults?.runtimeMode,
+    ],
   );
 
   const onOpenNotes = useCallback(() => {
+    workspaceNavigation.cancel();
     if (!loadNotesEnabled()) return;
-    setFilePickerOpen(false);
-    setSettingsOpen(false);
-    setSearchViewOpen(false);
-    setInboxViewOpen(false);
-    setAutomationsViewOpen(false);
-    setNotesViewOpen(true);
+    startTransition(() => {
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setAutomationsViewOpen(false);
+      setNotesViewOpen(true);
+    });
   }, []);
 
   const onLeaveNotes = useCallback(() => {
@@ -8124,12 +9940,15 @@ export default function App({
   }, []);
 
   const onOpenAutomations = useCallback(() => {
-    setFilePickerOpen(false);
-    setSettingsOpen(false);
-    setSearchViewOpen(false);
-    setInboxViewOpen(false);
-    setNotesViewOpen(false);
-    setAutomationsViewOpen(true);
+    workspaceNavigation.cancel();
+    startTransition(() => {
+      setFilePickerOpen(false);
+      setSettingsOpen(false);
+      setSearchViewOpen(false);
+      setInboxViewOpen(false);
+      setNotesViewOpen(false);
+      setAutomationsViewOpen(true);
+    });
   }, []);
 
   const onLeaveAutomations = useCallback(() => {
@@ -8147,7 +9966,7 @@ export default function App({
       setNotesViewOpen(false);
       setSettingsOpen(false);
       setFilePickerOpen(false);
-      setSidebarTab("sessions");
+      setSidebarTab("sessions", session.cwd);
       setProjectCwd(session.cwd);
       setRecents(rememberProject(session.cwd));
       await onSelectHistorySession(sessionId);
@@ -8157,23 +9976,52 @@ export default function App({
 
   const openSettings = useCallback(
     (section?: SettingsSectionId, anchor?: SettingsAnchor) => {
-      setFilePickerOpen(false);
-      setSearchViewOpen(false);
-      setInboxViewOpen(false);
-      setNotesViewOpen(false);
-      setAutomationsViewOpen(false);
-      if (section) {
-        setSettingsSection(section);
-        saveSettingsSection(section);
+      workspaceNavigation.cancel();
+      if (!settingsOpenRef.current) {
+        settingsReturnViewRef.current = {
+          search: searchViewOpenRef.current,
+          inbox: inboxViewOpenRef.current,
+          notes: notesViewOpenRef.current,
+          automations: automationsViewOpenRef.current,
+        };
       }
-      setSettingsAnchor(anchor ?? null);
-      setNotificationProjectPath(null);
-      setSettingsOpen(true);
+      startTransition(() => {
+        setFilePickerOpen(false);
+        setSearchViewOpen(false);
+        setInboxViewOpen(false);
+        setNotesViewOpen(false);
+        setAutomationsViewOpen(false);
+        if (section) {
+          setSettingsSection(section);
+          saveSettingsSection(section);
+        }
+        setSettingsAnchor(anchor ?? null);
+        setNotificationProjectPath(null);
+        setSettingsOpen(true);
+      });
     },
     [],
   );
 
   const onOpenSettings = useCallback(() => openSettings(), [openSettings]);
+  useEffect(() => {
+    const openConnections = () => openSettings("connections");
+    window.addEventListener(OPEN_CONNECTIONS_EVENT, openConnections);
+    return () =>
+      window.removeEventListener(OPEN_CONNECTIONS_EVENT, openConnections);
+  }, [openSettings]);
+  const [remoteProjectDialogOpen, setRemoteProjectDialogOpen] = useState(false);
+  useEffect(() => {
+    const open = () => setRemoteProjectDialogOpen(true);
+    window.addEventListener(OPEN_REMOTE_PROJECT_EVENT, open);
+    return () => window.removeEventListener(OPEN_REMOTE_PROJECT_EVENT, open);
+  }, []);
+
+  useEffect(() => {
+    const onOpenMcp = () => openSettings("mcp");
+    window.addEventListener("monocode:open-mcp-settings", onOpenMcp);
+    return () => window.removeEventListener("monocode:open-mcp-settings", onOpenMcp);
+  }, [openSettings]);
 
   const onOpenNotificationSettings = useCallback(
     (path?: string) => {
@@ -8190,6 +10038,11 @@ export default function App({
   );
 
   const onCloseSettings = useCallback(() => {
+    const returnView = settingsReturnViewRef.current;
+    setSearchViewOpen(returnView.search);
+    setInboxViewOpen(returnView.inbox);
+    setNotesViewOpen(returnView.notes && loadNotesEnabled());
+    setAutomationsViewOpen(returnView.automations);
     setSettingsOpen(false);
   }, []);
 
@@ -8208,7 +10061,7 @@ export default function App({
 
   const onRailBack = useCallback(() => {
     if (settingsOpen) {
-      setSettingsOpen(false);
+      onCloseSettings();
       return;
     }
     if (searchViewOpen) {
@@ -8229,6 +10082,7 @@ export default function App({
     }
     onVisitBack();
   }, [
+    onCloseSettings,
     onVisitBack,
     searchViewOpen,
     settingsOpen,
@@ -8260,7 +10114,8 @@ export default function App({
     for (const tab of tabs) {
       for (const pane of tab.editorPanes) {
         for (const file of pane.files) {
-          if (!isFilesystemTab(file) || seen.has(file.path)) continue;
+          if (!isFilesystemTab(file) || seen.has(file.path))
+            continue;
           seen.add(file.path);
           paths.push(file.path);
         }
@@ -8289,33 +10144,67 @@ export default function App({
         (session) => session.id === activeWorkspace.focusedId,
       );
       if (!current) return;
+      const remoteProject = isRemoteProjectPath(current.cwd);
+      const navigationId = remoteProject
+        ? remoteSessionFor(current.id)
+        : current.id;
+      if (!navigationId) return;
 
       const next = adjacentItemId(
         sessionNavigationIdsRef.current,
-        current.id,
+        navigationId,
         delta,
       );
-      if (!next || next === current.id) return;
+      if (!next || next === navigationId) return;
+      if (remoteProject) {
+        if (inCurrentTab) {
+          rememberRemoteSession(current.id, next);
+          setComposerFocused(true);
+        } else {
+          onSelectRemoteSession(current.cwd, next);
+        }
+        return;
+      }
+      // Stepping gives no hover to warm the transcript, so load the one a
+      // further step away once this switch has its own session.
+      const prefetchAhead = () => {
+        const ahead = adjacentItemId(
+          sessionNavigationIdsRef.current,
+          next,
+          delta,
+        );
+        if (ahead && ahead !== current.id) onPrefetchHistorySession(ahead);
+      };
       if (!inCurrentTab) {
-        void onSelectHistorySession(next);
+        void onSelectHistorySession(next).then(prefetchAhead);
         return;
       }
       const activeTabId = activeWorkspace.id;
       const focusedId = current.id;
       void ensureOpenSession(next).then((session) => {
+        prefetchAhead();
         if (!session || session.inboxAsk) return;
         if (activeTabIdRef.current !== activeTabId) return;
-        const currentTab = tabsRef.current.find((tab) => tab.id === activeTabId);
+        const currentTab = tabsRef.current.find(
+          (tab) => tab.id === activeTabId,
+        );
         if (currentTab?.focusedId !== focusedId) return;
-        setTabs((prev) =>
-          switchSessionInTab(prev, activeTabId, focusedId, next) ?? prev,
+        setTabs(
+          (prev) =>
+            switchSessionInTab(prev, activeTabId, focusedId, next) ?? prev,
         );
         setComposerFocused(true);
         const linkedUpdate = linkedSessionUpdatesRef.current.get(next);
         if (linkedUpdate) revealLinkedSessionUpdate(next, linkedUpdate);
       });
     },
-    [ensureOpenSession, onSelectHistorySession, revealLinkedSessionUpdate],
+    [
+      ensureOpenSession,
+      onPrefetchHistorySession,
+      onSelectHistorySession,
+      onSelectRemoteSession,
+      revealLinkedSessionUpdate,
+    ],
   );
 
   const onNavigateProjectList = useCallback(
@@ -8404,30 +10293,52 @@ export default function App({
   }, []);
 
   useEffect(() => {
+    if (!IS_MAC) return;
+    void invoke("autosave_set_enabled", { enabled: loadAutosave() }).catch(
+      console.error,
+    );
+    void invoke("keybindings_set_overrides", {
+      overrides: loadKeybindingOverrides(),
+    }).catch(console.error);
+  }, []);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // Browser-standard UI zoom. Runs before tabCommand and always applies —
-      // even in inputs and the terminal — so Ctrl/Cmd + - 0 behave like a browser.
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.isComposing) {
-        const zoom = uiScaleCommand(e);
-        if (zoom) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (zoom === "zoom-in") {
-            const next = saveUiScale(zoomInUiScale(loadUiScale()));
-            void applyUiScale(next);
-          } else if (zoom === "zoom-out") {
-            const next = saveUiScale(zoomOutUiScale(loadUiScale()));
-            void applyUiScale(next);
-          } else {
-            saveUiScale(UI_SCALE_DEFAULT);
-            void applyUiScale(UI_SCALE_DEFAULT);
-          }
-          return;
+      // The Quick Composer recorder owns the next key combination, including
+      // bindings that the workspace would normally handle in capture phase.
+      if (document.querySelector('[data-shortcut-recorder-active="true"]'))
+        return;
+      // Never act on a chord while an IME is composing: tabCommand and the
+      // editor guards already do, and the app shortcut resolver does too, so
+      // this keeps the whole handler consistent for whatever is added next.
+      if (e.isComposing) return;
+      const customCommand = matchCustomKeybinding(e);
+      const pressed = (command: string, defaultMatch: boolean) =>
+        keybindingPressed(command, e, defaultMatch);
+      // A rebound zoom chord may be Option-only, so it is resolved outside the
+      // Cmd/Ctrl guard that only the browser-standard defaults need.
+      const zoom = resolveZoomKeybinding(e);
+      if (zoom) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (zoom === "zoom-in") {
+          const next = saveUiScale(zoomInUiScale(loadUiScale()));
+          void applyUiScale(next);
+        } else if (zoom === "zoom-out") {
+          const next = saveUiScale(zoomOutUiScale(loadUiScale()));
+          void applyUiScale(next);
+        } else {
+          saveUiScale(UI_SCALE_DEFAULT);
+          void applyUiScale(UI_SCALE_DEFAULT);
         }
+        return;
       }
-      const cmd = tabCommand(e);
-      if (cmd) {
+      const cmd = customCommand
+        ? tabCommandForKeybinding(customCommand, e)
+        : tabCommand(e);
+      if (cmd && pressed(tabCommandKeybinding(cmd), !customCommand)) {
         if (cmd === "archive-session") {
+          if (e.repeat) return;
           actions.current.onArchiveFocusedSession(e);
           return;
         }
@@ -8500,6 +10411,8 @@ export default function App({
         else if (cmd === "close") run("close", a.onClosePane);
         else if (cmd === "next") run("next", a.onNext);
         else if (cmd === "prev") run("prev", a.onPrev);
+        else if (cmd === "cycle-next") run("next", a.onNext);
+        else if (cmd === "cycle-prev") run("prev", a.onPrev);
         else if (cmd === "back") run("back", a.onVisitBack);
         else if (cmd === "forward") run("forward", a.onVisitForward);
         else if (cmd === "split-right")
@@ -8543,57 +10456,39 @@ export default function App({
         e.stopPropagation();
         return;
       }
-      const mod = e.metaKey || e.ctrlKey;
-      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "b") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("toggle_sidebar", actions.current.onToggleSidebar);
-        return;
-      }
-      if (mod && !e.altKey && e.shiftKey && e.key.toLowerCase() === "b") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("toggle_session_sidebar", actions.current.onToggleSessionSidebar);
-        return;
-      }
-      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "p") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("go_to_file", actions.current.onGoToFile);
-        return;
-      }
-      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "p") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("open_command_palette", actions.current.onOpenCommandPalette);
-        return;
-      }
-      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "r") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("reload", actions.current.onReload);
-        return;
-      }
-      if (mod && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "k") {
-        const target = e.target instanceof Element ? e.target : null;
-        if (target?.closest(".monocode-terminal") && e.ctrlKey && !e.metaKey) {
+      const shortcut = resolveAppShortcut(e);
+      if (shortcut) {
+        if (
+          shortcut === "App: Search" &&
+          e.target instanceof Element &&
+          e.target.closest(".monocode-terminal") &&
+          e.ctrlKey &&
+          !e.metaKey
+        ) {
           return;
         }
         e.preventDefault();
         e.stopPropagation();
-        run("open_search", actions.current.onOpenSearch);
+        const a = actions.current;
+        if (shortcut === "App: New Window")
+          run("new_window", () => void invoke("open_new_window"));
+        else if (shortcut === "App: Open Project")
+          run("open_project", () => void a.pickProject());
+        else if (shortcut === "App: Toggle Sidebar")
+          run("toggle_sidebar", a.onToggleSidebar);
+        else if (shortcut === "App: Toggle Session Sidebar")
+          run("toggle_session_sidebar", a.onToggleSessionSidebar);
+        else if (shortcut === "App: Go to File")
+          run("go_to_file", a.onGoToFile);
+        else if (shortcut === "App: Command Palette")
+          run("open_command_palette", a.onOpenCommandPalette);
+        else if (shortcut === "View: Reload") run("reload", a.onReload);
+        else if (shortcut === "App: Search") run("open_search", a.onOpenSearch);
+        else if (shortcut === "App: Settings")
+          run("open_settings", () => a.openSettings());
+        else if (shortcut === "App: Find in Files")
+          run("find_in_project", a.onFindInProject);
         return;
-      }
-      if (mod && !e.altKey && !e.shiftKey && e.key === ",") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("open_settings", () => actions.current.openSettings());
-        return;
-      }
-      if (mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "f") {
-        e.preventDefault();
-        e.stopPropagation();
-        run("find_in_project", actions.current.onFindInProject);
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -8610,6 +10505,12 @@ export default function App({
         run("close-all", actions.current.onCloseAllTabs),
       ),
       listen("close_tab", () => run("close", actions.current.onClosePane)),
+      listen<boolean>("toggle_autosave", ({ payload }) => {
+        const saved = saveAutosave(payload);
+        if (saved !== payload && IS_MAC) {
+          void invoke("autosave_set_enabled", { enabled: saved });
+        }
+      }),
       listen("next_tab", () => run("next", actions.current.onNext)),
       listen("prev_tab", () => run("prev", actions.current.onPrev)),
       listen("back_tab", () => run("back", actions.current.onVisitBack)),
@@ -8735,17 +10636,71 @@ export default function App({
     );
   }, [currentProjectDock, dockVisible]);
 
+  const lastRemoteSnapshot = useRef(new Map<string, HostSession>());
+  const onRemoteSnapshot = useCallback((shellId: string, snapshot?: HostSession) => {
+    if (!snapshot) {
+      lastRemoteSnapshot.current.delete(shellId);
+      setSessions((current) => current.map((entry) => entry.id === shellId
+        ? { ...entry, title: "New remote session", blocks: [], busy: false }
+        : entry));
+      return;
+    }
+    if (lastRemoteSnapshot.current.get(shellId) === snapshot) return;
+    lastRemoteSnapshot.current.set(shellId, snapshot);
+    // A host turn that ends is announced like a local one, whether or not
+    // its tab is showing.
+    const finished =
+      !!sessionsRef.current.find((entry) => entry.id === shellId)?.busy &&
+      !snapshot.session.busy;
+    setSessions((current) => {
+      const shell = current.find((entry) => entry.id === shellId);
+      if (!shell) return current;
+      const project = remoteProjectFor(shell.cwd);
+      if (!project) return current;
+      return current.map((entry) => entry.id === shellId
+        ? remoteSessionState(entry, snapshot, project)
+        : entry);
+    });
+    if (finished)
+      window.setTimeout(() => {
+        const session = sessionsRef.current.find((entry) => entry.id === shellId);
+        if (session)
+          void announceSessionFinished(
+            session,
+            shellId === activeSessionIdRef.current,
+          );
+      }, 0);
+  }, []);
+  const markRemoteBusy = useCallback((shellId: string) => {
+    setSessions((current) => current.map((entry) =>
+      entry.id === shellId && !entry.busy ? { ...entry, busy: true } : entry));
+  }, []);
+  useRemoteTurnUpdates(sessions, {
+    onBusy: markRemoteBusy,
+    onSnapshot: onRemoteSnapshot,
+    known: (shellId) => lastRemoteSnapshot.current.get(shellId),
+  });
+
+  const onManageWorktrees = useCallback(
+    () => openSettings("worktrees"),
+    [openSettings],
+  );
+
   const sessionPaneProps = {
+    workspaceSwitchingSessionId: workspaceNavigation.pending
+      ? active?.id
+      : undefined,
     recents,
     hideProjectPicker: true,
     onFocus: onFocusPane,
     onClose: onClosePane,
     onCwdChange,
     onBranchChange,
-    onWorktreeChange,
+    onWorktreeChange: onComposerWorktreeChange,
+    onRemoteSnapshot,
     onWorkspaceModeChange,
     onWorktreeBaseChange,
-    onManageWorktrees: () => openSettings("worktrees"),
+    onManageWorktrees,
     onModelChange,
     onModelSettingsChange,
     onRuntimeModeChange,
@@ -8760,6 +10715,9 @@ export default function App({
     onQueuedMessageEditingChange,
     onSteerQueuedMessage,
     onResumeQueue,
+    onUsageLimitResume,
+    onUsageLimitResumeAtReset,
+    onUsageLimitDismiss,
     onInboxCardDismiss,
     onLinkedWorkItemUpdateCardDismiss,
     onNoteCardDismiss,
@@ -8776,6 +10734,11 @@ export default function App({
     onBuildPlan,
     onSecondOpinion,
     onHandoff,
+    onBtwSubmit,
+    onBtwRetry,
+    onBtwDelete,
+    onBtwStop,
+    onBtwModelChange,
     onNewTerminal: onNewTerminalInSession,
   };
 
@@ -8810,9 +10773,12 @@ export default function App({
       onOpenNotes={notesEnabled ? onOpenNotes : undefined}
       onClose={onCloseTitleTab}
       onCloseMany={onCloseTabs}
+      onArchiveTab={onArchiveTitleTab}
+      onDeleteTab={onDeleteTitleTab}
       onReorder={onReorderTabs}
       onPlaceOnPane={onPlaceTabOnPane}
       onGoToFile={onGoToFile}
+      onPinFile={onPinFile}
       recents={recents}
       onSelectProject={onSelectProject}
     />
@@ -8831,6 +10797,16 @@ export default function App({
             <Sidebar
               cwd={sidebarCwd}
               gitCwd={gitCwd}
+              worktreeTabStats={worktreeTabStats}
+              onSelectWorkspace={onSelectWorkspace}
+              workspaceSwitchPending={
+                workspaceNavigation.pending?.project === sidebarCwd
+              }
+              workspaceSwitchError={
+                workspaceNavigation.error?.project === sidebarCwd
+                  ? workspaceNavigation.error.message
+                  : undefined
+              }
               explorerRootLabel={explorerRootLabel}
               open={sessionSidebarOpen}
               tab={sidebarTab}
@@ -8846,6 +10822,8 @@ export default function App({
               status={historyFailed ? "error" : "idle"}
               pending={historyPending}
               onSelectSession={onSelectHistorySession}
+              onSelectRemoteSession={onSelectRemoteSession}
+              onRemoteSessionDeleted={onRemoteSessionDeleted}
               onPrefetchSession={onPrefetchHistorySession}
               onSessionNavigationOrder={onSessionNavigationOrder}
               onPlaceSessionOnPane={onPlaceSessionOnPane}
@@ -8878,7 +10856,6 @@ export default function App({
               onOpenDiff={onOpenWorkingTreeDiff}
               onOpenAllChanges={onOpenAllChanges}
               onOpenCommit={onOpenCommit}
-              onShowSourceControl={onToggleChanges}
               selectedDiffPath={
                 activeTab ? selectedChangePath(activeTab, gitCwd) : undefined
               }
@@ -9079,9 +11056,11 @@ export default function App({
                                 onSelectFile={onSelectFileSurface}
                                 onCloseFile={onCloseFile}
                                 onCloseOtherFiles={onCloseOtherFiles}
+                                onPinFile={onPinFile}
                                 onReorderFiles={onReorderFiles}
                                 onFileDirtyChange={onFileDirtyChange}
                                 onFileErrorCountChange={onFileErrorCountChange}
+                                transcriptPool={transcriptPool}
                                 onRatio={(splitId, index, ratio) =>
                                   onRatio(tab.id, splitId, index, ratio)
                                 }
@@ -9099,6 +11078,12 @@ export default function App({
                   </div>
                   {[...linkedWorkItemPanels.values()].map((panel) => (
                     <LinkedWorkItemPanel
+                      repairSessions={repairSessions}
+                      onRepairChecks={onRepairChecks}
+                      onOpenSession={(sessionId) => {
+                        closeLinkedWorkItemPanel(panel.sessionId);
+                        onOpenInboxSession(sessionId);
+                      }}
                       key={panel.sessionId}
                       target={panel.item}
                       cwd={panel.cwd}
@@ -9130,7 +11115,8 @@ export default function App({
                   onToggleSidebar={onToggleSidebar}
                   onOpenFile={onOpenFile}
                   onOpenSession={(sessionId, blockId, query) => {
-                    if (blockId) requestTranscriptJump(sessionId, blockId, query);
+                    if (blockId)
+                      requestTranscriptJump(sessionId, blockId, query);
                     void onSelectHistorySession(sessionId);
                   }}
                   onOpenProject={onSelectProject}
@@ -9173,6 +11159,8 @@ export default function App({
                   onAskRestart={onRestartInboxAsk}
                   onAskMount={setInboxAskPortal}
                   sessions={inboxRelatedSessions}
+                  repairSessions={repairSessions}
+                  onRepairChecks={onRepairChecks}
                   onOpenSession={onOpenInboxSession}
                   onOpenIntegrations={onOpenInboxIntegrations}
                 />
@@ -9246,10 +11234,10 @@ export default function App({
                   terminalOpen={runningTerminalOpen}
                   onToggleTerminal={onToggleRunningTerminal}
                   onNewTerminal={
-                    looksLikeProject(projectCwd) ? onNewTerminal : undefined
+                    isLocalProject(projectCwd) ? onNewTerminal : undefined
                   }
                   onShowTerminal={
-                    looksLikeProject(projectCwd)
+                    isLocalProject(projectCwd)
                       ? onShowProjectTerminal
                       : undefined
                   }
@@ -9266,7 +11254,7 @@ export default function App({
             <FilePicker
               key={filePickerResetToken}
               open
-              cwd={gitCwd}
+              cwd={filesCwd}
               openPaths={openFilePaths}
               initialQuery={filePickerInitialQuery}
               onOpenFile={onOpenFile}
@@ -9287,10 +11275,18 @@ export default function App({
               }}
             />
           )}
+          <HarnessUpdateNotice
+            topOffset={
+              12 + (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
+            }
+            onHeightChange={setHarnessUpdateHeight}
+          />
           <ApprovalToasts
             notices={hiddenApprovalToasts}
             topOffset={
-              12 + (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0)
+              12 +
+              (reminderNoticesHeight ? reminderNoticesHeight + 8 : 0) +
+              (harnessUpdateHeight ? harnessUpdateHeight + 8 : 0)
             }
             onFocusSession={onOpenApprovalSession}
             onApproval={onApproval}
@@ -9311,6 +11307,15 @@ export default function App({
               onClose={() => setWhatsNewVersion(null)}
             />
           ) : null}
+          {remoteProjectDialogOpen ? (
+            <AddRemoteProjectDialog
+              onCancel={() => setRemoteProjectDialogOpen(false)}
+              onOpen={(key) => {
+                setRemoteProjectDialogOpen(false);
+                onSelectProject(key);
+              }}
+            />
+          ) : null}
           {providerSignInRequest ? (
             <ProviderSignInDialog
               key={providerSignInRequest.key}
@@ -9319,12 +11324,22 @@ export default function App({
             />
           ) : null}
         </div>
+        <TranscriptPoolOutlet pool={transcriptPool} />
       </OrchestrationWorkers.Provider>
     </OrchestrationActions.Provider>
   );
 }
 function conversationTitle(session: Session): string {
-  const title = sessionDisplayTitle(session.title, session.harness);
+  const hostId = isRemoteProjectPath(session.cwd)
+    ? remoteSessionFor(session.id)
+    : undefined;
+  const remote = hostId
+    ? cachedRemoteSessionSummary(session.cwd, hostId)
+    : undefined;
+  const title = sessionDisplayTitle(
+    remote?.title ?? session.title,
+    remote?.harness ?? session.harness,
+  );
   return title === "New session" ? "" : title;
 }
 
@@ -9369,6 +11384,7 @@ function isBlankWorkspaceTab(tab: WorkspaceTab, sessions: Session[]): boolean {
     return false;
   const ids = leafIds(tab.layout);
   if (ids.length !== 1) return false;
+  if (remoteSessionFor(ids[0]) || remotePendingWorktree(ids[0])) return false;
   return isBlankSession(sessions.find((entry) => entry.id === ids[0]));
 }
 
@@ -9490,6 +11506,7 @@ function toTitleTab(
       ),
     ),
     terminal: hasTerminal && harnesses.length === 0,
+    previewFileId: previewWorkspaceFile(tab)?.id,
     groupId: tab.groupId,
   };
 }
@@ -9503,7 +11520,8 @@ function dropOpenFiles(
   const editorPanes: EditorPane[] = [];
   for (const pane of tab.editorPanes) {
     const files = pane.files.filter(
-      (file) => !isFilesystemTab(file) || !shouldDrop(file.path),
+      (file) =>
+        !isFilesystemTab(file) || !shouldDrop(file.path),
     );
     if (files.length === 0) {
       const sibling = siblingLeafId(layout, pane.id);

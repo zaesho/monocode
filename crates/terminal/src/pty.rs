@@ -895,10 +895,11 @@ mod label_tests {
             .expect("spawn sleep");
         let pid = child.id() as i32;
         // Linux can return from spawn while the child is still inside execve,
-        // when /proc/<pid>/cmdline is empty. Wait for the new argv.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // when /proc/<pid>/cmdline is empty or still the parent's. Wait for
+        // the new argv.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut read = process_args(pid);
-        while read.is_none() && std::time::Instant::now() < deadline {
+        while read.as_deref() != Some("sleep 30") && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
             read = process_args(pid);
         }

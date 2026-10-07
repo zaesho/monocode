@@ -786,7 +786,7 @@ fn process_args(pid: i32) -> Option<String> {
 
 /// `KERN_PROCARGS2`: argc as a C int, the executable path, NUL padding, then
 /// argc NUL-terminated arguments (and the environment after them).
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn parse_procargs2(buf: &[u8]) -> Option<String> {
     let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
     let rest = &buf[4..];

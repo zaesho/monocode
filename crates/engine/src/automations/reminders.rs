@@ -707,8 +707,8 @@ impl Reminders {
     }
 }
 
-/// `ensureReminderSessionsSaved`: save each open session; one that cannot
-/// be saved yet has no message.
+/// `ensureReminderSessionsSaved`: save each open session, including blank
+/// ones. Only remote and project-less conversations cannot be saved.
 pub fn ensure_sessions_saved(session_ids: &[String], cx: &gpui::App) -> Task<Result<(), String>> {
     let sessions = Engine::sessions(cx);
     let writer = Engine::writer(cx);
@@ -718,11 +718,9 @@ pub fn ensure_sessions_saved(session_ids: &[String], cx: &gpui::App) -> Task<Res
         .collect();
     cx.spawn(async move |_| {
         for session in open {
-            let saved = writer.upsert_session(&session).await?;
+            let saved = writer.upsert_session_allow_empty(&session).await?;
             if saved.is_none() {
-                return Err(
-                    "Send a message in this conversation before setting a reminder.".into(),
-                );
+                return Err("Reminders need a conversation in a local project.".into());
             }
         }
         Ok(())

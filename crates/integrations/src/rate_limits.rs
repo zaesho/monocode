@@ -4,10 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-use monocode_process::claude_keychain::KEYCHAIN_TIMEOUT;
 #[cfg(target_os = "macos")]
-use monocode_process::claude_keychain::claude_keychain_service;
+use monocode_process::claude_keychain::{KEYCHAIN_TIMEOUT, claude_keychain_service};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -20,6 +18,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_FALLBACK_USER: &str = "claude-code-user";
+
+/// How long the Linux Secret Service lookup for Droid's key may take. It
+/// matches the macOS Keychain timeout, which lives in a macOS-only module.
+#[cfg(target_os = "linux")]
+const SECRET_SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1006,7 +1009,7 @@ fn read_droid_keyring_key() -> Option<Vec<u8>> {
                     child.stdout.take()?.read_to_string(&mut out).ok()?;
                     return decode_droid_key(&out);
                 }
-                Ok(None) if started.elapsed() > KEYCHAIN_TIMEOUT => {
+                Ok(None) if started.elapsed() > SECRET_SERVICE_TIMEOUT => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;

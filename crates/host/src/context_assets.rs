@@ -525,6 +525,8 @@ mod tests {
     #[test]
     fn reports_missing_files_changed_files_symbolic_links_and_both_size_limits() {
         let s = setup();
+        // Only Unix adds the symbolic link case below.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut attachments = vec![
             Attachment {
                 id: "missing".into(),

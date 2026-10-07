@@ -36,13 +36,114 @@ struct ContextCards {
 pub struct ComposerCards {
     session_id: String,
     cards: ContextCards,
+    /// Linked sessions as (id, title).
+    peers: Vec<(String, String)>,
+    _links: Subscription,
+    _titles: Option<gpui::Task<()>>,
 }
 impl ComposerCards {
-    pub fn new(session_id: String, _: &mut Context<Self>) -> Self {
-        Self {
+    pub fn new(session_id: String, cx: &mut Context<Self>) -> Self {
+        let links = Engine::links(cx);
+        let mut this = Self {
             session_id,
             cards: ContextCards::default(),
+            peers: Vec::new(),
+            _links: cx.observe(&links, |this, _, cx| this.refresh_peers(cx)),
+            _titles: None,
+        };
+        this.refresh_peers(cx);
+        this
+    }
+
+    /// Read the linked sessions and their titles.
+    fn refresh_peers(&mut self, cx: &mut Context<Self>) {
+        let ids = Engine::links(cx).read(cx).peers(&self.session_id, cx);
+        let titles: Vec<_> = ids
+            .iter()
+            .map(|id| crate::session_links::session_title(id, cx))
+            .collect();
+        self._titles = Some(cx.spawn(async move |this, cx| {
+            let mut peers = Vec::new();
+            for (id, title) in ids.into_iter().zip(titles) {
+                peers.push((id, title.await));
+            }
+            this.update(cx, |this, cx| {
+                if this.peers != peers {
+                    this.peers = peers;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn render_peers(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        use gpui::{InteractiveElement as _, StatefulInteractiveElement as _, Styled as _};
+        use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
+        if self.peers.is_empty() {
+            return None;
         }
+        let theme = Theme::of(cx).clone();
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(u(6.))
+            .px(u(12.))
+            .pt(u(8.));
+        for (peer, title) in &self.peers {
+            let label = if title.trim().is_empty() {
+                "Untitled session".to_string()
+            } else {
+                title.trim().to_string()
+            };
+            let (own, peer) = (self.session_id.clone(), peer.clone());
+            row = row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("linked-session-{peer}")))
+                    .flex()
+                    .items_center()
+                    .gap(u(6.))
+                    .min_w_0()
+                    .max_w(u(280.))
+                    .pl(u(8.))
+                    .pr(u(4.))
+                    .py(u(2.))
+                    .rounded(u(theme.radius.md))
+                    .bg(theme.content(0.05))
+                    .text_px(12.)
+                    .text_color(theme.content(0.75))
+                    .tooltip(monocode_ui::widgets::tooltip::tooltip(format!(
+                        "Linked with {label}. The two agents can read and message each other."
+                    )))
+                    .child(
+                        icon(IconName::MessageMultiple)
+                            .size(u(14.))
+                            .text_color(theme.content(0.45)),
+                    )
+                    .child(div().text_color(theme.content(0.50)).child("Linked"))
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .id(gpui::SharedString::from(format!("unlink-session-{peer}")))
+                            .p(u(2.))
+                            .rounded(u(theme.radius.sm))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme.content(0.08)))
+                            .tooltip(monocode_ui::widgets::tooltip::tooltip("Unlink"))
+                            .child(
+                                icon(IconName::X)
+                                    .size(u(12.))
+                                    .text_color(theme.content(0.45)),
+                            )
+                            .on_click(move |_, _, cx| {
+                                Engine::links(cx)
+                                    .update(cx, |links, cx| links.unlink(&own, &peer, cx));
+                            }),
+                    ),
+            );
+        }
+        Some(row.into_any_element())
     }
     pub fn set_session(&mut self, session: Option<&Session>, cx: &mut Context<Self>) {
         let cards = ContextCards {
@@ -58,7 +159,7 @@ impl ComposerCards {
 }
 impl Render for ComposerCards {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut cards = div();
+        let mut cards = div().children(self.render_peers(cx));
         if let Some(card) = self.cards.inbox.clone() {
             let id = self.session_id.clone();
             cards = cards.child(

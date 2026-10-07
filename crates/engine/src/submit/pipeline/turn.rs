@@ -40,6 +40,7 @@ use crate::runtime::edits::{nudge_open_editors, track_session_edits};
 use crate::runtime::engine::Engine;
 use crate::runtime::in_flight::CONTINUE_PROMPT;
 use crate::submit::acceptance::{ControlOutcome, ControlStatus};
+use crate::submit::app_access::TurnAppAccess;
 use crate::submit::attachments::prepare_attachments;
 use crate::submit::edit_last_turn::EditedResendAttempt;
 use crate::submit::handoff::{
@@ -49,6 +50,7 @@ use crate::submit::handoff::{
 use crate::submit::handoff_turn::{OutgoingHandoffInput, request_outgoing_handoff};
 use crate::submit::hooks::SubmitPeers;
 use crate::submit::prompt::prepare_prompt;
+use crate::submit::session_context::expand_dropped_sessions;
 use crate::submit::skills::{SkillCatalog, SkillCatalogContext};
 
 /// What an adapter reports while a harness call runs.
@@ -111,14 +113,17 @@ pub(crate) async fn prepare(
     cx: &AsyncApp,
 ) -> String {
     let context = SkillCatalogContext::new(harness, cwd).with_session(session_id);
-    prepare_prompt(
+    let prompt = prepare_prompt(
         text,
         &context,
         skills,
         |text| cx.update(|cx| peers.prompt.apply_file_mentions(text, cwd, cx)),
         |text| cx.update(|cx| peers.prompt.apply_notes(text, cx)),
     )
-    .await
+    .await;
+    // Expand dropped sessions last, so mention and note expansion never
+    // rewrites another session's history.
+    expand_dropped_sessions(prompt, cx).await
 }
 
 /// A recap waiting to reach the incoming provider.
@@ -141,6 +146,10 @@ pub(crate) struct TurnRun {
     pub raw_command: bool,
     pub operator_matched: bool,
     pub operator_access: bool,
+    /// Every app action the turn may use, `/operator` or not.
+    pub app_access: TurnAppAccess,
+    /// The short `<monocode_app>` block, when the agent has not seen it.
+    pub app_note: Option<String>,
     pub provider_account_id: Option<String>,
     pub initial_work_cwd: String,
     pub create_draft_worktree: bool,
@@ -574,6 +583,11 @@ impl TurnRun {
                 "\n\n<monocode_app>\nThe user's Operator command enables app access in this thread, including later turns without the command. You can start session tabs or split session panes right or down, list and create project worktrees, choose a new session's checkout, read and continue other project sessions, save unsent drafts, organize session folders, and read or write saved notes through its local CLI. Run `{cli} --help` for exact commands and JSON fields, then use it as needed for the user's request. When reading another session, start with its latest two or three user/assistant exchanges. Request older exchanges with nextBefore or a larger excerpt only if needed. The CLI uses a session credential already in your environment; never print it. New sessions inherit this session's permission mode unless runtimeMode is set explicitly. For a new session with a draft, call sessions.start with its prompt and draft:true; do not submit a seed prompt. The returned ID can be used as besideSessionId to split its pane again or moved into a folder immediately. A normal sessions.start submits its prompt but returns after acceptance, so do not wait for that agent to finish before organizing it.\n</monocode_app>"
             ));
         }
+        if let Some(note) = &self.app_note {
+            let cli = format!("{} app", shell_path(&(self.config.app_cli_path)()?));
+            send_text.push_str("\n\n");
+            send_text.push_str(&note.replace("{cli}", &cli));
+        }
         self.send_turn(send_text, prepared, state, cx).await?;
         self.accept_edited_resend(state, cx);
         if let Some(draft) = state.proposal.clone()
@@ -662,8 +676,13 @@ impl TurnRun {
                 }),
                 // A /operator user turn enables app access for this thread;
                 // orchestration leads retain their separate control access.
-                controls_agents: Some(self.operator_access || lead_active),
-                app_access: Some(self.operator_access),
+                // Linked sessions need the loopback socket too. The open
+                // session actions alone keep the provider's network policy,
+                // so a sandboxed Codex thread asks before it calls the CLI.
+                controls_agents: Some(
+                    self.operator_access || lead_active || !self.app_access.peers.is_empty(),
+                ),
+                app_access: Some(self.app_access.any()),
                 ..self.session_input(&state.work_cwd)
             },
             text,

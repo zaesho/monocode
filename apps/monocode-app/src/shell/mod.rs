@@ -1404,5 +1404,9 @@ fn workspace_chat_context(
             code: code.clone(),
             comment: comment.clone(),
         },
+        Source::Session { id, title } => Target::Session {
+            id: id.clone(),
+            title: title.clone(),
+        },
     }
 }

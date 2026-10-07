@@ -110,6 +110,9 @@ pub struct Submit {
     link_previews: LinkPreviews,
     pub(crate) edited_resends: EditedResendCoordinator,
     project_location_syncs: HashMap<String, LocationSync>,
+    /// The last `<monocode_app>` note each session's agent received, so a
+    /// note goes out again only when it changes.
+    pub(crate) app_notes: HashMap<String, String>,
 }
 
 impl EventEmitter<SubmitEvent> for Submit {}
@@ -134,6 +137,7 @@ impl Submit {
             link_previews: LinkPreviews::default(),
             edited_resends: EditedResendCoordinator::new(),
             project_location_syncs: HashMap::new(),
+            app_notes: HashMap::new(),
         }
     }
 

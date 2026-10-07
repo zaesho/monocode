@@ -10,6 +10,7 @@ use super::backend::{CheckpointBackend, SessionBackend, StoreBackend};
 use super::checkpoint::{Checkpoints, ReviewChanges, new_review_entity};
 use super::hooks::EngineHooks;
 use super::lifecycle::Lifecycle;
+use super::session_links::{SessionLinks, load_links};
 use super::session_store::SessionWriter;
 use super::sessions::Sessions;
 
@@ -51,6 +52,8 @@ pub struct Engine {
     pub lifecycle: Entity<Lifecycle>,
     /// Emits `ReviewChanged` when a session's reviewable changes move.
     pub review: Entity<ReviewChanges>,
+    /// Linked sessions and the agent message budget of each link.
+    pub links: Entity<SessionLinks>,
     pub writer: SessionWriter,
     pub checkpoints: Checkpoints,
     pub hooks: EngineHooks,
@@ -67,14 +70,17 @@ impl Engine {
         let sessions = cx.new(Sessions::new);
         let lifecycle = cx.new(Lifecycle::new);
         let review = new_review_entity(cx);
+        let links = cx.new(|_| SessionLinks::new());
         cx.set_global(Engine {
             sessions,
             lifecycle,
             review,
+            links,
             writer,
             checkpoints,
             hooks: config.hooks,
         });
+        load_links(cx);
     }
 
     pub fn global(cx: &App) -> &Engine {
@@ -88,6 +94,11 @@ impl Engine {
     /// The `Sessions` entity.
     pub fn sessions(cx: &App) -> Entity<Sessions> {
         Self::global(cx).sessions.clone()
+    }
+
+    /// The `SessionLinks` entity.
+    pub fn links(cx: &App) -> Entity<SessionLinks> {
+        Self::global(cx).links.clone()
     }
 
     /// The `Lifecycle` entity.

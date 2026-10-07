@@ -97,6 +97,7 @@ mod tests {
 
     fn queued(id: &str) -> QueuedMessage {
         QueuedMessage {
+            app_request_id: None,
             id: id.into(),
             text: id.into(),
             attachments: vec![],

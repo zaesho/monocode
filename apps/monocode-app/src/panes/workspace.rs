@@ -146,6 +146,36 @@ impl WorkspaceArea {
             .is_some_and(|pane| pane.session_shortcuts_blocked(cx))
     }
 
+    /// Hide the split hint while the composer holds a session drag. The
+    /// next move outside the composer draws it again.
+    pub fn hide_external_drop(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| tree.set_external_drop(None, cx));
+        }
+    }
+
+    /// The composer took a drop, so the tree's outside drag is over.
+    pub fn end_external_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| tree.external_drag_end(position, false, cx));
+        }
+    }
+
+    /// A drop the composer passed on: handle it as a drop on the pane area.
+    pub fn drop_external(
+        &mut self,
+        source: PaneDragSource,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| {
+                tree.external_drag_move(source, position, cx);
+                tree.external_drag_end(position, true, cx);
+            });
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             workspace: None,

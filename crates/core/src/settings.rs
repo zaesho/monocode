@@ -392,6 +392,18 @@ pub fn settings_index(platform: Platform) -> Vec<SettingsEntry> {
             "Tab animations",
             "motion open close resize transition",
         ),
+        entry(
+            "agent-sessions",
+            S::General,
+            "Let agents open sessions",
+            "operator app cli start new session agent permission",
+        ),
+        entry(
+            "agent-sessions-review",
+            S::General,
+            "Review agent-opened sessions before they run",
+            "draft approve prompt agent start session",
+        ),
     ]);
     if platform.is_windows() {
         index.push(entry(

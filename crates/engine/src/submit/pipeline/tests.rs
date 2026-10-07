@@ -917,6 +917,7 @@ async fn puts_output_that_already_arrived_before_a_submitted_message(cx: &mut Te
     );
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut TestAppContext) {
     use crate::orchestration::engine_host::EngineHost;
@@ -948,6 +949,7 @@ async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut 
     assert_eq!(fixture.codex.calls.lock().steers.len(), 1);
 }
 
+#[cfg(feature = "orchestration")]
 /// An `EngineHost` over a projects backend that records worktree calls.
 fn worker_host(
     cx: &mut TestAppContext,
@@ -978,6 +980,7 @@ fn worker_host(
     (host, projects)
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn creates_a_worker_checkpoint_before_its_first_turn(cx: &mut TestAppContext) {
     use crate::orchestration::host::OrchestrationHost;
@@ -1016,6 +1019,7 @@ async fn creates_a_worker_checkpoint_before_its_first_turn(cx: &mut TestAppConte
     );
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn removes_a_new_worktree_when_its_checkpoint_fails(cx: &mut TestAppContext) {
     use crate::orchestration::host::OrchestrationHost;
@@ -1050,6 +1054,7 @@ async fn removes_a_new_worktree_when_its_checkpoint_fails(cx: &mut TestAppContex
     assert!(cx.update(|cx| Engine::sessions(cx).read(cx).get("a").is_none()));
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn keeps_an_integrated_worktree_with_outside_files_until_the_lead_discards_them(
     cx: &mut TestAppContext,

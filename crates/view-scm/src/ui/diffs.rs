@@ -12,7 +12,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Subscription, Task, Window, div,
 };
-use monocode_editor::git_diff::stage_chunk_text;
+use monocode_editor::git_diff::{LINE_DIFF_CONFIG, stage_chunk_text_with};
 use monocode_editor::unified_diff::{
     DiffCommentTarget, PatchStatus, UNIFIED_CONTEXT_DEFAULT, UnifiedFileDiff, build_unified_file,
     file_hunks,
@@ -186,7 +186,15 @@ impl DiffState {
     fn new(cx: &mut App) -> Self {
         let theme = editor_theme(cx);
         Self {
-            view: cx.new(|cx| DiffView::new(Vec::new(), theme, cx)),
+            view: cx.new(|cx| {
+                let view = DiffView::new(Vec::new(), theme, cx);
+                let appearance = cx.observe_global::<Theme>(|view, cx| {
+                    let theme = editor_theme(cx);
+                    view.set_theme(theme, cx);
+                });
+                cx.on_release(move |_, _| drop(appearance)).detach();
+                view
+            }),
             models: Arc::new(Vec::new()),
             focus: None,
             focused: false,
@@ -374,6 +382,8 @@ pub struct WorkingTreeDiff {
     diffs: HashMap<String, LoadedDiff>,
     error: Option<String>,
     busy_id: Option<String>,
+    /// The count passed to the view's `fileCount`.
+    file_count: Option<usize>,
     state: DiffState,
     generation: u64,
     load: Option<Task<()>>,
@@ -433,6 +443,7 @@ impl WorkingTreeDiff {
             diffs: HashMap::new(),
             error: None,
             busy_id: None,
+            file_count: None,
             state,
             generation: 0,
             load: None,
@@ -492,7 +503,9 @@ impl WorkingTreeDiff {
                 }
                 match result {
                     Ok(index) => {
-                        this.entries = working_tree_diff_entries(&index.files);
+                        // A review opened from the Changes or Staged
+                        // Changes section shows only that side.
+                        this.entries = working_tree_diff_entries(&index.files, this.focus_kind);
                         this.files = Some(index.files);
                         this.diffs.clear();
                         this.error = None;
@@ -592,6 +605,17 @@ impl WorkingTreeDiff {
             })
             .collect();
         self.state.publish(models, cx);
+        // A partially staged file counts once, unless the review shows one side.
+        let file_count = match (&self.files, self.focus_kind) {
+            (Some(files), None) => files.len(),
+            _ => self.entries.len(),
+        };
+        if self.file_count != Some(file_count) {
+            self.file_count = Some(file_count);
+            self.state.view.update(cx, |view, cx| {
+                view.set_truncated(false, Some(file_count), cx)
+            });
+        }
         cx.notify();
     }
 
@@ -642,7 +666,14 @@ impl WorkingTreeDiff {
         let Some(pos) = request.hunk.pos else {
             return;
         };
-        let Some(next) = stage_chunk_text(&loaded.original, &loaded.current, pos, None) else {
+        // The same diff the view used to produce `pos`, so the same hunk is staged.
+        let Some(next) = stage_chunk_text_with(
+            &loaded.original,
+            &loaded.current,
+            pos,
+            None,
+            LINE_DIFF_CONFIG,
+        ) else {
             return;
         };
         let (cwd, relative) = (self.cwd.clone(), entry.file.relative.clone());
@@ -1080,5 +1111,89 @@ impl Render for SessionChangesDiff {
             None,
             cx,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use monocode_editor::unified_diff::{FoldDirection, UnifiedBlock};
+    use monocode_ui::{AppearanceSettings, ThemePreference, set_appearance};
+
+    #[gpui::test]
+    fn cached_diff_follows_appearance_without_resetting_content_or_expansion(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            monocode_ui::init(
+                AppearanceSettings {
+                    theme_preference: ThemePreference::Dark,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let original = (0..40)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        let current = original.replace("line 20\n", "changed line 20\n");
+        let first = DiffFile::from_texts("first.txt", &original, &current);
+        let second = DiffFile::from_texts("second.txt", "before\n", "after\n");
+        let mut state = cx.update(DiffState::new);
+        cx.update(|cx| state.publish(vec![FileModel(first), FileModel(second)], cx));
+        let view = state.view.clone();
+        view.update(cx, |view, cx| {
+            view.toggle_file(1, cx);
+            let fold = view.files()[0]
+                .diff
+                .blocks
+                .iter()
+                .position(|block| matches!(block, UnifiedBlock::Fold { .. }))
+                .expect("the controlled diff must have collapsed context");
+            view.reveal_fold(0, fold, FoldDirection::All, cx);
+        });
+        cx.run_until_parked();
+        let (original_theme, files, expanded, revealed) = view.read_with(cx, |view, _| {
+            assert_eq!(view.expanded_files(), &[0].into());
+            assert!(!view.revealed_folds().is_empty());
+            (
+                view.theme().clone(),
+                view.files()
+                    .iter()
+                    .map(|file| file.diff.clone())
+                    .collect::<Vec<_>>(),
+                view.expanded_files().clone(),
+                view.revealed_folds().clone(),
+            )
+        });
+        let models = state.models.clone();
+        cx.update(|cx| {
+            set_appearance(
+                AppearanceSettings {
+                    theme_preference: ThemePreference::Light,
+                    accent_color: Some("#cc5500".into()),
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(state.view.entity_id(), view.entity_id());
+        assert!(Arc::ptr_eq(&models, &state.models));
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.theme(), &editor_theme(cx));
+            assert_ne!(view.theme(), &original_theme);
+            assert_eq!(view.expanded_files(), &expanded);
+            assert_eq!(view.revealed_folds(), &revealed);
+            assert_eq!(
+                view.files()
+                    .iter()
+                    .map(|file| file.diff.clone())
+                    .collect::<Vec<_>>(),
+                files,
+            );
+        });
     }
 }

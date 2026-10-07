@@ -30,10 +30,16 @@ use monocode_core::js;
 use monocode_core::reducer::snapshot_remainder;
 use monocode_core::user_question::{UserQuestionReply, question_prompt_title};
 
+use monocode_core::portable_context::{native_portable_context_items, render_portable_context};
+
 use crate::core::catalog::SharedCatalog;
 use crate::core::child::{ChildAccount, ChildEvent, Children};
+use crate::core::context_transfer::{
+    ContextTransferError, ContextTransferInput, ContextTransferReceipt, DeliveryMode,
+    report_inline_context_delivery,
+};
 use crate::core::json_rpc::{
-    JsonRpcClient, JsonRpcClientOptions, JsonRpcHandlers, JsonRpcId, RpcErrorBody,
+    JsonRpcClient, JsonRpcClientOptions, JsonRpcHandlers, JsonRpcId, RpcError, RpcErrorBody,
 };
 use crate::core::registry::{AcceptedHook, EventSink};
 use crate::core::task::{BoxFuture, SharedSpawner, sleep};
@@ -230,6 +236,10 @@ struct Live {
     thread_id: String,
     cwd: String,
     provider_account_id: Option<String>,
+    /// This app-server resumed a saved thread rather than starting one.
+    resumed: bool,
+    /// The binary that runs this app-server, for the history-import check.
+    binary_path: String,
     /// Thread-level network policy used when this app-server opened the thread.
     controls_agents: bool,
     /// `live.turns`: turns and compactions on this session run one at a time.
@@ -297,6 +307,9 @@ struct SessionsShared {
     live_by_thread: Mutex<HashMap<String, Arc<Live>>>,
     resume_by_thread: Mutex<HashMap<String, Resume>>,
     cancelled_threads: Mutex<HashSet<String>>,
+    /// App-server binaries that answered `thread/inject_items` with
+    /// method-not-found. Their transfers use attributed text.
+    unsupported_history_binaries: Mutex<HashSet<String>>,
 }
 
 /// The live Codex sessions of one app. Clones share the same sessions.
@@ -336,6 +349,9 @@ fn same_rpc_id(id: &JsonRpcId, value: Option<&Value>) -> bool {
     }
 }
 
+/// JSON-RPC method-not-found.
+const METHOD_NOT_FOUND: i64 = -32601;
+
 fn error_text(error: &anyhow::Error) -> String {
     error.to_string()
 }
@@ -355,6 +371,7 @@ impl CodexSessions {
                 live_by_thread: Mutex::new(HashMap::new()),
                 resume_by_thread: Mutex::new(HashMap::new()),
                 cancelled_threads: Mutex::new(HashSet::new()),
+                unsupported_history_binaries: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -371,6 +388,19 @@ impl CodexSessions {
     pub async fn send_turn(
         &self,
         input: SendTurnInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> Result<()> {
+        self.send_turn_with_context(input, None, on_event, on_accepted)
+            .await
+    }
+
+    /// `sendCodexTurn` with shared history from another provider. The
+    /// history goes in as native thread items before the request.
+    pub async fn send_turn_with_context(
+        &self,
+        input: SendTurnInput,
+        transfer: Option<ContextTransferInput>,
         on_event: EventSink,
         on_accepted: Option<AcceptedHook>,
     ) -> Result<()> {
@@ -395,10 +425,127 @@ impl CodexSessions {
             state.cancelled = false;
             state.mute_updates = false;
         }
+        let prepared = match transfer {
+            Some(transfer) => {
+                self.prepare_context(&live, input, transfer, on_accepted)
+                    .await
+            }
+            None => Ok(Some((input, on_accepted))),
+        };
+        let (input, on_accepted) = match prepared {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Ok(()),
+            Err(_) if live.cancelled() => return Ok(()),
+            Err(error) => return Err(error),
+        };
         match self.run_turn(&live, &input, on_accepted).await {
             Err(_) if live.cancelled() => Ok(()),
             result => result,
         }
+    }
+
+    /// `prepareCodexContext`: import the shared history into the thread.
+    /// A fresh thread gets the full fallback history. An app-server without
+    /// `thread/inject_items` gets attributed text instead, and any other
+    /// failure forgets the thread, since some items may have arrived.
+    /// `None` means the turn was cancelled.
+    async fn prepare_context(
+        &self,
+        live: &Arc<Live>,
+        input: SendTurnInput,
+        transfer: ContextTransferInput,
+        on_accepted: Option<AcceptedHook>,
+    ) -> Result<Option<(SendTurnInput, Option<AcceptedHook>)>> {
+        let context = match (&transfer.fallback_context, live.resumed) {
+            (Some(fallback), false) => fallback.clone(),
+            _ => transfer.context.clone(),
+        };
+        let inline = |input: SendTurnInput, on_accepted: Option<AcceptedHook>| {
+            let receipt = ContextTransferReceipt::for_context(
+                DeliveryMode::Inline,
+                Some(live.thread_id.clone()),
+                &context,
+            );
+            let text = render_portable_context(&context, &input.text);
+            let transfer = transfer.clone();
+            let on_event = live.state.lock().on_event.clone();
+            let spawner = live.env.spawner.clone();
+            let accepted: AcceptedHook = Arc::new(move || {
+                report_inline_context_delivery(&transfer, receipt.clone(), &on_event, &spawner);
+                if let Some(on_accepted) = &on_accepted {
+                    on_accepted();
+                }
+            });
+            Some((SendTurnInput { text, ..input }, Some(accepted)))
+        };
+        if self
+            .shared
+            .unsupported_history_binaries
+            .lock()
+            .contains(&live.binary_path)
+        {
+            return Ok(inline(input, on_accepted));
+        }
+        // Native item notifications must not duplicate transcript rows or
+        // prove acceptance of a request that has not started yet.
+        let previous_mute = {
+            let mut state = live.state.lock();
+            std::mem::replace(&mut state.mute_updates, true)
+        };
+        let imported = live
+            .rpc
+            .request_value(
+                "thread/inject_items",
+                Some(json!({
+                    "threadId": live.thread_id,
+                    "items": native_portable_context_items(&context),
+                })),
+                0,
+            )
+            .await;
+        let result = match imported {
+            Ok(_) if live.cancelled() => Ok(None),
+            Ok(_) => {
+                let receipt = ContextTransferReceipt::for_context(
+                    DeliveryMode::Native,
+                    Some(live.thread_id.clone()),
+                    &context,
+                );
+                match &transfer.on_delivered {
+                    Some(on_delivered) => {
+                        on_delivered(receipt).await.map_err(|error| anyhow!(error))
+                    }
+                    None => Ok(()),
+                }
+                .map(|()| Some((input, on_accepted)))
+            }
+            Err(error)
+                if error
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(|error| error.code == Some(METHOD_NOT_FOUND)) =>
+            {
+                self.shared
+                    .unsupported_history_binaries
+                    .lock()
+                    .insert(live.binary_path.clone());
+                Ok(inline(input, on_accepted))
+            }
+            Err(error) => {
+                // A transport or mutation error may mean some items arrived.
+                // Retrying on this thread could repeat history, so require a
+                // fresh one.
+                let _ = self.forget_session(&input.session.session_id).await;
+                Err(anyhow::Error::new(ContextTransferError {
+                    message: "Codex history delivery is uncertain. Retry with a fresh provider conversation.".into(),
+                    cause: error_text(&error),
+                }))
+            }
+        };
+        {
+            let mut state = live.state.lock();
+            state.mute_updates = previous_mute || state.cancelled;
+        }
+        result
     }
 
     /// `compactCodexContext`.
@@ -496,6 +643,7 @@ impl CodexSessions {
             .await?;
         live.emit(HarnessEvent::TurnStarted {
             provider_turn_id: turn_id,
+            native: None,
         });
         Ok(())
     }
@@ -737,6 +885,7 @@ impl CodexSessions {
                 &rpc_slot,
                 &live_ref,
                 resume.filter(|_| can_resume),
+                &binary.path,
                 on_event,
             )
             .await;
@@ -803,6 +952,7 @@ impl CodexSessions {
 
     /// The `try` block of `ensureLive`: initialize, then resume or start the
     /// thread, then bind the live session.
+    #[allow(clippy::too_many_arguments)]
     async fn open_live(
         &self,
         input: &HarnessSessionInput,
@@ -810,6 +960,7 @@ impl CodexSessions {
         rpc_slot: &RpcSlot,
         live_ref: &LiveRef,
         resume: Option<Resume>,
+        binary_path: &str,
         on_event: EventSink,
     ) -> Result<Arc<Live>> {
         rpc.request_value(
@@ -889,6 +1040,8 @@ impl CodexSessions {
             thread_id: thread_id.clone(),
             cwd: input.cwd.clone(),
             provider_account_id: input.provider_account_id.clone(),
+            resumed: did_resume,
+            binary_path: binary_path.to_string(),
             controls_agents: input.controls_agents == Some(true),
             turns: futures::lock::Mutex::new(()),
             env: self.shared.env.clone(),
@@ -1027,6 +1180,7 @@ impl CodexSessions {
             if let Some(turn_id) = started {
                 live.emit(HarnessEvent::TurnStarted {
                     provider_turn_id: turn_id,
+                    native: None,
                 });
             }
             settle_pending_turn(live);
@@ -1747,10 +1901,10 @@ fn handle_notification(
         }
         track_agent_row(live, &event);
         match event {
-            HarnessEvent::MessageDelta { text } => {
+            HarnessEvent::MessageDelta { text, .. } => {
                 publish_codex_text(live, TextRole::Assistant, &text, snapshot, item_id)
             }
-            HarnessEvent::ReasoningDelta { text } => {
+            HarnessEvent::ReasoningDelta { text, .. } => {
                 publish_codex_text(live, TextRole::Reasoning, &text, snapshot, item_id)
             }
             other => live.emit(other),
@@ -2225,8 +2379,14 @@ fn publish_codex_text(
         emit.to_string()
     };
     live.emit(match role {
-        TextRole::Assistant => HarnessEvent::MessageDelta { text: emit },
-        TextRole::Reasoning => HarnessEvent::ReasoningDelta { text: emit },
+        TextRole::Assistant => HarnessEvent::MessageDelta {
+            text: emit,
+            append: None,
+        },
+        TextRole::Reasoning => HarnessEvent::ReasoningDelta {
+            text: emit,
+            append: None,
+        },
     });
 }
 

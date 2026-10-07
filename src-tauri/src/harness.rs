@@ -256,7 +256,6 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
     binary_provider: Option<String>,
     binary_path: Option<String>,
-    env: Option<HashMap<String, String>>,
 ) -> Result<u32, String> {
     let data_dir = crate::app_data_dir(&app)?;
     let control = app.try_state::<monocode_process::control::ControlHost>();
@@ -271,7 +270,6 @@ pub fn harness_spawn(
         account,
         binary_provider,
         binary_path,
-        env,
     )
 }
 

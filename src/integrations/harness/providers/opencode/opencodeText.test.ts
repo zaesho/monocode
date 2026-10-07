@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { HarnessEvent } from "../../core/types";
 
-const cleanup = vi.hoisted(() => ({ kill: vi.fn(async () => undefined) }));
 let onStdout: ((line: string) => void) | undefined;
 let onSseEvent: ((event: Record<string, unknown>) => void) | undefined;
 let finishPrompt:
@@ -35,7 +34,7 @@ vi.mock("../../core/child", () => ({
   execChild: async () => "opencode 1.14.19",
   freeHarnessPort: async () => 4096,
   harnessHttp,
-  killChild: cleanup.kill,
+  killChild: async () => undefined,
   openHarnessSse: async () => undefined,
   resolveOpenCodeBinary: async () => ({ path: "/fake/opencode" }),
   spawnChild: async () => {
@@ -103,14 +102,13 @@ beforeEach(() => {
   finishPrompt = undefined;
   promptStarted = false;
   harnessHttp.mockClear();
-  cleanup.kill.mockClear();
 });
 
 afterEach(async () => {
   await stopOpenCodeTextPrompt();
 });
 
-it("forwards OpenCode assistant part snapshots", async () => {
+it("forwards only incremental OpenCode assistant text", async () => {
   const events: HarnessEvent[] = [];
   const result = runOpenCodeTextPrompt({
     cwd: "/repo",
@@ -134,7 +132,10 @@ it("forwards OpenCode assistant part snapshots", async () => {
   });
 
   await expect(result).resolves.toBe("Hello");
-  expect(events).toEqual([snapshot("Hel"), snapshot("Hello")]);
+  expect(events).toEqual([
+    { type: "message.delta", text: "Hel" },
+    { type: "message.delta", text: "lo" },
+  ]);
 });
 
 it("does not replay a delta after a stale snapshot", async () => {
@@ -161,7 +162,10 @@ it("does not replay a delta after a stale snapshot", async () => {
   });
 
   await expect(result).resolves.toBe("Hello!");
-  expect(events).toEqual([snapshot("Hello"), snapshot("Hello!")]);
+  expect(events).toEqual([
+    { type: "message.delta", text: "Hello" },
+    { type: "message.delta", text: "!" },
+  ]);
 });
 
 it("does not replay a delta after an out-of-order completed snapshot", async () => {
@@ -187,7 +191,7 @@ it("does not replay a delta after an out-of-order completed snapshot", async () 
   });
 
   await expect(result).resolves.toBe("Hello");
-  expect(events).toEqual([snapshot("Hello", false)]);
+  expect(events).toEqual([{ type: "message.delta", text: "Hello" }]);
 });
 
 it("buffers a delta that arrives before its part snapshot", async () => {
@@ -215,120 +219,7 @@ it("buffers a delta that arrives before its part snapshot", async () => {
 
   await expect(result).resolves.toBe("Hello");
   expect(events).toEqual([
-    snapshot("Hel"),
-    snapshot("Hello"),
-    snapshot("Hello", false),
+    { type: "message.delta", text: "Hel" },
+    { type: "message.delta", text: "lo" },
   ]);
-});
-
-it("cleans up when cancellation arrives during session creation", async () => {
-  const controller = new AbortController();
-  harnessHttp.mockImplementationOnce(async () => {
-    controller.abort();
-    return { status: 200, body: JSON.stringify({ id: "text_session" }) };
-  });
-  await expect(
-    runOpenCodeTextPrompt({
-      cwd: "/repo",
-      model: "openai/fixture",
-      prompt: "question",
-      signal: controller.signal,
-    }),
-  ).rejects.toHaveProperty("name", "AbortError");
-  expect(cleanup.kill).toHaveBeenCalledWith("monocode-opencode-text");
-  expect(promptStarted).toBe(false);
-});
-
-function snapshot(text: string, streaming = true): HarnessEvent {
-  return {
-    type: "message.part",
-    partId: "part_assistant_message",
-    text,
-    reasoning: false,
-    streaming,
-  };
-}
-
-it("replaces streamed text with a shorter completed part", async () => {
-  const events: HarnessEvent[] = [];
-  const result = runOpenCodeTextPrompt({
-    cwd: "/repo",
-    model: "openai/fixture",
-    prompt: "question",
-    onEvent: (event) => events.push(event),
-  });
-  await waitFor(() => promptStarted, "prompt");
-  message("assistant_message", "assistant");
-  part("assistant_message", "A longer provisional answer");
-  part("assistant_message", "Final", true);
-  finishPrompt?.({
-    status: 200,
-    body: JSON.stringify({
-      info: {},
-      parts: [{ type: "text", text: "Final" }],
-    }),
-  });
-  await expect(result).resolves.toBe("Final");
-  expect(events).toEqual([
-    snapshot("A longer provisional answer"),
-    snapshot("Final", false),
-  ]);
-});
-
-it("reconciles the completed HTTP response before closing the stream", async () => {
-  const events: HarnessEvent[] = [];
-  const result = runOpenCodeTextPrompt({
-    cwd: "/repo",
-    model: "openai/fixture",
-    prompt: "question",
-    onEvent: (event) => events.push(event),
-  });
-  await waitFor(() => promptStarted, "prompt");
-  message("assistant_message", "assistant");
-  part("assistant_message", "A longer provisional answer");
-  finishPrompt?.({
-    status: 200,
-    body: JSON.stringify({
-      info: {
-        id: "assistant_message",
-        role: "assistant",
-        sessionID: "text_session",
-      },
-      parts: [
-        {
-          id: "part_assistant_message",
-          messageID: "assistant_message",
-          type: "text",
-          text: "Final",
-        },
-      ],
-    }),
-  });
-  await expect(result).resolves.toBe("Final");
-  expect(events).toEqual([
-    snapshot("A longer provisional answer"),
-    snapshot("Final", false),
-  ]);
-});
-
-it("kills the owned server when its abort request fails", async () => {
-  const result = runOpenCodeTextPrompt({
-    cwd: "/repo",
-    model: "openai/fixture",
-    prompt: "question",
-  });
-  await waitFor(() => promptStarted, "prompt");
-  harnessHttp.mockImplementationOnce(async () => ({
-    status: 503,
-    body: "server unavailable",
-  }));
-  finishPrompt?.({
-    status: 200,
-    body: JSON.stringify({
-      info: {},
-      parts: [{ type: "text", text: "Answer" }],
-    }),
-  });
-  await expect(result).resolves.toBe("Answer");
-  expect(cleanup.kill).toHaveBeenCalledWith("monocode-opencode-text");
 });

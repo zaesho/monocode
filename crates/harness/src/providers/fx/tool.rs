@@ -1,13 +1,18 @@
 //! Port of src/integrations/harness/providers/fx/fxTool.ts: fx tool metadata
 //! recovery.
 //!
-//! Unlike every other ACP harness MonoCode speaks to, fx sends no `rawInput`,
-//! no `locations`, and no `diff` content on `tool_call` and
-//! `tool_call_update`. It sends a gerund title ("Reading"), a kind, a status,
-//! and, once the call completes, a free-text result. The path, query, and
-//! command the transcript needs are mined back out of that text.
+//! fx sends no `locations` and no `diff` content on `tool_call` and
+//! `tool_call_update`. Through 0.0.7 it sent no `rawInput` either, so all
+//! MonoCode got was a gerund title ("Reading"), a kind, a status, and, once
+//! the call completed, a free-text result. This file mines the path, query,
+//! and command back out of that text.
 //!
-//! The shapes below come from `fx acp` 0.0.5 wire captures.
+//! Since 0.0.8 the pending `tool_call` also carries `name` and `rawInput`
+//! (the tool arguments, such as `{ path, content }` for write_file). This
+//! file returns `resolved: false` for a call with no result yet, so the
+//! shared ACP extraction reads that path and edits are known before they run.
+//!
+//! The result shapes below come from `fx acp` 0.0.5 wire captures.
 
 use std::sync::LazyLock;
 

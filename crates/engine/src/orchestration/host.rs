@@ -40,6 +40,10 @@ pub struct WorkerPreparation {
 pub struct WorkerIntegration {
     pub files: Vec<String>,
     pub already_applied: i64,
+    /// Changed files outside the write scopes, left in the worker worktree.
+    pub skipped: Vec<String>,
+    /// Gitignored files the worker created that the lead lacks, not applied.
+    pub ignored: Vec<String>,
 }
 
 /// The terminal callback of a managed turn.
@@ -65,11 +69,13 @@ pub trait OrchestrationHost {
         cx: &mut App,
     ) -> Task<Result<WorkerIntegration, String>>;
     /// `Ok(false)` when unreviewed changes require the worktree to be kept.
+    /// `discard_outside` removes it even while out-of-scope files remain.
     fn cleanup_worker(
         &self,
         run: &OrchestrationRun,
         task: &OrchestrationTask,
         only_if_unchanged: bool,
+        discard_outside: bool,
         cx: &mut App,
     ) -> Task<Result<bool, String>>;
     /// Start a managed turn. `done` runs exactly once when it ends or is

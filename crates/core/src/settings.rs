@@ -392,6 +392,18 @@ pub fn settings_index(platform: Platform) -> Vec<SettingsEntry> {
             "Tab animations",
             "motion open close resize transition",
         ),
+        entry(
+            "agent-sessions",
+            S::General,
+            "Let agents open sessions",
+            "operator app cli start new session agent permission",
+        ),
+        entry(
+            "agent-sessions-review",
+            S::General,
+            "Review agent-opened sessions before they run",
+            "draft approve prompt agent start session",
+        ),
     ]);
     if platform.is_windows() {
         index.push(entry(
@@ -404,6 +416,12 @@ pub fn settings_index(platform: Platform) -> Vec<SettingsEntry> {
     index.extend([
         entry("theme", S::Appearance, "Theme", "dark light system appearance mode"),
         entry("accent-color", S::Appearance, "Accent color", "highlight bubble send button tint"),
+        entry(
+            "diff-colors",
+            S::Appearance,
+            "Diff colors",
+            "colorblind color blind accessibility added removed red green blue orange high contrast changes",
+        ),
         entry("hue", S::Appearance, "Hue", "tint color chrome"),
         entry("saturation", S::Appearance, "Saturation", "tint color neutral grey gray"),
         entry("dark-lightness", S::Appearance, "Dark-mode lightness", "black brightness contrast background"),
@@ -424,7 +442,10 @@ pub fn settings_index(platform: Platform) -> Vec<SettingsEntry> {
         entry("diff-view", S::Chat, "Diff view", "unified editor review changes working tree"),
         entry("empty-session-games", S::Chat, "Empty session games", "pacman snake arcade grid fun"),
         entry("agent-clis", S::Providers, "Agent CLIs", "codex opencode cursor grok pi omp fx hermes antigravity binary path"),
+        entry("harness-updates", S::Providers, "CLI updates", "update upgrade version outdated latest release claude codex cursor grok opencode pi omp fx"),
         entry("provider-accounts", S::Providers, "Provider accounts", "account sign in login rename remove delete credentials profile usage limit quota exhausted"),
+        entry("show-remaining-usage", S::Providers, "Show remaining usage", "usage limit meter bar left used quota percent"),
+        entry("mask-emails", S::Providers, "Mask account emails", "email privacy blur hide screenshot account"),
         entry("claude-hooks", S::Providers, "Claude Code hooks", "pretooluse settings.json block command notification"),
         entry("project-notifications", S::Inbox, "Project notifications", "mute resume sounds banners reminders categories"),
         entry("github", S::Inbox, "GitHub", "gh cli connect pull request sign in"),
@@ -462,14 +483,9 @@ fn match_score(needle: &str, label: &str, keywords: Option<&str>) -> Option<u32>
     None
 }
 
-/// Approximation of `String.prototype.localeCompare` for settings labels:
-/// case-insensitive first, then lowercase before uppercase.
-// TODO(port): localeCompare uses ICU collation. This matches it for the
-// ASCII labels in the settings index.
+/// `String.prototype.localeCompare` for settings labels with the OS default locale.
 pub(crate) fn locale_compare(a: &str, b: &str) -> Ordering {
-    a.to_lowercase()
-        .cmp(&b.to_lowercase())
-        .then_with(|| b.cmp(a))
+    monocode_locale::compare(a, b)
 }
 
 /// `searchSettings`: individual settings first, then whole sections, so a row

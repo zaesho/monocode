@@ -14,7 +14,7 @@ use monocode_core::user_question::{UserQuestionPrompt, UserQuestionReply};
 use monocode_core::{Block, Extra, HarnessEvent, HarnessId};
 use serde_json::{Value, json};
 
-use super::host::{ChoiceModel, HarnessChoice};
+use super::host::{ChoiceModel, HarnessChoice, WorkerIntegration};
 use super::orchestrator::{
     Orchestrator, delete_session, handle, hydrate, start, start_approved, stop_run,
 };
@@ -682,7 +682,12 @@ fn persists_dispatch_authority_and_binds_review_to_the_completed_attempt(cx: &mu
         Some(dispatch_id.as_str())
     );
     assert_eq!(*f.host.integrated.borrow(), vec![task.id.clone()]);
-    assert!(f.host.cleanups.borrow().contains(&(task.id.clone(), false)));
+    assert!(
+        f.host
+            .cleanups
+            .borrow()
+            .contains(&(task.id.clone(), false, false))
+    );
     assert_eq!(f.tasks(cx)[0].workspace, None);
     assert_eq!(
         f.run(cx).unwrap().dispatch_list()[0].stage,
@@ -714,7 +719,12 @@ fn reports_a_cancelled_dirty_worktree_instead_of_silently_orphaning_it(cx: &mut 
         f.tasks(cx)[0].workspace.as_ref().unwrap().checkout_cwd,
         format!("/worktrees/{}", task.id)
     );
-    assert!(f.host.cleanups.borrow().contains(&(task.id.clone(), true)));
+    assert!(
+        f.host
+            .cleanups
+            .borrow()
+            .contains(&(task.id.clone(), true, false))
+    );
 }
 
 #[gpui::test]
@@ -798,6 +808,119 @@ fn keeps_a_dependency_queued_until_the_lead_accepts_the_upstream_result(cx: &mut
     assert_eq!(f.tasks(cx)[1].status, TaskStatus::Queued);
     f.call(cx, "review", json!({ "taskId": upstream.id }))
         .unwrap();
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
+}
+
+#[gpui::test]
+fn keeps_out_of_scope_files_until_the_lead_discards_them_and_holds_dependents(
+    cx: &mut TestAppContext,
+) {
+    let f = setup(cx);
+    f.start(cx);
+    f.delegate(cx, &["src/types.ts"], json!({})).unwrap();
+    let upstream = f.tasks(cx)[0].clone();
+    f.delegate(cx, &["src/ui"], json!({ "dependsOn": [upstream.id] }))
+        .unwrap();
+    f.complete(cx, &upstream.session_id, completed("Done"));
+    assert_eq!(f.tasks(cx)[0].status, TaskStatus::Completed);
+    f.host
+        .integrations
+        .borrow_mut()
+        .push_back(WorkerIntegration {
+            files: vec!["src/types.ts".into()],
+            skipped: vec!["coverage/out.json".into()],
+            ..WorkerIntegration::default()
+        });
+    // The host keeps a worktree that still holds out-of-scope files.
+    f.host.cleanup_result.set(false);
+
+    let first = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(first["outsideAssignment"], json!(["coverage/out.json"]));
+    let note = first["note"].as_str().unwrap();
+    assert!(
+        note.contains(&format!("still in /worktrees/{}", upstream.id)),
+        "{note}"
+    );
+    assert!(note.contains("discardOutside"), "{note}");
+    assert!(f.tasks(cx)[0].accepted);
+    assert_eq!(
+        f.store.saved.borrow()["lead"].dispatch_list()[0].outside_assignment,
+        Some(vec!["coverage/out.json".to_string()])
+    );
+
+    // A repeated review reports the files again and applies nothing twice.
+    let again = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(again["outsideAssignment"], json!(["coverage/out.json"]));
+    assert_eq!(*f.host.integrated.borrow(), vec![upstream.id.clone()]);
+    f.call(cx, "list", json!({})).unwrap();
+    let run = f.run(cx).unwrap();
+    assert_eq!(run.tasks[1].status, TaskStatus::Queued);
+    assert_eq!(
+        Orchestrator::waiting_for(&run, &run.tasks[1]).as_deref(),
+        Some("Waiting for out-of-scope files to be resolved: Task")
+    );
+
+    f.host.cleanup_result.set(true);
+    let discarded = f
+        .call(
+            cx,
+            "review",
+            json!({ "taskId": upstream.id, "discardOutside": true }),
+        )
+        .unwrap();
+    assert_eq!(
+        f.host.cleanups.borrow().last(),
+        Some(&(upstream.id.clone(), false, true))
+    );
+    assert!(discarded.get("outsideAssignment").is_none());
+    assert_eq!(f.tasks(cx)[0].workspace, None);
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
+}
+
+#[gpui::test]
+fn keeps_gitignored_files_a_worker_created_until_the_lead_discards_them(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    f.start(cx);
+    f.delegate(cx, &["src/types.ts"], json!({})).unwrap();
+    let upstream = f.tasks(cx)[0].clone();
+    f.delegate(cx, &["src/ui"], json!({ "dependsOn": [upstream.id] }))
+        .unwrap();
+    f.complete(cx, &upstream.session_id, completed("Done"));
+    f.host
+        .integrations
+        .borrow_mut()
+        .push_back(WorkerIntegration {
+            files: vec!["src/types.ts".into()],
+            ignored: vec![".env.local".into()],
+            ..WorkerIntegration::default()
+        });
+    f.host.cleanup_result.set(false);
+
+    let result = f
+        .call(cx, "review", json!({ "taskId": upstream.id }))
+        .unwrap();
+    assert_eq!(result["ignoredCreated"], json!([".env.local"]));
+    assert!(result.get("outsideAssignment").is_none());
+    assert!(
+        result["note"]
+            .as_str()
+            .unwrap()
+            .contains("gitignored files the worker created")
+    );
+    f.call(cx, "list", json!({})).unwrap();
+    assert_eq!(f.tasks(cx)[1].status, TaskStatus::Queued);
+
+    f.host.cleanup_result.set(true);
+    f.call(
+        cx,
+        "review",
+        json!({ "taskId": upstream.id, "discardOutside": true }),
+    )
+    .unwrap();
     assert_eq!(f.tasks(cx)[1].status, TaskStatus::Running);
 }
 
@@ -889,6 +1012,170 @@ fn persists_a_delegation_and_its_retry_receipt_in_the_same_snapshot(cx: &mut Tes
     assert_eq!(
         restored.read_with(cx, |o, _| o.run("lead").unwrap().tasks.len()),
         1
+    );
+}
+
+#[gpui::test]
+fn restored_typescript_receipt_reuses_the_delegation_without_dispatching_again(
+    cx: &mut TestAppContext,
+) {
+    let f = setup(cx);
+    f.start(cx);
+    let input = json!({"title":"A","prompt":"Implement","harness":"codex","files":["a"]});
+    let result = f
+        .call_id_now(cx, "delegate", input.clone(), "legacy-retry")
+        .unwrap();
+    let legacy_signature = r#"{"action":"delegate","input":{"title":"A","prompt":"Implement","harness":"codex","files":["a"]}}"#;
+    f.store
+        .saved
+        .borrow_mut()
+        .get_mut("lead")
+        .unwrap()
+        .requests
+        .get_mut("legacy-retry")
+        .unwrap()
+        .signature = legacy_signature.into();
+    let restored = orchestrator(f.store.clone(), f.host.clone(), cx);
+    let weak = restored.downgrade();
+    finish(
+        cx,
+        cx.spawn(|mut cx| async move { hydrate(&weak, "lead", &mut cx).await }),
+    )
+    .unwrap();
+    let submissions = f.host.submit_count();
+    let workers = f.host.created.borrow().len();
+    let scopes = f.store.scope_calls.get();
+    let tasks = restored.read_with(cx, |o, _| o.run("lead").unwrap().tasks.clone());
+    let dispatches = restored.read_with(cx, |o, _| o.run("lead").unwrap().dispatch_list().to_vec());
+    let weak = restored.downgrade();
+    let object: serde_json::Map<String, Value> = ["files", "harness", "prompt", "title"]
+        .into_iter()
+        .map(|key| (key.into(), input[key].clone()))
+        .collect();
+    let retry = finish(
+        cx,
+        cx.spawn(|mut cx| async move {
+            handle(&weak, "lead", "legacy-retry", "delegate", &object, &mut cx).await
+        }),
+    )
+    .expect("the unchanged TypeScript receipt must return its saved result");
+    assert_eq!(retry, result);
+    cx.run_until_parked();
+    assert_eq!(f.host.submit_count(), submissions);
+    assert_eq!(f.host.created.borrow().len(), workers);
+    assert_eq!(f.store.scope_calls.get(), scopes);
+    assert_eq!(
+        restored.read_with(cx, |o, _| o.run("lead").unwrap().tasks.clone()),
+        tasks
+    );
+    assert_eq!(
+        restored.read_with(cx, |o, _| o.run("lead").unwrap().dispatch_list().to_vec()),
+        dispatches
+    );
+    assert_eq!(
+        restored.read_with(cx, |o, _| o.run("lead").unwrap().requests["legacy-retry"]
+            .signature
+            .clone()),
+        legacy_signature
+    );
+    let weak = restored.downgrade();
+    let mut changed = input.as_object().cloned().unwrap();
+    changed.insert("prompt".into(), json!("Different work"));
+    let conflict = finish(
+        cx,
+        cx.spawn(|mut cx| async move {
+            handle(&weak, "lead", "legacy-retry", "delegate", &changed, &mut cx).await
+        }),
+    )
+    .unwrap_err();
+    assert!(conflict.contains("different input"));
+}
+
+#[gpui::test]
+fn restored_typescript_approval_receipt_accepts_ordinary_integral_spelling(
+    cx: &mut TestAppContext,
+) {
+    let f = setup(cx);
+    f.start(cx);
+    f.delegate(cx, &["a"], json!({})).unwrap();
+    let task = f.tasks(cx)[0].clone();
+    f.host.with_session(&task.session_id, |worker| {
+        worker.blocks = vec![approval(7, "Owned fixture")]
+    });
+    let input = json!({"taskId":task.id,"requestId":7.0,"decision":"deny"});
+    let result = f
+        .call_id_now(cx, "respond", input.clone(), "legacy-approval")
+        .unwrap();
+    assert_eq!(f.host.approvals.borrow().len(), 1);
+    let mut legacy_input = input.clone();
+    legacy_input["requestId"] = json!(7);
+    let legacy_signature =
+        serde_json::to_string(&json!({"action":"respond","input":legacy_input})).unwrap();
+    f.store
+        .saved
+        .borrow_mut()
+        .get_mut("lead")
+        .unwrap()
+        .requests
+        .get_mut("legacy-approval")
+        .unwrap()
+        .signature = legacy_signature.clone();
+    let restored = orchestrator(f.store.clone(), f.host.clone(), cx);
+    let weak = restored.downgrade();
+    finish(
+        cx,
+        cx.spawn(|mut cx| async move { hydrate(&weak, "lead", &mut cx).await }),
+    )
+    .unwrap();
+    let weak = restored.downgrade();
+    let object = input.as_object().cloned().unwrap();
+    assert_eq!(
+        finish(
+            cx,
+            cx.spawn(|mut cx| async move {
+                handle(
+                    &weak,
+                    "lead",
+                    "legacy-approval",
+                    "respond",
+                    &object,
+                    &mut cx,
+                )
+                .await
+            })
+        )
+        .expect("TypeScript serializes valid request ID 7.0 as 7"),
+        result
+    );
+    assert_eq!(f.host.approvals.borrow().len(), 1);
+    assert_eq!(
+        restored.read_with(cx, |o, _| {
+            o.run("lead").unwrap().requests["legacy-approval"]
+                .signature
+                .clone()
+        }),
+        legacy_signature
+    );
+    let weak = restored.downgrade();
+    let mut changed = input.as_object().cloned().unwrap();
+    changed.insert("requestId".into(), json!(8));
+    assert!(
+        finish(
+            cx,
+            cx.spawn(|mut cx| async move {
+                handle(
+                    &weak,
+                    "lead",
+                    "legacy-approval",
+                    "respond",
+                    &changed,
+                    &mut cx,
+                )
+                .await
+            })
+        )
+        .unwrap_err()
+        .contains("different input")
     );
 }
 

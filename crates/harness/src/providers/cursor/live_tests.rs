@@ -108,7 +108,7 @@ fn live_turn_replies_ok_in_a_temp_directory() {
     let reply: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();

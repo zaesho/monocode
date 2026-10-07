@@ -23,6 +23,7 @@ use monocode_core::harness_event::{HarnessEvent, HarnessSessionInput, SendTurnIn
 
 use super::adapter::OpenCodeAdapter;
 use super::catalog::discover_open_code_models;
+use super::test_support::policy_reply;
 use crate::core::catalog::SharedCatalog;
 use crate::core::child::{Children, HostChildOptions};
 use crate::core::registry::{HarnessAdapter, TextPromptInput, event_sink};
@@ -38,14 +39,17 @@ impl FixtureServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let subscribers: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
-        let messages: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let state = Arc::new(Mutex::new(FixtureState {
+            messages: Vec::new(),
+            status: "idle",
+        }));
         let directory = directory.to_string_lossy().into_owned();
         thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let subscribers = subscribers.clone();
+                let state = state.clone();
                 let directory = directory.clone();
-                let messages = messages.clone();
-                thread::spawn(move || serve(stream, &subscribers, &messages, &directory));
+                thread::spawn(move || serve(stream, &subscribers, &state, &directory));
             }
         });
         Self { port }
@@ -66,10 +70,16 @@ fn respond(mut stream: TcpStream, status: &str, body: &str) {
     let _ = stream.flush();
 }
 
+/// What the fixture session holds between requests.
+struct FixtureState {
+    messages: Vec<Value>,
+    status: &'static str,
+}
+
 fn serve(
     stream: TcpStream,
     subscribers: &Mutex<Vec<TcpStream>>,
-    messages: &Mutex<Vec<Value>>,
+    state: &Mutex<FixtureState>,
     directory: &str,
 ) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -106,34 +116,54 @@ fn serve(
     }
     let session = json!({ "id": "fixture_open", "directory": directory }).to_string();
     match path {
-        "/agent" => respond(
-            stream,
-            "200 OK",
-            r#"[{"name":"build","permission":[{"permission":"*","pattern":"*","action":"ask"}]}]"#,
-        ),
-        "/config" => respond(stream, "200 OK", r#"{"experimental":{"primary_tools":[]}}"#),
+        // The fixture binary saved the config the server started with.
+        "/config" | "/agent" => {
+            let config = std::fs::read_to_string(Path::new(directory).join("fixture-config.json"))
+                .ok()
+                .and_then(|config| serde_json::from_str(&config).ok())
+                .unwrap_or_else(|| json!({}));
+            let (_, body) = policy_reply(path, &config);
+            respond(stream, "200 OK", &body);
+        }
+        "/session/status" => {
+            let status = state.lock().status;
+            respond(
+                stream,
+                "200 OK",
+                &json!({ "fixture_open": { "type": status } }).to_string(),
+            );
+        }
         "/session" | "/session/fixture_open" => respond(stream, "200 OK", &session),
-        "/session/fixture_open/message" => respond(
-            stream,
-            "200 OK",
-            &serde_json::to_string(&*messages.lock()).unwrap(),
-        ),
+        "/session/fixture_open/message" => {
+            let messages = Value::Array(state.lock().messages.clone()).to_string();
+            respond(stream, "200 OK", &messages);
+        }
         "/session/fixture_open/prompt_async" => {
-            let prompt: Value = serde_json::from_slice(&body).unwrap();
-            let user = json!({"id":prompt["messageID"],"sessionID":"fixture_open","role":"user"});
-            let assistant = json!({"id":"msg","sessionID":"fixture_open","role":"assistant","parentID":prompt["messageID"],"agent":"build","finish":"stop","time":{"completed":1}});
-            *messages.lock() = vec![
-                json!({"info":user,"parts":prompt["parts"]}),
-                json!({"info":assistant,"parts":[]}),
-            ];
+            let input: Value = serde_json::from_slice(&body).unwrap_or_default();
+            let user = json!({ "sessionID": "fixture_open", "id": input["messageID"].clone(), "role": "user", "time": { "created": 1 } });
+            let assistant = json!({
+                "sessionID": "fixture_open", "id": "msg", "parentID": input["messageID"].clone(), "role": "assistant",
+                "finish": "stop", "time": { "created": 2, "completed": 3 },
+            });
+            let part = json!({
+                "sessionID": "fixture_open", "id": "part", "messageID": "msg", "type": "text",
+                "text": "Headless OpenCode completed", "time": { "end": 3 },
+            });
+            {
+                let mut state = state.lock();
+                state.messages = vec![
+                    json!({ "info": user, "parts": input["parts"].clone() }),
+                    json!({ "info": assistant, "parts": [part] }),
+                ];
+                state.status = "busy";
+            }
             respond(stream, "204 No Content", "");
             thread::sleep(Duration::from_millis(30));
+            state.lock().status = "idle";
             let events = [
-                json!({ "type": "message.updated", "properties": { "info":user } }),
-                json!({ "type": "message.updated", "properties": { "info":assistant } }),
-                json!({ "type": "message.part.updated", "properties": { "part": {
-                    "sessionID": "fixture_open", "id": "part", "messageID": "msg", "type": "text", "text": "Headless OpenCode completed",
-                } } }),
+                json!({ "type": "message.updated", "properties": { "info": user } }),
+                json!({ "type": "message.updated", "properties": { "info": assistant } }),
+                json!({ "type": "message.part.updated", "properties": { "part": part } }),
                 json!({ "type": "session.status", "properties": { "sessionID": "fixture_open", "status": { "type": "idle" } } }),
             ];
             for subscriber in subscribers.lock().iter_mut() {
@@ -159,7 +189,11 @@ fn write_fixture_binary(dir: &Path, port: u16) -> PathBuf {
     std::fs::write(
         &binary,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.20.0; exit 0; fi\nif [ \"$1\" = agent ]; then printf \"build (primary)\\n[]\\n\"; exit 0; fi\nif [ \"$1\" = debug ]; then printf 'data       /data/opencode\\n'; exit 0; fi\n\
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 1.20.0; exit 0; fi\n\
+             if [ \"$1 $2\" = 'debug paths' ]; then echo \"data       $PWD/fixture-data\"; exit 0; fi\n\
+             if [ \"$1 $2\" = 'agent list' ]; then echo 'build (primary)'; \
+             echo '[{{\"permission\":\"*\",\"pattern\":\"*\",\"action\":\"allow\"}}]'; exit 0; fi\n\
+             printf '%s' \"$OPENCODE_CONFIG_CONTENT\" > fixture-config.json\n\
              echo 'opencode server listening on http://127.0.0.1:{port}'\nexec sleep 600\n"
         ),
     )

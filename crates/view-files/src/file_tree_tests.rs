@@ -128,6 +128,25 @@ fn uses_a_worktree_branch_as_the_explorer_root_identity(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn keeps_room_for_descenders_in_truncated_file_names(cx: &mut TestAppContext) {
+    let h = mount(setup(vec![file("first.ts")]), cx);
+    let name = h.cx.debug_bounds("tree-name:/project/first.ts").unwrap();
+    let (font, leading) = h.cx.update(|_, cx| {
+        let theme = monocode_ui::Theme::of(cx);
+        (
+            theme.rem_size() * (theme.text.ui / 16.),
+            theme.leading.label,
+        )
+    });
+    assert!(
+        name.size.height >= font * (leading - 0.05),
+        "{:?} clips below {:?}",
+        name.size.height,
+        font * leading
+    );
+}
+
+#[gpui::test]
 fn shows_git_decorations_and_opens_a_clicked_file(cx: &mut TestAppContext) {
     let mut h = mount(setup(vec![file("first.ts")]), cx);
     let statuses = GitStatusMap {
@@ -241,7 +260,7 @@ fn pastes_files_from_the_system_clipboard_into_the_selected_folder(cx: &mut Test
     ];
     let mut h = mount(fs, cx);
     h.select("/project/docs");
-    h.keys("cmd-v");
+    h.keys("secondary-v");
     assert_eq!(
         h.fs.copies(),
         vec![
@@ -263,7 +282,7 @@ fn pastes_into_the_parent_folder_when_a_file_is_selected(cx: &mut TestAppContext
     fs.state.borrow_mut().clipboard_files = vec!["/Users/me/Desktop/a.txt".into()];
     let mut h = mount(fs, cx);
     h.select("/project/first.ts");
-    h.keys("cmd-v");
+    h.keys("secondary-v");
     assert_eq!(
         h.fs.copies(),
         vec![("/Users/me/Desktop/a.txt".to_string(), CWD.to_string())]
@@ -280,7 +299,7 @@ fn pastes_into_the_parent_folder_when_a_file_is_selected(cx: &mut TestAppContext
 fn does_nothing_on_paste_when_the_clipboard_holds_no_files(cx: &mut TestAppContext) {
     let mut h = mount(outside_setup(), cx);
     h.select("/project/docs");
-    h.keys("cmd-v");
+    h.keys("secondary-v");
     assert!(h.fs.copies().is_empty());
 }
 
@@ -390,7 +409,7 @@ fn copies_the_selected_path_on_mod_shift_c(cx: &mut TestAppContext) {
     let mut h = mount(setup(vec![file("first.ts")]), cx);
     h.cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
     h.select("/project/first.ts");
-    h.keys("cmd-shift-c");
+    h.keys("secondary-shift-c");
     assert_eq!(h.clipboard().as_deref(), Some("/project/first.ts"));
 }
 
@@ -399,7 +418,7 @@ fn copies_the_project_root_path_from_the_root_row(cx: &mut TestAppContext) {
     let mut h = mount(setup(vec![file("first.ts")]), cx);
     h.select("/project/first.ts");
     h.click("explorer-root");
-    h.keys("cmd-shift-c");
+    h.keys("secondary-shift-c");
     assert_eq!(h.clipboard().as_deref(), Some(CWD));
 }
 
@@ -409,7 +428,7 @@ fn matches_the_typed_letter_not_another_key(cx: &mut TestAppContext) {
     h.cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
     h.select("/project/first.ts");
     // Dvorak types "j" on the physical C key.
-    h.keys("cmd-shift-j");
+    h.keys("secondary-shift-j");
     assert_eq!(h.clipboard().as_deref(), Some("before"));
 }
 
@@ -417,7 +436,7 @@ fn matches_the_typed_letter_not_another_key(cx: &mut TestAppContext) {
 fn cuts_and_pastes_a_file_into_a_folder(cx: &mut TestAppContext) {
     let mut h = mount(outside_setup(), cx);
     h.select("/project/first.ts");
-    h.keys("cmd-x");
+    h.keys("secondary-x");
     assert_eq!(
         h.tree.read_with(h.cx, |tree, _| tree.clip().cloned()),
         Some(Clip {
@@ -427,7 +446,7 @@ fn cuts_and_pastes_a_file_into_a_folder(cx: &mut TestAppContext) {
         })
     );
     h.select("/project/docs");
-    h.keys("cmd-v");
+    h.keys("secondary-v");
     assert_eq!(
         h.fs.calls(),
         vec![Call::Move {
@@ -449,8 +468,8 @@ fn cuts_and_pastes_a_file_into_a_folder(cx: &mut TestAppContext) {
 fn refuses_to_paste_a_folder_into_itself(cx: &mut TestAppContext) {
     let mut h = mount(outside_setup(), cx);
     h.select("/project/docs");
-    h.keys("cmd-c");
-    h.keys("cmd-v");
+    h.keys("secondary-c");
+    h.keys("secondary-v");
     assert_eq!(
         h.tree
             .read_with(h.cx, |tree, _| tree.op_error().map(str::to_string)),
@@ -460,7 +479,7 @@ fn refuses_to_paste_a_folder_into_itself(cx: &mut TestAppContext) {
     // Escape drops only a cut.
     h.keys("escape");
     assert!(h.tree.read_with(h.cx, |tree, _| tree.clip().is_some()));
-    h.keys("cmd-x escape");
+    h.keys("secondary-x escape");
     assert!(h.tree.read_with(h.cx, |tree, _| tree.clip().is_none()));
 }
 

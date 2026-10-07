@@ -38,7 +38,7 @@ pub fn irc(id: &str, text: &str) -> Block {
     block.interjection = Some(InterjectionMeta {
         custom_type: "irc:incoming".into(),
         severity: None,
-        extra: Default::default(),
+        ..Default::default()
     });
     block
 }
@@ -208,6 +208,7 @@ pub fn handoff(id: &str) -> Block {
         to: HarnessId::Claude,
         status: HandoffStatus::Ready,
         pending: None,
+        transfer: None,
         extra: Default::default(),
     });
     block

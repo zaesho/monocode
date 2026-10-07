@@ -48,6 +48,8 @@ struct FakeState {
     failing: HashSet<String>,
     gates: HashMap<String, VecDeque<oneshot::Receiver<()>>>,
     shell_commands: HashMap<String, String>,
+    links: Vec<(String, String)>,
+    snapshots: HashMap<String, String>,
 }
 
 /// An in-memory `SessionBackend` and `CheckpointBackend`.
@@ -148,6 +150,16 @@ impl FakeBackend {
             .collect()
     }
 
+    /// Context snapshots by the path `write_context_snapshot` returned.
+    pub fn context_snapshots(&self) -> HashMap<String, String> {
+        self.state.lock().snapshots.clone()
+    }
+
+    /// Stored session links, each pair in stored order.
+    pub fn session_links(&self) -> Vec<(String, String)> {
+        self.state.lock().links.clone()
+    }
+
     /// Bash commands `claude_shell_commands` returns, by tool-use id.
     pub fn set_shell_commands(&self, commands: HashMap<String, String>) {
         self.state.lock().shell_commands = commands;
@@ -221,6 +233,7 @@ fn record_from_upsert(payload: &SessionUpsert) -> SessionRecord {
         title: payload.title.clone(),
         provider_session_id: payload.provider_session_id.clone(),
         provider_account_id: payload.provider_account_id.clone(),
+        provider_context: payload.provider_context.clone(),
         blocks: payload.blocks.clone(),
         context_used: payload.context_used,
         context_window: payload.context_window,
@@ -343,6 +356,17 @@ impl SessionBackend for FakeBackend {
         )
     }
 
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        self.call(
+            "session_discard_draft",
+            serde_json::json!({ "sessionId": session_id }),
+            move |state| {
+                state.records.remove(&session_id);
+                Ok(())
+            },
+        )
+    }
+
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()> {
         self.call(
             "session_set_archived",
@@ -407,6 +431,79 @@ impl SessionBackend for FakeBackend {
         })
     }
 
+    // Links skip the command log: the engine reads them once at startup, and
+    // tests that compare the exact command list should not see that read.
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>> {
+        futures::future::ready(Ok(self.state.lock().links.clone())).boxed()
+    }
+
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()> {
+        let pair = monocode_store::session_links::ordered(&a, &b);
+        let pair = (pair.0.to_string(), pair.1.to_string());
+        let mut state = self.state.lock();
+        state.links.retain(|entry| entry != &pair);
+        if linked {
+            state.links.push(pair);
+        }
+        futures::future::ready(Ok(())).boxed()
+    }
+
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String> {
+        let path = format!("/data/context-snapshots/{session_id}/{name}.md");
+        self.state.lock().snapshots.insert(path.clone(), text);
+        futures::future::ready(Ok(path)).boxed()
+    }
+
+    fn write_switch_snapshot(
+        &self,
+        session_id: String,
+        switch_id: String,
+        content: String,
+    ) -> StoreFuture<String> {
+        self.call(
+            "session_context_snapshot",
+            serde_json::json!({ "sessionId": session_id, "switchId": switch_id }),
+            move |state| {
+                let path = format!("/data/context-history/{session_id}/{switch_id}.md");
+                state.snapshots.insert(path.clone(), content);
+                Ok(path)
+            },
+        )
+    }
+
+    fn snapshot_context_assets(
+        &self,
+        session_id: String,
+        attachments: Vec<monocode_store::context_history::ContextAssetSource>,
+    ) -> StoreFuture<Vec<monocode_store::context_history::ContextAssetSnapshot>> {
+        let ids: Vec<String> = attachments.iter().map(|source| source.id.clone()).collect();
+        self.call(
+            "session_context_assets",
+            serde_json::json!({ "sessionId": session_id, "ids": ids }),
+            move |_| {
+                Ok(attachments
+                    .into_iter()
+                    .map(
+                        |source| monocode_store::context_history::ContextAssetSnapshot {
+                            path: Some(format!(
+                                "/data/context-history/{session_id}/assets/{}",
+                                source.id
+                            )),
+                            sha256: Some("0".repeat(64)),
+                            unavailable_reason: None,
+                            id: source.id,
+                        },
+                    )
+                    .collect())
+            },
+        )
+    }
+
     fn claude_shell_commands(
         &self,
         provider_session_id: String,
@@ -433,12 +530,12 @@ fn empty_status() -> CheckpointStatus {
 }
 
 impl CheckpointBackend for FakeBackend {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()> {
-        self.call(
-            "session_checkpoint_ensure",
-            serde_json::json!({ "sessionId": session_id, "cwd": cwd }),
-            |_| Ok(()),
-        )
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()> {
+        let mut args = serde_json::json!({ "sessionId": session_id, "cwd": cwd });
+        if isolated {
+            args["isolated"] = serde_json::Value::Bool(true);
+        }
+        self.call("session_checkpoint_ensure", args, |_| Ok(()))
     }
 
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()> {
@@ -470,17 +567,16 @@ impl CheckpointBackend for FakeBackend {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult> {
-        self.call(
-            "session_checkpoint_apply",
-            serde_json::json!({ "sessionId": session_id, "fromCwd": from_cwd, "toCwd": to_cwd }),
-            |_| {
-                Ok(CheckpointApplyResult {
-                    files: Vec::new(),
-                    already_applied: 0,
-                })
-            },
-        )
+        let mut args =
+            serde_json::json!({ "sessionId": session_id, "fromCwd": from_cwd, "toCwd": to_cwd });
+        if let Some(scopes) = write_scopes {
+            args["writeScopes"] = serde_json::json!(scopes);
+        }
+        self.call("session_checkpoint_apply", args, |_| {
+            Ok(CheckpointApplyResult::default())
+        })
     }
 
     fn cleanup_safe(&self, session_id: String, cwd: String) -> StoreFuture<bool> {

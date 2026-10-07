@@ -5,10 +5,7 @@ import {
   respondHarnessQuestion,
   sendHarnessTurn,
 } from "../../../integrations/harness/core/registry";
-import {
-  mergeStream,
-  MessageParts,
-} from "../../../integrations/harness/core/streamText";
+import { mergeStream } from "../../../integrations/harness/core/streamText";
 import type { HarnessId } from "./session";
 
 const HANDOFF_TIMEOUT_MS = 45_000;
@@ -23,7 +20,6 @@ export async function requestOutgoingHandoff(input: {
   userRequest: string;
 }): Promise<string> {
   let brief = "";
-  const parts = new MessageParts();
   const timer = setTimeout(() => {
     void cancelHarnessTurn(input.harness, input.sessionId);
   }, HANDOFF_TIMEOUT_MS);
@@ -40,9 +36,6 @@ export async function requestOutgoingHandoff(input: {
       onEvent: (event) => {
         if (event.type === "message.delta") {
           brief = mergeStream(brief, event.text);
-        }
-        if (event.type === "message.part" && !event.reasoning) {
-          brief = parts.update(event.partId, event.text);
         }
         if (event.type === "approval.requested") {
           respondHarnessApproval(

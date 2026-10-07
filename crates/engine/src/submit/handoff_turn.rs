@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::FutureExt;
 use monocode_core::harness_event::{ApprovalDecision, HarnessSessionInput, SendTurnInput};
-use monocode_core::reducer::join_stream_text;
+use monocode_core::reducer::{MessageParts, join_stream_text};
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{HarnessEvent, HarnessId, ModelSettings, RuntimeMode, js};
 use monocode_harness::core::registry::{HarnessRegistry, event_sink};
@@ -46,16 +46,14 @@ pub async fn request_outgoing_handoff_with_timeout(
     timeout: Duration,
 ) -> String {
     let brief = Arc::new(Mutex::new(String::new()));
-    let parts = Arc::new(Mutex::new(
-        monocode_core::message_parts::MessageParts::default(),
-    ));
+    let parts = Arc::new(Mutex::new(MessageParts::default()));
     let sink = {
         let brief = brief.clone();
         let registry = registry.clone();
         let harness = input.harness;
         let session_id = input.session_id.clone();
         event_sink(move |event| match event {
-            HarnessEvent::MessageDelta { text } => {
+            HarnessEvent::MessageDelta { text, .. } => {
                 let mut brief = brief.lock();
                 *brief = join_stream_text(&brief, &text);
             }

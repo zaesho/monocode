@@ -9,5 +9,8 @@ pub mod control_cli;
 pub mod external_editor;
 pub mod harness;
 pub mod mcp;
+mod opencode_config;
+#[cfg(unix)]
+mod provider_guard;
 pub mod skills;
 pub mod worktree_lifecycle;

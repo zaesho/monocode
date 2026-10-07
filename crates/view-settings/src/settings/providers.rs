@@ -1,6 +1,6 @@
 //! Port of `ProvidersPage`, `ProviderRow`, and `ProjectScopeIcon` in
-//! SettingsView.tsx. The accounts card at the top is a slot the accounts
-//! module fills.
+//! SettingsView.tsx. The accounts card at the top and the CLI updates card
+//! after the Agent CLIs are slots the accounts module fills.
 
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
@@ -20,6 +20,7 @@ use monocode_core::project_providers::{
 };
 use monocode_core::settings::CLAUDE_HOOKS_KEY;
 use monocode_layout::paths::project_name;
+use monocode_settings::display_prefs::{self, MASK_EMAILS_KEY, SHOW_REMAINING_USAGE_KEY};
 use monocode_settings::settings_store as ss;
 use monocode_ui::{IconName, ProviderLogo, Theme, UiStyled as _, icon, provider_logo, u};
 
@@ -192,10 +193,13 @@ pub struct ProvidersSection {
     prefs: ModelPrefs,
     projects: ProjectProviders,
     claude_hooks: bool,
+    show_remaining_usage: bool,
+    mask_emails: bool,
     scope_select: Entity<Select>,
     model_selects: BTreeMap<HarnessId, Entity<Select>>,
     binaries: BTreeMap<HarnessId, Entity<BinaryControl>>,
     accounts: Option<AnyView>,
+    harness_updates: Option<AnyView>,
     _watch: (Vec<monocode_settings::Subscription>, Task<()>),
     _subscriptions: Vec<Subscription>,
 }
@@ -262,6 +266,11 @@ impl ProvidersSection {
             .accounts
             .clone()
             .map(|build| build(slot, window, cx));
+        let harness_updates = ctx
+            .hosts
+            .harness_updates
+            .clone()
+            .map(|build| build(slot, window, cx));
         let watch = watch_keys(
             &kv,
             &[
@@ -270,6 +279,8 @@ impl ProvidersSection {
                 HIDDEN_PICKER_PROVIDERS_KEY,
                 PROJECT_PROVIDER_SETTINGS_KEY,
                 CLAUDE_HOOKS_KEY,
+                SHOW_REMAINING_USAGE_KEY,
+                MASK_EMAILS_KEY,
             ],
             |this: &mut Self, cx| {
                 this.reload();
@@ -281,6 +292,8 @@ impl ProvidersSection {
             prefs: store::load_model_prefs(&kv),
             projects: store::load_project_providers(&kv),
             claude_hooks: ss::load_claude_hooks(&kv),
+            show_remaining_usage: display_prefs::load_show_remaining_usage(&kv),
+            mask_emails: display_prefs::load_mask_emails(&kv),
             cwd: slot.cwd.clone(),
             recents: slot.recents.clone(),
             scope: GLOBAL_PROVIDER_SCOPE.into(),
@@ -288,6 +301,7 @@ impl ProvidersSection {
             model_selects,
             binaries,
             accounts,
+            harness_updates,
             ctx,
             _watch: watch,
             _subscriptions: Vec::new(),
@@ -299,12 +313,22 @@ impl ProvidersSection {
         self.prefs = store::load_model_prefs(kv);
         self.projects = store::load_project_providers(kv);
         self.claude_hooks = ss::load_claude_hooks(kv);
+        self.show_remaining_usage = display_prefs::load_show_remaining_usage(kv);
+        self.mask_emails = display_prefs::load_mask_emails(kv);
     }
 
     /// Re-reads the catalog and availability after the host reports a change.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.reload();
         cx.notify();
+    }
+
+    pub fn show_remaining_usage(&self) -> bool {
+        self.show_remaining_usage
+    }
+
+    pub fn mask_emails(&self) -> bool {
+        self.mask_emails
     }
 
     pub fn scope(&self) -> &str {
@@ -555,6 +579,39 @@ impl Render for ProvidersSection {
             clis = clis.child(self.provider_row(state, &catalog, &availability, cx));
         }
 
+        // `UsageDisplaySettings`.
+        let usage_display = group(&reveal, "Usage and privacy")
+            .child(
+                row(&reveal, "Show remaining usage")
+                    .id("show-remaining-usage")
+                    .description("Fill usage meters with what is left in each limit instead of what has been used.")
+                    .switch_only()
+                    .child(
+                        toggle("Show remaining usage", self.show_remaining_usage).on_change(
+                            cx.listener(|this, next: &bool, _, cx| {
+                                display_prefs::save_show_remaining_usage(&this.ctx.kv, *next);
+                                this.show_remaining_usage = *next;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                row(&reveal, "Mask account emails")
+                    .id("mask-emails")
+                    .description("Blur account emails in Settings and the usage popover until you click one, so they stay out of screenshots.")
+                    .switch_only()
+                    .child(
+                        toggle("Mask account emails", self.mask_emails).on_change(cx.listener(
+                            |this, next: &bool, _, cx| {
+                                display_prefs::save_mask_emails(&this.ctx.kv, *next);
+                                this.mask_emails = *next;
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            );
+
         let advanced = group(&reveal, "Advanced").child(
             row(&reveal, "Claude Code hooks")
                 .id("claude-hooks")
@@ -593,11 +650,23 @@ impl Render for ProvidersSection {
                     )
                     .into_any_element(),
             });
+        // `HarnessUpdatesGroup` is the `harness-updates` card, which the
+        // accounts module fills. Without it a placeholder keeps the search
+        // target.
+        let harness_updates = match self.harness_updates.clone() {
+            Some(view) => view.into_any_element(),
+            None => group(&reveal, "CLI updates")
+                .id("harness-updates")
+                .description("MonoCode compares each installed CLI with its newest release and updates it with the CLI's own updater.")
+                .into_any_element(),
+        };
         div()
             .flex()
             .flex_col()
             .child(accounts)
+            .child(usage_display)
             .child(clis)
+            .child(harness_updates)
             .child(advanced)
     }
 }

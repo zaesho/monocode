@@ -1,14 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { joinStreamText, snapshotRemainder, streamTextDelta, MessageParts } from "./streamText";
-
-it("collects corrected provider parts for handoff and control replies in their original order", () => {
-  const parts = new MessageParts();
-  expect(parts.update("first", "Hello worle")).toBe("Hello worle");
-  expect(parts.update("second", "!")).toBe("Hello worle!");
-  expect(parts.update("first", "Hi")).toBe("Hi!");
-  parts.clear();
-  expect(parts.update("second", "New")).toBe("New");
-});
+import { joinStreamText, snapshotRemainder, streamTextDelta } from "./streamText";
 
 describe("joinStreamText", () => {
   it("appends tokens, including doubled letters and punctuation", () => {

@@ -15,7 +15,6 @@ use monocode_core::attachment::{
     Attachment, attachment_path, attachment_path_text, is_vision_image, prompt_text,
 };
 use monocode_core::block::{ToolPreview, TurnMetrics};
-use monocode_core::harness::RuntimeMode;
 use monocode_core::harness_event::{ApprovalDecision, HarnessEvent};
 use monocode_core::js;
 use monocode_core::task_list::is_task_list_tool_name;
@@ -30,25 +29,6 @@ pub type Record = Map<String, Value>;
 
 /// The oldest OpenCode whose server API this adapter speaks.
 pub const MINIMUM_OPENCODE_VERSION: &str = "1.14.19";
-/// This adapter uses the OpenCode 1 HTTP protocol.
-pub fn is_supported_open_code_version(version: &str) -> bool {
-    version.split('.').next() == Some("1") && compare_semver(version, MINIMUM_OPENCODE_VERSION) >= 0
-}
-
-pub fn open_code_version_error(version: Option<&str>) -> Option<String> {
-    match version {
-        Some(version) if is_supported_open_code_version(version) => None,
-        Some(version) if compare_semver(version, MINIMUM_OPENCODE_VERSION) < 0 => Some(format!(
-            "OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer in the 1.x series."
-        )),
-        Some(version) => Some(format!(
-            "OpenCode v{version} is unsupported. MonoCode requires OpenCode 1.x, v{MINIMUM_OPENCODE_VERSION} or newer."
-        )),
-        None => Some(format!(
-            "Unable to determine OpenCode version. MonoCode requires OpenCode 1.x, v{MINIMUM_OPENCODE_VERSION} or newer."
-        )),
-    }
-}
 pub const OPENCODE_SERVER_READY_PREFIX: &str = "opencode server listening";
 /// Agents OpenCode runs for its own bookkeeping. Their text never reaches the
 /// transcript.
@@ -100,6 +80,7 @@ pub struct OpenCodePermissionRule {
     pub action: PermissionAction,
 }
 
+#[cfg(test)]
 impl OpenCodePermissionRule {
     fn new(permission: &str, pattern: &str, action: PermissionAction) -> Self {
         Self {
@@ -273,6 +254,63 @@ pub fn compare_semver(left: &str, right: &str) -> i64 {
     0
 }
 
+/// The only OpenCode major version whose server API this adapter speaks.
+pub const MAXIMUM_OPENCODE_MAJOR_VERSION: i64 = 1;
+
+/// `isSupportedOpenCodeVersion`: major version 1, at or after the minimum.
+pub fn is_supported_open_code_version(version: &str) -> bool {
+    parse_int(version.split('.').next().unwrap_or_default()) == Some(MAXIMUM_OPENCODE_MAJOR_VERSION)
+        && compare_semver(version, MINIMUM_OPENCODE_VERSION) >= 0
+}
+
+/// `unsupportedOpenCodeVersionMessage`.
+pub fn unsupported_open_code_version_message(version: Option<&str>) -> String {
+    match version {
+        Some(version) => format!(
+            "OpenCode v{version} is unsupported. MonoCode requires OpenCode v{MINIMUM_OPENCODE_VERSION} or newer within major version 1. OpenCode 2 uses a different API."
+        ),
+        None => format!(
+            "Unable to determine OpenCode version. MonoCode requires OpenCode v{MINIMUM_OPENCODE_VERSION} or newer within major version 1."
+        ),
+    }
+}
+
+/// The last timestamp `next_open_code_message_id` encoded, and how many ids
+/// it gave out within that millisecond.
+static MESSAGE_ID_CLOCK: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// `nextOpenCodeMessageId`: a `msg_` id in OpenCode's ascending timestamp
+/// encoding. Revert boundaries compare ids, so ids MonoCode generates must
+/// sort after the ones OpenCode already stored.
+pub fn next_open_code_message_id(timestamp: u64) -> String {
+    message_id_from_clock(&MESSAGE_ID_CLOCK, timestamp)
+}
+
+fn message_id_from_clock(clock: &std::sync::Mutex<(u64, u64)>, timestamp: u64) -> String {
+    let counter = {
+        let mut clock = clock.lock().unwrap_or_else(|error| error.into_inner());
+        if clock.0 != timestamp {
+            *clock = (timestamp, 0);
+        }
+        clock.1 += 1;
+        clock.1
+    };
+    let time = (u128::from(timestamp) * 0x1000 + u128::from(counter)) & 0xffff_ffff_ffff;
+    const CHARS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let suffix: String = uuid::Uuid::new_v4().as_bytes()[..14]
+        .iter()
+        .map(|byte| CHARS[usize::from(*byte) % CHARS.len()] as char)
+        .collect();
+    format!("msg_{time:012x}{suffix}")
+}
+
+/// The current time for `next_open_code_message_id`, in milliseconds.
+pub fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// `isOpenCodeDefaultTitle`: the placeholder title OpenCode gives a session.
 pub fn is_open_code_default_title(title: &str) -> bool {
     OPENCODE_DEFAULT_TITLE_PATTERN.is_match(title)
@@ -323,341 +361,7 @@ pub fn is_open_code_not_found(cause: &Value) -> bool {
     false
 }
 
-/// `buildOpenCodePermissionRules`: the session permission rules for an
-/// access mode. Questions are always allowed so the agent can ask.
-pub fn build_open_code_permission_rules(runtime_mode: RuntimeMode) -> Vec<OpenCodePermissionRule> {
-    build_open_code_turn_permission_rules(runtime_mode, false)
-}
-
-/// Plan intent restricts server tools even when the session uses full access.
-pub fn build_open_code_turn_permission_rules(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-) -> Vec<OpenCodePermissionRule> {
-    use PermissionAction::*;
-    if planning {
-        let mut rules = vec![OpenCodePermissionRule::new("*", "*", Deny)];
-        for permission in [
-            "read",
-            "grep",
-            "glob",
-            "list",
-            "websearch",
-            "codesearch",
-            "question",
-        ] {
-            rules.push(OpenCodePermissionRule::new(permission, "*", Allow));
-        }
-        rules.push(OpenCodePermissionRule::new("task", "explore", Allow));
-        return rules;
-    }
-    if runtime_mode == RuntimeMode::FullAccess {
-        return vec![OpenCodePermissionRule::new("*", "*", Allow)];
-    }
-    let mut rules = vec![
-        OpenCodePermissionRule::new("*", "*", Ask),
-        OpenCodePermissionRule::new("question", "*", Allow),
-    ];
-    if matches!(
-        runtime_mode,
-        RuntimeMode::AutoAcceptEdits | RuntimeMode::Auto
-    ) {
-        rules.push(OpenCodePermissionRule::new("edit", "*", Allow));
-    }
-    if runtime_mode == RuntimeMode::Auto {
-        rules.push(OpenCodePermissionRule::new("read", "*", Allow));
-    }
-    rules
-}
-
-/// Apply the same tool policy to every configured agent before task children
-/// can start. Child sessions do not inherit the parent's session rules.
-pub fn managed_open_code_server_config(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    inventory: &str,
-) -> anyhow::Result<Value> {
-    managed_open_code_server_config_with_tool_output(runtime_mode, planning, inventory, None)
-}
-
-pub fn build_open_code_turn_permission_rules_with_tool_output(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    tool_output_glob: Option<&str>,
-) -> Vec<OpenCodePermissionRule> {
-    let mut rules = build_open_code_turn_permission_rules(runtime_mode, planning);
-    if let Some(tool_output_glob) = tool_output_glob {
-        rules.push(OpenCodePermissionRule::new(
-            "external_directory",
-            tool_output_glob,
-            PermissionAction::Allow,
-        ));
-    }
-    rules
-}
-
-/// Read the data directory from the owned CLI's `debug paths` output.
-pub fn parse_open_code_tool_output_glob(paths: &str) -> anyhow::Result<String> {
-    let mut data = paths.lines().filter_map(|line| {
-        line.trim_start()
-            .strip_prefix("data")
-            .filter(|rest| rest.starts_with(char::is_whitespace))
-            .map(str::trim)
-    });
-    let Some(data_path) = data.next().filter(|path| !path.is_empty()) else {
-        anyhow::bail!("OpenCode did not expose its data directory");
-    };
-    let windows_drive = data_path.as_bytes().get(1) == Some(&b':')
-        && data_path
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-        && matches!(data_path.as_bytes().get(2), Some(b'/' | b'\\'));
-    let windows_unc = data_path.strip_prefix("\\\\").is_some_and(|path| {
-        let mut parts = path.split(['/', '\\']);
-        parts.next().is_some_and(|part| !part.is_empty())
-            && parts.next().is_some_and(|part| !part.is_empty())
-    });
-    let windows = windows_drive || windows_unc;
-    if data.next().is_some()
-        || (!data_path.starts_with('/') && !windows)
-        || data_path.chars().any(|character| {
-            character.is_control() || matches!(character, '*' | '?' | '[' | ']' | '{' | '}')
-        })
-        || data_path
-            .split(if windows {
-                &['/', '\\'][..]
-            } else {
-                &['/'][..]
-            })
-            .any(|component| matches!(component, "." | ".."))
-    {
-        anyhow::bail!("OpenCode exposed an invalid data directory");
-    }
-    let separator = if windows && data_path.contains('\\') {
-        '\\'
-    } else {
-        '/'
-    };
-    let data_path = data_path.trim_end_matches(separator);
-    Ok(format!("{data_path}{separator}tool-output{separator}*"))
-}
-
-pub fn managed_open_code_server_config_with_tool_output(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    inventory: &str,
-    tool_output_glob: Option<&str>,
-) -> anyhow::Result<Value> {
-    let mut agents: Vec<(String, Vec<OpenCodePermissionRule>)> = Vec::new();
-    let mut primary_agents = std::collections::BTreeSet::new();
-    let mut name: Option<String> = None;
-    let mut lines = Vec::new();
-    let flush = |name: &mut Option<String>,
-                 lines: &mut Vec<&str>,
-                 agents: &mut Vec<(String, Vec<OpenCodePermissionRule>)>|
-     -> anyhow::Result<()> {
-        if let Some(name) = name.take() {
-            let raw = lines.join("\n");
-            let rules = if raw.trim().is_empty() {
-                Vec::new()
-            } else {
-                serde_json::from_str(&raw).map_err(|error| {
-                    anyhow::anyhow!("Could not read OpenCode agent permissions: {error}")
-                })?
-            };
-            agents.push((name, rules));
-        }
-        lines.clear();
-        Ok(())
-    };
-    for line in inventory.lines() {
-        if let Some((agent, mode)) = line
-            .trim()
-            .rsplit_once(" (")
-            .filter(|(_, mode)| mode.ends_with(')'))
-        {
-            flush(&mut name, &mut lines, &mut agents)?;
-            if mode == "primary)" {
-                primary_agents.insert(agent.to_string());
-            }
-            name = Some(agent.to_string());
-        } else if name.is_some() {
-            lines.push(line);
-        }
-    }
-    flush(&mut name, &mut lines, &mut agents)?;
-    if agents.is_empty() {
-        anyhow::bail!("OpenCode did not expose its agent permissions");
-    }
-    let mut keys: std::collections::BTreeSet<String> = [
-        "*",
-        "edit",
-        "bash",
-        "task",
-        "external_directory",
-        "skill",
-        "question",
-        "read",
-        "grep",
-        "glob",
-        "list",
-        "lsp",
-        "webfetch",
-        "websearch",
-        "codesearch",
-        "todowrite",
-        "todoread",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    for (_, rules) in &agents {
-        for rule in rules {
-            keys.insert(rule.permission.clone());
-        }
-    }
-    let rules = build_open_code_turn_permission_rules(runtime_mode, planning);
-    let mut permission: Record = keys
-        .into_iter()
-        .map(|key| {
-            let action = rules
-                .iter()
-                .rev()
-                .find(|rule| rule.permission == key || rule.permission == "*")
-                .map(|rule| rule.action)
-                .unwrap_or(PermissionAction::Ask);
-            (key, serde_json::to_value(action).unwrap())
-        })
-        .collect();
-    if planning {
-        permission.insert(
-            "task".into(),
-            serde_json::json!({"*":"deny", "explore":"allow"}),
-        );
-    }
-    if let Some(tool_output_glob) = tool_output_glob {
-        let baseline = permission["external_directory"].clone();
-        let mut external_directory = Record::from_iter([("*".into(), baseline.clone())]);
-        for (_, rules) in &agents {
-            for rule in rules {
-                if rule.permission == "external_directory" {
-                    external_directory.insert(rule.pattern.clone(), baseline.clone());
-                }
-            }
-        }
-        external_directory.insert(tool_output_glob.into(), serde_json::json!("allow"));
-        permission.insert(
-            "external_directory".into(),
-            Value::Object(external_directory),
-        );
-    }
-    let agent_config: Record = agents
-        .into_iter()
-        .map(|(name, _)| (name, serde_json::json!({"permission": permission})))
-        .collect();
-    let mut config = serde_json::json!({ "permission": permission, "agent": agent_config });
-    config["mode"] = Value::Object(
-        primary_agents
-            .into_iter()
-            .map(|name| (name, serde_json::json!({"permission":permission})))
-            .collect(),
-    );
-    if planning || runtime_mode != RuntimeMode::FullAccess {
-        config["experimental"] = serde_json::json!({"primary_tools": []});
-    }
-    Ok(config)
-}
-
-pub fn validate_open_code_agent_permissions(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    agents: &Value,
-) -> anyhow::Result<()> {
-    validate_open_code_agent_permissions_with_tool_output(runtime_mode, planning, agents, None)
-}
-
-pub fn validate_open_code_agent_permissions_with_tool_output(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    agents: &Value,
-    tool_output_glob: Option<&str>,
-) -> anyhow::Result<()> {
-    if runtime_mode == RuntimeMode::FullAccess && !planning {
-        return Ok(());
-    }
-    let Some(agents) = agents.as_array().filter(|agents| !agents.is_empty()) else {
-        anyhow::bail!("OpenCode did not expose its effective agent permissions");
-    };
-    let required = build_open_code_turn_permission_rules(runtime_mode, planning);
-    for agent in agents {
-        let name = agent
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let actual: Vec<OpenCodePermissionRule> =
-            serde_json::from_value(agent.get("permission").cloned().unwrap_or(Value::Null))
-                .map_err(|error| {
-                    anyhow::anyhow!("Could not verify OpenCode agent {name} permissions: {error}")
-                })?;
-        let Some(boundary) = actual.iter().rposition(|rule| {
-            rule.permission == "*"
-                && rule.pattern == "*"
-                && (rule.action == PermissionAction::Deny
-                    || (!planning && rule.action == PermissionAction::Ask))
-        }) else {
-            anyhow::bail!("OpenCode agent {name} does not retain MonoCode's default access policy");
-        };
-        for (index, probe) in actual.iter().enumerate().skip(boundary + 1) {
-            let expected = required
-                .iter()
-                .rev()
-                .find(|rule| {
-                    rule.permission == probe.permission
-                        && (rule.pattern == "*" || rule.pattern == probe.pattern)
-                })
-                .or_else(|| required.iter().find(|rule| rule.permission == "*"))
-                .map(|rule| rule.action)
-                .unwrap_or(PermissionAction::Ask);
-            let safe = probe.action == PermissionAction::Deny
-                || expected == PermissionAction::Allow
-                || (probe.action == PermissionAction::Ask && expected == PermissionAction::Ask)
-                || (probe.permission == "external_directory"
-                    && tool_output_glob == Some(probe.pattern.as_str()));
-            let covered = actual[index + 1..].iter().any(|later| {
-                (later.permission == "*" || later.permission == probe.permission)
-                    && (later.pattern == "*" || later.pattern == probe.pattern)
-            });
-            if !safe && !covered {
-                anyhow::bail!(
-                    "OpenCode agent {name} permits {} for {} outside the selected access policy. An organization or managed configuration may override MonoCode's permissions.",
-                    probe.permission,
-                    probe.pattern
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_open_code_server_config(
-    runtime_mode: RuntimeMode,
-    planning: bool,
-    config: &Value,
-) -> anyhow::Result<()> {
-    if (planning || runtime_mode != RuntimeMode::FullAccess)
-        && !config
-            .get("experimental")
-            .and_then(|value| value.get("primary_tools"))
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    {
-        anyhow::bail!(
-            "OpenCode enables task child tool grants outside the selected access policy. An organization or managed configuration may override MonoCode's permissions."
-        );
-    }
-    Ok(())
-}
+pub use super::policy::build_open_code_permission_rules;
 
 /// `toOpenCodePermissionReply`.
 pub fn to_open_code_permission_reply(decision: ApprovalDecision) -> PermissionReply {
@@ -750,11 +454,17 @@ pub struct MergedText {
 
 /// `mergeOpenCodeAssistantText`: fold a part snapshot into the text already
 /// shown. A shorter snapshot that the shown text starts with is stale and
-/// keeps the longer text.
-pub fn merge_open_code_assistant_text(previous_text: Option<&str>, next_text: &str) -> MergedText {
+/// keeps the longer text, unless it is the part's `final` snapshot, which
+/// may correct or shorten the text.
+pub fn merge_open_code_assistant_text(
+    previous_text: Option<&str>,
+    next_text: &str,
+    final_snapshot: bool,
+) -> MergedText {
     let latest_text = match previous_text {
         Some(previous)
-            if !previous.is_empty()
+            if !final_snapshot
+                && !previous.is_empty()
                 && previous.len() > next_text.len()
                 && previous.starts_with(next_text) =>
         {
@@ -872,14 +582,9 @@ pub fn open_code_variant_label(value: &str) -> String {
         .unwrap_or_else(|| title_case_slug(value))
 }
 
-/// Approximation of `String.prototype.localeCompare`: case-insensitive
-/// first, then lowercase before uppercase.
-// TODO(port): localeCompare uses ICU collation, which also orders
-// punctuation before digits. This matches it for ASCII names.
+/// The default collation used by `String.prototype.localeCompare`.
 pub(crate) fn locale_compare(a: &str, b: &str) -> Ordering {
-    a.to_lowercase()
-        .cmp(&b.to_lowercase())
-        .then_with(|| b.cmp(a))
+    monocode_locale::compare(a, b)
 }
 
 /// `sortOpenCodeVariants`: lowest to highest effort; unknown values sort last.
@@ -934,6 +639,7 @@ pub fn tool_kind_from_name(tool_name: &str) -> String {
         || normalized.contains("glob")
         || normalized.contains("search")
         || normalized.contains("find")
+        || normalized == "list"
     {
         return "search".into();
     }
@@ -1146,9 +852,15 @@ pub fn text_delta_event(part: &OpenCodePart, text: &str) -> Option<HarnessEvent>
         return None;
     }
     if part.part_type == "reasoning" {
-        return Some(HarnessEvent::ReasoningDelta { text: text.into() });
+        return Some(HarnessEvent::ReasoningDelta {
+            text: text.into(),
+            append: None,
+        });
     }
-    Some(HarnessEvent::MessageDelta { text: text.into() })
+    Some(HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: None,
+    })
 }
 
 /// `Map<string, OpenCodePart>`: parts by id, iterated in insertion order. A
@@ -1188,6 +900,7 @@ impl PartStore {
 mod tests {
     use super::*;
     use monocode_core::attachment::{ATTACHMENT_ONLY_PROMPT, AttachmentKind};
+    use monocode_core::harness::RuntimeMode;
     use serde_json::json;
 
     fn rec(value: Value) -> Record {
@@ -1338,10 +1051,47 @@ mod tests {
         assert!(compare_semver("1.15.0", "1.14.19") > 0);
         assert!(compare_semver("1.14", "1.14.0") == 0);
         assert!(compare_semver("1.x.2", "1.0.1") > 0);
-        assert!(!is_supported_open_code_version("1.14.18"));
-        assert!(is_supported_open_code_version("1.14.19"));
-        assert!(is_supported_open_code_version("1.15.0"));
-        assert!(!is_supported_open_code_version("2.0.20"));
+    }
+
+    #[test]
+    fn checks_the_v1_api_version() {
+        for (version, supported) in [
+            ("1.14.18", false),
+            ("1.14.19", true),
+            ("1.15.0", true),
+            ("2.0.20", false),
+        ] {
+            assert_eq!(
+                is_supported_open_code_version(version),
+                supported,
+                "{version}"
+            );
+        }
+        assert!(
+            unsupported_open_code_version_message(Some("2.0.20"))
+                .contains("OpenCode 2 uses a different API")
+        );
+    }
+
+    #[test]
+    fn generates_ordered_message_ids_with_the_provider_timestamp_encoding() {
+        let timestamp = 1_791_034_039_388_u64;
+        let clock = std::sync::Mutex::new((0, 0));
+        let first = message_id_from_clock(&clock, timestamp);
+        let second = message_id_from_clock(&clock, timestamp);
+        assert!(
+            Regex::new(r"^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+                .unwrap()
+                .is_match(&first)
+        );
+        let encoded = (u128::from(timestamp) * 4096 + 1) & 0xffff_ffff_ffff;
+        assert_eq!(&first[4..16], format!("{encoded:012x}"));
+        assert!(first < second);
+    }
+
+    #[test]
+    fn maps_the_list_tool_to_search() {
+        assert_eq!(tool_kind_from_name("list"), "search");
     }
 
     // describe("buildOpenCodePermissionRules")
@@ -1349,248 +1099,19 @@ mod tests {
     #[test]
     fn allows_everything_in_full_access() {
         assert_eq!(
-            serde_json::to_value(build_open_code_permission_rules(RuntimeMode::FullAccess))
-                .unwrap(),
+            serde_json::to_value(build_open_code_permission_rules(
+                RuntimeMode::FullAccess,
+                false,
+                None
+            ))
+            .unwrap(),
             json!([{ "permission": "*", "pattern": "*", "action": "allow" }])
         );
     }
 
     #[test]
-    fn restricts_every_agent_and_observed_permission_even_in_full_access_plan() {
-        let inventory = r#"build (primary)
-[]
-custom (subagent)
-[{"permission":"bash","pattern":"*","action":"allow"},{"permission":"custom_mutation","pattern":"*","action":"allow"},{"permission":"spreadsheet_delete","pattern":"*","action":"allow"},{"permission":"search_and_delete","pattern":"*","action":"allow"}]
-"#;
-        let config =
-            managed_open_code_server_config(RuntimeMode::FullAccess, true, inventory).unwrap();
-        assert_eq!(config["permission"]["*"], "deny");
-        assert_eq!(config["permission"]["read"], "allow");
-        assert_eq!(config["permission"]["edit"], "deny");
-        assert_eq!(
-            config["permission"]["task"],
-            json!({"*":"deny","explore":"allow"})
-        );
-        for agent in ["build", "custom"] {
-            assert_eq!(config["agent"][agent]["permission"]["bash"], "deny");
-            assert_eq!(
-                config["agent"][agent]["permission"]["custom_mutation"],
-                "deny"
-            );
-            assert_eq!(
-                config["agent"][agent]["permission"]["spreadsheet_delete"],
-                "deny"
-            );
-            assert_eq!(
-                config["agent"][agent]["permission"]["search_and_delete"],
-                "deny"
-            );
-        }
-        assert_eq!(config["experimental"]["primary_tools"], json!([]));
-        assert_eq!(config["mode"]["build"]["permission"]["bash"], "deny");
-        assert!(config["mode"].get("custom").is_none());
-    }
-
-    #[test]
-    fn child_agents_require_supervision_for_custom_tools() {
-        let config = managed_open_code_server_config(
-            RuntimeMode::Supervised,
-            false,
-            r#"custom (subagent)
-[{"permission":"custom_mutation","pattern":"*","action":"allow"}]
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            config["agent"]["custom"]["permission"]["custom_mutation"],
-            "ask"
-        );
-        assert_eq!(config["agent"]["custom"]["permission"]["question"], "allow");
-        assert_eq!(config["experimental"]["primary_tools"], json!([]));
-        assert!(managed_open_code_server_config(RuntimeMode::Supervised, false, "").is_err());
-    }
-
-    #[test]
-    fn derives_the_tool_output_glob_only_from_a_valid_cli_data_path() {
-        assert_eq!(
-            parse_open_code_tool_output_glob(
-                "home       /home/test\ndata       /data path/opencode\n"
-            )
-            .unwrap(),
-            "/data path/opencode/tool-output/*"
-        );
-        assert_eq!(
-            parse_open_code_tool_output_glob("data       C:\\Users\\test\\opencode\n").unwrap(),
-            "C:\\Users\\test\\opencode\\tool-output\\*"
-        );
-        assert_eq!(
-            parse_open_code_tool_output_glob("data       \\\\server\\share\\opencode\n").unwrap(),
-            "\\\\server\\share\\opencode\\tool-output\\*"
-        );
-        for output in [
-            "",
-            "data relative/opencode",
-            "data /data/*/opencode",
-            "data /data/../opencode",
-            "data /one\ndata /two",
-            "data /data/?/opencode",
-            "data /data/[a]/opencode",
-            "data \\\\server",
-        ] {
-            assert!(
-                parse_open_code_tool_output_glob(output).is_err(),
-                "{output}"
-            );
-        }
-    }
-
-    #[test]
-    fn allows_only_the_owned_tool_output_directory_under_restricted_policies() {
-        let tool_output = "/data/opencode/tool-output/*";
-        for (mode, planning, wildcard) in [
-            (RuntimeMode::Supervised, false, "ask"),
-            (RuntimeMode::FullAccess, true, "deny"),
-        ] {
-            let config = managed_open_code_server_config_with_tool_output(
-                mode,
-                planning,
-                "build (primary)\n[]\n",
-                Some(tool_output),
-            )
-            .unwrap();
-            let expected = json!({"*":wildcard, tool_output:"allow"});
-            assert_eq!(config["permission"]["external_directory"], expected);
-            assert_eq!(
-                config["agent"]["build"]["permission"]["external_directory"],
-                expected
-            );
-            assert_eq!(
-                config["mode"]["build"]["permission"]["external_directory"],
-                expected
-            );
-            let rules = build_open_code_turn_permission_rules_with_tool_output(
-                mode,
-                planning,
-                Some(tool_output),
-            );
-            assert!(
-                rules
-                    .iter()
-                    .any(|rule| rule.permission == "external_directory"
-                        && rule.pattern == tool_output
-                        && rule.action == PermissionAction::Allow)
-            );
-            let actual = json!([{"name":"build","permission":[{"permission":"*","pattern":"*","action":wildcard},{"permission":"external_directory","pattern":tool_output,"action":"allow"}]}]);
-            assert!(
-                validate_open_code_agent_permissions_with_tool_output(
-                    mode,
-                    planning,
-                    &actual,
-                    Some(tool_output)
-                )
-                .is_ok()
-            );
-            for unsafe_glob in [
-                "/data/opencode/*",
-                "/data/opencode/tool-output*",
-                "/arbitrary/tool-output/*",
-            ] {
-                let actual = json!([{"name":"build","permission":[{"permission":"*","pattern":"*","action":wildcard},{"permission":"external_directory","pattern":unsafe_glob,"action":"allow"}]}]);
-                assert!(
-                    validate_open_code_agent_permissions_with_tool_output(
-                        mode,
-                        planning,
-                        &actual,
-                        Some(tool_output)
-                    )
-                    .is_err(),
-                    "{unsafe_glob}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn overrides_observed_external_patterns_in_global_agent_and_legacy_policies() {
-        let inventory = r#"build (primary)
-[{"permission":"external_directory","pattern":"/arbitrary/*","action":"allow"}]
-general (subagent)
-[{"permission":"external_directory","pattern":"/other/*","action":"allow"}]
-"#;
-        for (mode, planning, baseline) in [
-            (RuntimeMode::Supervised, false, "ask"),
-            (RuntimeMode::FullAccess, true, "deny"),
-        ] {
-            let config = managed_open_code_server_config_with_tool_output(
-                mode,
-                planning,
-                inventory,
-                Some("/data/opencode/tool-output/*"),
-            )
-            .unwrap();
-            for permissions in [
-                &config["permission"],
-                &config["agent"]["build"]["permission"],
-                &config["agent"]["general"]["permission"],
-                &config["mode"]["build"]["permission"],
-            ] {
-                assert_eq!(permissions["external_directory"]["/arbitrary/*"], baseline);
-                assert_eq!(permissions["external_directory"]["/other/*"], baseline);
-                assert_eq!(
-                    permissions["external_directory"]["/data/opencode/tool-output/*"],
-                    "allow"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn verifies_effective_agent_permissions_after_all_server_configuration() {
-        let restricted = json!([{"name":"general","permission":[{"permission":"*","pattern":"*","action":"allow"},{"permission":"*","pattern":"*","action":"ask"},{"permission":"bash","pattern":"*","action":"deny"}]}]);
-        assert!(
-            validate_open_code_agent_permissions(RuntimeMode::Supervised, false, &restricted)
-                .is_ok()
-        );
-        let overridden = json!([{"name":"organization_agent","permission":[{"permission":"*","pattern":"*","action":"ask"},{"permission":"bash","pattern":"git *","action":"allow"}]}]);
-        assert!(
-            validate_open_code_agent_permissions(RuntimeMode::Supervised, false, &overridden)
-                .is_err()
-        );
-        let plan = json!([{"name":"plan","permission":[{"permission":"*","pattern":"*","action":"deny"},{"permission":"read","pattern":"*","action":"allow"},{"permission":"task","pattern":"explore","action":"allow"}]}]);
-        assert!(validate_open_code_agent_permissions(RuntimeMode::FullAccess, true, &plan).is_ok());
-        assert!(
-            validate_open_code_agent_permissions(RuntimeMode::FullAccess, true, &overridden)
-                .is_err()
-        );
-        assert!(
-            validate_open_code_agent_permissions(RuntimeMode::Supervised, false, &json!([]))
-                .is_err()
-        );
-        let overlap = json!([{"name":"custom","permission":[{"permission":"*","pattern":"*","action":"ask"},{"permission":"foo","pattern":"foo*","action":"allow"},{"permission":"foo","pattern":"foo?","action":"deny"}]}]);
-        assert!(
-            validate_open_code_agent_permissions(RuntimeMode::Supervised, false, &overlap).is_err()
-        );
-        assert!(
-            validate_open_code_server_config(
-                RuntimeMode::Supervised,
-                false,
-                &json!({"experimental":{"primary_tools":["bash"]}})
-            )
-            .is_err()
-        );
-        assert!(
-            validate_open_code_server_config(
-                RuntimeMode::Supervised,
-                false,
-                &json!({"experimental":{"primary_tools":[]}})
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn asks_by_default_and_allows_edits_in_auto_accept_edits() {
-        let rules = build_open_code_permission_rules(RuntimeMode::AutoAcceptEdits);
+        let rules = build_open_code_permission_rules(RuntimeMode::AutoAcceptEdits, false, None);
         assert!(rules.contains(&OpenCodePermissionRule::new(
             "edit",
             "*",
@@ -1600,7 +1121,7 @@ general (subagent)
             rules[0],
             OpenCodePermissionRule::new("*", "*", PermissionAction::Ask)
         );
-        let auto = build_open_code_permission_rules(RuntimeMode::Auto);
+        let auto = build_open_code_permission_rules(RuntimeMode::Auto, false, None);
         assert!(auto.contains(&OpenCodePermissionRule::new(
             "read",
             "*",
@@ -1625,7 +1146,7 @@ general (subagent)
     #[test]
     fn merge_emits_only_the_new_suffix() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hel"), "Hello"),
+            merge_open_code_assistant_text(Some("Hel"), "Hello", false),
             MergedText {
                 latest_text: "Hello".into(),
                 delta_to_emit: "lo".into(),
@@ -1636,7 +1157,7 @@ general (subagent)
     #[test]
     fn merge_keeps_a_longer_snapshot_if_the_next_update_shrinks() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("Hello world"), "Hello"),
+            merge_open_code_assistant_text(Some("Hello world"), "Hello", false),
             MergedText {
                 latest_text: "Hello world".into(),
                 delta_to_emit: "".into(),
@@ -1647,13 +1168,23 @@ general (subagent)
     #[test]
     fn merge_slices_at_character_boundaries() {
         assert_eq!(
-            merge_open_code_assistant_text(Some("caf"), "café!").delta_to_emit,
+            merge_open_code_assistant_text(Some("caf"), "café!", false).delta_to_emit,
             "é!"
         );
         assert_eq!(
-            merge_open_code_assistant_text(None, "naïve").delta_to_emit,
+            merge_open_code_assistant_text(None, "naïve", false).delta_to_emit,
             "naïve"
         );
+    }
+
+    #[test]
+    fn accepts_final_text_corrections_and_shortening() {
+        let merge = |previous: &str, next: &str| {
+            merge_open_code_assistant_text(Some(previous), next, true).latest_text
+        };
+        assert_eq!(merge("Hello worle", "Hello world"), "Hello world");
+        assert_eq!(merge("Hello world", "Hello"), "Hello");
+        assert_eq!(merge("Hello", ""), "");
     }
 
     // describe("OpenCode helpers")
@@ -1726,6 +1257,53 @@ general (subagent)
             sort_open_code_variants(&strings(&["high", "minimal", "xhigh", "low", "medium"])),
             strings(&["minimal", "low", "medium", "high", "xhigh"])
         );
+    }
+
+    #[test]
+    fn catalog_locale_preserves_effort_rank_and_collates_unknown_variants() {
+        monocode_locale::with_locale("fr-FR", || {
+            assert_eq!(
+                sort_open_code_variants(&strings(&[
+                    "Zebra",
+                    "éclair",
+                    "e\u{301}clair",
+                    "xhigh",
+                    "high"
+                ])),
+                strings(&["high", "xhigh", "éclair", "e\u{301}clair", "Zebra"])
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn catalog_locale_keeps_equivalent_model_names_in_provider_order() {
+        use super::super::catalog::{flatten_open_code_models, parse_models_cli_output};
+
+        let output = [
+            "anthropic/composed",
+            r#"{"id":"composed","name":"éclair"}"#,
+            "anthropic/decomposed",
+            r#"{"id":"decomposed","name":"e\u0301clair"}"#,
+            "anthropic/zebra",
+            r#"{"id":"zebra","name":"Zebra"}"#,
+        ]
+        .join("\n");
+        monocode_locale::with_locale("fr-FR", || {
+            let models = flatten_open_code_models(&parse_models_cli_output(&output), &[]);
+            assert_eq!(
+                models
+                    .iter()
+                    .map(|model| model.native_id.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                [
+                    "anthropic/composed",
+                    "anthropic/decomposed",
+                    "anthropic/zebra"
+                ]
+            );
+        })
+        .unwrap();
     }
 
     // describe("contextUsedFromMessageInfo")
@@ -1851,12 +1429,18 @@ general (subagent)
         assert_eq!(text_delta_event(&part, ""), None);
         assert_eq!(
             text_delta_event(&part, "hi"),
-            Some(HarnessEvent::MessageDelta { text: "hi".into() })
+            Some(HarnessEvent::MessageDelta {
+                text: "hi".into(),
+                append: None
+            })
         );
         part.part_type = "reasoning".into();
         assert_eq!(
             text_delta_event(&part, "hm"),
-            Some(HarnessEvent::ReasoningDelta { text: "hm".into() })
+            Some(HarnessEvent::ReasoningDelta {
+                text: "hm".into(),
+                append: None
+            })
         );
     }
 

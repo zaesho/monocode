@@ -49,10 +49,12 @@ impl Checkpoints {
         }
     }
 
-    /// `ensureSessionCheckpoint`.
-    pub fn ensure(&self, session_id: &str, cwd: &str) -> Task<Result<(), String>> {
+    /// `ensureSessionCheckpoint`: record the session's starting state. An
+    /// isolated worker owns its checkout, so every later change there,
+    /// including shell edits, counts as its own.
+    pub fn ensure(&self, session_id: &str, cwd: &str, isolated: bool) -> Task<Result<(), String>> {
         let (id, cwd) = (session_id.to_string(), cwd.to_string());
-        self.enqueue(session_id, move |backend| backend.ensure(id, cwd))
+        self.enqueue(session_id, move |backend| backend.ensure(id, cwd, isolated))
     }
 
     /// `prepareSessionCheckpoint`: capture files right before a structured
@@ -90,20 +92,25 @@ impl Checkpoints {
         self.enqueue(session_id, move |backend| backend.status(id, cwd))
     }
 
-    /// `applySessionCheckpoint`: apply one isolated worker's captured delta
-    /// to its lead checkout.
+    /// `applySessionCheckpoint`: apply one isolated worker's delta to its
+    /// lead checkout. With `write_scopes`, changed files outside every scope
+    /// stay in the worker worktree and come back in `skipped`.
     pub fn apply(
         &self,
         session_id: &str,
         from_cwd: &str,
         to_cwd: &str,
+        write_scopes: Option<&[String]>,
     ) -> Task<Result<CheckpointApplyResult, String>> {
-        let (id, from, to) = (
+        let (id, from, to, scopes) = (
             session_id.to_string(),
             from_cwd.to_string(),
             to_cwd.to_string(),
+            write_scopes.map(<[String]>::to_vec),
         );
-        self.enqueue(session_id, move |backend| backend.apply(id, from, to))
+        self.enqueue(session_id, move |backend| {
+            backend.apply(id, from, to, scopes)
+        })
     }
 
     /// `sessionCheckpointCleanupSafe`: true only when the checkout still
@@ -204,7 +211,7 @@ pub fn begin_session_turn(session_id: &str, cwd: &str, cx: &mut App) -> Task<Res
     let Some(checkpoints) = Engine::try_global(cx).map(|engine| engine.checkpoints.clone()) else {
         return Task::ready(Ok(()));
     };
-    let ensure = checkpoints.ensure(session_id, cwd);
+    let ensure = checkpoints.ensure(session_id, cwd, false);
     let session_id = session_id.to_string();
     cx.spawn(async move |cx| {
         ensure.await?;

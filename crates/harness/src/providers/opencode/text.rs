@@ -22,22 +22,33 @@ use parking_lot::Mutex;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::catalog::discover_open_code_models;
+use super::catalog::CatalogRefresher;
 use super::client::{OpenCodeClient, PromptInput, parse_event};
 use super::deps::stream_text_delta;
 use super::protocol::{
-    OpenCodePart, OpenCodePermissionRule, OpenCodePromptPart, ParsedOpenCodeModelSlug, PartStore,
-    PartTime, PermissionAction, Record, append_open_code_assistant_text_delta, event_session_id,
-    field, is_known_hidden_agent, is_truthy, merge_open_code_assistant_text,
-    open_code_version_error, parse_open_code_model_slug, parse_open_code_version,
-    parse_server_url_from_output, record_field, string_field,
+    MINIMUM_OPENCODE_VERSION, OpenCodePart, OpenCodePermissionRule, OpenCodePromptPart,
+    ParsedOpenCodeModelSlug, PartStore, PartTime, PermissionAction, Record,
+    append_open_code_assistant_text_delta, compare_semver, event_session_id, field,
+    is_known_hidden_agent, is_truthy, merge_open_code_assistant_text, parse_open_code_model_slug,
+    parse_open_code_version, parse_server_url_from_output, record_field, string_field,
 };
 use crate::core::abort_text_prompt::with_text_prompt_abort;
 use crate::core::catalog::SharedCatalog;
 use crate::core::child::{BinaryPathChoice, ChildEvent, Children, SseEvent};
 use crate::core::json_text::js_string;
 use crate::core::registry::{EventSink, TextPromptInput};
-use crate::core::task::{SharedSpawner, sleep};
+use crate::core::task::{BoxFuture, SharedSpawner, sleep};
+
+/// Shared prompt builders can use either OpenCode transport.
+pub trait TextBackend: Send + Sync {
+    fn run_text(&self, input: TextPromptInput) -> crate::core::task::BoxFuture<'_, Result<String>>;
+}
+
+impl TextBackend for OpenCodeText {
+    fn run_text(&self, input: TextPromptInput) -> crate::core::task::BoxFuture<'_, Result<String>> {
+        self.run(input).boxed()
+    }
+}
 
 pub const TEXT_CHILD_ID: &str = "monocode-opencode-text";
 const SERVER_TIMEOUT_MS: u64 = 30_000;
@@ -55,6 +66,7 @@ struct TextState {
     message_role_by_id: HashMap<String, Role>,
     part_by_id: PartStore,
     emitted_text_by_part_id: HashMap<String, String>,
+    /// Parts whose final snapshot was emitted.
     emitted_ended_part_ids: HashSet<String>,
     pending_text_delta_by_part_id: HashMap<String, String>,
     on_event: Option<EventSink>,
@@ -73,6 +85,7 @@ struct LiveText {
 }
 
 struct TextInner {
+    refresher: CatalogRefresher,
     children: Children,
     catalog: SharedCatalog,
     spawner: SharedSpawner,
@@ -92,6 +105,11 @@ impl OpenCodeText {
     pub fn new(children: Children, catalog: SharedCatalog, spawner: SharedSpawner) -> Self {
         Self {
             inner: Arc::new(TextInner {
+                refresher: CatalogRefresher::new(
+                    children.clone(),
+                    catalog.clone(),
+                    spawner.clone(),
+                ),
                 children,
                 catalog,
                 spawner,
@@ -107,6 +125,12 @@ impl OpenCodeText {
     #[cfg(test)]
     pub(crate) fn processed_events(&self) -> usize {
         self.inner.processed_events.load(Ordering::SeqCst)
+    }
+
+    /// `refreshProjectOpenCodeCatalog`: shared with the adapter, so one
+    /// project refresh serves both.
+    pub fn refresh_project_catalog(&self, cwd: &str) -> BoxFuture<'static, ()> {
+        self.inner.refresher.refresh_project(cwd)
     }
 
     /// `stopOpenCodeTextPrompt`.
@@ -140,11 +164,11 @@ impl OpenCodeText {
                 input.model_settings.as_ref(),
             )
             .await?;
-        if let Some(signal) = &input.signal
-            && let Err(error) = signal.throw_if_aborted()
-        {
+        // A prompt cancelled while the server started must not leave it
+        // running for the next prompt.
+        if let Some(signal) = input.signal.as_ref().filter(|signal| signal.is_aborted()) {
             self.drop_live().await;
-            return Err(error);
+            signal.throw_if_aborted()?;
         }
         session.state.lock().on_event = input.on_event.clone();
 
@@ -162,6 +186,7 @@ impl OpenCodeText {
     ) -> Result<String> {
         let prompt = PromptInput {
             session_id: session.session_id.clone(),
+            message_id: None,
             model: session.model.clone(),
             agent: Some(open_code_text_agent(
                 input.intent,
@@ -199,32 +224,9 @@ impl OpenCodeText {
             };
             bail!(message);
         }
-        if let Some(info) = &result.info {
-            let event = serde_json::json!({
-                "type": "message.updated",
-                "properties": { "info": info },
-            });
-            handle_text_event(session, event.as_object().unwrap());
-        }
-        for value in result.parts.as_deref().unwrap_or_default() {
-            if parse_text_part(Some(value)).is_none() {
-                continue;
-            }
-            let mut part = value.as_object().unwrap().clone();
-            let mut time = part
-                .get("time")
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            // The HTTP response can arrive before the completed SSE snapshot.
-            time.entry("end").or_insert_with(|| Value::from(0));
-            part.insert("time".into(), Value::Object(time));
-            let event = serde_json::json!({
-                "type": "message.part.updated",
-                "properties": { "part": part },
-            });
-            handle_text_event(session, event.as_object().unwrap());
-        }
+        // The HTTP response can arrive before the completed SSE snapshot, so
+        // its parts are final too.
+        handle_text_result(session, result.info.as_ref(), result.parts.as_deref());
         let text = get_open_code_text_response(result.parts.as_deref());
         if text.is_empty() {
             bail!("OpenCode returned empty output.");
@@ -238,17 +240,14 @@ impl OpenCodeText {
         requested_model: Option<&str>,
         model_settings: Option<&ModelSettings>,
     ) -> Result<Arc<LiveText>> {
+        // Without a requested model, the project's own catalog decides.
         if requested_model.is_none()
-            && self
+            && !self
                 .inner
                 .catalog
-                .project_models_for(HarnessId::Opencode, cwd)
-                .is_none()
+                .has_project_harness_models(HarnessId::Opencode, cwd)
         {
-            let models = discover_open_code_models(&self.inner.children, Some(cwd)).await?;
-            self.inner
-                .catalog
-                .set_project_harness_models(HarnessId::Opencode, cwd, models);
+            self.inner.refresher.refresh_project(cwd).await;
         }
         let model = self.pick_text_model(requested_model, cwd);
         let settings_key = model_settings_key(model_settings);
@@ -285,32 +284,36 @@ impl OpenCodeText {
             .await
             .unwrap_or_default();
         let version = parse_open_code_version(&version_out);
-        if let Some(error) = open_code_version_error(version.as_deref()) {
-            bail!(error);
+        if version
+            .as_deref()
+            .is_none_or(|version| compare_semver(version, MINIMUM_OPENCODE_VERSION) < 0)
+        {
+            bail!(
+                "OpenCode v{} is too old for text generation.",
+                version.as_deref().unwrap_or("unknown")
+            );
         }
 
         self.inner.server_url.lock().clear();
         self.watch_server();
 
-        let startup = async {
-            let port = children.free_harness_port().await?;
-            children
-                .spawn_child(
-                    TEXT_CHILD_ID,
-                    &binary.path,
-                    vec![
-                        "serve".into(),
-                        "--hostname=127.0.0.1".into(),
-                        format!("--port={port}"),
-                    ],
-                    cwd,
-                    None,
-                    Some(HarnessId::Opencode),
-                )
-                .await?;
-            self.connect(cwd, model, model_settings).await
-        };
-        match startup.await {
+        let port = children.free_harness_port().await?;
+        children
+            .spawn_child(
+                TEXT_CHILD_ID,
+                &binary.path,
+                vec![
+                    "serve".into(),
+                    "--hostname=127.0.0.1".into(),
+                    format!("--port={port}"),
+                ],
+                cwd,
+                None,
+                Some(HarnessId::Opencode),
+            )
+            .await?;
+
+        match self.connect(cwd, model, model_settings).await {
             Ok(session) => Ok(session),
             Err(error) => {
                 self.drop_live().await;
@@ -427,8 +430,11 @@ impl OpenCodeText {
                 };
             }
         }
-        let catalog = self.inner.catalog.snapshot_for_directory(cwd);
-        for model in catalog.models_for(HarnessId::Opencode) {
+        let catalog = self.inner.catalog.read();
+        let models = catalog
+            .project_harness_models(HarnessId::Opencode, cwd)
+            .unwrap_or_else(|| catalog.models_for(HarnessId::Opencode));
+        for model in models {
             let slug = model.native_id.as_deref().unwrap_or(&model.id);
             if let Some(parsed) = parse_open_code_model_slug(Some(slug)) {
                 return parsed;
@@ -484,6 +490,42 @@ pub fn get_open_code_text_response(parts: Option<&[Value]>) -> String {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect();
     js::trim(&text).to_string()
+}
+
+/// Apply a finished prompt's message and parts as final snapshots.
+fn handle_text_result(session: &LiveText, info: Option<&Record>, parts: Option<&[Value]>) {
+    let (events, sink) = {
+        let mut state = session.state.lock();
+        if let Some(info) = info {
+            let mut event = Record::new();
+            event.insert("type".into(), Value::from("message.updated"));
+            let mut properties = Record::new();
+            properties.insert("info".into(), Value::Object(info.clone()));
+            event.insert("properties".into(), Value::Object(properties));
+            apply_text_event(session, &mut state, &event);
+        }
+        for value in parts.unwrap_or_default() {
+            let Some(mut part) = parse_text_part(Some(value)) else {
+                continue;
+            };
+            let time = part.time.unwrap_or_default();
+            part.time = Some(PartTime {
+                end: time.end.or(Some(0.0)),
+                ..time
+            });
+            state.part_by_id.set(part.clone());
+            state.pending_text_delta_by_part_id.remove(&part.id);
+            if text_part_role(&state, &part) == Some(Role::Assistant) {
+                emit_text_part(&mut state, &part);
+            }
+        }
+        (std::mem::take(&mut state.outbox), state.on_event.clone())
+    };
+    if let Some(sink) = sink {
+        for event in events {
+            sink(event);
+        }
+    }
 }
 
 fn handle_text_event(session: &LiveText, event: &Record) {
@@ -547,6 +589,7 @@ fn apply_text_event(session: &LiveText, state: &mut TextState, event: &Record) {
                     merge_open_code_assistant_text(
                         Some(&pending_delta),
                         part.text.as_deref().unwrap_or_default(),
+                        false,
                     )
                     .latest_text,
                 );
@@ -601,7 +644,8 @@ fn apply_text_event(session: &LiveText, state: &mut TextState, event: &Record) {
     emit_text_part(state, &next_part);
 }
 
-/// `emitTextPart`.
+/// `emitTextPart`: the part's whole text, once per change. An ended part's
+/// snapshot is final and replaces what was shown.
 fn emit_text_part(state: &mut TextState, part: &OpenCodePart) {
     if part.part_type != "text" && part.part_type != "reasoning" {
         return;
@@ -621,13 +665,13 @@ fn emit_text_part(state: &mut TextState, part: &OpenCodePart) {
     }
     state
         .emitted_text_by_part_id
-        .insert(part.id.clone(), text.into());
+        .insert(part.id.clone(), text.to_string());
     if ended {
         state.emitted_ended_part_ids.insert(part.id.clone());
     }
     state.outbox.push(HarnessEvent::MessagePart {
         part_id: part.id.clone(),
-        text: text.into(),
+        text: text.to_string(),
         reasoning: part.part_type == "reasoning",
         streaming: !ended,
     });
@@ -673,12 +717,13 @@ fn merge_text_part(previous: Option<&OpenCodePart>, next: OpenCodePart) -> OpenC
     if ended(&next) {
         return next;
     }
-    if ended(previous) && !ended(&next) {
+    if ended(previous) {
         return previous.clone();
     }
     let text = merge_open_code_assistant_text(
         previous.text.as_deref(),
         next.text.as_deref().unwrap_or_default(),
+        false,
     )
     .latest_text;
     OpenCodePart {
@@ -692,7 +737,6 @@ fn merge_text_part(previous: Option<&OpenCodePart>, next: OpenCodePart) -> OpenC
 mod tests {
     use super::*;
     use crate::core::registry::event_sink;
-    use crate::core::task::AbortSignal;
     use crate::providers::opencode::test_support::{FakeHost, path_of, wait_for};
     use serde_json::json;
 
@@ -799,10 +843,7 @@ mod tests {
         }
     }
 
-    fn delta(text: &str) -> HarnessEvent {
-        snapshot(text, true)
-    }
-
+    /// A snapshot of the assistant message's one text part.
     fn snapshot(text: &str, streaming: bool) -> HarnessEvent {
         HarnessEvent::MessagePart {
             part_id: "part_assistant_message".into(),
@@ -823,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn forwards_opencode_assistant_part_snapshots() {
+    fn forwards_assistant_text_as_part_snapshots_without_user_text() {
         smol::block_on(async {
             let mut harness = Harness::new();
             let reply = harness.host.defer("POST", "/session/text_session/message");
@@ -837,7 +878,10 @@ mod tests {
             harness.finish(reply, "Hello").await;
 
             assert_eq!(result.await.unwrap(), "Hello");
-            assert_eq!(harness.deltas(), vec![delta("Hel"), delta("Hello")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![snapshot("Hel", true), snapshot("Hello", true)]
+            );
         });
     }
 
@@ -856,7 +900,10 @@ mod tests {
             harness.finish(reply, "Hello!").await;
 
             assert_eq!(result.await.unwrap(), "Hello!");
-            assert_eq!(harness.deltas(), vec![delta("Hello"), delta("Hello!")]);
+            assert_eq!(
+                harness.deltas(),
+                vec![snapshot("Hello", true), snapshot("Hello!", true)]
+            );
         });
     }
 
@@ -895,57 +942,45 @@ mod tests {
             assert_eq!(result.await.unwrap(), "Hello");
             assert_eq!(
                 harness.deltas(),
-                vec![delta("Hel"), delta("Hello"), snapshot("Hello", false)]
-            );
-        });
-    }
-
-    #[test]
-    fn replaces_streamed_text_with_a_shorter_completed_part() {
-        smol::block_on(async {
-            let mut harness = Harness::new();
-            let reply = harness.host.defer("POST", "/session/text_session/message");
-            let result = harness.run();
-            prompt_started(&harness).await;
-            harness.message("assistant_message", "assistant");
-            harness.part("assistant_message", "Longer provisional answer", false);
-            harness.part("assistant_message", "Final", true);
-            harness.finish(reply, "Final").await;
-            assert_eq!(result.await.unwrap(), "Final");
-            assert_eq!(
-                harness.deltas(),
                 vec![
-                    snapshot("Longer provisional answer", true),
-                    snapshot("Final", false)
+                    snapshot("Hel", true),
+                    snapshot("Hello", true),
+                    snapshot("Hello", false),
                 ]
             );
         });
     }
 
     #[test]
-    fn reconciles_the_completed_http_response_before_closing_the_stream() {
+    fn applies_a_final_correction_and_treats_response_parts_as_final() {
         smol::block_on(async {
             let mut harness = Harness::new();
             let reply = harness.host.defer("POST", "/session/text_session/message");
             let result = harness.run();
             prompt_started(&harness).await;
             harness.message("assistant_message", "assistant");
-            harness.part("assistant_message", "Longer provisional answer", false);
+            harness.part("assistant_message", "Hello worle", false);
+            let injected = harness.injected;
             wait_for("events handled", || {
-                harness.text.processed_events() >= harness.injected
+                harness.text.processed_events() >= injected
             })
             .await;
+            // The HTTP reply arrives before the completed SSE snapshot.
             let body = json!({
                 "info": { "id": "assistant_message", "role": "assistant", "sessionID": "text_session" },
-                "parts": [{ "id": "part_assistant_message", "messageID": "assistant_message", "type": "text", "text": "Final" }],
+                "parts": [{
+                    "id": "part_assistant_message", "messageID": "assistant_message",
+                    "type": "text", "text": "Hello world",
+                }],
             });
             reply.send((200, body.to_string())).unwrap();
-            assert_eq!(result.await.unwrap(), "Final");
+
+            assert_eq!(result.await.unwrap(), "Hello world");
             assert_eq!(
                 harness.deltas(),
                 vec![
-                    snapshot("Longer provisional answer", true),
-                    snapshot("Final", false)
+                    snapshot("Hello worle", true),
+                    snapshot("Hello world", false)
                 ]
             );
         });
@@ -986,38 +1021,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_model_error_and_empty_output() {
-        smol::block_on(async {
-            let harness = Harness::new();
-            let reply = harness.host.defer("POST", "/session/text_session/message");
-            let result = harness.run();
-            prompt_started(&harness).await;
-            let body = json!({ "info": { "error": { "message": "Quota exceeded" } }, "parts": [] });
-            reply.send((200, body.to_string())).unwrap();
-            assert_eq!(result.await.unwrap_err().to_string(), "Quota exceeded");
-
-            let reply = harness.host.defer("POST", "/session/text_session/message");
-            let result = harness.run();
-            wait_for("second prompt", || {
-                harness.host.calls_to("/session/text_session/message").len() == 2
-            })
-            .await;
-            reply
-                .send((200, r#"{"info":{},"parts":[]}"#.into()))
-                .unwrap();
-            assert_eq!(
-                result.await.unwrap_err().to_string(),
-                "OpenCode returned empty output."
-            );
-        });
-    }
-
-    #[test]
     fn cancelling_during_session_creation_cleans_up_the_server() {
         smol::block_on(async {
             let harness = Harness::new();
             let reply = harness.host.defer("POST", "/session");
-            let signal = AbortSignal::new();
+            let signal = crate::core::task::AbortSignal::new();
             let text = harness.text.clone();
             let request_signal = signal.clone();
             let result = smol::spawn(async move {
@@ -1050,13 +1058,29 @@ mod tests {
     }
 
     #[test]
-    fn refuses_opencode_two_before_spawning_a_server() {
+    fn rejects_a_model_error_and_empty_output() {
         smol::block_on(async {
             let harness = Harness::new();
-            harness.host.set_exec_output("opencode 2.0.20");
-            let error = harness.run().await.unwrap_err();
-            assert!(error.to_string().contains("requires OpenCode 1.x"));
-            assert!(harness.host.spawns().is_empty());
+            let reply = harness.host.defer("POST", "/session/text_session/message");
+            let result = harness.run();
+            prompt_started(&harness).await;
+            let body = json!({ "info": { "error": { "message": "Quota exceeded" } }, "parts": [] });
+            reply.send((200, body.to_string())).unwrap();
+            assert_eq!(result.await.unwrap_err().to_string(), "Quota exceeded");
+
+            let reply = harness.host.defer("POST", "/session/text_session/message");
+            let result = harness.run();
+            wait_for("second prompt", || {
+                harness.host.calls_to("/session/text_session/message").len() == 2
+            })
+            .await;
+            reply
+                .send((200, r#"{"info":{},"parts":[]}"#.into()))
+                .unwrap();
+            assert_eq!(
+                result.await.unwrap_err().to_string(),
+                "OpenCode returned empty output."
+            );
         });
     }
 
@@ -1068,7 +1092,7 @@ mod tests {
             let error = harness.run().await.unwrap_err();
             assert_eq!(
                 error.to_string(),
-                "OpenCode v1.14.18 is too old. Upgrade to v1.14.19 or newer in the 1.x series."
+                "OpenCode v1.14.18 is too old for text generation."
             );
             assert!(harness.host.spawns().is_empty());
         });
@@ -1077,7 +1101,8 @@ mod tests {
     #[test]
     fn picks_text_models_from_the_request_or_the_catalog() {
         let host = FakeHost::new();
-        let text = OpenCodeText::new(host.children(), SharedCatalog::new(), host.spawner());
+        let catalog = SharedCatalog::new();
+        let text = OpenCodeText::new(host.children(), catalog.clone(), host.spawner());
         let slug = |provider: &str, model: &str| ParsedOpenCodeModelSlug {
             provider_id: provider.into(),
             model_id: model.into(),
@@ -1092,6 +1117,24 @@ mod tests {
         );
         assert_eq!(
             text.pick_text_model(None, "/repo"),
+            slug("opencode", "glm-5")
+        );
+        // A project's own catalog decides the model for prompts run there.
+        catalog.set_project_harness_models(
+            HarnessId::Opencode,
+            "/repo",
+            vec![
+                monocode_core::models::AgentModel::new(
+                    "opencode:local/model",
+                    HarnessId::Opencode,
+                    "Local",
+                )
+                .with_native_id("local/model"),
+            ],
+        );
+        assert_eq!(text.pick_text_model(None, "/repo"), slug("local", "model"));
+        assert_eq!(
+            text.pick_text_model(None, "/other"),
             slug("opencode", "glm-5")
         );
         assert_eq!(

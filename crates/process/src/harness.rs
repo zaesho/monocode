@@ -3,6 +3,7 @@
 //! src-tauri/src/harness.rs.
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -22,9 +23,12 @@ use monocode_platform::{dirs_home, expand_home, passwd_identity};
 /// Receives what harness children and OpenCode event streams produce. The
 /// Tauri app emits these as `harness-stdout`, `harness-stderr`,
 /// `harness-exit`, `harness-sse`, and `harness-sse-end`.
+///
+/// `pid` on a line is the child that wrote it, so a replacement under the
+/// same session id can ignore output from the process it replaced.
 pub trait HarnessEvents: Send + Sync {
-    fn stdout(&self, session_id: &str, line: String);
-    fn stderr(&self, session_id: &str, line: String);
+    fn stdout(&self, session_id: &str, line: String, pid: u32);
+    fn stderr(&self, session_id: &str, line: String, pid: u32);
     fn exit(&self, session_id: &str, code: Option<i32>, pid: u32);
     fn sse(&self, session_id: &str, data: String);
     fn sse_end(&self, session_id: &str, error: Option<String>);
@@ -33,8 +37,8 @@ pub trait HarnessEvents: Send + Sync {
 struct NoHarnessEvents;
 
 impl HarnessEvents for NoHarnessEvents {
-    fn stdout(&self, _session_id: &str, _line: String) {}
-    fn stderr(&self, _session_id: &str, _line: String) {}
+    fn stdout(&self, _session_id: &str, _line: String, _pid: u32) {}
+    fn stderr(&self, _session_id: &str, _line: String, _pid: u32) {}
     fn exit(&self, _session_id: &str, _code: Option<i32>, _pid: u32) {}
     fn sse(&self, _session_id: &str, _data: String) {}
     fn sse_end(&self, _session_id: &str, _error: Option<String>) {}
@@ -42,7 +46,45 @@ impl HarnessEvents for NoHarnessEvents {
 
 const DEFAULT_PROVIDER_ACCOUNT_ID: &str = "default";
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+/// The selected provider's directories after account and child environment setup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillLaunchContext {
+    pub provider: Option<String>,
+    pub account_id: Option<String>,
+    pub cwd: PathBuf,
+    pub provider_homes: HashMap<String, PathBuf>,
+}
+
+pub type SkillPreparer = Arc<dyn Fn(SkillLaunchContext) -> Result<(), String> + Send + Sync>;
+pub type SkillAccountRetirer = Arc<dyn Fn(PathBuf) -> Result<(), String> + Send + Sync>;
+
+/// Hold across account discovery, skill updates, and account setup or removal.
+pub struct SkillAccountLifecycle {
+    _file: File,
+}
+
+pub fn lock_skill_account_lifecycle(data_dir: &Path) -> Result<SkillAccountLifecycle, String> {
+    std::fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
+    let data_dir = std::fs::canonicalize(data_dir).map_err(|error| error.to_string())?;
+    let path = data_dir.join("shared-skills-accounts.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err("Shared skills account lock must be a regular file".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| format!("Cannot open shared skills account lock: {error}"))?;
+    file.lock()
+        .map_err(|error| format!("Cannot lock shared skills account lifecycle: {error}"))?;
+    Ok(SkillAccountLifecycle { _file: file })
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessAccount {
     provider: String,
@@ -89,10 +131,13 @@ struct LiveChild {
     stdin: Mutex<ChildStdin>,
     pid: u32,
     account: Option<HarnessAccount>,
+    #[cfg(unix)]
+    _guard: crate::provider_guard::ProviderGuard,
 }
 
 struct LiveSse {
     stop: Arc<AtomicBool>,
+    /// A clone of the stream's socket, shut down to end a blocked read.
     socket: Mutex<Option<TcpStream>>,
 }
 
@@ -108,6 +153,7 @@ impl LiveSse {
 struct HarnessInner {
     children: HashMap<String, Arc<LiveChild>>,
     epochs: HashMap<String, u64>,
+    account_generations: HashMap<HarnessAccount, u64>,
 }
 
 /// Supervises harness children. Clones share one set of children; the last
@@ -119,6 +165,8 @@ pub struct HarnessShared {
     inner: Mutex<HarnessInner>,
     sse: Mutex<HashMap<String, Arc<LiveSse>>>,
     runtime_binary_paths: Mutex<Option<HashMap<String, String>>>,
+    skill_preparer: Mutex<Option<SkillPreparer>>,
+    skill_account_retirer: Mutex<Option<SkillAccountRetirer>>,
     /// Bumped by `kill_all` so a spawn that started before quit cannot reinsert.
     kill_all_gen: AtomicU64,
     events: Arc<dyn HarnessEvents>,
@@ -145,9 +193,12 @@ impl HarnessHost {
             inner: Mutex::new(HarnessInner {
                 children: HashMap::new(),
                 epochs: HashMap::new(),
+                account_generations: HashMap::new(),
             }),
             sse: Mutex::new(HashMap::new()),
             runtime_binary_paths: Mutex::new(None),
+            skill_preparer: Mutex::new(None),
+            skill_account_retirer: Mutex::new(None),
             kill_all_gen: AtomicU64::new(0),
             events,
         }))
@@ -155,6 +206,54 @@ impl HarnessHost {
 }
 
 impl HarnessShared {
+    /// Install local skill preparation without changing provider credentials.
+    pub fn set_skill_preparer(&self, preparer: Option<SkillPreparer>) {
+        *self
+            .skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = preparer;
+    }
+
+    pub fn set_skill_account_retirer(&self, retirer: Option<SkillAccountRetirer>) {
+        *self
+            .skill_account_retirer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = retirer;
+    }
+
+    fn retire_skill_account(&self, path: PathBuf) -> Result<(), String> {
+        let retirer = self
+            .skill_account_retirer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(retirer) = retirer {
+            retirer(path)
+                .map_err(|error| format!("Could not retire shared skill exports: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn has_skill_preparer(&self) -> bool {
+        self.skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    fn prepare_skills(&self, context: SkillLaunchContext) -> Result<(), String> {
+        let preparer = self
+            .skill_preparer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(preparer) = preparer {
+            preparer(context)
+                .map_err(|error| format!("Could not prepare shared skills: {error}"))?;
+        }
+        Ok(())
+    }
+
     pub fn runtime_binary_path(&self, provider: &str) -> Option<String> {
         self.runtime_binary_paths
             .lock()
@@ -180,14 +279,49 @@ impl HarnessShared {
         self.lock_inner().children.get(session_id).cloned()
     }
 
-    /// Stamp this spawn and drop any child already registered under the id.
-    fn begin_spawn(&self, session_id: &str) -> (u64, u64, Option<Arc<LiveChild>>) {
+    /// Stamp before account preparation waits so Stop can cancel queued work.
+    fn stamp_spawn(
+        &self,
+        session_id: &str,
+        account: Option<&HarnessAccount>,
+    ) -> (u64, u64, Option<(HarnessAccount, u64)>) {
         let mut inner = self.lock_inner();
         let kill_all = self.kill_all_gen.load(Ordering::SeqCst);
         let epoch = inner.epochs.entry(session_id.to_string()).or_insert(0);
         *epoch += 1;
         let epoch = *epoch;
-        let prev = inner.children.remove(session_id);
+        let account = account.map(|account| {
+            let generation = inner.account_generations.get(account).copied().unwrap_or(0);
+            (account.clone(), generation)
+        });
+        (epoch, kill_all, account)
+    }
+
+    fn start_stamped_spawn(
+        &self,
+        session_id: &str,
+        epoch: u64,
+        kill_all: u64,
+        account: Option<&(HarnessAccount, u64)>,
+    ) -> Result<Option<Arc<LiveChild>>, String> {
+        let mut inner = self.lock_inner();
+        if self.kill_all_gen.load(Ordering::SeqCst) != kill_all
+            || inner.epochs.get(session_id) != Some(&epoch)
+            || account.is_some_and(|(account, generation)| {
+                inner.account_generations.get(account).copied().unwrap_or(0) != *generation
+            })
+        {
+            return Err(SPAWN_CANCELLED.into());
+        }
+        Ok(inner.children.remove(session_id))
+    }
+
+    #[cfg(all(test, unix))]
+    fn begin_spawn(&self, session_id: &str) -> (u64, u64, Option<Arc<LiveChild>>) {
+        let (epoch, kill_all, _) = self.stamp_spawn(session_id, None);
+        let prev = self
+            .start_stamped_spawn(session_id, epoch, kill_all, None)
+            .unwrap();
         (epoch, kill_all, prev)
     }
 
@@ -236,6 +370,11 @@ impl HarnessShared {
     fn kill_account(&self, provider: &str, account_id: &str) {
         let children: Vec<(String, Arc<LiveChild>)> = {
             let mut inner = self.lock_inner();
+            let account = HarnessAccount {
+                provider: provider.into(),
+                id: account_id.into(),
+            };
+            *inner.account_generations.entry(account).or_insert(0) += 1;
             let session_ids: Vec<String> = inner
                 .children
                 .iter()
@@ -277,11 +416,17 @@ impl HarnessShared {
         terminate_all(&pids);
     }
 
+    /// Register `live` and cancel the stream it replaces.
     fn insert_sse(&self, session_id: String, live: Arc<LiveSse>) -> Option<Arc<LiveSse>> {
-        self.sse
+        let previous = self
+            .sse
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(session_id, live)
+            .insert(session_id, live);
+        if let Some(previous) = &previous {
+            previous.cancel();
+        }
+        previous
     }
 
     fn stop_sse(&self, session_id: &str) {
@@ -398,14 +543,43 @@ fn resolve_mcp_binary(provider: &str, binary_path: Option<&str>) -> Result<PathB
     }
 }
 
+/// The Claude profile an MCP command runs under: the account's config
+/// directory, or the effective default one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeMcpProfile {
+    config_dir: Option<PathBuf>,
+    /// A named profile, which keeps its own credentials. The default
+    /// account's environment tokens must not leak into it.
+    named: bool,
+}
+
+impl ClaudeMcpProfile {
+    pub fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
+    }
+}
+
+/// `claudeMcpProfile`: the profile of `account_id`, `None` meaning the
+/// default account.
+pub fn claude_mcp_profile(
+    data_dir: &Path,
+    account_id: Option<&str>,
+) -> Result<ClaudeMcpProfile, String> {
+    Ok(ClaudeMcpProfile {
+        config_dir: provider_account_dir(data_dir, "claude", account_id)?,
+        named: account_id.is_some_and(|id| id != DEFAULT_PROVIDER_ACCOUNT_ID),
+    })
+}
+
 fn claude_mcp_command(
     args: Vec<String>,
     cwd: String,
     timeout: Duration,
     binary_path: Option<&str>,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<String, String> {
     let binary = resolve_mcp_binary("claude", binary_path)?;
-    mcp_command(binary, args, cwd, timeout)
+    mcp_command(binary, args, cwd, timeout, profile)
 }
 
 fn mcp_command(
@@ -413,12 +587,19 @@ fn mcp_command(
     args: Vec<String>,
     cwd: String,
     timeout: Duration,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<String, String> {
     let workdir = expand_home(&cwd);
     if !workdir.is_dir() {
         return Err("Project directory does not exist".into());
     }
-    let output = exec_output(&binary.to_string_lossy(), &args, Some(&cwd), timeout)?;
+    let output = exec_output_with_profile(
+        &binary.to_string_lossy(),
+        &args,
+        Some(&cwd),
+        timeout,
+        profile,
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if output.status.success() {
         return Ok(stdout);
@@ -427,15 +608,24 @@ fn mcp_command(
     Err(format!("{} {}", stderr.trim(), stdout).trim().to_string())
 }
 
-pub fn claude_mcp_list(host: &HarnessHost, cwd: String) -> Result<String, String> {
+/// `claude_mcp_list` under the selected profile (`None` for the default
+/// account).
+pub fn claude_mcp_list(
+    host: &HarnessHost,
+    data_dir: &Path,
+    cwd: String,
+    account_id: Option<&str>,
+) -> Result<String, String> {
+    let profile = claude_mcp_profile(data_dir, account_id)?;
     let binary_path = host.runtime_binary_path("claude");
     let mut output = claude_mcp_command(
         vec!["mcp".into(), "list".into()],
         cwd.clone(),
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(&profile),
     )?;
-    for name in configured_ws_mcp_servers(&expand_home(&cwd)) {
+    for name in configured_ws_mcp_servers(&expand_home(&cwd), profile.config_dir()) {
         if !output
             .lines()
             .any(|line| line.starts_with(&format!("{name}:")))
@@ -448,7 +638,7 @@ pub fn claude_mcp_list(host: &HarnessHost, cwd: String) -> Result<String, String
     Ok(output)
 }
 
-fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
+fn configured_ws_mcp_servers(cwd: &Path, config_dir: Option<&Path>) -> Vec<String> {
     let mut names = Vec::new();
     let read = |path: &Path| -> Option<serde_json::Value> {
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
@@ -465,8 +655,8 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
             }
         }
     };
-    if let Some(home) = dirs_home()
-        && let Some(settings) = read(&Path::new(&home).join(".claude.json"))
+    if let Some(path) = claude_config_path(config_dir)
+        && let Some(settings) = read(&path)
     {
         collect(settings.get("mcpServers"), &mut names);
         collect(
@@ -490,6 +680,7 @@ fn configured_ws_mcp_servers(cwd: &Path) -> Vec<String> {
 
 pub fn claude_mcp_add(
     host: &HarnessHost,
+    profile: &ClaudeMcpProfile,
     cwd: String,
     name: String,
     config: String,
@@ -518,6 +709,7 @@ pub fn claude_mcp_add(
         cwd,
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(profile),
     )?;
     Ok(())
 }
@@ -529,9 +721,16 @@ pub fn add_mcp_via_cli(
     name: &str,
     config: &serde_json::Value,
     binary_path: Option<&str>,
+    profile: Option<&ClaudeMcpProfile>,
 ) -> Result<(), String> {
     let (binary, args) = mcp_add_args(provider, scope, name, config, binary_path)?;
-    mcp_command(binary, args, cwd.to_owned(), Duration::from_secs(30))?;
+    mcp_command(
+        binary,
+        args,
+        cwd.to_owned(),
+        Duration::from_secs(30),
+        profile,
+    )?;
     Ok(())
 }
 
@@ -542,6 +741,7 @@ pub fn opencode_major_version(cwd: &str, binary_path: Option<&str>) -> Result<u3
         vec!["--version".into()],
         cwd.to_owned(),
         Duration::from_secs(10),
+        None,
     )?;
     version
         .split_whitespace()
@@ -670,6 +870,7 @@ fn mcp_key_values(
 
 pub fn claude_mcp_remove(
     host: &HarnessHost,
+    profile: &ClaudeMcpProfile,
     cwd: String,
     name: String,
     scope: String,
@@ -686,12 +887,15 @@ pub fn claude_mcp_remove(
         cwd,
         Duration::from_secs(30),
         binary_path.as_deref(),
+        Some(profile),
     )?;
     Ok(())
 }
 
+/// `profile` applies to Claude only.
 pub fn mcp_provider_login(
     host: &HarnessHost,
+    profile: Option<&ClaudeMcpProfile>,
     cwd: String,
     provider: String,
     name: String,
@@ -716,6 +920,7 @@ pub fn mcp_provider_login(
         args.into_iter().map(String::from).chain([name]).collect(),
         cwd,
         Duration::from_secs(180),
+        profile.filter(|_| provider == "claude"),
     )?;
     Ok(())
 }
@@ -832,8 +1037,59 @@ pub fn harness_spawn(
     account: Option<HarnessAccount>,
     binary_provider: Option<String>,
     binary_path: Option<String>,
-    env: Option<HashMap<String, String>>,
 ) -> Result<u32, String> {
+    harness_spawn_with_env(
+        host,
+        data_dir,
+        control,
+        session_id,
+        command,
+        args,
+        cwd,
+        account,
+        binary_provider,
+        binary_path,
+        HashMap::new(),
+    )
+}
+
+/// Starts a managed child with explicit process-local provider overrides.
+#[allow(clippy::too_many_arguments)]
+pub fn harness_spawn_with_env(
+    host: &HarnessHost,
+    data_dir: &Path,
+    control: Option<&ControlHost>,
+    session_id: String,
+    command: String,
+    args: Vec<String>,
+    cwd: String,
+    account: Option<HarnessAccount>,
+    binary_provider: Option<String>,
+    binary_path: Option<String>,
+    environment: HashMap<String, String>,
+) -> Result<u32, String> {
+    for (name, value) in &environment {
+        if binary_provider.as_deref() != Some("opencode")
+            || !matches!(
+                name.as_str(),
+                "OPENCODE_PASSWORD"
+                    | "OPENCODE_CONFIG_DIR"
+                    | "OPENCODE_CONFIG"
+                    | "OPENCODE_CONFIG_CONTENT"
+                    | "OPENCODE_CONFIG_PROJECT_DISABLE"
+                    | "OPENCODE_DISABLE_MODELS_FETCH"
+                    | "OPENCODE_CLIENT"
+                    | "XDG_DATA_HOME"
+                    | "XDG_CONFIG_HOME"
+                    | "XDG_CACHE_HOME"
+                    | "XDG_STATE_HOME"
+                    | "TMPDIR"
+            )
+            || value.contains('\0')
+        {
+            return Err("Unsupported provider environment override".into());
+        }
+    }
     let workdir = expand_home(&cwd);
     if !workdir.is_dir() {
         return Err(format!(
@@ -846,7 +1102,26 @@ pub fn harness_spawn(
     }
 
     let _reservation = crate::worktree_lifecycle::reserve_spawn(&workdir)?;
-    let (epoch, kill_all, prev) = host.begin_spawn(&session_id);
+    let (epoch, kill_all, account_stamp) = host.stamp_spawn(&session_id, account.as_ref());
+    let lifecycle = match lock_skill_account_lifecycle(data_dir) {
+        Ok(guard) => Some(guard),
+        Err(error)
+            if account
+                .as_ref()
+                .is_some_and(|account| account.id != DEFAULT_PROVIDER_ACCOUNT_ID) =>
+        {
+            return Err(format!(
+                "Cannot prepare provider account lifecycle: {error}"
+            ));
+        }
+        Err(error) => {
+            eprintln!(
+                "Shared skill exports were not updated: {error}. Open Settings > Skills to repair sharing."
+            );
+            None
+        }
+    };
+    let prev = host.start_stamped_spawn(&session_id, epoch, kill_all, account_stamp.as_ref())?;
     if let Some(prev) = prev {
         terminate(prev.pid);
     }
@@ -857,15 +1132,40 @@ pub fn harness_spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, &command);
-    apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
-    if binary_provider.as_deref() == Some("opencode")
-        && args.first().map(String::as_str) == Some("serve")
-    {
-        configure_opencode_server(&mut cmd, env.as_ref())?;
-    } else if env.as_ref().is_some_and(|env| !env.is_empty()) {
-        return Err("Environment overrides are limited to OpenCode servers".into());
+    // A configured Claude binary may have another name.
+    if binary_provider.as_deref() == Some("claude") && command_basename(&command) != "claude" {
+        apply_claude_env(&mut cmd);
     }
+    apply_provider_account(data_dir, &mut cmd, account.as_ref())?;
+    let environment = crate::opencode_config::apply_opencode_server_env(
+        &mut cmd,
+        binary_provider.as_deref(),
+        &args,
+        environment,
+    )?;
+    cmd.envs(environment);
+
+    if host.has_skill_preparer()
+        && lifecycle.is_some()
+        && !args
+            .iter()
+            .any(|arg| arg == "--no-skills" || arg == "--bare")
+    {
+        let preparation =
+            skill_launch_context(&cmd, &workdir, account.as_ref(), binary_provider.as_deref())
+                .and_then(|context| host.prepare_skills(context));
+        if let Err(error) = preparation {
+            eprintln!(
+                "Shared skill exports were not updated: {error}. Open Settings > Skills to repair sharing."
+            );
+        }
+    }
+
     crate::control::configure_child(control, &session_id, &mut cmd);
+
+    #[cfg(unix)]
+    let guard = crate::provider_guard::ProviderGuard::new(&mut cmd)
+        .map_err(|error| format!("Failed to guard {command}: {error}"))?;
 
     let mut child =
         spawn_managed(&mut cmd).map_err(|e| format!("Failed to start {command}: {e}"))?;
@@ -889,6 +1189,8 @@ pub fn harness_spawn(
         stdin: Mutex::new(stdin),
         pid,
         account,
+        #[cfg(unix)]
+        _guard: guard,
     });
     if let Some(rejected) = host.install_spawn(session_id.clone(), epoch, kill_all, live) {
         // A kill, or a newer spawn, won the race while this one was forking.
@@ -901,13 +1203,14 @@ pub fn harness_spawn(
         });
         return Err(SPAWN_CANCELLED.to_string());
     }
+    drop(lifecycle);
 
     let stdout_events = host.events.clone();
     let stdout_id = session_id.clone();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            stdout_events.stdout(&stdout_id, line);
+            stdout_events.stdout(&stdout_id, line, pid);
         }
     });
 
@@ -916,7 +1219,7 @@ pub fn harness_spawn(
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
-            stderr_events.stderr(&stderr_id, line);
+            stderr_events.stderr(&stderr_id, line, pid);
         }
     });
 
@@ -937,143 +1240,18 @@ pub fn harness_spawn(
     Ok(pid)
 }
 
-fn merge_config(target: &mut serde_json::Value, patch: serde_json::Value) {
-    if let (Some(target), Some(patch)) = (target.as_object_mut(), patch.as_object()) {
-        for (key, value) in patch {
-            if let Some(previous) = target.get_mut(key) {
-                merge_config(previous, value.clone());
-            } else {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    } else {
-        *target = patch;
-    }
-}
-
-fn configure_opencode_server(
-    cmd: &mut Command,
-    env: Option<&HashMap<String, String>>,
-) -> Result<(), String> {
-    cmd.env_remove("OPENCODE_SERVER_PASSWORD")
-        .env_remove("OPENCODE_SERVER_USERNAME");
-    let Some(env) = env else {
-        return Ok(());
-    };
-    if env.keys().any(|key| key != "OPENCODE_CONFIG_CONTENT") {
-        return Err("Unsupported OpenCode environment override".into());
-    }
-    if let Some(override_config) = env.get("OPENCODE_CONFIG_CONTENT") {
-        let inherited = command_env(cmd, "OPENCODE_CONFIG_CONTENT").unwrap_or_else(|| "{}".into());
-        let cwd = cmd
-            .get_current_dir()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let config = merge_opencode_config_with_env(&inherited, override_config, &cwd, |name| {
-            command_env(cmd, name)
-        })?;
-        cmd.env("OPENCODE_CONFIG_CONTENT", config);
-    }
-    Ok(())
-}
-
-fn command_env(cmd: &Command, name: &str) -> Option<String> {
-    match cmd.get_envs().find(|(key, _)| *key == name) {
-        Some((_, value)) => value.and_then(|value| value.to_str().map(str::to_owned)),
-        None => std::env::var(name).ok(),
-    }
-}
-
-#[cfg(test)]
-fn merge_opencode_config(base: &str, policy: &str, cwd: &Path) -> Result<String, String> {
-    merge_opencode_config_with_env(base, policy, cwd, |name| std::env::var(name).ok())
-}
-
-fn merge_opencode_config_with_env(
-    base: &str,
-    policy: &str,
-    cwd: &Path,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<String, String> {
-    let expanded = substitute_opencode_config(base, cwd, env)?;
-    let mut config: serde_json::Value = serde_json::from_str(&expanded)
-        .or_else(|_| serde_json::from_str(&crate::mcp::strip_jsonc(&expanded)))
-        .map_err(|_| "Invalid inherited OpenCode config".to_string())?;
-    let patch: serde_json::Value =
-        serde_json::from_str(policy).map_err(|_| "Invalid OpenCode policy config".to_string())?;
-    if !config.is_object() || !patch.is_object() {
-        return Err("Invalid OpenCode config object".into());
-    }
-    merge_config(&mut config, patch);
-    Ok(config
-        .to_string()
-        .replace("{env:", "\\u007benv:")
-        .replace("{file:", "\\u007bfile:"))
-}
-
-fn substitute_opencode_config(
-    raw: &str,
-    cwd: &Path,
-    env: impl Fn(&str) -> Option<String>,
-) -> Result<String, String> {
-    let mut expanded = String::with_capacity(raw.len());
-    let mut cursor = 0;
-    while let Some(offset) = raw[cursor..].find("{env:") {
-        let start = cursor + offset;
-        let Some(end) = raw[start + 5..].find('}').map(|end| start + 5 + end) else {
-            break;
-        };
-        expanded.push_str(&raw[cursor..start]);
-        if end == start + 5 {
-            expanded.push_str(&raw[start..=end]);
-        } else {
-            expanded.push_str(&env(&raw[start + 5..end]).unwrap_or_default());
-        }
-        cursor = end + 1;
-    }
-    expanded.push_str(&raw[cursor..]);
-    let mut result = String::with_capacity(expanded.len());
-    cursor = 0;
-    while let Some(offset) = expanded[cursor..].find("{file:") {
-        let start = cursor + offset;
-        let Some(end) = expanded[start + 6..].find('}').map(|end| start + 6 + end) else {
-            break;
-        };
-        result.push_str(&expanded[cursor..start]);
-        let line = expanded[..start].rfind('\n').map_or(0, |line| line + 1);
-        if end == start + 6 || expanded[line..start].trim_start().starts_with("//") {
-            result.push_str(&expanded[start..=end]);
-        } else {
-            let name = &expanded[start + 6..end];
-            let file = if name.starts_with("~/") {
-                expand_home(name)
-            } else {
-                PathBuf::from(name)
-            };
-            let file = if file.is_absolute() {
-                file
-            } else {
-                cwd.join(file)
-            };
-            let content = std::fs::read_to_string(&file)
-                .map_err(|_| format!("Invalid OpenCode file reference: {}", file.display()))?;
-            let quoted =
-                serde_json::to_string(content.trim()).map_err(|error| error.to_string())?;
-            result.push_str(&quoted[1..quoted.len() - 1]);
-        }
-        cursor = end + 1;
-    }
-    result.push_str(&expanded[cursor..]);
-    Ok(result)
-}
-
 pub fn provider_account_dir(
     data_dir: &Path,
     provider: &str,
     account_id: Option<&str>,
 ) -> Result<Option<PathBuf>, String> {
     let Some(account_id) = account_id.filter(|id| *id != DEFAULT_PROVIDER_ACCOUNT_ID) else {
-        return Ok(None);
+        // The default Claude account lives wherever CLAUDE_CONFIG_DIR says.
+        return Ok(if provider == "claude" {
+            configured_claude_dir()
+        } else {
+            None
+        });
     };
     let dir = provider_account_path(data_dir, provider, account_id)?;
     std::fs::create_dir_all(&dir).map_err(|error| {
@@ -1083,6 +1261,48 @@ pub fn provider_account_dir(
         )
     })?;
     Ok(Some(dir))
+}
+
+/// `CLAUDE_CONFIG_DIR` from this process or the login shell: where the
+/// default Claude account keeps its config.
+pub fn configured_claude_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| login_shell_env("CLAUDE_CONFIG_DIR").map(PathBuf::from))
+}
+
+/// [`configured_claude_dir`] without starting a login shell: the login
+/// shell's value counts only once something else has read it. Safe to call
+/// from the UI thread.
+pub fn configured_claude_dir_if_loaded() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let cache = LOGIN_SHELL_ENV.try_lock().ok()?;
+            cache
+                .as_ref()?
+                .get("CLAUDE_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR`: which macOS Keychain entry the default
+/// Claude account uses, when it differs from its config directory.
+pub fn configured_claude_secure_storage_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| login_shell_env("CLAUDE_SECURESTORAGE_CONFIG_DIR").map(PathBuf::from))
+}
+
+/// `.claude.json` in a Claude config directory, or in the home directory
+/// when there is none.
+pub fn claude_config_path(dir: Option<&Path>) -> Option<PathBuf> {
+    dir.map(|dir| dir.join(".claude.json"))
+        .or_else(|| dirs_home().map(|home| PathBuf::from(home).join(".claude.json")))
 }
 
 pub fn provider_account_path(
@@ -1117,6 +1337,10 @@ pub fn provider_account_remove(
     account_id: String,
 ) -> Result<(), String> {
     let dir = provider_account_path(data_dir, &provider, &account_id)?;
+    let _lifecycle = lock_skill_account_lifecycle(data_dir)?;
+    // Validate and retire persisted exports before deleting profile credentials.
+    // A later filesystem failure leaves this target retired until another launch.
+    host.retire_skill_account(dir.clone())?;
     host.kill_account(&provider, &account_id);
 
     #[cfg(target_os = "macos")]
@@ -1144,7 +1368,8 @@ pub fn provider_account_remove(
             "Could not remove the {provider} account directory {}: {error}",
             dir.display()
         )
-    })
+    })?;
+    Ok(())
 }
 
 fn apply_provider_account(
@@ -1155,6 +1380,10 @@ fn apply_provider_account(
     let Some(account) = account else {
         return Ok(());
     };
+    // The default account keeps the user's own environment.
+    if account.id == DEFAULT_PROVIDER_ACCOUNT_ID {
+        return Ok(());
+    }
     let Some(dir) = provider_account_dir(data_dir, &account.provider, Some(&account.id))? else {
         return Ok(());
     };
@@ -1180,6 +1409,93 @@ fn apply_provider_account(
     Ok(())
 }
 
+/// Resolve relative paths and existing symlink prefixes without creating directories.
+pub fn resolve_provider_home(path: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                resolved.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            component => {
+                resolved.push(component.as_os_str());
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(_) => {
+                        resolved = std::fs::canonicalize(&resolved).map_err(|error| {
+                            format!(
+                                "Could not resolve provider directory {}: {error}",
+                                resolved.display()
+                            )
+                        })?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not inspect provider directory {}: {error}",
+                            resolved.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn child_env_path(cmd: &Command, key: &str, cwd: &Path) -> Result<Option<PathBuf>, String> {
+    let explicit = cmd.get_envs().find(|(name, _)| {
+        if cfg!(windows) {
+            name.to_string_lossy().eq_ignore_ascii_case(key)
+        } else {
+            *name == std::ffi::OsStr::new(key)
+        }
+    });
+    let value = match explicit {
+        Some((_, value)) => value.map(|value| value.to_os_string()),
+        None => std::env::var_os(key),
+    };
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    resolve_provider_home(Path::new(&value), cwd).map(Some)
+}
+
+fn skill_launch_context(
+    cmd: &Command,
+    cwd: &Path,
+    account: Option<&HarnessAccount>,
+    provider: Option<&str>,
+) -> Result<SkillLaunchContext, String> {
+    let provider = provider.or_else(|| account.map(|account| account.provider.as_str()));
+    let mut provider_homes = HashMap::new();
+    for (source, key) in [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")] {
+        if provider == Some(source)
+            && let Some(path) = child_env_path(cmd, key, cwd)?
+        {
+            provider_homes.insert(source.to_string(), path);
+        }
+    }
+    Ok(SkillLaunchContext {
+        provider: provider.map(str::to_string),
+        account_id: account.map(|account| account.id.clone()),
+        cwd: cwd.to_path_buf(),
+        provider_homes,
+    })
+}
+
 /// A child that stops draining stdin can block `write_all` for minutes, so the
 /// write runs on the blocking pool — never on an async worker or the IPC path,
 /// where it would starve `harness_kill` and make the wedged child unrecoverable.
@@ -1195,14 +1511,25 @@ pub fn harness_write(host: &HarnessHost, session_id: String, line: String) -> Re
         .map_err(|e| format!("Failed to write to harness: {e}"))
 }
 
-/// `async` dispatch keeps kill executable while a sibling `harness_write` is
-/// blocked on a wedged child's stdin.
+/// Returns only once the session's process tree is gone, so a caller that
+/// applies a worker's files next knows nothing is still writing them. Call it
+/// off the main thread. That also keeps kill executable while a sibling
+/// `harness_write` is blocked on a wedged child's stdin.
 pub fn harness_kill(host: &HarnessHost, session_id: String) -> Result<(), String> {
     host.stop_sse(&session_id);
-    if let Some(live) = host.kill_session(&session_id) {
-        terminate(live.pid);
+    let Some(live) = host.kill_session(&session_id) else {
+        return Ok(());
+    };
+    let pid = live.pid;
+    // Drop stdin before signaling so ACP CLIs that watch the pipe can exit.
+    drop(live);
+    if terminate_and_wait(pid, KILL_ESCALATE, KILL_CONFIRM) {
+        Ok(())
+    } else {
+        Err(format!(
+            "The agent's process did not exit after it was stopped (session {session_id}, pid {pid})."
+        ))
     }
-    Ok(())
 }
 
 /// Off the main thread: `kill_all` waits for the children to die before it
@@ -1221,6 +1548,7 @@ pub fn harness_http(
 ) -> Result<HarnessHttpResponse, String> {
     assert_loopback(&url)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
+    // A redirect could send the request off loopback.
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(0)
@@ -1245,6 +1573,9 @@ pub fn harness_http(
     }
 }
 
+/// Open the OpenCode event stream for `session_id`. Returns once the server
+/// has answered with an event stream, so a prompt sent afterwards cannot
+/// finish before the stream sees it. Blocks; call it off the UI thread.
 pub fn harness_sse_open(
     host: &HarnessHost,
     session_id: String,
@@ -1252,42 +1583,34 @@ pub fn harness_sse_open(
     headers: Option<HashMap<String, String>>,
 ) -> Result<(), String> {
     assert_loopback(&url)?;
-    host.stop_sse(&session_id);
     let live = Arc::new(LiveSse {
         stop: Arc::new(AtomicBool::new(false)),
         socket: Mutex::new(None),
     });
     host.insert_sse(session_id.clone(), live.clone());
-    let shared = Arc::downgrade(&host.0);
-    let stream_id = session_id.clone();
+    let events = CurrentSseEvents {
+        host: Arc::downgrade(&host.0),
+        events: host.events.clone(),
+        session_id: session_id.clone(),
+        live: live.clone(),
+    };
     let stream_live = live.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let body = open_sse_body(&url, headers.as_ref(), &stream_live);
-        match body {
+    thread::spawn(
+        move || match open_sse_body(&url, headers.as_ref(), &stream_live) {
             Ok(body) => {
                 if ready_tx.send(Ok(())).is_err() {
                     stream_live.cancel();
                     return;
                 }
-                let events = CurrentSseEvents {
-                    shared,
-                    session_id: stream_id,
-                    live: stream_live,
-                };
-                read_sse(
-                    BufReader::new(body),
-                    &events,
-                    &events.session_id,
-                    &events.live.stop,
-                );
-                events.sse_end(&events.session_id, None);
+                read_sse(BufReader::new(body), &events, &stream_live.stop);
+                events.end(None);
             }
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
             }
-        }
-    });
+        },
+    );
     match ready_rx.recv_timeout(Duration::from_secs(12)) {
         Ok(Ok(())) if !live.stop.load(Ordering::SeqCst) => Ok(()),
         result => {
@@ -1307,42 +1630,93 @@ pub fn harness_sse_open(
     }
 }
 
+pub fn harness_sse_close(host: &HarnessHost, session_id: String) -> Result<(), String> {
+    host.stop_sse(&session_id);
+    Ok(())
+}
+
+fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, String> {
+    let status = response.status();
+    let body = response
+        .into_string()
+        .map_err(|e| format!("Failed to read OpenCode response: {e}"))?;
+    Ok(HarnessHttpResponse { status, body })
+}
+
+/// Delivers one stream's frames only while it is still the registered
+/// stream for its session, so a replaced stream cannot reach the new one.
 struct CurrentSseEvents {
-    shared: std::sync::Weak<HarnessShared>,
+    host: std::sync::Weak<HarnessShared>,
+    events: Arc<dyn HarnessEvents>,
     session_id: String,
     live: Arc<LiveSse>,
 }
 
-impl HarnessEvents for CurrentSseEvents {
-    fn stdout(&self, _: &str, _: String) {}
-    fn stderr(&self, _: &str, _: String) {}
-    fn exit(&self, _: &str, _: Option<i32>, _: u32) {}
-    fn sse(&self, session_id: &str, data: String) {
-        if let Some(shared) = self.shared.upgrade() {
-            let streams = shared.sse.lock().unwrap_or_else(|e| e.into_inner());
-            if streams
-                .get(session_id)
-                .is_some_and(|live| Arc::ptr_eq(live, &self.live))
-                && !self.live.stop.load(Ordering::SeqCst)
-            {
-                shared.events.sse(session_id, data);
-            }
+impl CurrentSseEvents {
+    fn sse(&self, data: String) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let current = host
+            .sse
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.session_id)
+            .is_some_and(|live| Arc::ptr_eq(live, &self.live));
+        if current && !self.live.stop.load(Ordering::SeqCst) {
+            self.events.sse(&self.session_id, data);
         }
     }
-    fn sse_end(&self, session_id: &str, error: Option<String>) {
-        if let Some(shared) = self.shared.upgrade() {
-            let mut streams = shared.sse.lock().unwrap_or_else(|e| e.into_inner());
-            if streams
-                .get(session_id)
-                .is_some_and(|live| Arc::ptr_eq(live, &self.live))
-            {
-                streams.remove(session_id);
-                shared.events.sse_end(session_id, error);
+
+    fn end(&self, error: Option<String>) {
+        let Some(host) = self.host.upgrade() else {
+            return;
+        };
+        let current = {
+            let mut streams = host.sse.lock().unwrap_or_else(|e| e.into_inner());
+            let current = streams
+                .get(&self.session_id)
+                .is_some_and(|live| Arc::ptr_eq(live, &self.live));
+            if current {
+                streams.remove(&self.session_id);
             }
+            current
+        };
+        if current {
+            self.events.sse_end(&self.session_id, error);
         }
     }
 }
 
+fn read_sse<R: BufRead>(reader: R, events: &CurrentSseEvents, stop: &AtomicBool) {
+    let mut data = String::new();
+    for line in reader.lines() {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(line) = line else { break };
+        if line.starts_with(':') {
+            continue;
+        }
+        if line.is_empty() {
+            if data.is_empty() {
+                continue;
+            }
+            let payload = std::mem::take(&mut data);
+            events.sse(payload);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            let piece = rest.strip_prefix(' ').unwrap_or(rest);
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(piece);
+        }
+    }
+}
+
+/// One CRLF- or LF-terminated HTTP line of at most 64 KiB.
 fn http_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     let mut line = String::new();
     reader.take(64 * 1024).read_line(&mut line)?;
@@ -1355,8 +1729,44 @@ fn http_line<R: BufRead>(reader: &mut R) -> std::io::Result<String> {
     Ok(line)
 }
 
-struct SseBody {
+/// The stream's socket, read so that a cancel always ends the read.
+struct SseSocket {
     reader: BufReader<TcpStream>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SseSocket {
+    fn new(reader: BufReader<TcpStream>, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
+        // Winsock shutdown on a duplicate need not interrupt an existing recv.
+        // Nonblocking reads let this thread observe cancellation itself.
+        reader.get_ref().set_read_timeout(None)?;
+        if cfg!(windows) {
+            reader.get_ref().set_nonblocking(true)?;
+        }
+        Ok(Self { reader, stop })
+    }
+}
+
+impl Read for SseSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if buf.is_empty() || self.stop.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            match self.reader.read(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+/// The response body, with chunked transfer decoding. A partial chunk
+/// header or chunk stays buffered across idle reads.
+struct SseBody {
+    reader: BufReader<SseSocket>,
     chunked: bool,
     remaining: usize,
     chunk_end: bool,
@@ -1381,6 +1791,7 @@ impl Read for SseBody {
                         "Invalid HTTP chunk separator",
                     ));
                 }
+                self.chunk_end = false;
             }
             let size = http_line(&mut self.reader)?;
             self.remaining = usize::from_str_radix(size.trim().split(';').next().unwrap_or(""), 16)
@@ -1403,6 +1814,9 @@ impl Read for SseBody {
     }
 }
 
+/// Connect, send the request, and read the response head. Fails unless the
+/// server answers 200 with an identity-encoded event stream; redirects are
+/// not followed.
 fn open_sse_body(
     url: &str,
     headers: Option<&HashMap<String, String>>,
@@ -1442,30 +1856,28 @@ fn open_sse_body(
         let mut request = format!(
             "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
         );
-        if let Some(headers) = headers {
-            for (key, value) in headers {
-                if key.is_empty()
-                    || !key
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
-                    || value.contains(['\r', '\n'])
-                {
-                    return Err("Invalid OpenCode event stream header".into());
-                }
-                if [
-                    "host",
-                    "connection",
-                    "accept-encoding",
-                    "content-length",
-                    "transfer-encoding",
-                ]
-                .iter()
-                .any(|name| key.eq_ignore_ascii_case(name))
-                {
-                    return Err("Unsupported OpenCode event stream header".into());
-                }
-                request.push_str(&format!("{key}: {value}\r\n"));
+        for (key, value) in headers.into_iter().flatten() {
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c))
+                || value.contains(['\r', '\n'])
+            {
+                return Err("Invalid OpenCode event stream header".into());
             }
+            if [
+                "host",
+                "connection",
+                "accept-encoding",
+                "content-length",
+                "transfer-encoding",
+            ]
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+            {
+                return Err("Unsupported OpenCode event stream header".into());
+            }
+            request.push_str(&format!("{key}: {value}\r\n"));
         }
         request.push_str("\r\n");
         reader
@@ -1508,12 +1920,10 @@ fn open_sse_body(
         if !sse {
             return Err("OpenCode server did not return an event stream".into());
         }
-        reader
-            .get_mut()
-            .set_read_timeout(None)
-            .map_err(|error| error.to_string())?;
         Ok(SseBody {
-            reader,
+            reader: BufReader::new(
+                SseSocket::new(reader, live.stop.clone()).map_err(|error| error.to_string())?,
+            ),
             chunked,
             remaining: 0,
             chunk_end: false,
@@ -1523,52 +1933,8 @@ fn open_sse_body(
     open().map_err(|error| format!("OpenCode event stream failed: {error}"))
 }
 
-pub fn harness_sse_close(host: &HarnessHost, session_id: String) -> Result<(), String> {
-    host.stop_sse(&session_id);
-    Ok(())
-}
-
-fn read_http_response(response: ureq::Response) -> Result<HarnessHttpResponse, String> {
-    let status = response.status();
-    let body = response
-        .into_string()
-        .map_err(|e| format!("Failed to read OpenCode response: {e}"))?;
-    Ok(HarnessHttpResponse { status, body })
-}
-
-fn read_sse<R: BufRead>(
-    reader: R,
-    events: &dyn HarnessEvents,
-    session_id: &str,
-    stop: &AtomicBool,
-) {
-    let mut data = String::new();
-    for line in reader.lines() {
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let Ok(line) = line else { break };
-        if line.starts_with(':') {
-            continue;
-        }
-        if line.is_empty() {
-            if data.is_empty() {
-                continue;
-            }
-            let payload = std::mem::take(&mut data);
-            events.sse(session_id, payload);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("data:") {
-            let piece = rest.strip_prefix(' ').unwrap_or(rest);
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(piece);
-        }
-    }
-}
-
+/// Plain `http` to `127.0.0.1` or `localhost`, with no credentials in the
+/// URL.
 fn assert_loopback(url: &str) -> Result<(), String> {
     let parsed =
         url::Url::parse(url).map_err(|_| "OpenCode HTTP is limited to localhost".to_string())?;
@@ -1629,9 +1995,9 @@ pub fn harness_exec(
     binary_provider: Option<String>,
     binary_path: Option<String>,
 ) -> Result<String, String> {
+    // `debug paths` reveals OpenCode's data directory and nothing else needs it.
     if !exec_args_allowed(&args)
-        || (args.iter().map(String::as_str).eq(["debug", "paths"])
-            && binary_provider.as_deref() != Some("opencode"))
+        || (args == ["debug", "paths"] && binary_provider.as_deref() != Some("opencode"))
     {
         return Err("harness_exec: unsupported arguments".into());
     }
@@ -1653,49 +2019,49 @@ fn exec_capture(command: &str, args: &[String], cwd: Option<&str>) -> Result<Str
 
 const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn harness_command(command: &str, args: &[String]) -> Result<Command, String> {
-    let entry = opencode_npm_entry(command, cfg!(windows))?;
-    let mut process = Command::new(if entry.is_some() { "node" } else { command });
-    if let Some(entry) = entry {
-        process.arg(entry);
-    }
-    process.args(args);
-    Ok(process)
-}
-
-fn opencode_npm_entry(command: &str, windows: bool) -> Result<Option<PathBuf>, String> {
-    let path = Path::new(command);
-    if windows
-        && path
-            .file_stem()
-            .is_some_and(|name| name.eq_ignore_ascii_case("opencode"))
-        && path.extension().is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-        })
-    {
-        let entry = path
-            .parent()
-            .unwrap_or(Path::new(""))
-            .join("node_modules/opencode-ai/bin/opencode");
-        if !entry.is_file() {
-            return Err("Missing npm OpenCode entry point".into());
-        }
-        return Ok(Some(entry));
-    }
-    Ok(None)
-}
-
 pub fn exec_output(
     command: &str,
     args: &[String],
     cwd: Option<&str>,
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
+    exec_output_with_profile(command, args, cwd, timeout, None)
+}
+
+/// [`exec_output`] for a Claude command run under `profile`.
+fn exec_output_with_profile(
+    command: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    timeout: Duration,
+    profile: Option<&ClaudeMcpProfile>,
+) -> Result<std::process::Output, String> {
     let mut cmd = harness_command(command, args)?;
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_child(&mut cmd, command);
+    if let Some(profile) = profile {
+        // A configured binary may not be named claude.
+        if command_basename(command) != "claude" {
+            apply_claude_env(&mut cmd);
+        }
+        if let Some(dir) = &profile.config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+            if profile.named {
+                cmd.env("CLAUDE_SECURESTORAGE_CONFIG_DIR", dir);
+            }
+        }
+        if profile.named {
+            for key in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+            ] {
+                cmd.env_remove(key);
+            }
+        }
+    }
     if let Some(dir) = cwd {
         let workdir = expand_home(dir);
         if workdir.is_dir() {
@@ -1720,7 +2086,46 @@ pub fn exec_output(
     }
 }
 
+/// The command that runs `command`. Node cannot run npm's Windows `.cmd`
+/// shim for OpenCode without a console, so that shim runs its JavaScript
+/// entry point under `node` instead.
+fn harness_command(command: &str, args: &[String]) -> Result<Command, String> {
+    let entry = opencode_npm_entry(command, cfg!(windows))?;
+    let mut process = Command::new(if entry.is_some() { "node" } else { command });
+    if let Some(entry) = entry {
+        process.arg(entry);
+    }
+    process.args(args);
+    Ok(process)
+}
+
+/// The entry point beside npm's `opencode.cmd` or `opencode.bat` shim.
+fn opencode_npm_entry(command: &str, windows: bool) -> Result<Option<PathBuf>, String> {
+    let path = Path::new(command);
+    let shim = windows
+        && path
+            .file_stem()
+            .is_some_and(|name| name.eq_ignore_ascii_case("opencode"))
+        && path.extension().is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if !shim {
+        return Ok(None);
+    }
+    let entry = path
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join("node_modules/opencode-ai/bin/opencode");
+    if !entry.is_file() {
+        return Err("Missing npm OpenCode entry point".into());
+    }
+    Ok(Some(entry))
+}
+
 const KILL_ESCALATE: Duration = Duration::from_secs(2);
+/// How long `harness_kill` keeps polling after SIGKILL before it reports the
+/// tree as stuck.
+const KILL_CONFIRM: Duration = Duration::from_secs(5);
 /// Quit and `Drop` cannot wait on a detached escalate thread — the process
 /// exits first and isolated harness groups stay behind as PID-1 orphans.
 #[cfg(not(windows))]
@@ -1748,6 +2153,19 @@ fn isolate_child(cmd: &mut Command) {
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+        // Dispatch workers can block SIGCHLD and termination signals. A CLI
+        // must receive them to reap its subprocesses and stop when requested.
+        unsafe {
+            cmd.pre_exec(|| {
+                let mut mask = std::mem::zeroed::<libc::sigset_t>();
+                if libc::sigemptyset(&mut mask) != 0
+                    || libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -1822,6 +2240,36 @@ fn terminate_after(pid: u32, escalate: Duration) {
                 signal_tree(pid, TreeSignal::Kill);
             }
         });
+    }
+}
+
+/// SIGTERM the tree, wait up to `grace` for it to exit, SIGKILL it if it has
+/// not, then wait up to `confirm` more. Returns whether the tree is gone.
+///
+/// The thread that owns the `Child` must be reaping it: a zombie leader still
+/// answers `kill(pid, 0)`. On Windows `taskkill /T /F` runs to completion
+/// before this returns and there is no liveness probe, so it reports success.
+fn terminate_and_wait(pid: u32, grace: Duration, confirm: Duration) -> bool {
+    if pid == 0 || pid == 1 {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let _ = (grace, confirm);
+        signal_tree(pid, TreeSignal::Kill);
+        true
+    }
+    #[cfg(not(windows))]
+    {
+        let pids = [pid];
+        signal_tree(pid, TreeSignal::Term);
+        wait_until_dead(&pids, Instant::now() + grace);
+        if !tree_alive(pid) {
+            return true;
+        }
+        signal_tree(pid, TreeSignal::Kill);
+        wait_until_dead(&pids, Instant::now() + confirm);
+        !tree_alive(pid)
     }
 }
 
@@ -3178,8 +3626,19 @@ fn prepare_child(cmd: &mut Command, command: &str) {
     if command_basename(command) == "grok" {
         apply_grok_env(cmd);
     }
+    if command_basename(command) == "claude" {
+        apply_claude_env(cmd);
+        cmd.env("CLAUDE_CODE_ENTRYPOINT", CLAUDE_CODE_ENTRYPOINT);
+    }
     isolate_child(cmd);
 }
+
+/// Claude Code tags every transcript with the entrypoint that wrote it, and
+/// its `--resume` picker hides `sdk-cli`, which is what a stream-json run
+/// without a terminal gets by default. A name of our own keeps MonoCode's
+/// sessions in that picker. It also overrides an `sdk-cli` value inherited
+/// when MonoCode itself was launched from inside a Claude Code session.
+const CLAUDE_CODE_ENTRYPOINT: &str = "monocode";
 
 /// fx keeps its Gateway credential in the macOS Keychain and reads it by
 /// shelling out to `osascript`. From a bundled app that read can block on a
@@ -3203,6 +3662,66 @@ fn apply_fx_env(cmd: &mut Command) {
 
 fn apply_grok_env(cmd: &mut Command) {
     for key in ["XAI_API_KEY", "GROK_CODE_XAI_API_KEY"] {
+        if std::env::var_os(key).is_some() {
+            continue;
+        }
+        if let Some(value) = login_shell_env(key) {
+            cmd.env(key, value);
+        }
+    }
+}
+
+/// What Claude reads from the environment to authenticate, route to a
+/// gateway or cloud, reach a proxy, and trust certificates. A Finder-launched
+/// app inherits none of what the user set in their shell profile.
+const CLAUDE_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "AWS_PROFILE",
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_FOUNDRY_RESOURCE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "NODE_EXTRA_CA_CERTS",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
+
+/// Give Claude the login shell's values for [`CLAUDE_ENV_KEYS`] this
+/// process does not have. A named profile removes the tokens afterwards.
+fn apply_claude_env(cmd: &mut Command) {
+    for key in CLAUDE_ENV_KEYS {
         if std::env::var_os(key).is_some() {
             continue;
         }
@@ -3245,6 +3764,7 @@ fn load_login_shell_env() -> HashMap<String, String> {
     {
         LOGIN_SHELL_KEYS
             .into_iter()
+            .chain(CLAUDE_ENV_KEYS.iter().copied())
             .filter_map(|key| {
                 let value = std::env::var(key).ok()?;
                 (!value.is_empty()).then(|| (key.to_string(), value))
@@ -3291,12 +3811,20 @@ fn load_unix_login_shell_env() -> HashMap<String, String> {
             return HashMap::new();
         }
     };
+    parse_login_shell_env(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The `printenv` lines worth keeping: PATH, the provider keys, and Claude's
+/// variables. Empty values are dropped.
+#[cfg(not(windows))]
+fn parse_login_shell_env(output: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in output.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if LOGIN_SHELL_KEYS.contains(&key) && !value.is_empty() {
+        if (LOGIN_SHELL_KEYS.contains(&key) || CLAUDE_ENV_KEYS.contains(&key)) && !value.is_empty()
+        {
             map.insert(key.to_string(), value.to_string());
         }
     }
@@ -3310,11 +3838,406 @@ fn command_basename(command: &str) -> &str {
         .unwrap_or(command)
 }
 
+#[cfg(all(test, windows))]
+mod provider_path_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_verbatim_windows_provider_roots_without_creating_profiles() {
+        let directory =
+            std::env::temp_dir().join(format!("monocode-skill-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let root = std::fs::canonicalize(&directory).unwrap();
+        let profile = root.join("new profile").join("skills");
+        assert_eq!(resolve_provider_home(&profile, &root).unwrap(), profile);
+        assert_eq!(
+            resolve_provider_home(Path::new("new profile/skills"), &root).unwrap(),
+            profile
+        );
+        assert!(!profile.exists());
+        std::fs::remove_dir(directory).unwrap();
+    }
+}
+
 #[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::process::CommandExt;
+
+    struct SkillHookFixture(PathBuf);
+
+    impl SkillHookFixture {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("monocode-skill-hook-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            Self(std::fs::canonicalize(directory).unwrap())
+        }
+
+        fn account(&self) -> HarnessAccount {
+            HarnessAccount {
+                provider: "codex".into(),
+                id: "work".into(),
+            }
+        }
+
+        fn account_path(&self) -> PathBuf {
+            provider_account_path(&self.0, "codex", "work").unwrap()
+        }
+
+        fn binary(&self) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let binary = self.0.join("codex");
+            std::fs::write(
+                &binary,
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo 'codex 1.2.3'
+  exit 0
+fi
+if [ -f "$CODEX_HOME/skills/example/SKILL.md" ]; then
+  cat "$CODEX_HOME/skills/example/SKILL.md" > "$CODEX_HOME/child-skill.txt"
+fi
+printf '%s' "$CODEX_HOME" > "$CODEX_HOME/child-root.txt"
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            binary
+        }
+
+        fn spawn(&self, host: &HarnessHost, flags: Vec<String>) -> Result<u32, String> {
+            let binary = self.binary().to_string_lossy().into_owned();
+            harness_spawn(
+                host,
+                &self.0,
+                None,
+                "skill-hook-test".into(),
+                binary.clone(),
+                flags,
+                self.0.to_string_lossy().into_owned(),
+                Some(self.account()),
+                Some("codex".into()),
+                Some(binary),
+            )
+        }
+    }
+
+    impl Drop for SkillHookFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn skill_preparation_uses_account_environment_before_the_child_launches() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        host.set_skill_preparer(Some(Arc::new(move |context| {
+            let root = &context.provider_homes["codex"];
+            let data = root.parent().unwrap().parent().unwrap().parent().unwrap();
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(data.join("shared-skills-accounts.lock"))
+                .unwrap();
+            assert!(
+                lock.try_lock().is_err(),
+                "The process supervisor must hold the lifecycle guard during export preparation"
+            );
+            std::fs::create_dir_all(root.join("skills/example")).unwrap();
+            std::fs::write(root.join("skills/example/SKILL.md"), "Prepared skill").unwrap();
+            sink.lock().unwrap().push(context);
+            Ok(())
+        })));
+        fixture.spawn(&host, Vec::new()).unwrap();
+        let child_root = fixture.account_path().join("child-root.txt");
+        for _ in 0..100 {
+            if child_root.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let context = &seen.lock().unwrap()[0];
+        assert_eq!(context.account_id.as_deref(), Some("work"));
+        assert_eq!(context.provider.as_deref(), Some("codex"));
+        assert_eq!(context.provider_homes["codex"], fixture.account_path());
+        assert_eq!(
+            std::fs::read_to_string(child_root).unwrap(),
+            fixture.account_path().to_string_lossy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.account_path().join("child-skill.txt")).unwrap(),
+            "Prepared skill"
+        );
+    }
+
+    #[test]
+    fn failed_skill_preparation_warns_and_disable_flags_skip_it() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let calls = Arc::new(AtomicU64::new(0));
+        let count = calls.clone();
+        host.set_skill_preparer(Some(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err("Cannot read skill registry".into())
+        })));
+        for flags in [
+            Vec::new(),
+            vec!["--no-skills".into()],
+            vec!["--bare".into()],
+        ] {
+            fixture.spawn(&host, flags).unwrap();
+            for _ in 0..100 {
+                if fixture.account_path().join("child-root.txt").exists() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(fixture.account_path().join("child-root.txt").exists());
+            std::fs::remove_file(fixture.account_path().join("child-root.txt")).unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_named_account_lifecycle_lock_preserves_the_previous_child() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let current = host.begin_spawn("skill-hook-test");
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(
+            host.install_spawn("skill-hook-test".into(), current.0, current.1, live)
+                .is_none()
+        );
+        std::fs::create_dir(fixture.0.join("shared-skills-accounts.lock")).unwrap();
+        assert!(
+            fixture
+                .spawn(&host, Vec::new())
+                .unwrap_err()
+                .contains("account lock must be a regular file")
+        );
+        assert_eq!(host.get("skill-hook-test").map(|live| live.pid), Some(pid));
+        reap(child);
+    }
+
+    #[test]
+    fn failed_skill_account_retirement_preserves_account_artifacts() {
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let account = fixture.account_path();
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join("auth.json"), b"test credential artifact").unwrap();
+        host.set_skill_account_retirer(Some(Arc::new(|_| Err("Registry unavailable".into()))));
+        assert!(
+            provider_account_remove(&host, &fixture.0, "codex".into(), "work".into())
+                .unwrap_err()
+                .contains("Registry unavailable")
+        );
+        assert_eq!(
+            std::fs::read(account.join("auth.json")).unwrap(),
+            b"test credential artifact"
+        );
+        host.set_skill_account_retirer(None);
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        assert!(!account.exists());
+    }
+
+    #[test]
+    fn skill_account_retirement_runs_for_missing_paths_and_preserves_symlink_targets() {
+        use std::os::unix::fs::symlink;
+        let fixture = SkillHookFixture::new();
+        let host = HarnessHost::default();
+        let retired = Arc::new(Mutex::new(Vec::new()));
+        let sink = retired.clone();
+        host.set_skill_account_retirer(Some(Arc::new(move |path| {
+            sink.lock().unwrap().push(path);
+            Ok(())
+        })));
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        let account = fixture.account_path();
+        let external = fixture.0.join("external");
+        std::fs::create_dir_all(account.parent().unwrap()).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("auth.json"), b"preserve external profile").unwrap();
+        symlink(&external, &account).unwrap();
+        provider_account_remove(&host, &fixture.0, "codex".into(), "work".into()).unwrap();
+        assert!(std::fs::symlink_metadata(&account).is_err());
+        assert_eq!(
+            std::fs::read(external.join("auth.json")).unwrap(),
+            b"preserve external profile"
+        );
+        assert_eq!(
+            retired.lock().unwrap().as_slice(),
+            &[account.clone(), account]
+        );
+    }
+
+    #[test]
+    fn provider_environment_paths_resolve_relative_symlinks_and_respect_unix_key_case() {
+        use std::os::unix::fs::symlink;
+        let fixture = SkillHookFixture::new();
+        let real = fixture.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, fixture.0.join("alias")).unwrap();
+        let mut command = Command::new("codex");
+        command.env("CODEX_HOME", "alias/new profile");
+        command.env_remove("CLAUDE_CONFIG_DIR");
+        let context = skill_launch_context(&command, &fixture.0, None, Some("codex")).unwrap();
+        assert_eq!(context.provider_homes["codex"], real.join("new profile"));
+        assert!(!real.join("new profile").exists());
+        let key = format!("MC_SKILL_TEST_{}", uuid::Uuid::new_v4().simple());
+        let mut command = Command::new("codex");
+        command.env(key.to_lowercase(), "alias/wrong profile");
+        assert!(
+            child_env_path(&command, &key, &fixture.0)
+                .unwrap()
+                .is_none()
+        );
+        command.env(&key, "alias/right profile");
+        assert_eq!(
+            child_env_path(&command, &key, &fixture.0).unwrap(),
+            Some(real.join("right profile"))
+        );
+        command.env_remove(&key);
+        assert!(
+            child_env_path(&command, &key, &fixture.0)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminate_and_wait_returns_after_a_term_ignoring_group_exits() {
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 30 & echo ready; sleep 30"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn test process");
+        let pid = child.id();
+        // Signal only after the trap is installed, or SIGTERM kills sh early.
+        let mut ready = String::new();
+        BufReader::new(child.stdout.take().expect("test child stdout"))
+            .read_line(&mut ready)
+            .expect("read readiness line");
+        assert_eq!(ready.trim(), "ready");
+        // Stands in for the `harness_spawn` thread that owns and reaps the child.
+        let waiter = thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+        assert!(tree_alive(pid));
+        let grace = Duration::from_millis(200);
+        let started = Instant::now();
+        let exited = terminate_and_wait(pid, grace, KILL_CONFIRM);
+        let elapsed = started.elapsed();
+        let alive = tree_alive(pid);
+        if alive {
+            signal_tree(pid, TreeSignal::Kill);
+        }
+        let _ = waiter.join();
+        assert!(exited, "terminate_and_wait reported a live tree");
+        assert!(
+            !alive,
+            "terminate_and_wait returned before the group exited"
+        );
+        assert!(elapsed >= grace, "returned before the SIGTERM grace period");
+        assert!(
+            elapsed < grace + KILL_CONFIRM,
+            "took longer than the timeout"
+        );
+    }
+
+    #[test]
+    fn terminate_and_wait_returns_early_when_term_is_honoured() {
+        let child = spawn_group("sleep 30");
+        let pid = child.id();
+        let waiter = thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+        let started = Instant::now();
+        let exited = terminate_and_wait(pid, KILL_ESCALATE, KILL_CONFIRM);
+        let elapsed = started.elapsed();
+        let _ = waiter.join();
+        assert!(exited);
+        assert!(!tree_alive(pid));
+        assert!(
+            elapsed < KILL_ESCALATE,
+            "waited out the grace period anyway"
+        );
+    }
+
+    #[test]
+    fn terminate_and_wait_reports_a_tree_that_outlives_the_timeout() {
+        // No thread reaps this leader, so after SIGKILL it stays a zombie that
+        // `kill(pid, 0)` still answers: the same signal a stuck tree gives.
+        let mut child = spawn_group("trap '' TERM; while true; do sleep 1; done");
+        let pid = child.id();
+        let exited =
+            terminate_and_wait(pid, Duration::from_millis(100), Duration::from_millis(200));
+        let _ = child.wait();
+        assert!(!exited, "terminate_and_wait missed a surviving process");
+    }
+
+    #[test]
+    fn login_shell_env_keeps_claude_routing_and_auth_without_unrelated_variables() {
+        let env = parse_login_shell_env(
+            "PATH=/bin\nANTHROPIC_API_KEY=dummy\nANTHROPIC_BASE_URL=http://localhost\nCLAUDE_CONFIG_DIR=/tmp/profile\nAWS_PROFILE=testing\nGOOGLE_APPLICATION_CREDENTIALS=/tmp/fixture\nHTTPS_PROXY=http://localhost:8000\nNODE_EXTRA_CA_CERTS=/tmp/certs\nUNRELATED_SECRET=excluded\nANTHROPIC_AUTH_TOKEN=\n",
+        );
+        assert_eq!(env.len(), 8);
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("dummy")
+        );
+        assert!(!env.contains_key("UNRELATED_SECRET"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_mcp_commands_select_named_storage_and_remove_default_tokens() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("monocode-mcp-profile-{}", uuid::Uuid::new_v4()));
+        let profile_dir = root.join("profile");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let binary = root.join("claude");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo '2.1.287 (Claude Code)'; exit 0; fi
+printf '%s\n' "$CLAUDE_CONFIG_DIR" "$CLAUDE_SECURESTORAGE_CONFIG_DIR"
+if [ -n "${ANTHROPIC_API_KEY-}${ANTHROPIC_AUTH_TOKEN-}${CLAUDE_CODE_OAUTH_TOKEN-}" ]; then echo default-token-present; fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let profile = ClaudeMcpProfile {
+            config_dir: Some(profile_dir.clone()),
+            named: true,
+        };
+        let output = claude_mcp_command(
+            vec!["mcp".into(), "list".into()],
+            root.to_string_lossy().into_owned(),
+            Duration::from_secs(5),
+            Some(&binary.to_string_lossy()),
+            Some(&profile),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            format!("{}\n{}", profile_dir.display(), profile_dir.display())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn spawn_group(script: &str) -> std::process::Child {
         Command::new("sh")
@@ -3343,13 +4266,15 @@ mod tests {
     /// A real child so `install_spawn` can be exercised directly, rather than
     /// through a helper that re-states its condition.
     fn live_child() -> (Arc<LiveChild>, std::process::Child) {
-        let mut child = Command::new("sleep")
+        let mut command = Command::new("sleep");
+        command
             .arg("30")
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn test process");
+            .stderr(Stdio::null());
+        let guard = crate::provider_guard::ProviderGuard::new(&mut command).unwrap();
+        let mut child = command.spawn().expect("spawn test process");
         let pid = child.id();
         let stdin = child.stdin.take().expect("test child stdin");
         (
@@ -3358,6 +4283,7 @@ mod tests {
                 stdin: Mutex::new(stdin),
                 pid,
                 account: None,
+                _guard: guard,
             }),
             child,
         )
@@ -3418,6 +4344,52 @@ mod tests {
         assert!(host.spawn_stamp_current("s1", epoch, kill_all));
         host.kill_session("s1");
         assert!(!host.spawn_stamp_current("s1", epoch, kill_all));
+    }
+
+    #[test]
+    fn stopped_spawn_waiting_for_account_preparation_preserves_a_newer_child() {
+        let host = HarnessHost::default();
+        let waiting = host.stamp_spawn("s1", None);
+        host.kill_session("s1");
+        let current = host.begin_spawn("s1");
+        let (live, child) = live_child();
+        let pid = live.pid;
+        assert!(
+            host.install_spawn("s1".into(), current.0, current.1, live)
+                .is_none()
+        );
+        assert_eq!(
+            host.start_stamped_spawn("s1", waiting.0, waiting.1, None)
+                .err()
+                .as_deref(),
+            Some(SPAWN_CANCELLED)
+        );
+        assert_eq!(host.get("s1").map(|live| live.pid), Some(pid));
+        reap(child);
+    }
+
+    #[test]
+    fn account_removal_cancels_a_queued_spawn_without_a_live_child() {
+        let host = HarnessHost::default();
+        let account = HarnessAccount {
+            provider: "codex".into(),
+            id: "work".into(),
+        };
+        let waiting = host.stamp_spawn("s1", Some(&account));
+        assert!(host.get("s1").is_none());
+        host.kill_account("codex", "work");
+        assert_eq!(
+            host.start_stamped_spawn("s1", waiting.0, waiting.1, waiting.2.as_ref())
+                .err()
+                .as_deref(),
+            Some(SPAWN_CANCELLED)
+        );
+        assert!(host.get("s1").is_none());
+        let fresh = host.stamp_spawn("s2", Some(&account));
+        assert!(
+            host.start_stamped_spawn("s2", fresh.0, fresh.1, fresh.2.as_ref())
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3506,14 +4478,15 @@ mod tests {
     }
 
     fn live_group(script: &str) -> (Arc<LiveChild>, std::process::Child) {
-        let mut child = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .args(["-c", script])
             .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn grouped child");
+            .stderr(Stdio::null());
+        let guard = crate::provider_guard::ProviderGuard::new(&mut command).unwrap();
+        let mut child = command.spawn().expect("spawn grouped child");
         let pid = child.id();
         let stdin = child.stdin.take().expect("grouped child stdin");
         (
@@ -3522,6 +4495,7 @@ mod tests {
                 stdin: Mutex::new(stdin),
                 pid,
                 account: None,
+                _guard: guard,
             }),
             child,
         )
@@ -3635,6 +4609,73 @@ mod tests {
     }
 
     #[test]
+    fn managed_children_reset_the_inherited_signal_mask() {
+        const PROBE: &str = "MONOCODE_TEST_CHILD_SIGNAL_MASK";
+        let signals = [libc::SIGCHLD, libc::SIGINT, libc::SIGTERM];
+        if std::env::var_os(PROBE).is_some() {
+            let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask) },
+                0
+            );
+            for signal in signals {
+                assert_eq!(
+                    unsafe { libc::sigismember(&mask, signal) },
+                    0,
+                    "the child inherited blocked signal {signal}"
+                );
+            }
+            return;
+        }
+        thread::spawn(move || {
+            struct RestoreMask(libc::sigset_t);
+            impl Drop for RestoreMask {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut())
+                    };
+                }
+            }
+            let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            assert_eq!(unsafe { libc::sigemptyset(&mut blocked) }, 0);
+            for signal in signals {
+                assert_eq!(unsafe { libc::sigaddset(&mut blocked, signal) }, 0);
+            }
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) },
+                0
+            );
+            let _restore = RestoreMask(previous);
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "harness::tests::managed_children_reset_the_inherited_signal_mask",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            isolate_child(&mut command);
+            let output = spawn_managed(&mut command)
+                .unwrap()
+                .wait_with_output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn runtime_binary_paths_stay_fixed_for_the_process() {
         let runtime = Mutex::new(None);
         let old = HashMap::from([("cursor".to_string(), "/old".to_string())]);
@@ -3682,6 +4723,7 @@ mod tests {
                     vec!["mcp".into(), "login".into(), "docs".into()],
                     cwd.clone(),
                     Duration::from_secs(5),
+                    None,
                 )
                 .unwrap(),
                 "mcp\nlogin\ndocs"
@@ -3693,6 +4735,7 @@ mod tests {
                 cwd.clone(),
                 Duration::from_secs(5),
                 paths.get("claude").map(String::as_str),
+                None,
             )
             .unwrap(),
             "mcp\nlist"
@@ -3727,6 +4770,7 @@ mod tests {
                 "docs",
                 &config,
                 paths.get(provider).map(String::as_str),
+                None,
             )
             .unwrap();
         }
@@ -4112,6 +5156,22 @@ mod tests {
         } else {
             assert!(antigravity_args().is_empty());
         }
+    }
+
+    #[test]
+    fn claude_children_name_monocode_as_their_entrypoint() {
+        let mut cmd = Command::new("/usr/local/bin/claude");
+        prepare_child(&mut cmd, "/usr/local/bin/claude");
+        assert!(cmd.get_envs().any(|(key, value)| {
+            key == "CLAUDE_CODE_ENTRYPOINT" && value == Some(std::ffi::OsStr::new("monocode"))
+        }));
+        let mut other = Command::new("/usr/local/bin/codex");
+        prepare_child(&mut other, "/usr/local/bin/codex");
+        assert!(
+            !other
+                .get_envs()
+                .any(|(key, _)| key == "CLAUDE_CODE_ENTRYPOINT")
+        );
     }
 
     #[test]

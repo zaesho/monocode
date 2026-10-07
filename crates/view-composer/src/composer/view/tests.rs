@@ -344,6 +344,69 @@ fn paste_keys() -> &'static str {
 // ComposerAction
 
 #[gpui::test]
+fn image_attachment_preview_owns_escape_and_restores_the_prompt(cx: &mut TestAppContext) {
+    use base64::Engine as _;
+    let (host, calls, _) = TestHost::new();
+    let mut f = mount(
+        cx,
+        host,
+        ComposerProps {
+            busy: true,
+            ..props()
+        },
+        Some("caption"),
+    );
+    let file = Attachment {
+        id: "preview-image".into(),
+        name: "red-blue.avif".into(),
+        kind: AttachmentKind::Image,
+        mime_type: "image/avif".into(),
+        path: Some("/missing/on-this-desktop/red-blue.avif".into()),
+        data: Some(
+            base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../../../editor/tests/fixtures/red-blue.avif"
+            )),
+        ),
+        ..Attachment::default()
+    };
+    f.update(|composer, window, cx| composer.add_attachments(vec![file], window, cx));
+    for _ in 0..50 {
+        f.draw();
+        if f.cx.debug_bounds("composer-attachment-image").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let bounds =
+        f.cx.debug_bounds("composer-attachment-image")
+            .expect("image thumbnail");
+    f.cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    f.draw();
+    assert!(f.read(|composer, cx| composer.attachment_preview.is_some() && composer.any_picker_open(cx)));
+    assert!(f.cx.debug_bounds("composer-image-lightbox").is_some());
+    let image_bounds =
+        f.cx.debug_bounds("composer-image-lightbox-image")
+            .expect("lightbox image rendered");
+    f.cx.simulate_click(image_bounds.center(), gpui::Modifiers::default());
+    assert!(f.read(|composer, _| composer.attachment_preview.is_some()));
+    f.keys("enter");
+    assert!(calls.borrow().submits.is_empty());
+    f.keys("escape");
+    assert!(f.read(|composer, _| composer.attachment_preview.is_none()));
+    assert_eq!(calls.borrow().stops, 0);
+    assert_eq!(f.text(), "caption");
+    let composer = f.composer.clone();
+    assert!(f.cx.update(|window, cx| {
+        composer
+            .read(cx)
+            .prompt
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }));
+}
+
+#[gpui::test]
 fn replaces_stop_with_send_when_typing_during_a_running_turn(cx: &mut TestAppContext) {
     let (host, calls, _) = TestHost::new();
     let mut f = mount(
@@ -1129,6 +1192,67 @@ fn send_waits_for_a_paste_and_a_reset_drops_a_late_one(cx: &mut TestAppContext) 
 }
 
 // Drop.
+
+#[gpui::test]
+fn a_dropped_session_asks_whether_to_add_it_or_link_it(cx: &mut TestAppContext) {
+    use monocode_ui::drag::PaneDragSource;
+    let (host, _, _) = TestHost::new();
+    let mut f = mount(cx, host, props(), None);
+    let events = f.events();
+    let other = PaneDragSource::Session("s2".into());
+    assert!(f.read(|c, _| c.accepts_session_drag(&other)));
+    // A session dropped on itself, or a workspace tab, goes back to the pane
+    // tree.
+    for source in [
+        PaneDragSource::Session("s1".into()),
+        PaneDragSource::WorkspaceTab("tab".into()),
+    ] {
+        assert!(!f.read(|c, _| c.accepts_session_drag(&source)));
+        f.update(|composer, _, cx| composer.on_pane_drop(&source, cx));
+        assert!(f.read(|c, _| c.pending_session_drop().is_none()));
+        assert_eq!(
+            events.borrow().last(),
+            Some(&ComposerEvent::ForwardDrop(source.clone()))
+        );
+    }
+
+    let shown = f.update(|composer, _, cx| {
+        composer.set_session_drag(true, cx);
+        composer.session_drag
+    });
+    assert!(shown);
+    assert!(events.borrow().contains(&ComposerEvent::SessionDragOver));
+    f.update(|composer, _, cx| composer.on_pane_drop(&other, cx));
+    assert!(!f.read(|c, _| c.session_drag));
+    assert_eq!(
+        f.read(|c, _| c.pending_session_drop().map(str::to_string)),
+        Some("s2".into())
+    );
+    assert_eq!(events.borrow().last(), Some(&ComposerEvent::SessionDropped));
+
+    f.update(|composer, _, cx| composer.choose_add_session_context(cx));
+    assert_eq!(
+        events.borrow().last(),
+        Some(&ComposerEvent::AddSessionContext("s2".into()))
+    );
+    let session = ChatContextItem::Session {
+        id: "s2".into(),
+        title: "Auth".into(),
+    };
+    f.update(|composer, _, cx| {
+        composer.add_context_item(session.clone(), cx);
+        composer.add_context_item(session.clone(), cx);
+    });
+    assert_eq!(f.read(|c, _| c.context_items.clone()), vec![session]);
+
+    f.update(|composer, _, cx| composer.on_pane_drop(&other, cx));
+    f.update(|composer, _, cx| composer.choose_link_session(cx));
+    assert_eq!(
+        events.borrow().last(),
+        Some(&ComposerEvent::LinkSession("s2".into()))
+    );
+    assert!(f.read(|c, _| c.pending_session_drop().is_none()));
+}
 
 #[gpui::test]
 fn dropping_files_attaches_them_and_clears_the_overlay(cx: &mut TestAppContext) {

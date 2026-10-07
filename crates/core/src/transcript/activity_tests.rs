@@ -1024,7 +1024,7 @@ mod foldable_work {
         advisor.interjection = Some(InterjectionMeta {
             custom_type: "advisor".into(),
             severity: Some(InterjectionSeverity::Nit),
-            extra: Default::default(),
+            ..Default::default()
         });
         let turn = items(vec![
             shell("before"),

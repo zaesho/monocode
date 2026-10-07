@@ -20,6 +20,7 @@ use monocode_core::{HarnessEvent, HarnessId, Session};
 
 use super::engine::Engine;
 use super::harness_flush::{FlushKind, ScheduledFlush, schedule_harness_flush};
+use super::hooks::CatalogScope;
 use super::in_flight::{in_flight_refs, in_flight_snapshot_key, should_write_in_flight_snapshot};
 use super::reducer::{Reducer, apply_harness_events, last_user_block_id};
 use super::session_cache::SessionCache;
@@ -511,6 +512,13 @@ impl Sessions {
         self.last_persisted.remove(session_id);
     }
 
+    /// Clear the queued save and saved-turn bookkeeping for a discarded chat.
+    pub fn clear_save_state(&mut self, session_id: &str) {
+        self.pending_persist.retain(|pending| pending != session_id);
+        self.last_persisted.remove(session_id);
+        self.last_persisted_user_block.remove(session_id);
+    }
+
     /// The fingerprint of the last save that finished for this session.
     pub fn last_persisted(&self, session_id: &str) -> Option<&str> {
         self.last_persisted.get(session_id).map(String::as_str)
@@ -840,6 +848,16 @@ impl Sessions {
         *self.load_epochs.entry(session_id.to_string()).or_insert(0) += 1;
     }
 
+    /// Reject in-flight reads that may still contain deleted ownership. Only
+    /// the history package calls this.
+    #[cfg(feature = "history")]
+    pub(crate) fn invalidate_pending_loads(&mut self) {
+        let pending: Vec<String> = self.loads.keys().cloned().collect();
+        for id in pending {
+            self.invalidate_loaded(&id);
+        }
+    }
+
     /// `loadStoredSession`: the cached copy, the load already running, or a
     /// new read from the store. Resolves to `None` when the session is
     /// missing, being removed, or was invalidated meanwhile.
@@ -918,15 +936,7 @@ impl Sessions {
             return Some(appeared.clone());
         }
         let hooks = Engine::hooks(cx);
-        if restored.worktree_removed != Some(true)
-            && restored
-                .provider_session_id
-                .as_ref()
-                .is_some_and(|p| !p.is_empty())
-            && hooks.harness.is_live_harness(restored.harness)
-        {
-            hooks.harness.bind_session(&restored, cx);
-        }
+        bind_resumed_sessions(std::slice::from_ref(&restored), &hooks, cx);
         self.last_persisted
             .insert(restored.id.clone(), persist_fingerprint(&restored));
         self.list.push(restored.clone());
@@ -971,22 +981,40 @@ impl Sessions {
         hooks.harness.probe_availability(cx);
         // Only the harnesses already in this window. Probing every installed
         // CLI at boot left unused agents running in the background.
+        // OpenCode reads its models from project config, so its catalog
+        // loads once per session working directory instead.
         let mut harnesses: Vec<HarnessId> = Vec::new();
-        let mut directories = Vec::new();
+        let mut opencode_directories: Vec<String> = Vec::new();
         for session in &self.list {
-            if !harnesses.contains(&session.harness) {
+            if session.harness == HarnessId::Opencode {
+                let directory = session_work_cwd(session).to_string();
+                if !opencode_directories.contains(&directory) {
+                    opencode_directories.push(directory);
+                }
+            } else if !harnesses.contains(&session.harness) {
                 harnesses.push(session.harness);
             }
-            let key = (session.harness, session_work_cwd(session).to_string());
-            if !directories.contains(&key) {
-                directories.push(key);
-            }
         }
-        let refresh = hooks
+        // Claude lists models by project and account, so read them where the
+        // session in front works.
+        let scope = self
+            .list
+            .iter()
+            .find(|session| {
+                session.harness == HarnessId::Claude
+                    && hooks.workspace.is_foreground(&session.id, cx)
+            })
+            .map(|session| CatalogScope {
+                cwd: Some(monocode_core::session::session_work_cwd(session).to_string()),
+                provider_account_id: session.provider_account_id.clone(),
+            })
+            .unwrap_or_default();
+        let refresh = hooks.harness.refresh_catalogs(harnesses, scope, cx);
+        let projects = hooks
             .harness
-            .refresh_catalogs_for_directories(harnesses, directories, cx);
+            .refresh_project_catalogs(opencode_directories, cx);
         cx.spawn(async move |this, cx| {
-            refresh.await;
+            futures::join!(refresh, projects);
             this.update(cx, |this, cx| {
                 let hooks = Engine::hooks(cx);
                 let updates: Vec<(String, String, monocode_core::ModelSettings)> = this
@@ -1025,12 +1053,37 @@ pub fn bind_resumed_sessions(
     cx: &mut App,
 ) {
     for session in sessions {
-        if session.worktree_removed == Some(true)
-            || session
-                .provider_session_id
+        if session.worktree_removed == Some(true) {
+            continue;
+        }
+        let cwd = monocode_core::session::session_work_cwd(session);
+        // The source of a pending switch keeps its conversation, so a
+        // switch back can resume it.
+        if let Some(source) = &session.pending_switch
+            && source
+                .from_provider_session_id
                 .as_ref()
-                .is_none_or(|id| id.is_empty())
+                .is_some_and(|id| !id.is_empty())
+            && source.from != session.harness
+            && hooks.harness.is_live_harness(source.from)
+        {
+            let mut from = session.clone();
+            from.harness = source.from;
+            from.provider_session_id = source.from_provider_session_id.clone();
+            from.provider_account_id = source.from_provider_account_id.clone();
+            hooks.harness.bind_session(&from, cx);
+        }
+        if session
+            .provider_session_id
+            .as_ref()
+            .is_none_or(|id| id.is_empty())
             || !hooks.harness.is_live_harness(session.harness)
+            || monocode_core::provider_context::requires_fresh_provider_binding(
+                session,
+                session.harness,
+                cwd,
+                session.provider_account_id.as_deref(),
+            )
         {
             continue;
         }
@@ -1039,9 +1092,10 @@ pub fn bind_resumed_sessions(
 }
 
 /// `getSession`: a stored session with its load-time repairs. Old Claude
-/// rows get their Bash commands back from Claude's transcript, and the
-/// provider hooks repair Cursor subagents and OMP interjections. Repairs
-/// that change the transcript are saved before the session is shown.
+/// rows get their Bash commands back from Claude's transcript, old Codex rows
+/// are relabelled from the command saved on the row, and the provider hooks
+/// repair Cursor subagents and OMP interjections. Repairs that change the
+/// transcript are saved before the session is shown.
 pub fn get_stored_session(session_id: &str, cx: &App) -> Task<Option<Session>> {
     let writer = Engine::writer(cx);
     let record = writer.get_record(session_id);
@@ -1070,6 +1124,20 @@ pub fn get_stored_session(session_id: &str, cx: &App) -> Task<Option<Session>> {
                     session.blocks = blocks;
                     let _ = writer.upsert_session(&session).await;
                 }
+            }
+        }
+        // The Codex protocol mapping lives in the harness crate, which the
+        // runtime-only build leaves out.
+        #[cfg(feature = "package-deps")]
+        {
+            use monocode_harness::providers::codex::protocol::backfill_codex_shell_commands;
+            if session.harness == HarnessId::Codex
+                && let Some(blocks) = backfill_codex_shell_commands(&session.blocks)
+            {
+                session.blocks = blocks;
+                // A failed write must not cost the reader the session. The
+                // repair stays in memory and the next load retries it.
+                let _ = writer.upsert_session(&session).await;
             }
         }
         let recover = cx.update(|cx| {

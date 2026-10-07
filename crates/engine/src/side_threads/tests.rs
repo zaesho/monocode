@@ -249,6 +249,7 @@ fn install(cx: &mut TestAppContext, backend: Arc<FakeBackend>) -> Fixture {
         RegistryOptions {
             turn_control: None,
             idle_park: Duration::from_secs(86_400),
+            ambient_events: None,
         },
     );
     let claude = FakeText::new(HarnessId::Claude);
@@ -459,9 +460,11 @@ fn btw_streams_activity_then_settles_a_ready_reply(cx: &mut TestAppContext) {
         events: vec![
             HarnessEvent::ReasoningDelta {
                 text: "Checking".into(),
+                append: None,
             },
             HarnessEvent::MessageDelta {
                 text: "Because it".into(),
+                append: None,
             },
         ],
         result: Ok("  Because it tokenizes first.  ".into()),
@@ -656,6 +659,7 @@ fn btw_stop_keeps_what_streamed_and_readies_the_thread(cx: &mut TestAppContext) 
     fixture.claude.push(TextScript {
         events: vec![HarnessEvent::MessageDelta {
             text: "Partial answer".into(),
+            append: None,
         }],
         hold: true,
         ..TextScript::reply("Never seen.")

@@ -8,11 +8,11 @@
 //!
 //! Views other crates build plug into slots: the connections page, the MCP
 //! settings page, the skills page, the worktrees page, the project
-//! notification card, and the provider accounts card.
+//! notification card, the provider accounts card, and the CLI updates card.
 
 use std::rc::Rc;
 
-use gpui::{AnyElement, AnyView, App, Task, Window};
+use gpui::{AnyElement, AnyView, App, Entity, Task, Window};
 use monocode_core::harness::HarnessId;
 use monocode_core::models::{HarnessAvailability, ModelCatalog};
 use monocode_core::settings::{CollapsedProjectRailMode, KeybindingOverrides, SettingsSectionId};
@@ -378,7 +378,17 @@ pub struct SlotContext {
     pub notification_settings_request: u64,
     /// The project notification card flashes while this is true.
     pub highlighted: bool,
+    /// The row or card Settings is highlighting, if any.
+    pub revealed: Option<gpui::SharedString>,
+    /// These values as they change after the slot was built: a repeated
+    /// notification request, the highlight ending. Slot views observe it.
+    pub live: Option<Entity<LiveSlotContext>>,
 }
+
+/// The page's current [`SlotContext`] (with `live` unset), kept up to date
+/// for slot views to observe.
+#[derive(Clone, Debug, Default)]
+pub struct LiveSlotContext(pub SlotContext);
 
 /// Builds a view another crate owns. The page builds a fresh one each time
 /// the section opens, the way React remounted it.
@@ -406,6 +416,8 @@ pub struct SettingsHosts {
     pub project_notifications: Option<ViewSlot>,
     /// `ProviderAccountsSettings`, the first card on the Providers page.
     pub accounts: Option<ViewSlot>,
+    /// `HarnessUpdatesGroup`, the CLI updates card on the Providers page.
+    pub harness_updates: Option<ViewSlot>,
     /// `WindowControls` on Windows and Linux.
     pub window_controls: Option<ViewSlot>,
 }
@@ -426,6 +438,7 @@ impl Default for SettingsHosts {
             worktrees: None,
             project_notifications: None,
             accounts: None,
+            harness_updates: None,
             window_controls: None,
         }
     }

@@ -5,7 +5,7 @@ import {
 } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
-import { join } from "node:path";
+import { basename, extname, join } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -15,10 +15,6 @@ import {
   type RemoteProvider,
 } from "../src/features/connections/model/protocol";
 import { providerLaunch, resolveProvider } from "./process";
-import {
-  parseInheritedOpenCodeConfig,
-  serializeOpenCodeConfig,
-} from "./opencode-config";
 
 const exec = promisify(execFile);
 const ALLOWED_EXEC_ARGS = new Set([
@@ -29,7 +25,6 @@ const ALLOWED_EXEC_ARGS = new Set([
   "models",
   "status --json",
   "agent list",
-  "debug paths",
 ]);
 
 function loopbackUrl(value: unknown): string {
@@ -42,35 +37,6 @@ function loopbackUrl(value: unknown): string {
   )
     throw new Error("OpenCode HTTP is limited to localhost");
   return url.href;
-}
-
-export function mergeOpenCodeConfig(
-  base: string | undefined,
-  override: string,
-  cwd = process.cwd(),
-  environment: NodeJS.ProcessEnv = process.env,
-): string {
-  const original = base
-    ? parseInheritedOpenCodeConfig(base, cwd, environment)
-    : {};
-  const policy = JSON.parse(override);
-  const object = (value: unknown): value is Record<string, unknown> =>
-    value !== null && typeof value === "object" && !Array.isArray(value);
-  if (!object(original) || !object(policy))
-    throw new Error("Invalid OpenCode config object");
-  const merge = (
-    target: Record<string, unknown>,
-    patch: Record<string, unknown>,
-  ) => {
-    for (const [key, value] of Object.entries(patch)) {
-      if (["__proto__", "constructor", "prototype"].includes(key))
-        throw new Error("Invalid OpenCode config key");
-      if (object(value) && object(target[key])) merge(target[key], value);
-      else target[key] = value;
-    }
-  };
-  merge(original, policy);
-  return serializeOpenCodeConfig(original);
 }
 
 /** Native process implementation for the headless execution proof. */
@@ -131,9 +97,7 @@ export class HostChildBackend implements ChildBackend {
           args.command !== commandPath ||
           !Array.isArray(args.args) ||
           !args.args.every((arg) => typeof arg === "string") ||
-          !ALLOWED_EXEC_ARGS.has(args.args.join(" ")) ||
-          (args.args.join(" ") === "debug paths" &&
-            (provider !== "opencode" || args.args.length !== 2))
+          !ALLOWED_EXEC_ARGS.has(args.args.join(" "))
         )
           throw new Error("Unsupported headless catalog command");
         const launch = await providerLaunch(commandPath, args.args as string[]);
@@ -181,36 +145,12 @@ export class HostChildBackend implements ChildBackend {
         this.stopStream(id);
         const controller = new AbortController();
         this.streams.set(id, controller);
-        const timer = setTimeout(() => controller.abort(), 10_000);
-        try {
-          const response = await fetch(url, {
-            headers: {
-              Accept: "text/event-stream",
-              ...(args.headers as Record<string, string>),
-            },
-            redirect: "error",
-            signal: controller.signal,
-          });
-          if (
-            !response.ok ||
-            !response.body ||
-            !response.headers
-              .get("content-type")
-              ?.startsWith("text/event-stream")
-          )
-            throw new Error(
-              `OpenCode event stream returned HTTP ${response.status} without SSE`,
-            );
-          if (this.streams.get(id) !== controller)
-            throw new Error("OpenCode event stream was cancelled");
-          void this.readStream(id, response, controller);
-        } catch (error) {
-          controller.abort();
-          if (this.streams.get(id) === controller) this.streams.delete(id);
-          throw error;
-        } finally {
-          clearTimeout(timer);
-        }
+        void this.readStream(
+          id,
+          url,
+          args.headers as Record<string, string> | undefined,
+          controller,
+        );
         return undefined as T;
       }
       case "harness_sse_close":
@@ -263,32 +203,34 @@ export class HostChildBackend implements ChildBackend {
 
   private async readStream(
     id: string,
-    response: Response,
+    url: string,
+    headers: Record<string, string> | undefined,
     controller: AbortController,
   ): Promise<void> {
     let error: string | undefined;
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      reader = response.body!.getReader();
+      const response = await fetch(url, {
+        headers: { Accept: "text/event-stream", ...headers },
+        redirect: "error",
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body)
+        throw new Error(
+          `OpenCode event stream returned HTTP ${response.status}`,
+        );
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       let data: string[] = [];
       let dataLength = 0;
       while (!controller.signal.aborted) {
         const next = await reader.read();
-        if (
-          next.done ||
-          controller.signal.aborted ||
-          this.streams.get(id) !== controller
-        )
-          break;
+        if (next.done) break;
         buffer += decoder.decode(next.value, { stream: true });
         if (buffer.length > 8 * 1024 * 1024)
           throw new Error("OpenCode event stream frame is too large");
         let index: number;
         while ((index = buffer.indexOf("\n")) >= 0) {
-          if (controller.signal.aborted || this.streams.get(id) !== controller)
-            break;
           const line = buffer.slice(0, index).replace(/\r$/, "");
           buffer = buffer.slice(index + 1);
           if (!line) {
@@ -312,12 +254,8 @@ export class HostChildBackend implements ChildBackend {
       if (!controller.signal.aborted)
         error = reason instanceof Error ? reason.message : String(reason);
     } finally {
-      controller.abort();
-      reader?.releaseLock();
-      if (this.streams.get(id) === controller) {
-        this.streams.delete(id);
-        this.emit("harness-sse-end", { sessionId: id, error });
-      }
+      if (this.streams.get(id) === controller) this.streams.delete(id);
+      this.emit("harness-sse-end", { sessionId: id, error });
     }
   }
 
@@ -326,31 +264,6 @@ export class HostChildBackend implements ChildBackend {
     args: Record<string, unknown>,
   ): Promise<number> {
     if (this.closing) throw new Error("Host is stopping");
-    const env: NodeJS.ProcessEnv = { ...process.env, MONOCODE_HOST: "1" };
-    const overrides = args.env as Record<string, string> | undefined;
-    if (
-      args.binaryProvider === "opencode" &&
-      (args.args as string[])[0] === "serve"
-    ) {
-      delete env.OPENCODE_SERVER_PASSWORD;
-      delete env.OPENCODE_SERVER_USERNAME;
-      if (overrides) {
-        if (
-          Object.keys(overrides).some(
-            (key) => key !== "OPENCODE_CONFIG_CONTENT",
-          )
-        )
-          throw new Error("Unsupported OpenCode environment override");
-        if (overrides.OPENCODE_CONFIG_CONTENT)
-          env.OPENCODE_CONFIG_CONTENT = mergeOpenCodeConfig(
-            env.OPENCODE_CONFIG_CONTENT,
-            overrides.OPENCODE_CONFIG_CONTENT,
-            String(args.cwd),
-            env,
-          );
-      }
-    } else if (overrides && Object.keys(overrides).length)
-      throw new Error("Environment overrides are limited to OpenCode servers");
     await this.kill(id);
     if (this.closing) throw new Error("Host is stopping");
     const account = args.account as { id?: string } | undefined;
@@ -375,7 +288,7 @@ export class HostChildBackend implements ChildBackend {
         stdio: ["pipe", "pipe", "pipe", "pipe"],
         detached: process.platform !== "win32",
         windowsHide: true,
-        env,
+        env: providerEnv(String(args.command)),
       },
     );
     this.children.set(id, child);
@@ -491,4 +404,16 @@ export class HostChildBackend implements ChildBackend {
     for (const id of this.streams.keys()) this.stopStream(id);
     await Promise.all([...this.children.keys()].map((id) => this.kill(id)));
   }
+}
+
+/**
+ * Claude Code hides `sdk-cli` sessions from its `--resume` picker, and that
+ * is the entrypoint a stream-json run gets by default. Naming our own keeps
+ * sessions started here resumable from a terminal.
+ */
+export function providerEnv(command: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, MONOCODE_HOST: "1" };
+  const name = basename(command, extname(command)).toLowerCase();
+  if (name === "claude") env.CLAUDE_CODE_ENTRYPOINT = "monocode";
+  return env;
 }

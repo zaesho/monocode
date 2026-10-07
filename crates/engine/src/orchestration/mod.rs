@@ -33,7 +33,8 @@ mod orchestrator_tests;
 pub(crate) mod testing;
 
 pub use agent_app::{
-    AgentAppHost, AppLaunch, AppSessionListing, AppSessionPlacement, handle_agent_app,
+    AgentAppHost, AppAccess, AppLaunch, AppSessionListing, AppSessionPlacement, LinkedPeer,
+    LinkedSendResult, handle_agent_app,
 };
 pub use executor::{ControlExecutor, EngineAppHost, serve_control_requests, start_control_server};
 pub use host::{

@@ -489,10 +489,10 @@ fn working_dir(cwd: &str) -> std::path::PathBuf {
 fn default_shell() -> (String, Vec<String>) {
     #[cfg(windows)]
     {
-        if let Ok(comspec) = std::env::var("COMSPEC") {
-            if !comspec.is_empty() {
-                return (comspec, Vec::new());
-            }
+        if let Ok(comspec) = std::env::var("COMSPEC")
+            && !comspec.is_empty()
+        {
+            return (comspec, Vec::new());
         }
         ("powershell.exe".into(), vec!["-NoLogo".into()])
     }
@@ -608,7 +608,7 @@ fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32), String> {
 fn slave_name(master: i32) -> Result<std::ffi::CString, String> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let mut buf = vec![0_i8; 64];
+        let mut buf = vec![0 as libc::c_char; 64];
         let ret = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
         if ret != 0 {
             return Err(os_err("Failed to resolve terminal name"));

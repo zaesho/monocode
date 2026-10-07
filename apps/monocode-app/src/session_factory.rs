@@ -60,21 +60,16 @@ impl SessionFactory for AppSessionFactory {
         runtime_mode: Option<RuntimeMode>,
         model_settings: Option<&ModelSettings>,
     ) -> Session {
-        let mut env = self.snapshot();
-        env.catalog = self.catalog.snapshot_for_directory(cwd);
-        env.new_session(harness, cwd, model, runtime_mode, model_settings)
+        self.snapshot()
+            .new_session(harness, cwd, model, runtime_mode, model_settings)
     }
 
     fn new_default_session(&self, cwd: &str, runtime_mode: Option<RuntimeMode>) -> Session {
-        let mut env = self.snapshot();
-        env.catalog = self.catalog.snapshot_for_directory(cwd);
-        env.new_default_session(cwd, runtime_mode)
+        self.snapshot().new_default_session(cwd, runtime_mode)
     }
 
     fn new_session_like(&self, seed: Option<&Session>, cwd: &str) -> Session {
-        let mut env = self.snapshot();
-        env.catalog = self.catalog.snapshot_for_directory(cwd);
-        env.new_session_like(seed, cwd)
+        self.snapshot().new_session_like(seed, cwd)
     }
 }
 

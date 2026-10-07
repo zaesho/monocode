@@ -10,30 +10,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveProvider, providerLaunch } from "./process";
-
-it("runs the standard Windows npm OpenCode entry without interpreting its wrapper", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "monocode-opencode-launch-"));
-  const entry = join(directory, "node_modules/opencode-ai/bin/opencode");
-  mkdirSync(join(directory, "node_modules/opencode-ai/bin"), {
-    recursive: true,
-  });
-  writeFileSync(entry, "process.exit(0)");
-  try {
-    expect(
-      await providerLaunch(
-        join(directory, "opencode.cmd"),
-        ["serve", "a & b"],
-        "win32",
-      ),
-    ).toEqual({ command: process.execPath, args: [entry, "serve", "a & b"] });
-    await expect(
-      providerLaunch(join(directory, "custom.cmd"), [], "win32"),
-    ).rejects.toThrow("Unsupported Windows provider launcher");
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
+import { resolveProvider } from "./process";
 
 it.each(["cursor", "pi", "fx"] as const)(
   "does not execute an unrelated ambiguous %s binary while resolving providers",
@@ -56,6 +33,69 @@ it.each(["cursor", "pi", "fx"] as const)(
       }
       expect(resolved).not.toBe(candidate);
       expect(existsSync(sentinel)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+it.runIf(process.platform !== "win32")(
+  "recognizes an npm-installed pi launcher stub through its package manifest",
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "monocode-pi-npm-"));
+    const packageDirectory = join(
+      directory,
+      "lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle",
+    );
+    const stub = join(packageDirectory, "cli.js");
+    mkdirSync(packageDirectory, { recursive: true });
+    // Mirrors the real npm launcher: a thin stub whose content carries none
+    // of the marker strings — identity only lives in the package manifest.
+    writeFileSync(
+      stub,
+      '#!/usr/bin/env node\nimport { createRequire } from "node:module";\n\nenableCompileCache();\ncreateRequire(import.meta.url)("./cli-runtime.js");\n',
+    );
+    chmodSync(stub, 0o755);
+    writeFileSync(
+      join(packageDirectory, "../../package.json"),
+      JSON.stringify({ name: "@earendil-works/pi-coding-agent" }),
+    );
+    const candidate = join(directory, "bin/pi");
+    mkdirSync(join(directory, "bin"), { recursive: true });
+    symlinkSync(stub, candidate);
+    vi.stubEnv("PATH", join(directory, "bin"));
+    try {
+      expect(await resolveProvider("pi")).toBe(candidate);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+it.runIf(process.platform !== "win32")(
+  "does not mistake an unrelated npm stub named pi for the pi agent",
+  async () => {
+    const directory = mkdtempSync(join(tmpdir(), "monocode-pi-unrelated-"));
+    const packageDirectory = join(
+      directory,
+      "lib/node_modules/pi-coding-agent-tools/dist",
+    );
+    mkdirSync(packageDirectory, { recursive: true });
+    writeFileSync(join(packageDirectory, "cli.js"), "#!/usr/bin/env node\n");
+    chmodSync(join(packageDirectory, "cli.js"), 0o755);
+    writeFileSync(
+      join(packageDirectory, "../../package.json"),
+      JSON.stringify({ name: "pi-coding-agent-tools" }),
+    );
+    const candidate = join(directory, "bin/pi");
+    mkdirSync(join(directory, "bin"), { recursive: true });
+    symlinkSync(join(packageDirectory, "cli.js"), candidate);
+    vi.stubEnv("PATH", join(directory, "bin"));
+    try {
+      const resolved = await resolveProvider("pi").catch(() => undefined);
+      expect(resolved).not.toBe(candidate);
     } finally {
       vi.unstubAllEnvs();
       rmSync(directory, { recursive: true, force: true });

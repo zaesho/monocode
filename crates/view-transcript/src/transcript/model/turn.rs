@@ -5,7 +5,8 @@
 use std::sync::LazyLock;
 
 use monocode_core::block::{
-    AgentStep, AgentStepKind, BlockTool, InterjectionMeta, InterjectionSeverity, TurnMetrics,
+    AgentStep, AgentStepKind, BlockTool, InterjectionMeta, InterjectionSeverity,
+    InterjectionStatus, TurnMetrics,
 };
 use monocode_core::{Block, BlockRole};
 use regex::Regex;
@@ -217,47 +218,12 @@ pub fn turn_metrics_summary(
     })
 }
 
-/// Local hour and minute for an epoch ms time.
-#[cfg(unix)]
-fn local_hour_minute(epoch_ms: i64) -> (i64, i64) {
-    let secs = epoch_ms.div_euclid(1000) as libc::time_t;
-    // SAFETY: `tm` is plain old data that `localtime_r` fills in. Both
-    // pointers are valid for the call and `localtime_r` is reentrant.
-    let tm = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&secs, &mut tm).is_null() {
-            return utc_hour_minute(epoch_ms);
-        }
-        tm
-    };
-    (tm.tm_hour as i64, tm.tm_min as i64)
-}
-
-#[cfg(not(unix))]
-fn local_hour_minute(epoch_ms: i64) -> (i64, i64) {
-    // TODO(port): read the Windows time zone. UTC until then.
-    utc_hour_minute(epoch_ms)
-}
-
-fn utc_hour_minute(epoch_ms: i64) -> (i64, i64) {
-    let day_ms = epoch_ms.rem_euclid(86_400_000);
-    (day_ms / 3_600_000, (day_ms / 60_000) % 60)
-}
-
-/// `formatClockTime`: "5:43 AM" in local time.
-// TODO(port): the TypeScript used the reader's locale; this is the en-US form.
+/// The turn's clock time in the reader's locale and time zone.
 pub fn format_clock_time(epoch_ms: i64) -> String {
-    let (hour, minute) = local_hour_minute(epoch_ms);
-    format_hour_minute(hour, minute)
-}
-
-fn format_hour_minute(hour: i64, minute: i64) -> String {
-    let suffix = if hour < 12 { "AM" } else { "PM" };
-    let hour12 = match hour % 12 {
-        0 => 12,
-        h => h,
-    };
-    format!("{hour12}:{minute:02} {suffix}")
+    monocode_platform::date_time::format_local(
+        epoch_ms,
+        monocode_platform::date_time::DateTimeStyle::Time,
+    )
 }
 
 /// `subagentStatusLine`: how far a run got, "3 steps, 1 failed", or "failed".
@@ -332,20 +298,67 @@ pub struct InterjectionChrome {
 }
 
 pub fn interjection_chrome(meta: &InterjectionMeta) -> InterjectionChrome {
-    let label = match meta.custom_type.as_str() {
+    let mut label = match meta.custom_type.as_str() {
         "advisor" => "Advisor".to_string(),
         "custom" => "Notice".to_string(),
         other => other.to_string(),
     };
-    let severity_text = meta.severity.map(|severity| match severity {
-        InterjectionSeverity::Blocker => "Blocker",
-        InterjectionSeverity::Concern => "Concern",
-        InterjectionSeverity::Nit => "Nit",
-    });
+    if let Some(model) = meta.model.as_deref().and_then(interjection_model_label) {
+        label = format!("{label} \u{b7} {model}");
+    }
+    // A consult still waiting reads as muted text, and a failed one takes the
+    // blocker color.
+    let (severity_text, severity) = match meta.status {
+        Some(InterjectionStatus::Running) => (Some("Consulting"), None),
+        Some(InterjectionStatus::Failed) => (Some("Failed"), Some(InterjectionSeverity::Blocker)),
+        _ => (
+            meta.severity.map(|severity| match severity {
+                InterjectionSeverity::Blocker => "Blocker",
+                InterjectionSeverity::Concern => "Concern",
+                InterjectionSeverity::Nit => "Nit",
+            }),
+            meta.severity,
+        ),
+    };
     InterjectionChrome {
         label,
         severity_text,
-        severity: meta.severity,
+        severity,
+    }
+}
+
+/// `claude-fable-5-1` as `Fable 5.1`, with any date suffix dropped. Other ids
+/// show as they are.
+fn interjection_model_label(model: &str) -> Option<String> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let Some(rest) = model.strip_prefix("claude-") else {
+        return Some(model.to_string());
+    };
+    let mut parts = rest.split('-');
+    let family = parts.next().filter(|family| !family.is_empty());
+    let mut version: Vec<&str> = parts.collect();
+    // Dated snapshots like `claude-haiku-4-5-20251001` name the same model.
+    if version.len() > 1 && version.last().is_some_and(|part| part.len() == 8) {
+        version.pop();
+    }
+    let numeric = !version.is_empty()
+        && version.len() <= 2
+        && version
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+    match family {
+        Some(family) if numeric => {
+            let mut chars = family.chars();
+            let family: String = chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default();
+            Some(format!("{family} {}", version.join(".")))
+        }
+        _ => Some(model.to_string()),
     }
 }
 
@@ -489,13 +502,16 @@ mod tests {
     }
 
     #[test]
-    fn formats_clock_times_in_twelve_hours() {
-        assert_eq!(format_hour_minute(0, 5), "12:05 AM");
-        assert_eq!(format_hour_minute(5, 43), "5:43 AM");
-        assert_eq!(format_hour_minute(12, 0), "12:00 PM");
-        assert_eq!(format_hour_minute(23, 59), "11:59 PM");
-        assert_eq!(utc_hour_minute(3_600_000 * 5 + 60_000 * 43), (5, 43));
-        assert!(format_clock_time(0).ends_with('M'));
+    fn formats_clock_times_in_the_system_locale() {
+        let label = format_clock_time(0);
+        assert!(!label.is_empty());
+        assert_eq!(
+            label,
+            monocode_platform::date_time::format_local(
+                0,
+                monocode_platform::date_time::DateTimeStyle::Time,
+            )
+        );
     }
 
     #[test]
@@ -546,16 +562,50 @@ mod tests {
         let chrome = interjection_chrome(&InterjectionMeta {
             custom_type: "advisor".into(),
             severity: Some(InterjectionSeverity::Concern),
-            extra: Default::default(),
+            ..Default::default()
         });
         assert_eq!(chrome.label, "Advisor");
         assert_eq!(chrome.severity_text, Some("Concern"));
         let custom = interjection_chrome(&InterjectionMeta {
             custom_type: "custom".into(),
             severity: None,
-            extra: Default::default(),
+            ..Default::default()
         });
         assert_eq!(custom.label, "Notice");
         assert_eq!(custom.severity_text, None);
+    }
+
+    #[test]
+    fn names_the_advisor_model_and_consult_status() {
+        let running = interjection_chrome(&InterjectionMeta {
+            custom_type: "advisor".into(),
+            status: Some(InterjectionStatus::Running),
+            ..Default::default()
+        });
+        assert_eq!(running.label, "Advisor");
+        assert_eq!(running.severity_text, Some("Consulting"));
+        assert_eq!(running.severity, None);
+        let done = interjection_chrome(&InterjectionMeta {
+            custom_type: "advisor".into(),
+            model: Some("claude-fable-5-1".into()),
+            status: Some(InterjectionStatus::Completed),
+            ..Default::default()
+        });
+        assert_eq!(done.label, "Advisor \u{b7} Fable 5.1");
+        assert_eq!(done.severity_text, None);
+        let failed = interjection_chrome(&InterjectionMeta {
+            custom_type: "advisor".into(),
+            model: Some("claude-opus-5".into()),
+            status: Some(InterjectionStatus::Failed),
+            ..Default::default()
+        });
+        assert_eq!(failed.label, "Advisor \u{b7} Opus 5");
+        assert_eq!(failed.severity_text, Some("Failed"));
+        assert_eq!(failed.severity, Some(InterjectionSeverity::Blocker));
+        assert_eq!(
+            interjection_model_label("claude-opus-4-8-20260101").as_deref(),
+            Some("Opus 4.8")
+        );
+        assert_eq!(interjection_model_label("gpt-5").as_deref(), Some("gpt-5"));
     }
 }

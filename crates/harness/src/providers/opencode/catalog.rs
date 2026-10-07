@@ -18,8 +18,8 @@ use regex::Regex;
 use serde_json::Value;
 
 use super::protocol::{
-    infer_default_agent, infer_default_variant, is_known_hidden_agent, locale_compare,
-    open_code_variant_label, open_code_version_error, parse_open_code_version,
+    MINIMUM_OPENCODE_VERSION, compare_semver, infer_default_agent, infer_default_variant,
+    is_known_hidden_agent, locale_compare, open_code_variant_label, parse_open_code_version,
     sort_open_code_variants, title_case_slug,
 };
 use crate::core::catalog::SharedCatalog;
@@ -94,11 +94,17 @@ pub async fn discover_open_code_models(
         )
     };
     let version_out = exec(&["--version"]).await?;
-    let version = parse_open_code_version(&version_out);
-    if let Some(error) = open_code_version_error(version.as_deref()) {
-        bail!(error);
+    let Some(version) = parse_open_code_version(&version_out) else {
+        bail!(
+            "Unable to determine OpenCode version. MonoCode requires v{MINIMUM_OPENCODE_VERSION} or newer."
+        );
+    };
+    if compare_semver(&version, MINIMUM_OPENCODE_VERSION) < 0 {
+        bail!("OpenCode v{version} is too old. Upgrade to v{MINIMUM_OPENCODE_VERSION} or newer.");
     }
-
+    if super::v2::protocol::version(&version_out)? == super::v2::protocol::MajorVersion::Two {
+        return super::v2::catalog::discover(children.clone(), &cwd, &Default::default()).await;
+    }
     let models_out = exec(&["models", "--verbose"]).await?;
     let parsed = parse_models_cli_output(&models_out);
     let agents = match exec(&["agent", "list"]).await {
@@ -329,11 +335,14 @@ type Inflight = Shared<BoxFuture<'static, ()>>;
 
 /// `refreshOpenCodeCatalog` and its module-level `inflight` promise. One
 /// refresh runs at a time; callers that arrive meanwhile share it.
+#[derive(Clone)]
 pub struct CatalogRefresher {
     children: Children,
     catalog: SharedCatalog,
     spawner: SharedSpawner,
-    inflight: Arc<Mutex<HashMap<Option<String>, Inflight>>>,
+    inflight: Arc<Mutex<Option<Inflight>>>,
+    /// Project refreshes in flight, by working directory.
+    project_inflight: Arc<Mutex<HashMap<String, Inflight>>>,
 }
 
 impl CatalogRefresher {
@@ -342,26 +351,55 @@ impl CatalogRefresher {
             children,
             catalog,
             spawner,
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(Mutex::new(None)),
+            project_inflight: Arc::default(),
         }
+    }
+
+    /// `refreshProjectOpenCodeCatalog`: the models OpenCode offers in `cwd`,
+    /// kept apart from the home catalog and other projects. Project config
+    /// can add local models and agents. Failures are logged.
+    pub fn refresh_project(&self, cwd: &str) -> BoxFuture<'static, ()> {
+        let mut inflight = self.project_inflight.lock();
+        if let Some(running) = inflight.get(cwd) {
+            return running.clone().boxed();
+        }
+        let (done, finished) = oneshot::channel::<()>();
+        let shared: Inflight = finished.map(|_| ()).boxed().shared();
+        inflight.insert(cwd.to_string(), shared.clone());
+        drop(inflight);
+
+        let children = self.children.clone();
+        let catalog = self.catalog.clone();
+        let slot = self.project_inflight.clone();
+        let cwd = cwd.to_string();
+        self.spawner.spawn(
+            async move {
+                match discover_open_code_models(&children, Some(&cwd)).await {
+                    Ok(models) => {
+                        catalog.set_project_harness_models(HarnessId::Opencode, &cwd, models)
+                    }
+                    Err(error) => log::debug!("[monocode] opencode project catalog {error:#}"),
+                }
+                slot.lock().remove(&cwd);
+                let _ = done.send(());
+            }
+            .boxed(),
+        );
+        shared.boxed()
     }
 
     /// `refreshOpenCodeCatalog`. Failures are logged, as in TypeScript. The
     /// refresh runs on the spawner, so it finishes even if the caller stops
     /// waiting.
     pub fn refresh(&self) -> BoxFuture<'static, ()> {
-        self.refresh_for_directory(None)
-    }
-
-    pub fn refresh_for_directory(&self, cwd: Option<&str>) -> BoxFuture<'static, ()> {
-        let key = cwd.map(str::to_string);
         let mut inflight = self.inflight.lock();
-        if let Some(running) = inflight.get(&key) {
+        if let Some(running) = inflight.as_ref() {
             return running.clone().boxed();
         }
         let (done, finished) = oneshot::channel::<()>();
         let shared: Inflight = finished.map(|_| ()).boxed().shared();
-        inflight.insert(key.clone(), shared.clone());
+        *inflight = Some(shared.clone());
         drop(inflight);
 
         let children = self.children.clone();
@@ -369,17 +407,15 @@ impl CatalogRefresher {
         let slot = self.inflight.clone();
         self.spawner.spawn(
             async move {
-                match discover_open_code_models(&children, key.as_deref()).await {
+                match discover_open_code_models(&children, None).await {
                     Ok(models) => {
-                        if let Some(cwd) = key.as_deref() {
-                            catalog.set_project_harness_models(HarnessId::Opencode, cwd, models);
-                        } else if !models.is_empty() {
+                        if !models.is_empty() {
                             catalog.set_harness_models(HarnessId::Opencode, models);
                         }
                     }
                     Err(error) => log::debug!("[monocode] opencode catalog {error:#}"),
                 }
-                slot.lock().remove(&key);
+                *slot.lock() = None;
                 let _ = done.send(());
             }
             .boxed(),
@@ -398,78 +434,6 @@ mod tests {
     }
 
     // describe("OpenCode CLI inventory parsers")
-
-    #[test]
-    fn discovers_and_refreshes_project_inventory_without_cross_project_models() {
-        use crate::providers::opencode::test_support::FakeHost;
-        smol::block_on(async {
-            let host = FakeHost::new();
-            host.set_exec_handler(|request| {
-                if request.args == ["--version"] {
-                    return "1.14.19".into();
-                }
-                let id = request
-                    .cwd
-                    .as_deref()
-                    .unwrap_or("home")
-                    .trim_start_matches('/');
-                if request.args == ["agent", "list"] {
-                    return format!("agent_{id} (primary)\n{{}}");
-                }
-                format!("fixture/{id}\n{{\"id\":\"{id}\",\"name\":\"{id}\"}}")
-            });
-            let catalog = SharedCatalog::new();
-            let refresher = CatalogRefresher::new(host.children(), catalog.clone(), host.spawner());
-            futures::join!(
-                refresher.refresh_for_directory(Some("/a")),
-                refresher.refresh_for_directory(Some("/b"))
-            );
-            assert_eq!(
-                catalog
-                    .snapshot_for_directory("/a")
-                    .models_for(HarnessId::Opencode)[0]
-                    .native_id
-                    .as_deref(),
-                Some("fixture/a")
-            );
-            assert_eq!(
-                catalog
-                    .snapshot_for_directory("/b")
-                    .models_for(HarnessId::Opencode)[0]
-                    .native_id
-                    .as_deref(),
-                Some("fixture/b")
-            );
-            assert!(!catalog.has_live_catalog(HarnessId::Opencode));
-            let calls = host.exec_calls();
-            assert!(
-                calls
-                    .iter()
-                    .any(|request| request.cwd.as_deref() == Some("/a")
-                        && request.args == ["models", "--verbose"])
-            );
-            assert!(
-                calls
-                    .iter()
-                    .any(|request| request.cwd.as_deref() == Some("/b")
-                        && request.args == ["models", "--verbose"])
-            );
-            let settings = catalog
-                .project_models_for(HarnessId::Opencode, "/a")
-                .unwrap()[0]
-                .settings
-                .clone()
-                .unwrap();
-            assert_eq!(
-                settings
-                    .iter()
-                    .find(|setting| setting.id == "agent")
-                    .unwrap()
-                    .value,
-                "agent_a"
-            );
-        });
-    }
 
     #[test]
     fn parses_models_verbose_output() {
@@ -639,5 +603,57 @@ mod tests {
             .map(|(key, _)| key.as_str())
             .collect();
         assert_eq!(order, ["1", "2", "b", "a", "01"]);
+    }
+
+    #[test]
+    fn discovers_and_refreshes_project_inventory_without_cross_project_models() {
+        use crate::providers::opencode::test_support::FakeHost;
+        smol::block_on(async {
+            let host = FakeHost::new();
+            let catalog = SharedCatalog::new();
+            let refresher = CatalogRefresher::new(host.children(), catalog.clone(), host.spawner());
+            for id in ["a", "b"] {
+                host.exec_once("opencode 1.14.19");
+                host.exec_once(&format!(
+                    "fixture/{id}\n{{\"id\":\"{id}\",\"name\":\"{id}\"}}"
+                ));
+                host.exec_once(&format!("agent_{id} (primary)\n{{}}"));
+                refresher.refresh_project(&format!("/{id}")).await;
+            }
+            let project = |cwd: &str| {
+                catalog
+                    .read()
+                    .project_harness_models(HarnessId::Opencode, cwd)
+                    .map(<[AgentModel]>::to_vec)
+                    .unwrap_or_default()
+            };
+            let a = project("/a");
+            let b = project("/b");
+            assert_eq!(a.len(), 1);
+            assert_eq!(b.len(), 1);
+            assert_eq!(a[0].native_id.as_deref(), Some("fixture/a"));
+            assert_eq!(b[0].native_id.as_deref(), Some("fixture/b"));
+            // Project refreshes never fill the home catalog.
+            assert!(!catalog.has_live_catalog(HarnessId::Opencode));
+            let calls = host.exec_calls();
+            for cwd in ["/a", "/b"] {
+                assert!(
+                    calls
+                        .iter()
+                        .any(|request| request.cwd.as_deref() == Some(cwd)
+                            && request.args == ["models", "--verbose"])
+                );
+            }
+            let agent = a[0]
+                .settings
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|setting| setting.id == "agent")
+                .unwrap()
+                .value
+                .clone();
+            assert_eq!(agent, "agent_a");
+        });
     }
 }

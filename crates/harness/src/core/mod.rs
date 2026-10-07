@@ -15,6 +15,7 @@ pub mod availability;
 pub mod availability_state;
 pub mod catalog;
 pub mod child;
+pub mod context_transfer;
 pub mod git_text;
 pub mod json_rpc;
 pub mod json_text;

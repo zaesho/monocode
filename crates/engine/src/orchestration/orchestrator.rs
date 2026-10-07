@@ -22,6 +22,7 @@ use monocode_core::orchestration::{
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{Extra, HARNESSES, HarnessEvent, HarnessId, Session};
 use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 use super::host::{OrchestrationHost, OrchestrationStorage, PendingInput};
@@ -327,9 +328,16 @@ impl Orchestrator {
         if let Some(dependency) = run
             .tasks
             .iter()
-            .find(|entry| task.depends_on.contains(&entry.id) && !entry.accepted)
+            .find(|entry| task.depends_on.contains(&entry.id) && !dependency_met(run, entry))
         {
-            return Some(format!("Waiting for review: {}", dependency.title));
+            return Some(if dependency.accepted {
+                format!(
+                    "Waiting for out-of-scope files to be resolved: {}",
+                    dependency.title
+                )
+            } else {
+                format!("Waiting for review: {}", dependency.title)
+            });
         }
         if let Some(owner) = run
             .tasks
@@ -751,6 +759,35 @@ async fn patch_dispatch(
     commit(this, next, cx).await
 }
 
+/// `pendingOutside`: files an accepted task left unapplied in its kept
+/// worktree, as `(outside, ignored)`. These are changes outside its write
+/// scope and gitignored files it created. They are gone once that worktree
+/// is cleaned up.
+fn pending_outside(run: &OrchestrationRun, task: &OrchestrationTask) -> (Vec<String>, Vec<String>) {
+    let Some(dispatch) = run
+        .dispatch_list()
+        .iter()
+        .find(|entry| Some(&entry.id) == task.accepted_dispatch_id.as_ref())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    if dispatch.stage == DispatchStage::Cleaned {
+        return (Vec::new(), Vec::new());
+    }
+    (
+        dispatch.outside_assignment.clone().unwrap_or_default(),
+        dispatch.ignored_created.clone().unwrap_or_default(),
+    )
+}
+
+/// `dependencyMet`: a dependency is met once it is accepted and the lead has
+/// resolved any out-of-scope files, so dependents start from the checkout it
+/// settled on.
+fn dependency_met(run: &OrchestrationRun, task: &OrchestrationTask) -> bool {
+    let (outside, ignored) = pending_outside(run, task);
+    task.accepted && outside.is_empty() && ignored.is_empty()
+}
+
 /// `cleanupUnchangedWorker`: remove an isolated checkout that holds no
 /// unreviewed work. `Ok(false)` keeps it.
 async fn cleanup_unchanged_worker(
@@ -773,7 +810,7 @@ async fn cleanup_unchanged_worker(
             return Ok(false);
         };
         let cleaned = cx
-            .update(|cx| host.cleanup_worker(&run, &task, true, cx))
+            .update(|cx| host.cleanup_worker(&run, &task, true, false, cx))
             .await?;
         if !cleaned {
             return Ok(false);
@@ -1291,6 +1328,87 @@ async fn start_run(
     Ok(())
 }
 
+fn receipt_signature_matches(previous: &str, current: &str) -> bool {
+    if previous == current {
+        return true;
+    }
+    let (Ok(previous), Ok(current)) = (
+        serde_json::from_str::<Box<RawValue>>(previous),
+        serde_json::from_str::<Box<RawValue>>(current),
+    ) else {
+        return false;
+    };
+    receipt_value_matches(&previous, &current)
+}
+
+fn receipt_value_matches(previous: &RawValue, current: &RawValue) -> bool {
+    let previous = previous.get().trim();
+    let current = current.get().trim();
+    if previous == current {
+        return true;
+    }
+    match (previous.as_bytes().first(), current.as_bytes().first()) {
+        (Some(b'{'), Some(b'{')) => {
+            let (Ok(previous), Ok(current)) = (
+                serde_json::from_str::<HashMap<String, Box<RawValue>>>(previous),
+                serde_json::from_str::<HashMap<String, Box<RawValue>>>(current),
+            ) else {
+                return false;
+            };
+            previous.len() == current.len()
+                && previous.iter().all(|(key, value)| {
+                    current
+                        .get(key)
+                        .is_some_and(|current| receipt_value_matches(value, current))
+                })
+        }
+        (Some(b'['), Some(b'[')) => {
+            let (Ok(previous), Ok(current)) = (
+                serde_json::from_str::<Vec<Box<RawValue>>>(previous),
+                serde_json::from_str::<Vec<Box<RawValue>>>(current),
+            ) else {
+                return false;
+            };
+            previous.len() == current.len()
+                && previous
+                    .iter()
+                    .zip(&current)
+                    .all(|(previous, current)| receipt_value_matches(previous, current))
+        }
+        (Some(b'"'), Some(b'"')) => serde_json::from_str::<String>(previous)
+            .ok()
+            .zip(serde_json::from_str::<String>(current).ok())
+            .is_some_and(|(previous, current)| previous == current),
+        (Some(b'-' | b'0'..=b'9'), Some(b'-' | b'0'..=b'9')) => receipt_number(previous)
+            .zip(receipt_number(current))
+            .is_some_and(|(previous, current)| previous == current),
+        _ => false,
+    }
+}
+
+fn receipt_number(number: &str) -> Option<(bool, String, i64)> {
+    // RawValue validates the JSON number. Keep its decimal digits so parsing
+    // a float cannot round a changed integer into a matching receipt.
+    let negative = number.starts_with('-');
+    let number = number.strip_prefix('-').unwrap_or(number);
+    let (mantissa, exponent) = if let Some(index) = number.find(['e', 'E']) {
+        (&number[..index], number[index + 1..].parse::<i64>().ok()?)
+    } else {
+        (number, 0)
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = [whole, fraction].concat();
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some((false, "0".into(), 0));
+    }
+    let significant = digits.trim_end_matches('0');
+    let scale = exponent
+        .checked_sub(i64::try_from(fraction.len()).ok()?)?
+        .checked_add(i64::try_from(digits.len() - significant.len()).ok()?)?;
+    Some((negative, significant.into(), scale))
+}
+
 /// `handle`: run one control command for a lead. Each `requestId` applies at
 /// most once; a retry with the same input gets the same answer.
 pub async fn handle(
@@ -1311,7 +1429,7 @@ pub async fn handle(
             .and_then(|run| run.requests.get(request_id).cloned())
     })?;
     if let Some(previous) = receipt {
-        if previous.signature != signature {
+        if !receipt_signature_matches(&previous.signature, &signature) {
             return Err("Request ID was already used with different input".into());
         }
         return Ok(previous.result);
@@ -1813,6 +1931,7 @@ async fn review(
         return Err("This task has no completed dispatch to review".into());
     };
     let isolated = target.workspace_policy != Some(WorkspacePolicy::Shared);
+    let discard_outside = input.get("discardOutside") == Some(&Value::Bool(true));
     if !target.accepted {
         if isolated {
             if target.workspace.is_none() {
@@ -1830,8 +1949,23 @@ async fn review(
             )
             .await?;
             let current = require_run(this, lead_id, cx)?;
-            cx.update(|cx| host.integrate_worker(&current, &target, cx))
+            let integration = cx
+                .update(|cx| host.integrate_worker(&current, &target, cx))
                 .await?;
+            if !integration.skipped.is_empty() || !integration.ignored.is_empty() {
+                patch_dispatch(
+                    this,
+                    lead_id,
+                    &dispatch_id,
+                    |dispatch| {
+                        dispatch.outside_assignment = Some(integration.skipped);
+                        dispatch.ignored_created =
+                            (!integration.ignored.is_empty()).then_some(integration.ignored);
+                    },
+                    cx,
+                )
+                .await?;
+            }
         }
         let mut next = (*require_run(this, lead_id, cx)?).clone();
         next.map_task(&target.id, |entry| {
@@ -1854,7 +1988,7 @@ async fn review(
     if isolated {
         let current = require_run(this, lead_id, cx)?;
         match cx
-            .update(|cx| host.cleanup_worker(&current, &target, false, cx))
+            .update(|cx| host.cleanup_worker(&current, &target, false, discard_outside, cx))
             .await
         {
             Ok(result) => cleaned = result,
@@ -1874,11 +2008,35 @@ async fn review(
         });
         commit(this, next, cx).await?;
     }
+    let next = (*require_run(this, lead_id, cx)?).clone();
+    let (outside, ignored) = next
+        .task(&target.id)
+        .map(|task| pending_outside(&next, task))
+        .unwrap_or_default();
     let mut result = json!({ "accepted": true, "integrated": isolated, "cleaned": cleaned });
     if let Some(error) = cleanup_error {
         result["cleanupError"] = Value::String(error);
     }
-    let next = (*require_run(this, lead_id, cx)?).clone();
+    let mut kept = Vec::new();
+    if !outside.is_empty() {
+        kept.push("changed outside the task's write scope");
+        result["outsideAssignment"] = json!(outside);
+    }
+    if !ignored.is_empty() {
+        kept.push("are gitignored files the worker created");
+        result["ignoredCreated"] = json!(ignored);
+    }
+    if !kept.is_empty() {
+        let checkout = target
+            .workspace
+            .as_ref()
+            .map(|workspace| workspace.checkout_cwd.as_str())
+            .unwrap_or_default();
+        result["note"] = Value::String(format!(
+            "These files {}, so they were not applied. They are still in {checkout}, which was kept. Tasks that depend on this one wait until it is removed. Copy any you need into the lead checkout, then call review again with \"discardOutside\": true to remove the worktree and its branch.",
+            kept.join(" or ")
+        ));
+    }
     record(this, next, request_id, signature, result, cx).await
 }
 
@@ -1935,7 +2093,7 @@ async fn finish(
         let attempt: Result<bool, String> = async {
             let current = require_run(this, lead_id, cx)?;
             let cleaned = cx
-                .update(|cx| host.cleanup_worker(&current, &retained, false, cx))
+                .update(|cx| host.cleanup_worker(&current, &retained, false, false, cx))
                 .await?;
             if cleaned {
                 let mut next = (*require_run(this, lead_id, cx)?).clone();
@@ -2093,10 +2251,10 @@ async fn pump_runs(
                 continue;
             };
             if task.status != TaskStatus::Queued
-                || task
-                    .depends_on
-                    .iter()
-                    .any(|id| !run.task(id).is_some_and(|entry| entry.accepted))
+                || task.depends_on.iter().any(|id| {
+                    !run.task(id)
+                        .is_some_and(|entry| dependency_met(&run, entry))
+                })
             {
                 continue;
             }
@@ -2125,6 +2283,8 @@ async fn pump_runs(
                 result: None,
                 error: None,
                 cleanup_error: None,
+                outside_assignment: None,
+                ignored_created: None,
                 extra: Extra::new(),
             };
             // Persist authority before any external worker/resource operation.
@@ -2994,4 +3154,111 @@ fn is_absolute_report(path: &str) -> bool {
             && bytes[0].is_ascii_alphabetic()
             && bytes[1] == b':'
             && matches!(bytes[2], b'/' | b'\\'))
+}
+
+#[cfg(test)]
+mod receipt_signature_tests {
+    use super::receipt_signature_matches;
+
+    #[test]
+    fn object_order_does_not_change_a_persisted_request() {
+        assert!(receipt_signature_matches(
+            r#"{"action":"delegate","input":{"title":"A","files":["a","b"],"modelSettings":{"variant":"high","agent":"plan"}}}"#,
+            r#"{"input":{"modelSettings":{"agent":"plan","variant":"high"},"files":["a","b"],"title":"A"},"action":"delegate"}"#,
+        ));
+        for changed in [
+            r#"{"action":"delegate","input":{"title":"B","files":["a","b"],"modelSettings":{"variant":"high","agent":"plan"}}}"#,
+            r#"{"action":"delegate","input":{"title":"A","files":["b","a"],"modelSettings":{"variant":"high","agent":"plan"}}}"#,
+            r#"{"action":"delegate","input":{"title":"A","files":["a","b"],"modelSettings":{"variant":"low","agent":"plan"}}}"#,
+            r#"{"action":"retry","input":{"title":"A","files":["a","b"],"modelSettings":{"variant":"high","agent":"plan"}}}"#,
+        ] {
+            assert!(!receipt_signature_matches(
+                r#"{"action":"delegate","input":{"title":"A","files":["a","b"],"modelSettings":{"variant":"high","agent":"plan"}}}"#,
+                changed,
+            ));
+        }
+    }
+
+    #[test]
+    fn integral_spelling_preserves_safe_values_without_rounding_large_integers() {
+        for (integer, float) in [
+            ("7", "7.0"),
+            ("7", "7e0"),
+            ("7", "7000e-3"),
+            ("-7", "-7.0"),
+            ("0", "-0.0"),
+            ("9007199254740991", "9007199254740991.0"),
+        ] {
+            assert!(
+                receipt_signature_matches(integer, float),
+                "{integer} != {float}"
+            );
+            assert!(
+                receipt_signature_matches(float, integer),
+                "{float} != {integer}"
+            );
+        }
+        for (previous, current) in [
+            ("7", "7.1"),
+            ("7", "8.0"),
+            ("0.10000000000000001", "0.1"),
+            ("9007199254740990", "9007199254740991.0"),
+            ("9007199254740993", "9007199254740992"),
+            ("9007199254740993", "9007199254740992.0"),
+            ("-9007199254740993", "-9007199254740992.0"),
+            ("18446744073709551615", "18446744073709551616.0"),
+        ] {
+            assert!(
+                !receipt_signature_matches(previous, current),
+                "{previous} == {current}"
+            );
+            assert!(
+                !receipt_signature_matches(current, previous),
+                "{current} == {previous}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_and_exponent_comparisons_are_exact_and_fail_closed_on_overflow() {
+        for (previous, current) in [
+            ("1e3", "1000.0"),
+            ("0.0010", "1e-3"),
+            ("1.234e2", "123.4"),
+            ("-1.234e2", "-123.4"),
+            ("-0.0010", "-1e-3"),
+        ] {
+            assert!(receipt_signature_matches(previous, current));
+            assert!(receipt_signature_matches(current, previous));
+        }
+        for (previous, current) in [
+            ("1e3", "1001.0"),
+            ("0.0010", "1e-2"),
+            ("1.234e2", "123.5"),
+            ("-0.0010", "1e-3"),
+            ("1e9223372036854775808", "10e9223372036854775807"),
+            ("1e-9223372036854775809", "0.1e-9223372036854775808"),
+        ] {
+            assert!(!receipt_signature_matches(previous, current));
+            assert!(!receipt_signature_matches(current, previous));
+        }
+        assert!(receipt_signature_matches(
+            "1e9223372036854775808",
+            "1e9223372036854775808"
+        ));
+    }
+
+    #[test]
+    fn corrupt_receipts_and_different_value_types_do_not_match() {
+        for (previous, current) in [
+            ("not json", "{}"),
+            ("{", "{}"),
+            ("{}", "{\"extra\":null}"),
+            ("[1]", "[1,2]"),
+            ("\"7\"", "7"),
+            ("true", "1"),
+        ] {
+            assert!(!receipt_signature_matches(previous, current));
+        }
+    }
 }

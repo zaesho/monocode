@@ -12,7 +12,6 @@
 //! `crypto.randomUUID()` and `Date.now()` come from a [`ReducerEnv`], so tests
 //! can pin block ids and time.
 
-use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -95,14 +94,18 @@ pub fn apply_harness_events_mut(
             continue;
         };
         let start = index;
-        while index + 1 < events.len() && delta_role(&events[index + 1]) == Some(role) {
+        let append = delta_appends(&events[index]);
+        while index + 1 < events.len()
+            && delta_role(&events[index + 1]) == Some(role)
+            && delta_appends(&events[index + 1]) == append
+        {
             index += 1;
         }
         let texts: Vec<&str> = events[start..=index]
             .iter()
             .filter_map(delta_text)
             .collect();
-        changed |= patch_streaming(env, session, role, &texts, true);
+        changed |= patch_streaming(env, session, role, &texts, true, append);
         index += 1;
     }
     changed
@@ -116,9 +119,25 @@ fn delta_role(event: &HarnessEvent) -> Option<BlockRole> {
     }
 }
 
+/// The delta carries plain incremental text (`append: true`).
+fn delta_appends(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::MessageDelta {
+            append: Some(true),
+            ..
+        } | HarnessEvent::ReasoningDelta {
+            append: Some(true),
+            ..
+        }
+    )
+}
+
 fn delta_text(event: &HarnessEvent) -> Option<&str> {
     match event {
-        HarnessEvent::MessageDelta { text } | HarnessEvent::ReasoningDelta { text } => Some(text),
+        HarnessEvent::MessageDelta { text, .. } | HarnessEvent::ReasoningDelta { text, .. } => {
+            Some(text)
+        }
         _ => None,
     }
 }
@@ -137,9 +156,14 @@ pub fn apply_harness_event_mut(
     event: &HarnessEvent,
 ) -> bool {
     match event {
-        HarnessEvent::MessageDelta { text } => {
-            patch_streaming(env, session, BlockRole::Assistant, &[text.as_str()], true)
-        }
+        HarnessEvent::MessageDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Assistant,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
         HarnessEvent::MessagePart {
             part_id,
             text,
@@ -151,26 +175,30 @@ pub fn apply_harness_event_mut(
             } else {
                 BlockRole::Assistant
             };
-            if let Some(block) = session.blocks.iter_mut().find(|block| {
-                block.role == role
-                    && block.extra.get("providerPartId").and_then(Value::as_str)
-                        == Some(part_id.as_str())
-            }) {
-                if block.text == *text && block.streaming == Some(*streaming) {
-                    return false;
+            let existing = session.blocks.iter_mut().find(|block| {
+                block.provider_part_id.as_deref() == Some(part_id.as_str()) && block.role == role
+            });
+            match existing {
+                Some(block) => {
+                    if block.text == *text && block.streaming == Some(*streaming) {
+                        return false;
+                    }
+                    block.text = text.clone();
+                    block.streaming = Some(*streaming);
                 }
-                block.text = text.clone();
-                block.streaming = Some(*streaming);
-            } else {
-                if text.is_empty() {
-                    return false;
+                None => {
+                    if text.is_empty() {
+                        return false;
+                    }
+                    append_block(
+                        session,
+                        Block {
+                            provider_part_id: Some(part_id.clone()),
+                            streaming: Some(*streaming),
+                            ..Block::new(env.new_id(), role, text.clone())
+                        },
+                    );
                 }
-                let mut block = Block::new(env.new_id(), role, text);
-                block
-                    .extra
-                    .insert("providerPartId".into(), Value::String(part_id.clone()));
-                block.streaming = Some(*streaming);
-                append_block(session, block);
             }
             true
         }
@@ -203,9 +231,14 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::ImageGenerated(GeneratedImage::Inline { .. }) => false,
-        HarnessEvent::ReasoningDelta { text } => {
-            patch_streaming(env, session, BlockRole::Reasoning, &[text.as_str()], true)
-        }
+        HarnessEvent::ReasoningDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Reasoning,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
         HarnessEvent::ReasoningCompleted => {
             finish_role(session, BlockRole::Reasoning);
             true
@@ -347,7 +380,27 @@ pub fn apply_harness_event_mut(
             session.provider_session_id = Some(provider_session_id.clone());
             true
         }
-        HarnessEvent::TurnStarted { provider_turn_id } => {
+        // A turn the provider started on its own has no user block to stamp;
+        // it only shows the session working until it finishes.
+        HarnessEvent::TurnStarted {
+            native: Some(true), ..
+        } => {
+            let changed = session.busy != Some(true);
+            session.busy = Some(true);
+            changed
+        }
+        HarnessEvent::TurnFinished { native } => {
+            if *native != Some(true) {
+                return false;
+            }
+            finish_role(session, BlockRole::Assistant);
+            finish_role(session, BlockRole::Reasoning);
+            session.busy = Some(false);
+            true
+        }
+        HarnessEvent::TurnStarted {
+            provider_turn_id, ..
+        } => {
             let Some(index) = last_user_index(&session.blocks) else {
                 return false;
             };
@@ -379,21 +432,47 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::Interjection {
+            id,
             text,
             custom_type,
             severity,
+            model,
+            status,
         } => {
+            let meta = InterjectionMeta {
+                custom_type: custom_type.clone(),
+                severity: *severity,
+                model: model.clone(),
+                status: *status,
+                extra: Extra::new(),
+            };
+            // A provider that reports progress on one interjection repeats its
+            // id. Update that block where it sits so the transcript keeps one
+            // row per consult.
+            if let Some(id) = nonempty(id.as_deref())
+                && let Some(block) = session
+                    .blocks
+                    .iter_mut()
+                    .find(|block| block.id == id && block.interjection.is_some())
+            {
+                if block.text == *text && block.interjection.as_ref() == Some(&meta) {
+                    return false;
+                }
+                block.text = text.clone();
+                block.interjection = Some(meta);
+                return true;
+            }
             // A visible boundary the user must not miss, so unlike status it
             // never deduplicates and never reads as turn lifecycle.
+            let block_id = match nonempty(id.as_deref()) {
+                Some(id) => id.to_string(),
+                None => env.new_id(),
+            };
             append_block(
                 session,
                 Block {
-                    interjection: Some(InterjectionMeta {
-                        custom_type: custom_type.clone(),
-                        severity: *severity,
-                        extra: Extra::new(),
-                    }),
-                    ..Block::new(env.new_id(), BlockRole::System, text.as_str())
+                    interjection: Some(meta),
+                    ..Block::new(block_id, BlockRole::System, text.as_str())
                 },
             );
             true
@@ -1016,6 +1095,7 @@ fn patch_streaming(
     role: BlockRole,
     texts: &[&str],
     streaming: bool,
+    append: bool,
 ) -> bool {
     if role == BlockRole::Reasoning && texts.iter().all(|text| text.is_empty()) {
         return false;
@@ -1031,9 +1111,16 @@ fn patch_streaming(
             // tokens and full snapshots, so concatenating the incoming chunks
             // would duplicate text. The text only ever grows, so it changed
             // exactly when a join did something.
+            // An appending provider sends plain increments, so they are
+            // concatenated as is.
             let mut changed = false;
             for text in texts {
-                changed |= join_stream_text_into(&mut last.text, text);
+                if append {
+                    changed |= !text.is_empty();
+                    last.text.push_str(text);
+                } else {
+                    changed |= join_stream_text_into(&mut last.text, text);
+                }
             }
             if !changed && last.streaming == Some(streaming) {
                 return false;
@@ -1043,9 +1130,13 @@ fn patch_streaming(
         }
     }
     seal_last_stream(&mut session.blocks);
-    let text = texts
-        .iter()
-        .fold(String::new(), |acc, text| join_stream_text(&acc, text));
+    let text = if append {
+        texts.concat()
+    } else {
+        texts
+            .iter()
+            .fold(String::new(), |acc, text| join_stream_text(&acc, text))
+    };
     session.blocks.push(Block {
         streaming: Some(streaming),
         ..Block::new(env.new_id(), role, text)

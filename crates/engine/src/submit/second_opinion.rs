@@ -318,6 +318,7 @@ mod tests {
                 to,
                 status: HandoffStatus::Ready,
                 pending: None,
+                transfer: None,
                 extra: Extra::new(),
             }),
             ..Block::new("h", BlockRole::Handoff, "")

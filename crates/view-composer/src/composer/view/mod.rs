@@ -13,11 +13,12 @@ mod keys;
 mod message_queue;
 mod render;
 pub(crate) mod runner;
+mod session_drop;
 mod submit;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use gpui::{
@@ -222,6 +223,19 @@ pub enum ComposerEvent {
     ResumeQueue,
     /// `onEditingLastTurnChange`.
     EditingLastTurnChange(bool),
+    /// Another session's card is over the composer, which takes the drop.
+    /// The owner hides the pane tree's split hint.
+    SessionDragOver,
+    /// A session card dropped on the composer; the pane tree's drag ended.
+    SessionDropped,
+    /// A drag the composer does not use dropped on it. The owner passes it
+    /// to the pane tree.
+    ForwardDrop(monocode_ui::drag::PaneDragSource),
+    /// "Add to context" for a dropped session. The owner adds the chip with
+    /// `add_context_item` once it knows the title.
+    AddSessionContext(String),
+    /// "Link sessions" for a dropped session.
+    LinkSession(String),
 }
 
 /// The mode toggles in the + menu.
@@ -255,9 +269,15 @@ pub struct Composer {
     pub(crate) context_items: Vec<ChatContextItem>,
     pub(crate) has_value: bool,
     pub(crate) attachments: Vec<Attachment>,
+    pub(crate) attachment_preview: Option<chips::AttachmentPreview>,
+    pub(crate) attachment_images: HashMap<String, chips::AttachmentImage>,
     pub(crate) borrowed_attachment_ids: HashSet<String>,
     pub(crate) paste_error: Option<String>,
     pub(crate) file_drag: bool,
+    /// A session card is over the composer.
+    pub(crate) session_drag: bool,
+    /// A dropped session waiting for "Add to context" or "Link sessions".
+    pub(crate) session_drop: Option<String>,
     pub(crate) plus_open: bool,
     pub(crate) modes: ModeSelection,
     pub(crate) slash: Option<SlashToken>,
@@ -366,6 +386,8 @@ impl Composer {
             borrowed_attachment_ids: HashSet::new(),
             paste_error: None,
             file_drag: false,
+            session_drag: false,
+            session_drop: None,
             plus_open: false,
             modes: ModeSelection::default(),
             slash: None,
@@ -399,6 +421,8 @@ impl Composer {
             runner: None,
             bar,
             chip_preview: chips::ChipPreview::default(),
+            attachment_preview: None,
+            attachment_images: HashMap::new(),
             runner_geometry: runner::RunnerGeometry::default(),
             header_views: Vec::new(),
             card_views: Vec::new(),
@@ -420,6 +444,11 @@ impl Composer {
 
     pub fn props(&self) -> &ComposerProps {
         &self.props
+    }
+
+    /// The composer box bounds from the last frame, in window coordinates.
+    pub fn bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.runner_geometry.r#box.get()
     }
 
     pub fn prompt(&self) -> &Entity<PromptInput> {
@@ -470,6 +499,15 @@ impl Composer {
     pub fn set_top_bar_views(&mut self, views: Vec<AnyView>, cx: &mut Context<Self>) {
         self.top_bar_views = views;
         cx.notify();
+    }
+
+    pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.props.hotkeys || !self.props.enabled || self.prompt.read(cx).is_composing() {
+            return;
+        }
+        if let Some(picker) = &self.bar.model_picker {
+            picker.update(cx, |picker, cx| picker.toggle_from_hotkey(window, cx));
+        }
     }
 
     /// Replaces the prompt text as typing would, caret at the end. The
@@ -549,6 +587,9 @@ impl Composer {
     /// Applies new props and runs the React effects that watched them.
     pub fn set_props(&mut self, props: ComposerProps, window: &mut Window, cx: &mut Context<Self>) {
         let old = std::mem::replace(&mut self.props, props);
+        if !self.props.enabled || self.props.disabled || old.session_id != self.props.session_id {
+            self.attachment_preview = None;
+        }
         let new = &self.props;
         let suggestions = old.harness != new.harness
             || old.execution_cwd != new.execution_cwd
@@ -648,7 +689,7 @@ impl Composer {
     }
 
     /// `navigationEmpty`: nothing typed, attached, or carded.
-    pub(crate) fn navigation_empty(&self) -> bool {
+    pub fn navigation_empty(&self) -> bool {
         self.draft.is_empty()
             && self.attachments.is_empty()
             && self.context_items.is_empty()
@@ -667,8 +708,12 @@ impl Composer {
 
     /// True while a popup that should keep focus is open (the focus effect
     /// skips stealing focus then).
-    pub(crate) fn any_picker_open(&self, cx: &App) -> bool {
-        self.picker_open() || self.mention_open() || self.plus_open || self.bar.any_open(cx)
+    pub fn any_picker_open(&self, cx: &App) -> bool {
+        self.picker_open()
+            || self.mention_open()
+            || self.plus_open
+            || self.bar.any_open(cx)
+            || self.attachment_preview.is_some()
     }
 
     /// `slashItems`: MonoCode's commands, then the catalog without the names
@@ -779,6 +824,8 @@ impl Composer {
 
     /// `syncHasValue`.
     pub(crate) fn sync_has_value(&mut self) {
+        self.attachment_images
+            .retain(|id, _| self.attachments.iter().any(|file| &file.id == id));
         self.has_value = !monocode_core::js::trim(&self.draft).is_empty()
             || !self.attachments.is_empty()
             || !self.context_items.is_empty()

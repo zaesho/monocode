@@ -2674,7 +2674,6 @@ export function Composer({
                   values={modelSettings}
                   allowedHarnesses={allowedModelHarnesses}
                   project={cwd}
-                  catalogCwd={executionCwd}
                   hideSettings={controlsBeside}
                   hotkeys={hotkeys && enabled}
                   onChange={onModelChange}
@@ -2685,7 +2684,6 @@ export function Composer({
                 />
                 {controlsBeside ? (
                   <ModelControlPills
-                    project={executionCwd}
                     harness={harness}
                     model={model}
                     values={modelSettings}

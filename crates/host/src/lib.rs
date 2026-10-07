@@ -18,6 +18,7 @@ pub mod browse;
 pub mod child_backend;
 pub mod cli;
 pub mod commands;
+pub mod context_assets;
 pub mod engine;
 pub mod git_branches;
 pub mod git_worktrees;

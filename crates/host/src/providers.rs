@@ -3,16 +3,19 @@
 //!
 //! The TypeScript imported each provider's functions. Here they are the
 //! registered harness adapters, called directly rather than through the
-//! registry's queues and idle parking, as the Node host called them.
+//! registry's queues and idle parking, as the Node host called them. The
+//! engine prepares each turn with `prepare_context_transfer_input`, as the
+//! registry does for desktop turns.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use monocode_core::harness_event::{ApprovalDecision, CompactContextInput, SendTurnInput};
+use monocode_core::harness_event::{ApprovalDecision, CompactContextInput};
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{AgentModel, HarnessId};
+use monocode_harness::core::context_transfer::{ContextTransferCapabilities, PreparedTurn};
 use monocode_harness::core::registry::{EventSink, HarnessAdapter, HarnessRegistry, TitleInput};
 use monocode_harness::core::session_title::GeneratedSessionTitle;
 use monocode_harness::core::task::SharedSpawner;
@@ -24,7 +27,14 @@ pub type ProviderFuture<T> = BoxFuture<'static, Result<T, String>>;
 
 /// `HostProvider`: what the engine needs from one provider.
 pub trait HostProvider: Send + Sync {
-    fn send(&self, input: SendTurnInput, on_event: EventSink) -> ProviderFuture<()>;
+    /// Runs a turn prepared by `prepare_context_transfer_input`. Its
+    /// `transfer` is present only for a provider that imports shared history
+    /// natively.
+    fn send(&self, turn: PreparedTurn) -> ProviderFuture<()>;
+    /// `contextTransferCapabilities`: how the provider takes shared history.
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        None
+    }
     /// Whether [`HostProvider::compact`] exists (`provider.compact != null`).
     fn can_compact(&self) -> bool {
         false
@@ -33,8 +43,23 @@ pub trait HostProvider: Send + Sync {
         async { Err("Context compaction is unavailable for this provider".to_string()) }.boxed()
     }
     fn cancel(&self, id: &str) -> ProviderFuture<()>;
-    /// Stops the child and drops its callbacks.
+    /// Stops the child and drops its callbacks. The provider conversation
+    /// stays available to `bind`.
     fn stop(&self, id: &str) -> ProviderFuture<()>;
+    /// Stops the child and forgets its conversation, so the next turn starts
+    /// a fresh one.
+    fn forget(&self, id: &str) -> ProviderFuture<()> {
+        self.stop(id)
+    }
+    /// The child stays running between turns, so it can start turns of its
+    /// own, until idle parking stops it.
+    fn persistent(&self) -> bool {
+        false
+    }
+    /// The idle child still has work that can wake it.
+    fn needs_process(&self, _id: &str) -> bool {
+        false
+    }
     /// Keeps the provider conversation for an explicit later follow-up.
     fn bind(&self, id: &str, provider_id: &str, cwd: &str);
     fn approve(&self, id: &str, request: i64, decision: ApprovalDecision) -> Result<(), String>;
@@ -92,15 +117,33 @@ impl AdapterProvider {
 }
 
 impl HostProvider for AdapterProvider {
-    fn send(&self, input: SendTurnInput, on_event: EventSink) -> ProviderFuture<()> {
+    fn send(&self, turn: PreparedTurn) -> ProviderFuture<()> {
         let adapter = self.adapter.clone();
         async move {
-            adapter
-                .send_turn(input, on_event, None)
-                .await
-                .map_err(message)
+            match turn.transfer {
+                Some(transfer) => {
+                    adapter
+                        .send_turn_with_context(
+                            turn.input,
+                            transfer,
+                            turn.on_event,
+                            turn.on_accepted,
+                        )
+                        .await
+                }
+                None => {
+                    adapter
+                        .send_turn(turn.input, turn.on_event, turn.on_accepted)
+                        .await
+                }
+            }
+            .map_err(message)
         }
         .boxed()
+    }
+
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        self.adapter.context_transfer_capabilities()
     }
 
     fn can_compact(&self) -> bool {
@@ -125,7 +168,20 @@ impl HostProvider for AdapterProvider {
 
     fn stop(&self, id: &str) -> ProviderFuture<()> {
         let (adapter, id) = (self.adapter.clone(), id.to_string());
+        async move { adapter.stop_session(id).await.map_err(message) }.boxed()
+    }
+
+    fn forget(&self, id: &str) -> ProviderFuture<()> {
+        let (adapter, id) = (self.adapter.clone(), id.to_string());
         async move { adapter.forget_session(id).await.map_err(message) }.boxed()
+    }
+
+    fn persistent(&self) -> bool {
+        self.adapter.id() == HarnessId::Claude
+    }
+
+    fn needs_process(&self, id: &str) -> bool {
+        self.adapter.needs_process(id)
     }
 
     fn bind(&self, id: &str, provider_id: &str, cwd: &str) {
@@ -162,7 +218,7 @@ impl HostProvider for AdapterProvider {
         let (adapter, cwd, text) = (self.adapter.clone(), cwd.to_string(), text.to_string());
         async move {
             adapter
-                .generate_branch_name(cwd, text)
+                .generate_branch_name(cwd, text, None)
                 .await
                 .map_err(message)
         }

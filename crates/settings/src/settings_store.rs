@@ -16,7 +16,7 @@ use crate::storage_flags::{read_flag, write_flag};
 
 /// Every localStorage key `AppSettings::from_local_storage` reads: each
 /// `*_KEY` constant in `monocode_core`.
-pub const APP_SETTINGS_KEYS: [&str; 52] = [
+pub const APP_SETTINGS_KEYS: [&str; 53] = [
     // settings.rs
     SECTION_KEY,
     FOLLOW_UP_BEHAVIOR_KEY,
@@ -61,6 +61,7 @@ pub const APP_SETTINGS_KEYS: [&str; 52] = [
     appearance::CHAT_BACKGROUND_BLUR_KEY,
     appearance::NEW_THREAD_BACKGROUND_EFFECT_KEY,
     appearance::CHANGES_VIEW_KEY,
+    appearance::DIFF_PALETTE_KEY,
     appearance::SHOW_EXCLUDED_FILES_KEY,
     appearance::UI_SCALE_KEY,
     // models.rs
@@ -259,6 +260,34 @@ pub fn subscribe_live_agents_enabled(
     on_store_change: impl Fn() + Send + Sync + 'static,
 ) -> Subscription {
     on_change(kv, LIVE_AGENTS_ENABLED_KEY, on_store_change)
+}
+
+/// Agents in any thread may list project sessions and open new ones,
+/// without `/operator`. Lives here rather than in `monocode_core` because the
+/// Tauri app has no such setting.
+pub const AGENT_SESSIONS_ENABLED_KEY: &str = "monocode.agentSessionsEnabled";
+pub const AGENT_SESSIONS_ENABLED_DEFAULT: bool = true;
+/// Sessions an agent opens without `/operator` start as unsent drafts the
+/// user reviews.
+pub const AGENT_SESSIONS_REVIEW_KEY: &str = "monocode.agentSessionsReview";
+pub const AGENT_SESSIONS_REVIEW_DEFAULT: bool = false;
+
+/// Whether agents may open sessions without `/operator`.
+pub fn load_agent_sessions_enabled(kv: &Kv) -> bool {
+    read_flag(kv, AGENT_SESSIONS_ENABLED_KEY).unwrap_or(AGENT_SESSIONS_ENABLED_DEFAULT)
+}
+
+pub fn save_agent_sessions_enabled(kv: &Kv, value: bool) {
+    write_flag(kv, AGENT_SESSIONS_ENABLED_KEY, value);
+}
+
+/// Whether sessions agents open without `/operator` wait as drafts.
+pub fn load_agent_sessions_review(kv: &Kv) -> bool {
+    read_flag(kv, AGENT_SESSIONS_REVIEW_KEY).unwrap_or(AGENT_SESSIONS_REVIEW_DEFAULT)
+}
+
+pub fn save_agent_sessions_review(kv: &Kv, value: bool) {
+    write_flag(kv, AGENT_SESSIONS_REVIEW_KEY, value);
 }
 
 /// `loadCloseToTray`: Close to tray is Windows-only, so other platforms read
@@ -484,6 +513,17 @@ pub fn current_keybindings(kv: &Kv, platform: Platform) -> Vec<KeybindingRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_open_sessions_by_default_without_review() {
+        let kv = Kv::in_memory();
+        assert!(load_agent_sessions_enabled(&kv));
+        assert!(!load_agent_sessions_review(&kv));
+        save_agent_sessions_enabled(&kv, false);
+        save_agent_sessions_review(&kv, true);
+        assert!(!load_agent_sessions_enabled(&kv));
+        assert!(load_agent_sessions_review(&kv));
+    }
     use monocode_core::shortcut::Modifiers;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

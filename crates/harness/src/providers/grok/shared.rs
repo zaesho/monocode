@@ -32,6 +32,15 @@ pub fn selected_outcome(option_id: &str) -> Value {
     json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
 }
 
+/// `permissionOutcome`: the selected option, or `cancelled` when there is
+/// none to pick.
+pub fn permission_outcome(option_id: Option<&str>) -> Value {
+    match option_id {
+        Some(option_id) => selected_outcome(option_id),
+        None => json!({ "outcome": { "outcome": "cancelled" } }),
+    }
+}
+
 /// `respondError(id, { code: -32601, message: "Method not found: ..." })`,
 /// with the error ignored.
 pub async fn respond_method_not_found(acp: &AcpClient, id: i64, method: &str) {

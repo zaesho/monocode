@@ -452,11 +452,15 @@ fn handle_frame(session: &LiveText, rec: &Rec) {
             match delta.kind {
                 PiDeltaKind::Text => {
                     state.output = join_stream_text(&state.output, &delta.text);
-                    events.push(HarnessEvent::MessageDelta { text: delta.text });
+                    events.push(HarnessEvent::MessageDelta {
+                        text: delta.text,
+                        append: None,
+                    });
                 }
-                PiDeltaKind::Thinking => {
-                    events.push(HarnessEvent::ReasoningDelta { text: delta.text })
-                }
+                PiDeltaKind::Thinking => events.push(HarnessEvent::ReasoningDelta {
+                    text: delta.text,
+                    append: None,
+                }),
             }
         }
         let mut finished = None;
@@ -532,10 +536,12 @@ mod tests {
             *events.lock(),
             vec![
                 HarnessEvent::ReasoningDelta {
-                    text: "Checking".into()
+                    text: "Checking".into(),
+                    append: None,
                 },
                 HarnessEvent::MessageDelta {
-                    text: "Partial answer".into()
+                    text: "Partial answer".into(),
+                    append: None,
                 },
             ]
         );

@@ -100,6 +100,9 @@ pub struct PromptResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptInput {
     pub session_id: String,
+    /// The id the user message gets. MonoCode picks it so it can tell its own
+    /// messages apart in the durable history.
+    pub message_id: Option<String>,
     pub model: ParsedOpenCodeModelSlug,
     pub agent: Option<String>,
     pub variant: Option<String>,
@@ -124,7 +127,7 @@ impl<'a> PromptBody<'a> {
         let present =
             |value: &'a Option<String>| value.as_deref().filter(|value| !value.is_empty());
         Self {
-            message_id: None,
+            message_id: present(&input.message_id),
             model: &input.model,
             agent: present(&input.agent),
             variant: present(&input.variant),
@@ -217,6 +220,22 @@ impl OpenCodeClient {
         session_from(value)
     }
 
+    /// `getAgents`: the effective agents and their ordered permission rules.
+    pub async fn get_agents(&self) -> Result<Value> {
+        let value = self
+            .request("GET", "/agent", RequestOptions::default())
+            .await?;
+        Ok(value.unwrap_or(Value::Null))
+    }
+
+    /// `getConfig`: the server's merged configuration.
+    pub async fn get_config(&self) -> Result<Value> {
+        let value = self
+            .request("GET", "/config", RequestOptions::default())
+            .await?;
+        Ok(value.unwrap_or(Value::Null))
+    }
+
     /// `getMessages`. `None` when the server did not return a list.
     pub async fn get_messages(&self, session_id: &str) -> Result<Option<Vec<OpenCodeMessage>>> {
         let value = self
@@ -232,30 +251,19 @@ impl OpenCodeClient {
             .map(|messages| messages.iter().map(OpenCodeMessage::from_value).collect()))
     }
 
-    pub async fn session_is_busy(&self, session_id: &str) -> Result<bool> {
-        let value = self
+    /// `sessionStatus`: `idle`, `busy`, or `retry`. OpenCode v1 removes idle
+    /// entries, so a session missing from `/session/status` is idle.
+    pub async fn session_status(&self, session_id: &str) -> Result<String> {
+        let statuses = self
             .request("GET", "/session/status", RequestOptions::default())
             .await?;
-        Ok(value
+        Ok(statuses
             .as_ref()
-            .and_then(|value| value.get(session_id))
+            .and_then(|statuses| statuses.get(session_id))
             .and_then(|status| status.get("type"))
             .and_then(Value::as_str)
-            .is_some_and(|status| status != "idle"))
-    }
-
-    pub async fn get_agents(&self) -> Result<Value> {
-        Ok(self
-            .request("GET", "/agent", RequestOptions::default())
-            .await?
-            .unwrap_or(Value::Null))
-    }
-
-    pub async fn get_config(&self) -> Result<Value> {
-        Ok(self
-            .request("GET", "/config", RequestOptions::default())
-            .await?
-            .unwrap_or(Value::Null))
+            .unwrap_or("idle")
+            .to_string())
     }
 
     pub async fn create_session(
@@ -314,7 +322,7 @@ impl OpenCodeClient {
         session_from(value)
     }
 
-    /// Confirm that the server received the cancellation request.
+    /// `abortSession`. A cancel reports a failure, so it is returned.
     pub async fn abort_session(&self, session_id: &str) -> Result<()> {
         self.request(
             "POST",
@@ -364,21 +372,11 @@ impl OpenCodeClient {
     /// `promptAsync`: start a turn. The reply has no body; the event stream
     /// reports the turn.
     pub async fn prompt_async(&self, input: &PromptInput) -> Result<()> {
-        self.prompt_async_for_message(input, None).await
-    }
-
-    pub async fn prompt_async_for_message(
-        &self,
-        input: &PromptInput,
-        message_id: Option<&str>,
-    ) -> Result<()> {
-        let mut body = PromptBody::new(input);
-        body.message_id = message_id;
         self.request(
             "POST",
             &format!("/session/{}/prompt_async", enc(&input.session_id)),
             RequestOptions {
-                body: json_body(&body),
+                body: json_body(&PromptBody::new(input)),
                 ..Default::default()
             },
         )
@@ -725,6 +723,7 @@ mod tests {
                 provider_id: "openai".into(),
                 model_id: "gpt-5.4".into(),
             },
+            message_id: None,
             agent: Some("build".into()),
             variant: Some(String::new()),
             parts: vec![OpenCodePromptPart::Text { text: "hi".into() }],

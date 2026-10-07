@@ -585,13 +585,21 @@ fn setup_with(cx: &mut TestAppContext, transport: FakeTransport) -> Setup {
 
 const PROJECT: &str = "remote://env/home/me/repo";
 
-fn descriptor() -> Value {
+/// The descriptor of a host that also advertises `extra` capabilities.
+fn descriptor_with(extra: &[&str]) -> Value {
+    let mut capabilities = vec![
+        "changes.wait",
+        "attachments.upload",
+        "sessions.plan",
+        "sessions.draft",
+    ];
+    capabilities.extend_from_slice(extra);
     json!({
         "protocolVersion": 1,
         "environmentId": "env",
         "name": "mini",
         "providers": ["codex", "claude"],
-        "capabilities": ["changes.wait", "attachments.upload", "sessions.plan", "sessions.draft"],
+        "capabilities": capabilities,
         "hostVersion": "0.6.0"
     })
 }
@@ -632,6 +640,8 @@ struct Host {
     next_session: String,
     dispatch_error: Option<String>,
     on_send: Option<fn(&mut Host, &Value)>,
+    /// Capabilities beyond the base set, such as provider switching.
+    capabilities: Vec<&'static str>,
 }
 
 fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
@@ -643,7 +653,7 @@ fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
     transport.set_handler(move |_, method, params| {
         let mut host = state.lock();
         let reply = match method {
-            "environment.describe" => Reply::Value(descriptor()),
+            "environment.describe" => Reply::Value(descriptor_with(&host.capabilities)),
             "models.list" => Reply::Value(catalog()),
             "changes.wait" => Reply::Hold,
             "sessions.list" => Reply::Value(json!([])),
@@ -677,6 +687,27 @@ fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
                     && let Some(on_send) = host.on_send
                 {
                     on_send(&mut host, params);
+                }
+                // The host side of RemoteSession.test.ts `dispatch`.
+                if let Some(value) = host.sessions.get_mut(&session_id) {
+                    let revision = value["revision"].as_i64().unwrap_or_default();
+                    match params["type"].as_str() {
+                        Some("switchProvider") => {
+                            value["revision"] = json!(revision + 1);
+                            for key in ["harness", "model", "modelSettings", "runtimeMode"] {
+                                value["session"][key] = params[key].clone();
+                            }
+                        }
+                        Some("confirmProviderInspection") => {
+                            value["revision"] = json!(revision + 1);
+                            if let Some(context) =
+                                value["session"]["providerContext"].as_object_mut()
+                            {
+                                context.remove("delivery");
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Reply::Value(json!({
                     "commandId": params["commandId"],
@@ -1058,6 +1089,7 @@ fn a_rejected_command_leaves_the_outbox_and_shows_the_error(cx: &mut TestAppCont
                 failed_draft: Some(false),
                 error: "Host rejected request: Session is busy".into(),
                 catalog_problem: String::new(),
+                inspection: None,
             }
         );
         assert!(tab.session(cx).blocks.is_empty());
@@ -1529,3 +1561,5 @@ fn real_host_answers_in_the_shapes_the_client_reads() {
     request("devices.revokeSelf", json!({})).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+mod provider_switch;

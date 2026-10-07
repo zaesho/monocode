@@ -1,10 +1,12 @@
 //! Port of src/integrations/harness/core/acp.ts: the ACP JSON-RPC client, a
-//! thin wrapper over [`JsonRpcClient`] that keeps the numeric request ids the
-//! Cursor adapter was written against.
+//! thin wrapper over [`JsonRpcClient`] that hands adapters numeric request
+//! ids and replies with the agent's original ids.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -42,22 +44,49 @@ impl AcpHandlers {
     }
 }
 
-/// `Number(id)` for an inbound request id.
-fn numeric_id(id: &JsonRpcId) -> i64 {
-    match id {
-        JsonRpcId::Number(id) => *id,
-        JsonRpcId::String(text) => {
-            let text = text.trim();
-            if text.is_empty() {
-                return 0;
-            }
-            // TODO(port): `Number("abc")` is NaN in TypeScript, which then
-            // serialized as `null` in a response. This reads it as 0.
-            text.parse::<i64>()
-                .ok()
-                .or_else(|| text.parse::<f64>().ok().map(|value| value as i64))
-                .unwrap_or(0)
+/// The largest id the remote host accepts for a UI approval
+/// (`Number.MAX_SAFE_INTEGER`).
+const MAX_UI_REQUEST_ID: i64 = (1 << 53) - 1;
+
+/// Maps the numeric ids handed to adapters back to the agent's raw request
+/// ids. Non-negative safe integer ids pass through. String ids and ids out of
+/// that range get unused numbers counted down from [`MAX_UI_REQUEST_ID`].
+struct RequestIds {
+    raw: HashMap<i64, JsonRpcId>,
+    next: i64,
+}
+
+impl Default for RequestIds {
+    fn default() -> Self {
+        Self {
+            raw: HashMap::new(),
+            next: MAX_UI_REQUEST_ID,
         }
+    }
+}
+
+impl RequestIds {
+    fn allocate(&mut self, id: JsonRpcId) -> i64 {
+        let mut numeric = match id {
+            JsonRpcId::Number(id) if (0..=MAX_UI_REQUEST_ID).contains(&id) => id,
+            _ => self.take_next(),
+        };
+        while self.raw.contains_key(&numeric) {
+            numeric = self.take_next();
+        }
+        self.raw.insert(numeric, id);
+        numeric
+    }
+
+    fn take_next(&mut self) -> i64 {
+        let next = self.next;
+        self.next -= 1;
+        next
+    }
+
+    /// The raw id for a reply. Each id answers once.
+    fn take(&mut self, id: i64) -> JsonRpcId {
+        self.raw.remove(&id).unwrap_or(JsonRpcId::Number(id))
     }
 }
 
@@ -65,6 +94,7 @@ fn numeric_id(id: &JsonRpcId) -> i64 {
 #[derive(Clone)]
 pub struct AcpClient {
     rpc: JsonRpcClient,
+    request_ids: Arc<Mutex<RequestIds>>,
 }
 
 impl AcpClient {
@@ -89,9 +119,12 @@ impl AcpClient {
         if let Some(on_notification) = handlers.on_notification {
             rpc_handlers.on_notification = Some(on_notification);
         }
+        let request_ids = Arc::new(Mutex::new(RequestIds::default()));
         if let Some(on_request) = handlers.on_request {
+            let request_ids = request_ids.clone();
             rpc_handlers.on_request = Some(Arc::new(move |id: JsonRpcId, method: &str, params| {
-                on_request(numeric_id(&id), method, params)
+                let numeric = request_ids.lock().allocate(id);
+                on_request(numeric, method, params)
             }));
         }
         let rpc = JsonRpcClient::new(
@@ -104,7 +137,7 @@ impl AcpClient {
                 ..options
             },
         );
-        Self { rpc }
+        Self { rpc, request_ids }
     }
 
     /// The underlying client.
@@ -118,6 +151,7 @@ impl AcpClient {
 
     pub fn close(&self, error: Option<&str>) {
         self.rpc.close(error);
+        self.request_ids.lock().raw.clear();
     }
 
     pub fn reject_pending(&self, error: Option<&str>) {
@@ -150,12 +184,16 @@ impl AcpClient {
         self.rpc.notify(method, params).await
     }
 
+    /// Reply to the request the adapter knows as `id`, using the agent's
+    /// original id.
     pub async fn respond(&self, id: i64, result: Value) -> Result<()> {
-        self.rpc.respond(JsonRpcId::Number(id), result).await
+        let raw = self.request_ids.lock().take(id);
+        self.rpc.respond(raw, result).await
     }
 
     pub async fn respond_error(&self, id: i64, error: RpcErrorBody) -> Result<()> {
-        self.rpc.respond_error(JsonRpcId::Number(id), error).await
+        let raw = self.request_ids.lock().take(id);
+        self.rpc.respond_error(raw, error).await
     }
 }
 
@@ -163,7 +201,6 @@ impl AcpClient {
 mod tests {
     use super::*;
     use crate::core::task::BoxFuture;
-    use parking_lot::Mutex;
 
     struct Recorder(Mutex<Vec<String>>);
 
@@ -175,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn sends_jsonrpc_and_hands_numeric_request_ids() {
+    fn sends_jsonrpc_and_replies_with_the_original_request_id() {
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         let ids = Arc::new(Mutex::new(Vec::new()));
         let seen = ids.clone();
@@ -190,11 +227,14 @@ mod tests {
         assert_eq!(
             *ids.lock(),
             vec![
-                (12, "session/request_permission".to_string()),
+                (MAX_UI_REQUEST_ID, "session/request_permission".to_string()),
                 (4, "fs/read_text_file".to_string())
             ]
         );
-        smol::block_on(client.respond(12, serde_json::json!({ "outcome": "allow" }))).unwrap();
+        smol::block_on(
+            client.respond(MAX_UI_REQUEST_ID, serde_json::json!({ "outcome": "allow" })),
+        )
+        .unwrap();
         smol::block_on(client.notify(
             "session/cancel",
             Some(serde_json::json!({ "sessionId": "x" })),
@@ -203,10 +243,67 @@ mod tests {
         assert_eq!(
             *recorder.0.lock(),
             vec![
-                r#"{"jsonrpc":"2.0","id":12,"result":{"outcome":"allow"}}"#.to_string(),
+                r#"{"jsonrpc":"2.0","id":"12","result":{"outcome":"allow"}}"#.to_string(),
                 r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"x"}}"#
                     .to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn maps_string_and_colliding_ids_to_unique_numbers_and_replies_with_raw_ids() {
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let seen = ids.clone();
+        let client = AcpClient::new(
+            "acp-ids",
+            recorder.clone(),
+            AcpHandlers::default().on_request(move |id, _, _| seen.lock().push(id)),
+        );
+        let incoming = [
+            serde_json::json!("permission-abc"),
+            serde_json::json!(MAX_UI_REQUEST_ID),
+            serde_json::json!("12"),
+            serde_json::json!(12),
+            serde_json::json!(-1),
+        ];
+        for id in &incoming {
+            client.push_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "session/request_permission",
+                    "params": {},
+                })
+                .to_string(),
+            );
+        }
+        let numeric = ids.lock().clone();
+        assert_eq!(
+            numeric
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            incoming.len()
+        );
+        assert!(
+            numeric
+                .iter()
+                .all(|id| (0..=MAX_UI_REQUEST_ID).contains(id))
+        );
+        for id in numeric {
+            smol::block_on(client.respond(
+                id,
+                serde_json::json!({ "outcome": { "outcome": "cancelled" } }),
+            ))
+            .unwrap();
+        }
+        let sent: Vec<Value> = recorder
+            .0
+            .lock()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["id"].clone())
+            .collect();
+        assert_eq!(sent, incoming.to_vec());
     }
 }

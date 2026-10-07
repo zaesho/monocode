@@ -5,6 +5,7 @@
 //! src/features/settings/model (MCP).
 
 pub mod acceptance;
+pub mod app_access;
 pub mod attachments;
 #[cfg(feature = "attention")]
 pub mod attention_glue;
@@ -26,10 +27,15 @@ pub mod monocode_tool_call;
 pub mod operator_command;
 pub mod paths;
 pub mod pipeline;
+/// The history export moved to `monocode_core` so the harness adapters and
+/// the remote host can use it too.
+pub use monocode_core::portable_context;
 pub mod prefs;
 pub mod prompt;
+pub mod provider_switch;
 pub mod quote_draft;
 pub mod second_opinion;
+pub mod session_context;
 pub mod session_folder_command;
 pub mod skills;
 pub mod text;

@@ -31,10 +31,11 @@ use monocode_layout::GitFileDiffKind;
 use monocode_markdown::{LinkClick, MarkdownView};
 use monocode_ui::widgets::{PopoverSide, popover_frame};
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
+use monocode_view_transcript::transcript::view::style::{MarkdownVariant, markdown_style};
 
 use crate::data::{EditorNavigation, FilesData};
 use crate::markdown_shell::{
-    MarkdownViewMode, markdown_view_shell, remember_mode, remembered_mode,
+    MarkdownViewMode, markdown_view_shell, remember_mode, remembered_mode_or,
     split_markdown_frontmatter,
 };
 use crate::paths::{basename, display_path};
@@ -222,8 +223,19 @@ impl FileEditorSurface {
                 this.load_git_base(cx);
             }
         });
+        let appearance = cx.observe_global::<Theme>(|this, cx| {
+            if let Some(preview) = this.preview.clone() {
+                let style = markdown_style(Theme::of(cx), MarkdownVariant::Normal);
+                preview.update(cx, |preview, cx| preview.set_style(style, cx));
+            }
+            if let Some(editor) = this.editor.clone() {
+                let theme = crate::editor_theme(cx);
+                editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
+            }
+            cx.notify();
+        });
         let mut this = Self {
-            mode: remembered_mode(&path, cx),
+            mode: remembered_mode_or(&path, MarkdownViewMode::Preview, cx),
             data,
             path,
             cwd: cwd.into(),
@@ -255,7 +267,7 @@ impl FileEditorSurface {
             _watch: None,
             _git: None,
             _editor_subscriptions: Vec::new(),
-            _subscriptions: vec![activation],
+            _subscriptions: vec![activation, appearance],
         };
         this.load(window, cx);
         this
@@ -335,6 +347,9 @@ impl FileEditorSurface {
             return;
         }
         self.show_diff = show;
+        self.mode = self.remembered_mode(cx);
+        self.sync_search_active(cx);
+        cx.notify();
         if show {
             let weak = cx.entity().downgrade();
             self._git = Some(self.data.subscribe_git_changed(
@@ -377,12 +392,33 @@ impl FileEditorSurface {
             return;
         }
         self.path = path;
-        self.mode = remembered_mode(&self.path, cx);
+        self.mode = self.remembered_mode(cx);
         self.git_base = None;
         self.load(window, cx);
         if self.show_diff {
             self.load_git_base(cx);
         }
+    }
+
+    /// Where this tab's mode is remembered. A diff tab keeps its own, so
+    /// opening a review does not change how the plain tab shows the file.
+    fn mode_key(&self) -> String {
+        if self.show_diff {
+            format!("review:{}", self.path)
+        } else {
+            self.path.clone()
+        }
+    }
+
+    /// Diff tabs open as source, because the git gutter only draws in the
+    /// editor. Other tabs open as preview.
+    fn remembered_mode(&self, cx: &App) -> MarkdownViewMode {
+        let fallback = if self.show_diff {
+            MarkdownViewMode::Source
+        } else {
+            MarkdownViewMode::Preview
+        };
+        remembered_mode_or(&self.mode_key(), fallback, cx)
     }
 
     /// Switch a Markdown or SVG file between Preview and Source.
@@ -392,7 +428,7 @@ impl FileEditorSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        remember_mode(&self.path, mode, cx);
+        remember_mode(&self.mode_key(), mode, cx);
         self.mode = mode;
         self.sync_search_active(cx);
         if mode == MarkdownViewMode::Source
@@ -508,12 +544,16 @@ impl FileEditorSurface {
         let save = self.save_handler();
         let settings = self.settings;
         let path = self.path.clone();
+        let formatter_data = self.data.clone();
         let editor = cx.new(|cx| {
             let mut editor = CodeEditor::new(path, &text, theme, window, cx);
             editor.set_footer(Some(relative), cx);
             editor.on_save(save);
             editor.set_autosave(settings.autosave, window, cx);
             editor.set_format_on_save(settings.format_on_save);
+            editor.set_formatter(Some(Rc::new(move |path, source, cursor| {
+                formatter_data.format_text(path, source, cursor)
+            })));
             editor
         });
         let state = editor.read(cx).editor_state().clone();
@@ -606,7 +646,14 @@ impl FileEditorSurface {
     fn build_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let parts = split_markdown_frontmatter(&self.draft);
         self.metadata = parts.metadata;
-        let preview = cx.new(|cx| MarkdownView::with_text(parts.body, cx));
+        let style = markdown_style(Theme::of(cx), MarkdownVariant::Normal);
+        let preview = cx.new(|cx| {
+            let mut preview = MarkdownView::with_text(parts.body, cx);
+            preview.set_style(style, cx);
+            // A document's lines stay on their own lines.
+            preview.set_hard_breaks(true, cx);
+            preview
+        });
         let weak = cx.entity().downgrade();
         let cwd = self.cwd.clone();
         preview.update(cx, |preview, _| {

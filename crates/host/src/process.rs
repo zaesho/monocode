@@ -115,16 +115,7 @@ fn matches_provider(candidate: &Path, provider: RemoteProvider, name: &str) -> b
         return file_contains(candidate, &["cursor-agent"], 64 * 1024);
     }
     if provider == Pi && name == "pi" {
-        return file_contains(
-            candidate,
-            &[
-                "pi-coding-agent",
-                "@earendil-works/pi",
-                "@mariozechner/pi-coding-agent",
-                "pi_coding_agent",
-            ],
-            64 * 1024,
-        );
+        return is_pi_launch_candidate(candidate);
     }
     if provider == Fx {
         return file_contains(
@@ -166,6 +157,53 @@ fn file_contains(path: &Path, markers: &[&str], max_bytes: usize) -> bool {
             return false;
         }
     }
+}
+
+/// `PI_MARKERS`: strings that identify a Pi coding agent install.
+const PI_MARKERS: &[&str] = &[
+    "pi-coding-agent",
+    "@earendil-works/pi",
+    "@mariozechner/pi-coding-agent",
+    "pi_coding_agent",
+];
+
+/// `PI_PACKAGE_NAMES`.
+const PI_PACKAGE_NAMES: &[&str] = &[
+    "@earendil-works/pi-coding-agent",
+    "@mariozechner/pi-coding-agent",
+];
+
+/// `isPiLaunchCandidate`. npm's bin launcher for pi is a short
+/// `#!/usr/bin/env node` stub that loads `./cli-runtime.js`, and the marker
+/// strings live megabytes deeper in `dist/bundle/chunks/*.js`. So after the
+/// head scan fails, resolve symlinks (npm bins link into
+/// `lib/node_modules/<pkg>/...`), walk up to the nearest `package.json`, and
+/// compare its exact `name` with the supported Pi packages.
+fn is_pi_launch_candidate(candidate: &Path) -> bool {
+    if file_contains(candidate, PI_MARKERS, 64 * 1024) {
+        return true;
+    }
+    let Ok(real) = std::fs::canonicalize(candidate) else {
+        return false;
+    };
+    let mut directory = real.parent();
+    // A scoped package's package.json sits two folders above a nested bin
+    // script. A few hops bound the walk without leaving the package.
+    for _ in 0..6 {
+        let Some(current) = directory else {
+            return false;
+        };
+        if let Ok(text) = std::fs::read_to_string(current.join("package.json"))
+            && let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            return manifest
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| PI_PACKAGE_NAMES.contains(&name.to_lowercase().as_str()));
+        }
+        directory = current.parent();
+    }
+    false
 }
 
 #[cfg(unix)]
@@ -281,7 +319,7 @@ pub fn provider_launch(command: &str, args: &[String], platform: &str) -> Result
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use monocode_core::HarnessId;
@@ -317,6 +355,60 @@ mod tests {
             assert_ne!(resolved.as_deref(), Some(candidate.as_path()));
             assert!(!sentinel.exists());
         }
+    }
+
+    /// process.test.ts: "recognizes an npm-installed pi launcher stub through
+    /// its package manifest".
+    #[test]
+    fn recognizes_an_npm_installed_pi_launcher_stub_through_its_package_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory
+            .path()
+            .join("lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle");
+        std::fs::create_dir_all(&package).unwrap();
+        // Mirrors the real npm launcher, a short stub with none of the marker
+        // strings. Only the package manifest names the Pi agent.
+        let stub = package.join("cli.js");
+        script(
+            &stub,
+            "#!/usr/bin/env node\nimport { createRequire } from \"node:module\";\n\nenableCompileCache();\ncreateRequire(import.meta.url)(\"./cli-runtime.js\");\n",
+        );
+        std::fs::write(
+            package.join("../../package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent"}"#,
+        )
+        .unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let candidate = bin.join("pi");
+        std::os::unix::fs::symlink(&stub, &candidate).unwrap();
+        assert_eq!(
+            resolve_provider_in(HarnessId::Pi, bin.to_str()).unwrap(),
+            candidate
+        );
+    }
+
+    /// process.test.ts: "does not mistake an unrelated npm stub named pi for
+    /// the pi agent".
+    #[test]
+    fn does_not_mistake_an_unrelated_npm_stub_named_pi_for_the_pi_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory
+            .path()
+            .join("lib/node_modules/pi-coding-agent-tools/dist");
+        std::fs::create_dir_all(&package).unwrap();
+        script(&package.join("cli.js"), "#!/usr/bin/env node\n");
+        std::fs::write(
+            package.join("../../package.json"),
+            r#"{"name":"pi-coding-agent-tools"}"#,
+        )
+        .unwrap();
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let candidate = bin.join("pi");
+        std::os::unix::fs::symlink(package.join("cli.js"), &candidate).unwrap();
+        let resolved = resolve_provider_in(HarnessId::Pi, bin.to_str()).ok();
+        assert_ne!(resolved.as_deref(), Some(candidate.as_path()));
     }
 
     /// process.test.ts: "recognizes a Cursor agent shim without executing it".
@@ -359,6 +451,25 @@ mod tests {
         assert_eq!(
             provider_launch("C:\\tools\\custom.cmd", &[], "windows").unwrap_err(),
             "Unsupported Windows provider launcher"
+        );
+    }
+
+    #[test]
+    fn runs_the_npm_opencode_wrapper_entry_with_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("opencode.cmd");
+        let entry = directory
+            .path()
+            .join("node_modules/opencode-ai/bin/opencode");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "@echo off\r\n").unwrap();
+        std::fs::write(&entry, "#!/usr/bin/env node\n").unwrap();
+        assert_eq!(
+            provider_launch(&wrapper.to_string_lossy(), &["serve".into()], "windows").unwrap(),
+            Launch {
+                command: "node".into(),
+                args: vec![entry.to_string_lossy().into_owned(), "serve".into()],
+            }
         );
     }
 }

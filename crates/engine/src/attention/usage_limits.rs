@@ -14,7 +14,7 @@ use monocode_core::HarnessId;
 use monocode_core::session::UsageLimit;
 
 use super::hooks::SubmitRequest;
-use super::rate_limits::{RateLimitProvider, exhausted_window_reset_at};
+use super::rate_limits::{RateLimitProvider, exhausted_window_reset_at_for};
 use super::rate_limits_fetch::RateLimitFetcher;
 use super::usage_limit::{USAGE_LIMIT_RESUME_GRACE_MS, usage_limit_resume_due};
 use super::{Attention, Clock};
@@ -169,16 +169,18 @@ impl UsageLimits {
                 .unwrap_or_else(|| "default".into());
             lookups.push((
                 session.id.clone(),
+                session.model.clone(),
                 limit,
                 self.fetcher.fetch(provider, &account),
             ));
         }
         // A limit that went away can come back as a new one.
         self.lookups.retain(|key| current.contains(key));
-        for (session_id, limit, fetch) in lookups {
+        for (session_id, model, limit, fetch) in lookups {
             cx.spawn(async move |_, cx| {
                 let limits = fetch.await;
-                let Some(resets_at) = exhausted_window_reset_at(&limits) else {
+                // A model's own weekly limit can be what stopped it.
+                let Some(resets_at) = exhausted_window_reset_at_for(&limits, Some(&model)) else {
                     return;
                 };
                 cx.update(|cx| {

@@ -29,12 +29,37 @@ use monocode_core::harness_event::{
 };
 use monocode_core::user_question::UserQuestionReply;
 
+use super::context_transfer::{
+    ContextTransferCapabilities, ContextTransferInput, prepare_context_transfer_input,
+};
 use super::native_commands::NativeCommandProvider;
 use super::session_title::GeneratedSessionTitle;
 use super::task::{AbortSignal, BoxFuture, SharedSpawner};
 
 /// `onEvent`: where an adapter reports what its harness did.
 pub type EventSink = Arc<dyn Fn(HarnessEvent) + Send + Sync>;
+
+/// Where a catalog refresh looks: the working directory and provider
+/// account whose settings decide the models a CLI offers. `force` re-reads
+/// a catalog that already loaded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CatalogScope {
+    pub cwd: Option<String>,
+    pub provider_account_id: Option<String>,
+    pub force: bool,
+}
+
+impl CatalogScope {
+    /// A scope names a working directory or an account.
+    pub fn is_scoped(&self) -> bool {
+        self.cwd.is_some() || self.provider_account_id.is_some()
+    }
+}
+
+/// Where events go that belong to no running send: a turn the provider
+/// started on its own after the last one ended, such as a scheduled wakeup.
+/// Takes the session id.
+pub type AmbientEvents = Arc<dyn Fn(&str, HarnessEvent) + Send + Sync>;
 
 /// `onAccepted`: called once the provider has accepted the user turn.
 pub type AcceptedHook = Arc<dyn Fn() + Send + Sync>;
@@ -158,6 +183,25 @@ pub trait HarnessAdapter: Send + Sync {
         on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>>;
 
+    /// `contextTransferCapabilities`: how this adapter takes shared history
+    /// from another provider. `None` means attributed text only.
+    fn context_transfer_capabilities(&self) -> Option<ContextTransferCapabilities> {
+        None
+    }
+
+    /// `sendTurn` with shared history for an adapter whose capabilities set
+    /// `native_messages`. The registry gives every other adapter the history
+    /// as text in `input`.
+    fn send_turn_with_context(
+        &self,
+        input: SendTurnInput,
+        _transfer: ContextTransferInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> BoxFuture<'_, Result<()>> {
+        self.send_turn(input, on_event, on_accepted)
+    }
+
     /// Trigger provider-owned compaction outside the normal user-turn path.
     fn compact_context(
         &self,
@@ -190,6 +234,12 @@ pub trait HarnessAdapter: Send + Sync {
     /// Kill the child but keep resume state for a later rebind.
     fn stop_session(&self, session_id: String) -> BoxFuture<'_, Result<()>>;
 
+    /// `needsProcess`: the child still has work that can wake it, such as a
+    /// scheduled job, so idle parking must keep it.
+    fn needs_process(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Drop resume state and kill the child (delete, harness switch, idle detach).
     fn forget_session(&self, session_id: String) -> BoxFuture<'_, Result<()>>;
 
@@ -210,7 +260,15 @@ pub trait HarnessAdapter: Send + Sync {
         ok(())
     }
 
-    fn refresh_catalog_for_directory(&self, _cwd: &str) -> BoxFuture<'_, Result<()>> {
+    /// Read the models available in one working directory, for providers
+    /// whose catalog depends on project config.
+    fn refresh_project_catalog(&self, _cwd: String) -> BoxFuture<'_, Result<()>> {
+        ok(())
+    }
+
+    /// Refresh the model catalog overlay for a working directory and
+    /// account. Adapters whose models do not depend on them ignore the scope.
+    fn refresh_catalog_in(&self, _scope: CatalogScope) -> BoxFuture<'_, Result<()>> {
         self.refresh_catalog()
     }
 
@@ -227,6 +285,7 @@ pub trait HarnessAdapter: Send + Sync {
         &self,
         _cwd: String,
         _signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         unsupported(self.id(), "commit message generation")
     }
@@ -235,6 +294,7 @@ pub trait HarnessAdapter: Send + Sync {
     fn generate_pr_content(
         &self,
         _cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         ok(None)
     }
@@ -244,6 +304,7 @@ pub trait HarnessAdapter: Send + Sync {
         &self,
         _cwd: String,
         _message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         ok(None)
     }
@@ -295,6 +356,81 @@ impl TurnControl for ControlTurns {
     }
 }
 
+/// Marks a send as over, so its sink hands later native turns to the
+/// ambient handler.
+struct TurnEnded(Arc<Mutex<SinkPhase>>);
+
+impl TurnEnded {
+    fn end(&self) {
+        let mut phase = self.0.lock();
+        if *phase == SinkPhase::Turn {
+            *phase = SinkPhase::Ended;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SinkPhase {
+    /// The send is running: every event goes to its sink.
+    Turn,
+    /// The send ended. Events are dropped until a native turn starts.
+    Ended,
+    /// A native turn is running after the send ended: its events go to the
+    /// ambient handler until it finishes.
+    Native,
+}
+
+/// A provider can keep emitting through a send's sink after the send ended,
+/// when it starts a turn on its own. The caller's sink is gone by then, so
+/// those turns go to `ambient`. Other late events are dropped, as before.
+fn outlive_turn(
+    on_event: EventSink,
+    session_id: &str,
+    ambient: Option<AmbientEvents>,
+) -> (EventSink, TurnEnded) {
+    let phase = Arc::new(Mutex::new(SinkPhase::Turn));
+    let ended = TurnEnded(phase.clone());
+    let session_id = session_id.to_string();
+    let sink: EventSink = Arc::new(move |event| {
+        // `None` sends the event to the turn's own sink.
+        let ambient_event = {
+            let mut phase = phase.lock();
+            match *phase {
+                SinkPhase::Turn => None,
+                SinkPhase::Ended => {
+                    let native_start = matches!(
+                        event,
+                        HarnessEvent::TurnStarted {
+                            native: Some(true),
+                            ..
+                        }
+                    );
+                    if native_start {
+                        *phase = SinkPhase::Native;
+                    }
+                    Some(native_start)
+                }
+                SinkPhase::Native => {
+                    if matches!(event, HarnessEvent::TurnFinished { native: Some(true) }) {
+                        *phase = SinkPhase::Ended;
+                    }
+                    Some(true)
+                }
+            }
+        };
+        match ambient_event {
+            None => on_event(event),
+            Some(true) => {
+                if let Some(ambient) = &ambient {
+                    ambient(&session_id, event);
+                }
+            }
+            Some(false) => {}
+        }
+    });
+    (sink, ended)
+}
+
 /// `HARNESS_IDLE_PARK_MS`. After a turn settles, keep the child warm for
 /// follow-ups, then park it. Resume state stays, so the next prompt respawns
 /// instead of starting over.
@@ -306,6 +442,8 @@ pub struct RegistryOptions {
     pub turn_control: Option<Arc<dyn TurnControl>>,
     /// Defaults to [`HARNESS_IDLE_PARK_MS`]. Tests shorten it.
     pub idle_park: Duration,
+    /// Receives native turns that start after their session's send ended.
+    pub ambient_events: Option<AmbientEvents>,
 }
 
 impl Default for RegistryOptions {
@@ -313,6 +451,7 @@ impl Default for RegistryOptions {
         Self {
             turn_control: None,
             idle_park: Duration::from_millis(HARNESS_IDLE_PARK_MS as u64),
+            ambient_events: None,
         }
     }
 }
@@ -612,6 +751,13 @@ impl HarnessRegistry {
                     state.idle_park_timers.remove(&session_id);
                 }
                 let registry = HarnessRegistry { inner };
+                if registry
+                    .get_harness(harness)
+                    .is_some_and(|adapter| adapter.needs_process(&session_id))
+                {
+                    registry.schedule_idle_park(harness, &session_id);
+                    return;
+                }
                 let _ = registry.stop_harness_session(harness, &session_id).await;
             }
             .boxed(),
@@ -628,6 +774,21 @@ impl HarnessRegistry {
         &self,
         harness: HarnessId,
         input: SendTurnInput,
+        on_event: EventSink,
+        on_accepted: Option<AcceptedHook>,
+    ) -> BoxFuture<'static, Result<()>> {
+        self.send_harness_turn_with_context(harness, input, None, on_event, on_accepted)
+    }
+
+    /// `sendHarnessTurn` with the shared history of a provider switch. The
+    /// turn goes through `prepareContextTransferInput`, so acceptance is
+    /// reported once and an adapter without native import gets the history
+    /// as text.
+    pub fn send_harness_turn_with_context(
+        &self,
+        harness: HarnessId,
+        input: SendTurnInput,
+        transfer: Option<ContextTransferInput>,
         on_event: EventSink,
         on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'static, Result<()>> {
@@ -655,7 +816,37 @@ impl HarnessRegistry {
                 .lock()
                 .active_turns
                 .insert(session_id.clone());
-            let result = adapter.send_turn(input, on_event, on_accepted).await;
+            let (on_event, ended) = outlive_turn(
+                on_event,
+                &session_id,
+                registry.inner.options.ambient_events.clone(),
+            );
+            let prepared = prepare_context_transfer_input(
+                input,
+                transfer,
+                adapter.context_transfer_capabilities(),
+                on_event,
+                on_accepted,
+                registry.inner.spawner.clone(),
+            );
+            let result = match prepared.transfer {
+                Some(transfer) => {
+                    adapter
+                        .send_turn_with_context(
+                            prepared.input,
+                            transfer,
+                            prepared.on_event,
+                            prepared.on_accepted,
+                        )
+                        .await
+                }
+                None => {
+                    adapter
+                        .send_turn(prepared.input, prepared.on_event, prepared.on_accepted)
+                        .await
+                }
+            };
+            ended.end();
             registry.inner.state.lock().active_turns.remove(&session_id);
             if let Some(control) = &control {
                 control.turn_finished(&session_id);
@@ -663,6 +854,14 @@ impl HarnessRegistry {
             registry.schedule_idle_park(harness, &session_id);
             result
         })
+    }
+
+    /// `canResumeHarnessWithContext`: the adapter can resume a saved native
+    /// conversation and append only the history it lacks.
+    pub fn can_resume_harness_with_context(&self, id: HarnessId) -> bool {
+        self.get_harness(id)
+            .and_then(|adapter| adapter.context_transfer_capabilities())
+            .is_some_and(|capabilities| capabilities.resumed_append)
     }
 
     /// `canCompactHarnessContext`.
@@ -856,6 +1055,24 @@ impl HarnessRegistry {
         force: bool,
         has_live_catalog: impl Fn(HarnessId) -> bool,
     ) {
+        let scope = CatalogScope {
+            force,
+            ..CatalogScope::default()
+        };
+        self.refresh_harness_catalogs_in(ids, scope, has_live_catalog)
+            .await;
+    }
+
+    /// [`Self::refresh_harness_catalogs`] for a working directory and
+    /// account. Claude's models depend on both, so a scoped refresh reads its
+    /// catalog again even when one already loaded.
+    pub async fn refresh_harness_catalogs_in(
+        &self,
+        ids: impl IntoIterator<Item = HarnessId>,
+        scope: CatalogScope,
+        has_live_catalog: impl Fn(HarnessId) -> bool,
+    ) {
+        let force = scope.force;
         let wanted: HashSet<HarnessId> = ids.into_iter().collect();
         if wanted.is_empty() {
             return;
@@ -865,37 +1082,31 @@ impl HarnessRegistry {
             .into_iter()
             .filter(|adapter| wanted.contains(&adapter.id()))
             .filter(|adapter| adapter.capabilities().refresh_catalog)
-            .filter(|adapter| force || !has_live_catalog(adapter.id()))
-            .map(|adapter| async move {
-                if let Err(error) = adapter.refresh_catalog().await {
-                    log::debug!("[monocode] {} catalog {error:#}", adapter.id());
+            .filter(|adapter| {
+                force
+                    || (adapter.id() == HarnessId::Claude && scope.is_scoped())
+                    || !has_live_catalog(adapter.id())
+            })
+            .map(|adapter| {
+                let scope = scope.clone();
+                async move {
+                    if let Err(error) = adapter.refresh_catalog_in(scope).await {
+                        log::debug!("[monocode] {} catalog {error:#}", adapter.id());
+                    }
                 }
             });
         futures::future::join_all(refreshes).await;
     }
 
-    pub async fn refresh_harness_catalogs_for_directory(
-        &self,
-        ids: impl IntoIterator<Item = HarnessId>,
-        cwd: &str,
-        has_live_catalog: impl Fn(HarnessId) -> bool,
-    ) {
-        let wanted: HashSet<HarnessId> = ids.into_iter().collect();
-        let refreshes = self
-            .list_harnesses()
-            .into_iter()
-            .filter(|adapter| {
-                wanted.contains(&adapter.id()) && adapter.capabilities().refresh_catalog
-            })
-            .filter(|adapter| {
-                adapter.id() == HarnessId::Opencode || !has_live_catalog(adapter.id())
-            })
-            .map(|adapter| async move {
-                if let Err(error) = adapter.refresh_catalog_for_directory(cwd).await {
-                    log::debug!("[monocode] {} project catalog {error:#}", adapter.id());
-                }
-            });
-        futures::future::join_all(refreshes).await;
+    /// `refreshProjectOpenCodeCatalog`, for any provider: read the catalog
+    /// `harness` offers in `cwd`. Failures are logged.
+    pub async fn refresh_project_harness_catalog(&self, harness: HarnessId, cwd: &str) {
+        let Some(adapter) = self.get_harness(harness) else {
+            return;
+        };
+        if let Err(error) = adapter.refresh_project_catalog(cwd.to_string()).await {
+            log::debug!("[monocode] {harness} project catalog {error:#}");
+        }
     }
 
     /// `generateHarnessTitle`.
@@ -918,6 +1129,7 @@ impl HarnessRegistry {
         harness: HarnessId,
         cwd: &str,
         signal: Option<AbortSignal>,
+        provider_account_id: Option<&str>,
     ) -> Result<String> {
         let adapter = self.require_harness(harness)?;
         if !adapter.capabilities().generate_commit_message {
@@ -927,7 +1139,11 @@ impl HarnessRegistry {
             signal.throw_if_aborted()?;
         }
         adapter
-            .generate_commit_message(cwd.to_string(), signal)
+            .generate_commit_message(
+                cwd.to_string(),
+                signal,
+                provider_account_id.map(str::to_string),
+            )
             .await
     }
 
@@ -936,10 +1152,13 @@ impl HarnessRegistry {
         &self,
         harness: HarnessId,
         cwd: &str,
+        provider_account_id: Option<&str>,
     ) -> Result<Option<GeneratedPrContent>> {
         match self.get_harness(harness) {
             Some(adapter) if adapter.capabilities().generate_pr_content => {
-                adapter.generate_pr_content(cwd.to_string()).await
+                adapter
+                    .generate_pr_content(cwd.to_string(), provider_account_id.map(str::to_string))
+                    .await
             }
             _ => Ok(None),
         }
@@ -951,11 +1170,16 @@ impl HarnessRegistry {
         harness: HarnessId,
         cwd: &str,
         message: &str,
+        provider_account_id: Option<&str>,
     ) -> Result<Option<String>> {
         match self.get_harness(harness) {
             Some(adapter) if adapter.capabilities().generate_branch_name => {
                 adapter
-                    .generate_branch_name(cwd.to_string(), message.to_string())
+                    .generate_branch_name(
+                        cwd.to_string(),
+                        message.to_string(),
+                        provider_account_id.map(str::to_string),
+                    )
                     .await
             }
             _ => Ok(None),

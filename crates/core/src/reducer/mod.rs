@@ -24,5 +24,5 @@ pub use shell_intent::{
     unwrap_shell_command,
 };
 pub use stream_text::{
-    join_stream_text, join_stream_text_into, snapshot_remainder, stream_text_delta,
+    MessageParts, join_stream_text, join_stream_text_into, snapshot_remainder, stream_text_delta,
 };

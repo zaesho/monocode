@@ -682,7 +682,7 @@ pub fn backfill_omp_interjections<'a>(
                 block.interjection = Some(InterjectionMeta {
                     custom_type: anchor.custom_type.clone(),
                     severity: anchor.severity,
-                    extra: Default::default(),
+                    ..Default::default()
                 });
                 let created = list.push(BoundaryNode {
                     block,
@@ -782,7 +782,7 @@ mod tests {
         block.interjection = Some(InterjectionMeta {
             custom_type: "advisor".into(),
             severity,
-            extra: Default::default(),
+            ..Default::default()
         });
         block
     }
@@ -1251,7 +1251,7 @@ mod tests {
                     block.interjection = Some(InterjectionMeta {
                         custom_type: "advisor".into(),
                         severity: None,
-                        extra: Default::default(),
+                        ..Default::default()
                     });
                     block
                 } else {

@@ -22,8 +22,17 @@ use crate::core::child::{
 };
 use crate::core::task::{SharedSpawner, SmolSpawner};
 
-type ExecHandler = Arc<dyn Fn(&ExecRequest) -> String + Send + Sync>;
 type Handler = Arc<dyn Fn(&HttpRequest) -> (u16, String) + Send + Sync>;
+
+/// An exec reply a test queued: output now, or once a sender answers.
+enum ExecOnce {
+    Output(String),
+    Pending(oneshot::Receiver<String>),
+}
+
+/// The agents `opencode agent list` prints by default.
+pub const DEFAULT_AGENT_LIST: &str =
+    "build (primary)\n[]\nplan (primary)\n[]\ngeneral (subagent)\n[]\nexplore (subagent)\n[]";
 
 /// A reply a test sends later: status and body.
 type LaterReply = oneshot::Receiver<(u16, String)>;
@@ -41,12 +50,20 @@ struct State {
     deferred: Vec<(String, String, LaterReply)>,
     spawns: Vec<SpawnRequest>,
     kills: Vec<String>,
-    deferred_kills: VecDeque<oneshot::Receiver<()>>,
     sse_opens: Vec<(String, String)>,
+    sse_closes: Vec<String>,
+    /// Fail the next `sse_close` with this error.
+    sse_close_error: Option<String>,
     exec_output: String,
-    exec_handler: Option<ExecHandler>,
+    /// What `opencode agent list` prints.
+    agent_list: String,
+    /// What `opencode debug paths` prints.
+    debug_paths: String,
+    /// Exec replies queued ahead of the argument defaults, oldest first.
+    exec_once: VecDeque<ExecOnce>,
     exec_calls: Vec<ExecRequest>,
-    messages: HashMap<String, Vec<Value>>,
+    logs: VecDeque<Result<Vec<Value>, String>>,
+    runtime_path: Option<String>,
 }
 
 struct Inner {
@@ -87,6 +104,18 @@ pub fn path_of(url: &str) -> String {
 
 impl FakeHost {
     pub fn new() -> Self {
+        Self::with_version(false, None)
+    }
+
+    pub fn v2() -> Self {
+        Self::with_version(true, None)
+    }
+
+    pub fn v2_startup(line: &str) -> Self {
+        Self::with_version(true, Some(line))
+    }
+
+    fn with_version(v2: bool, line: Option<&str>) -> Self {
         let router = Arc::new(ChildRouter::new());
         let inner = Arc::new(Inner {
             router: router.clone(),
@@ -97,15 +126,30 @@ impl FakeHost {
                 deferred: Vec::new(),
                 spawns: Vec::new(),
                 kills: Vec::new(),
-                deferred_kills: VecDeque::new(),
                 sse_opens: Vec::new(),
-                exec_output: "opencode 1.14.19".into(),
-                exec_handler: None,
+                sse_closes: Vec::new(),
+                sse_close_error: None,
+                exec_output: if v2 {
+                    "opencode 2.0.20"
+                } else {
+                    "opencode 1.14.19"
+                }
+                .into(),
+                agent_list: DEFAULT_AGENT_LIST.into(),
+                debug_paths: "data       /isolated/data/opencode".into(),
+                exec_once: VecDeque::new(),
                 exec_calls: Vec::new(),
-                messages: HashMap::new(),
+                logs: VecDeque::new(),
+                runtime_path: None,
             }),
             next_pid: AtomicU32::new(4000),
-            server_line: "opencode server listening on http://127.0.0.1:4096".into(),
+            server_line: line
+                .unwrap_or(if v2 {
+                    r#"{"url":"http://127.0.0.1:4096"}"#
+                } else {
+                    "opencode server listening on http://127.0.0.1:4096"
+                })
+                .into(),
         });
         let spawner: SharedSpawner = Arc::new(SmolSpawner);
         let backend = Arc::new(FakeBackend {
@@ -160,25 +204,43 @@ impl FakeHost {
         tx
     }
 
-    pub fn defer_kill(&self) -> oneshot::Sender<()> {
-        let (tx, rx) = oneshot::channel();
-        self.inner.state.lock().deferred_kills.push_back(rx);
-        tx
-    }
-
     pub fn set_exec_output(&self, output: &str) {
         self.inner.state.lock().exec_output = output.into();
     }
 
-    pub fn set_exec_handler(
-        &self,
-        handler: impl Fn(&ExecRequest) -> String + Send + Sync + 'static,
-    ) {
-        self.inner.state.lock().exec_handler = Some(Arc::new(handler));
+    pub fn set_debug_paths(&self, output: &str) {
+        self.inner.state.lock().debug_paths = output.into();
     }
 
-    pub fn exec_calls(&self) -> Vec<ExecRequest> {
-        self.inner.state.lock().exec_calls.clone()
+    /// The next exec call, whatever its arguments, prints `output`.
+    pub fn exec_once(&self, output: &str) {
+        self.inner
+            .state
+            .lock()
+            .exec_once
+            .push_back(ExecOnce::Output(output.into()));
+    }
+
+    /// The next exec call waits until the returned sender answers.
+    pub fn exec_once_later(&self) -> oneshot::Sender<String> {
+        let (tx, rx) = oneshot::channel();
+        self.inner
+            .state
+            .lock()
+            .exec_once
+            .push_back(ExecOnce::Pending(rx));
+        tx
+    }
+
+    /// The managed config the last server started with.
+    pub fn spawned_config(&self) -> Option<Value> {
+        let state = self.inner.state.lock();
+        let config = state
+            .spawns
+            .last()?
+            .environment
+            .get("OPENCODE_CONFIG_CONTENT")?;
+        serde_json::from_str(config).ok()
     }
 
     pub fn http_calls(&self) -> Vec<HttpRequest> {
@@ -201,52 +263,51 @@ impl FakeHost {
         self.inner.state.lock().kills.clone()
     }
 
+    pub fn exec_calls(&self) -> Vec<ExecRequest> {
+        self.inner.state.lock().exec_calls.clone()
+    }
+
+    pub fn watched_children(&self) -> usize {
+        self.inner.router.watched_children()
+    }
+
+    pub fn watched_streams(&self) -> usize {
+        self.inner.router.watched_streams()
+    }
+
+    pub fn next_log(&self, events: Vec<Value>) {
+        self.inner.state.lock().logs.push_back(Ok(events));
+    }
+
+    pub fn next_log_error(&self, error: &str) {
+        self.inner.state.lock().logs.push_back(Err(error.into()));
+    }
+
+    pub fn set_runtime_path(&self, path: &str) {
+        self.inner.state.lock().runtime_path = Some(path.into());
+    }
+
     pub fn sse_opens(&self) -> Vec<(String, String)> {
         self.inner.state.lock().sse_opens.clone()
     }
 
+    pub fn sse_closes(&self) -> Vec<String> {
+        self.inner.state.lock().sse_closes.clone()
+    }
+
+    pub fn clear_sse_closes_and_kills(&self) {
+        let mut state = self.inner.state.lock();
+        state.sse_closes.clear();
+        state.kills.clear();
+    }
+
+    /// Make the next `sse_close` fail with `error`.
+    pub fn fail_next_sse_close(&self, error: &str) {
+        self.inner.state.lock().sse_close_error = Some(error.into());
+    }
+
     /// One SSE frame on `stream_id`.
     pub fn sse(&self, stream_id: &str, event: Value) {
-        let properties = &event["properties"];
-        let session_id = properties["sessionID"]
-            .as_str()
-            .or_else(|| properties["info"]["sessionID"].as_str())
-            .or_else(|| properties["part"]["sessionID"].as_str());
-        if let Some(session_id) = session_id {
-            let mut state = self.inner.state.lock();
-            let messages = state.messages.entry(session_id.to_string()).or_default();
-            match event["type"].as_str() {
-                Some("message.updated") => {
-                    let info = &properties["info"];
-                    if let Some(existing) = messages
-                        .iter_mut()
-                        .find(|message| message["info"]["id"] == info["id"])
-                    {
-                        existing["info"] = info.clone();
-                    } else {
-                        messages.push(serde_json::json!({"info": info, "parts": []}));
-                    }
-                }
-                Some("message.part.updated") => {
-                    let part = &properties["part"];
-                    if let Some(message) = messages
-                        .iter_mut()
-                        .find(|message| message["info"]["id"] == part["messageID"])
-                    {
-                        let parts = message["parts"].as_array_mut().unwrap();
-                        if let Some(existing) = parts
-                            .iter_mut()
-                            .find(|existing| existing["id"] == part["id"])
-                        {
-                            *existing = part.clone();
-                        } else {
-                            parts.push(part.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
         self.inner.router.on_sse(stream_id, event.to_string());
     }
 
@@ -262,6 +323,45 @@ impl FakeHost {
         let pid = self.inner.next_pid.load(Ordering::SeqCst) - 1;
         self.inner.router.on_exit(session_id, code, pid);
     }
+}
+
+/// What the server answers at `/agent` or `/config` after starting with
+/// `config`: the config itself, or each configured agent with its rules
+/// flattened in key order.
+pub fn policy_reply(path: &str, config: &Value) -> (u16, String) {
+    if path == "/config" {
+        return (200, config.to_string());
+    }
+    let agents: Vec<Value> = config["agent"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, value)| {
+            let rules: Vec<Value> = value["permission"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .flat_map(|(permission, action)| match action {
+                    Value::Object(patterns) => patterns
+                        .iter()
+                        .map(|(pattern, action)| {
+                            serde_json::json!({ "permission": permission, "pattern": pattern, "action": action })
+                        })
+                        .collect::<Vec<_>>(),
+                    action => vec![
+                        serde_json::json!({ "permission": permission, "pattern": "*", "action": action }),
+                    ],
+                })
+                .collect();
+            let mode = if name == "build" || name == "plan" {
+                "primary"
+            } else {
+                "subagent"
+            };
+            serde_json::json!({ "name": name, "mode": mode, "permission": rules })
+        })
+        .collect();
+    (200, Value::Array(agents).to_string())
 }
 
 /// `waitFor`: poll `predicate` every 5 ms for up to 2 s.
@@ -299,18 +399,8 @@ impl ChildBackend for FakeBackend {
     }
 
     fn kill(&self, session_id: String) -> ChildFuture<()> {
-        let deferred = {
-            let mut state = self.inner.state.lock();
-            state.kills.push(session_id);
-            state.deferred_kills.pop_front()
-        };
-        async move {
-            if let Some(deferred) = deferred {
-                let _ = deferred.await;
-            }
-            Ok(())
-        }
-        .boxed()
+        self.inner.state.lock().kills.push(session_id);
+        ready(Ok(()))
     }
 
     fn kill_all(&self) -> ChildFuture<()> {
@@ -318,7 +408,7 @@ impl ChildBackend for FakeBackend {
     }
 
     fn runtime_binary_path(&self, _provider: HarnessId) -> Option<String> {
-        None
+        self.inner.state.lock().runtime_path.clone()
     }
 
     fn resolve_default(&self, _provider: HarnessId) -> ChildFuture<ResolvedHarnessBinary> {
@@ -340,14 +430,20 @@ impl ChildBackend for FakeBackend {
     }
 
     fn exec(&self, request: ExecRequest) -> ChildFuture<String> {
-        let (handler, output) = {
-            let mut state = self.inner.state.lock();
-            state.exec_calls.push(request.clone());
-            (state.exec_handler.clone(), state.exec_output.clone())
+        let mut state = self.inner.state.lock();
+        let output = match request.args.join(" ").as_str() {
+            "agent list" => state.agent_list.clone(),
+            "debug paths" => state.debug_paths.clone(),
+            _ => state.exec_output.clone(),
         };
-        ready(Ok(handler.map(|handler| handler(&request)).unwrap_or_else(|| {
-            if request.args == ["agent", "list"] { "build (primary)\n[]\nplan (primary)\n[]\ngeneral (subagent)\n[]\nexplore (subagent)\n[]\n".into() } else if request.args == ["debug", "paths"] { "data       /data/opencode\n".into() } else { output }
-        })))
+        state.exec_calls.push(request);
+        match state.exec_once.pop_front() {
+            Some(ExecOnce::Output(output)) => ready(Ok(output)),
+            Some(ExecOnce::Pending(reply)) => {
+                async move { reply.await.map_err(|_| "dropped".to_string()) }.boxed()
+            }
+            None => ready(Ok(output)),
+        }
     }
 
     fn free_port(&self) -> ChildFuture<u16> {
@@ -355,7 +451,7 @@ impl ChildBackend for FakeBackend {
     }
 
     fn http(&self, request: HttpRequest) -> ChildFuture<HttpResponse> {
-        let (once, deferred, handler) = {
+        let (once, deferred, handler, policy) = {
             let mut state = self.inner.state.lock();
             state.http_calls.push(request.clone());
             let path = path_of(&request.url);
@@ -368,11 +464,15 @@ impl ChildBackend for FakeBackend {
                 Some(_) => None,
                 None => state.once.pop_front(),
             };
-            (once, deferred, state.handler.clone())
+            let policy = state
+                .spawns
+                .last()
+                .and_then(|spawn| spawn.environment.get("OPENCODE_CONFIG_CONTENT"))
+                .and_then(|config| serde_json::from_str::<Value>(config).ok());
+            (once, deferred, state.handler.clone(), policy)
         };
-        let inner = self.inner.clone();
         async move {
-            let (mut status, mut body) = match (deferred, once) {
+            let (status, body) = match (deferred, once) {
                 (Some(reply), _) => reply.await.map_err(|_| "dropped".to_string())?,
                 (None, Some(Once::Reply(status, body))) => (status, body),
                 (None, Some(Once::Pending(reply))) => {
@@ -380,44 +480,15 @@ impl ChildBackend for FakeBackend {
                 }
                 (None, None) => handler(&request),
             };
-            let path = path_of(&request.url);
-            if status < 400 && body.is_empty() && request.method == "GET" && matches!(path.as_str(),"/agent"|"/config") {
-                let config = inner.state.lock().spawns.last().and_then(|spawn|spawn.env.as_ref()).and_then(|env|env.get("OPENCODE_CONFIG_CONTENT")).and_then(|config|serde_json::from_str::<Value>(config).ok()).unwrap_or_else(||serde_json::json!({}));
-                let value = if path == "/config" { config } else {
-                    let agents: Vec<_> = config["agent"].as_object().into_iter().flat_map(|agents|agents.iter()).map(|(name,agent)| {
-                        let mut rules = Vec::new();
-                        for (permission,policy) in agent["permission"].as_object().into_iter().flat_map(|permission|permission.iter()) {
-                            if let Some(action) = policy.as_str() { rules.push(serde_json::json!({"permission":permission,"pattern":"*","action":action})); }
-                            else if let Some(patterns) = policy.as_object() { for (pattern,action) in patterns { rules.push(serde_json::json!({"permission":permission,"pattern":pattern,"action":action})); } }
-                        }
-                        serde_json::json!({"name":name,"permission":rules})
-                    }).collect();
-                    Value::Array(agents)
-                };
-                status = 200;
-                body = value.to_string();
-            }
-            if status < 400 && path.ends_with("/prompt_async")
-                && let Some(message_id) = request.body.as_deref().and_then(|body| serde_json::from_str::<Value>(body).ok()).and_then(|body| body["messageID"].as_str().map(str::to_string)) {
-                    let session_id = path.split('/').nth(2).unwrap();
-                    let info = serde_json::json!({"id": message_id, "sessionID": session_id, "role":"user", "time":{"created":1}});
-                    let stream = {
-                        let mut state = inner.state.lock();
-                        state.messages.entry(session_id.to_string()).or_default().push(serde_json::json!({"info":info,"parts":[{"type":"text","text":"fixture prompt"}]}));
-                        state.sse_opens.last().map(|(stream, _)| stream.clone())
-                    };
-                    if let Some(stream) = stream { inner.router.on_sse(&stream, serde_json::json!({"type":"message.updated", "properties":{"info":info}}).to_string()); }
-            }
-            if status < 400 && request.method == "GET" && path.ends_with("/message") {
-                let session_id = path.split('/').nth(2).unwrap();
-                if let Some(dynamic) = inner.state.lock().messages.get(session_id) {
-                    let mut combined = serde_json::from_str::<Vec<Value>>(&body).unwrap_or_default();
-                    for message in dynamic {
-                        if let Some(existing) = combined.iter_mut().find(|existing| existing["info"]["id"] == message["info"]["id"]) { *existing = message.clone(); } else { combined.push(message.clone()); }
-                    }
-                    body = serde_json::to_string(&combined).unwrap();
-                }
-            }
+            // `GET /agent` and `GET /config` report the managed policy the
+            // server started with, unless the handler answered them itself.
+            let (status, body) = match path_of(&request.url).as_str() {
+                "/agent" | "/config" if status == 204 => policy
+                    .as_ref()
+                    .map(|config| policy_reply(&path_of(&request.url), config))
+                    .unwrap_or((status, body)),
+                _ => (status, body),
+            };
             Ok(HttpResponse { status, body })
         }
         .boxed()
@@ -429,12 +500,44 @@ impl ChildBackend for FakeBackend {
         url: String,
         _headers: Option<HashMap<String, String>>,
     ) -> ChildFuture<()> {
-        self.inner.state.lock().sse_opens.push((session_id, url));
+        self.inner
+            .state
+            .lock()
+            .sse_opens
+            .push((session_id.clone(), url.clone()));
+        if self.inner.server_line.starts_with('{') && path_of(&url) == "/api/event" {
+            self.inner.router.on_sse(
+                &session_id,
+                r#"{"type":"server.connected","data":{}}"#.into(),
+            );
+        }
+        if self.inner.server_line.starts_with('{')
+            && path_of(&url).starts_with("/api/experimental/session/")
+        {
+            let events = self
+                .inner
+                .state
+                .lock()
+                .logs
+                .pop_front()
+                .unwrap_or(Ok(Vec::new()));
+            match events {
+                Ok(events) => {
+                    for event in events {
+                        self.inner.router.on_sse(&session_id, event.to_string());
+                    }
+                    self.inner.router.on_sse_end(&session_id, None);
+                }
+                Err(error) => self.inner.router.on_sse_end(&session_id, Some(error)),
+            }
+        }
         ready(Ok(()))
     }
 
-    fn sse_close(&self, _session_id: String) -> ChildFuture<()> {
-        ready(Ok(()))
+    fn sse_close(&self, session_id: String) -> ChildFuture<()> {
+        let mut state = self.inner.state.lock();
+        state.sse_closes.push(session_id);
+        ready(state.sse_close_error.take().map_or(Ok(()), Err))
     }
 
     fn read_text_file(&self, _path: String) -> ChildFuture<String> {
@@ -446,8 +549,8 @@ impl ChildBackend for FakeBackend {
         _command: String,
         _provider: HarnessId,
         _binary_path: Option<String>,
-    ) -> ChildFuture<()> {
-        ready(Ok(()))
+    ) -> ChildFuture<String> {
+        ready(Ok(String::new()))
     }
 
     fn home_dir(&self) -> ChildFuture<String> {

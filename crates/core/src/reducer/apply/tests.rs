@@ -11,25 +11,6 @@ use crate::project_providers::ProjectProviders;
 use crate::reducer::preview::tests::preview_from_tool;
 use crate::session::new_session;
 
-#[test]
-fn provider_parts_replace_exact_rows_after_tools_and_later_parts() {
-    let mut t = T::new();
-    let mut session = t.session(HarnessId::Opencode, "/tmp");
-    session = t.apply_all(&session, &[
-        json!({"type":"message.part","partId":"first","text":"Hello worle","reasoning":false,"streaming":true}),
-        json!({"type":"tool.started","callId":"read","title":"Read file"}),
-        json!({"type":"message.part","partId":"second","text":"Next message","reasoning":false,"streaming":true}),
-    ]);
-    let first_id = session.blocks[0].id.clone();
-    session = t.apply(&session, json!({"type":"message.part","partId":"first","text":"Hello world","reasoning":false,"streaming":false}));
-    assert_eq!(session.blocks[0].id, first_id);
-    assert_eq!(session.blocks[0].text, "Hello world");
-    assert_eq!(session.blocks[2].text, "Next message");
-    session = t.apply(&session, json!({"type":"message.part","partId":"first","text":"Hi","reasoning":false,"streaming":false}));
-    assert_eq!(session.blocks[0].text, "Hi");
-    assert_eq!(session.blocks.len(), 3);
-}
-
 /// Counter ids and a clock the test sets, like the `Date.now` spy.
 struct TestEnv {
     ids: u64,
@@ -351,6 +332,44 @@ fn does_not_double_an_assistant_block_when_a_completed_snapshot_repeats_it() {
         &[delta("I'll read the file"), delta("I'll read the file")],
     );
     assert_eq!(texts(&session), ["I'll read the file"]);
+}
+
+#[test]
+fn shows_a_native_provider_turn_as_busy_until_it_finishes() {
+    let mut t = T::new();
+    let session = t.session(HarnessId::Claude, "/tmp");
+    let session = t.apply(
+        &session,
+        json!({ "type": "turn.started", "providerTurnId": "wake", "native": true }),
+    );
+    assert!(session.is_busy());
+    let session = t.apply(
+        &session,
+        json!({ "type": "message.delta", "text": "Reminder", "append": true }),
+    );
+    let session = t.apply(&session, json!({ "type": "turn.finished", "native": true }));
+    assert_eq!(session.busy, Some(false));
+    assert_eq!(session.blocks.last().unwrap().streaming, Some(false));
+    // A plain turn.finished changes nothing.
+    let unchanged = t.apply(&session, json!({ "type": "turn.finished" }));
+    assert_eq!(unchanged, session);
+}
+
+#[test]
+fn appends_marked_deltas_without_folding_repeated_chunks() {
+    let mut t = T::new();
+    let append = |text: &str| json!({ "type": "message.delta", "text": text, "append": true });
+    let session = t.apply_all(
+        &t.session(HarnessId::Claude, "/tmp"),
+        &[append("ha"), append("ha"), append("!")],
+    );
+    assert_eq!(texts(&session), ["haha!"]);
+    // One at a time takes the same path as a batch.
+    let mut session = t.session(HarnessId::Claude, "/tmp");
+    for text in ["ha", "ha", "!"] {
+        session = t.apply(&session, append(text));
+    }
+    assert_eq!(texts(&session), ["haha!"]);
 }
 
 #[test]
@@ -759,6 +778,44 @@ fn appends_every_interjection_as_a_distinct_persisted_boundary() {
         serde_json::to_value(interjections[0].interjection.as_ref().unwrap()).unwrap(),
         json!({ "customType": "advisor", "severity": "concern" })
     );
+}
+
+#[test]
+fn updates_an_interjection_with_a_known_id_in_place() {
+    let mut t = T::new();
+    let session = t.user(&t.session(HarnessId::Claude, "/tmp"), "go");
+    let running = json!({
+        "type": "interjection", "id": "advisor-srvtoolu_1",
+        "text": "Claude Code sent the full conversation to the advisor.",
+        "customType": "advisor", "status": "running",
+    });
+    let done = json!({
+        "type": "interjection", "id": "advisor-srvtoolu_1",
+        "text": "Check the fallback.\n\nClaude Code sent the full conversation to the advisor.",
+        "customType": "advisor", "status": "completed", "model": "claude-fable-5-1",
+    });
+    let session = t.apply_all(
+        &session,
+        &[running.clone(), delta("Checked."), done.clone()],
+    );
+    let interjections: Vec<&Block> = session
+        .blocks
+        .iter()
+        .filter(|block| block.interjection.is_some())
+        .collect();
+    assert_eq!(interjections.len(), 1);
+    assert_eq!(interjections[0].id, "advisor-srvtoolu_1");
+    assert!(interjections[0].text.starts_with("Check the fallback."));
+    assert_eq!(
+        serde_json::to_value(interjections[0].interjection.as_ref().unwrap()).unwrap(),
+        json!({ "customType": "advisor", "model": "claude-fable-5-1", "status": "completed" })
+    );
+    // The block keeps its place ahead of the prose that followed it.
+    assert_eq!(session.blocks[1].id, "advisor-srvtoolu_1");
+    assert_eq!(session.blocks[2].text, "Checked.");
+
+    let mut again = session.clone();
+    assert!(!apply_harness_event_mut(&mut t.env, &mut again, &ev(done)));
 }
 
 // task list updates
@@ -1680,4 +1737,31 @@ fn reports_no_change_where_the_typescript_kept_the_session() {
         );
         assert_eq!(next, session);
     }
+}
+
+#[test]
+fn updates_the_exact_provider_part_after_tools_and_later_text_without_retaining_corrected_text() {
+    let mut t = T::new();
+    let part = |part_id: &str, text: &str, streaming: bool| json!({ "type": "message.part", "partId": part_id, "text": text, "reasoning": false, "streaming": streaming });
+    let session = t.session(HarnessId::Opencode, "/tmp");
+    let session = t.apply_all(
+        &session,
+        &[
+            part("first", "Hello worle", true),
+            json!({ "type": "tool.started", "callId": "read", "title": "Read file" }),
+            part("second", "Next message", true),
+        ],
+    );
+    let first_id = session.blocks[0].id.clone();
+    let session = t.apply(&session, part("first", "Hello world", false));
+    assert_eq!(session.blocks[0].id, first_id);
+    assert_eq!(session.blocks[0].text, "Hello world");
+    assert_eq!(session.blocks[0].streaming, Some(false));
+    assert_eq!(session.blocks[0].provider_part_id.as_deref(), Some("first"));
+    assert_eq!(session.blocks[2].text, "Next message");
+    let session = t.apply(&session, part("first", "Hi", false));
+    assert_eq!(session.blocks[0].text, "Hi");
+    assert_eq!(session.blocks.len(), 3);
+    // An empty first snapshot adds nothing.
+    assert_eq!(t.apply(&session, part("third", "", true)).blocks.len(), 3);
 }

@@ -179,6 +179,7 @@ impl HarnessAdapter for CursorAdapter {
         &self,
         cwd: String,
         signal: Option<AbortSignal>,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<String>> {
         Box::pin(async move {
             generate_cursor_commit_message(&self.text, self.git.as_ref(), &cwd, signal).await
@@ -188,6 +189,7 @@ impl HarnessAdapter for CursorAdapter {
     fn generate_pr_content(
         &self,
         cwd: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<GeneratedPrContent>>> {
         Box::pin(
             async move { generate_cursor_pr_content(&self.text, self.git.as_ref(), &cwd).await },
@@ -198,6 +200,7 @@ impl HarnessAdapter for CursorAdapter {
         &self,
         cwd: String,
         message: String,
+        _provider_account_id: Option<String>,
     ) -> BoxFuture<'_, Result<Option<String>>> {
         Box::pin(async move { Ok(generate_cursor_branch_name(&self.text, &cwd, &message).await) })
     }

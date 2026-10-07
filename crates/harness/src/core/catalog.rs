@@ -2,7 +2,6 @@
 //! (`setHarnessModels`, `hasLiveCatalog`, `resetHarnessModelOverlays`),
 //! shared between the engine and the provider adapters that refresh it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
@@ -11,14 +10,12 @@ use monocode_core::harness::HarnessId;
 use monocode_core::models::{AgentModel, ModelCatalog};
 
 type Listener = Arc<dyn Fn(HarnessId) + Send + Sync>;
-type ProjectModels = HashMap<(HarnessId, String), Vec<AgentModel>>;
 
 /// A [`ModelCatalog`] behind a lock, with change listeners. Clones share one
 /// catalog.
 #[derive(Clone, Default)]
 pub struct SharedCatalog {
     catalog: Arc<RwLock<ModelCatalog>>,
-    project_models: Arc<RwLock<ProjectModels>>,
     listeners: Arc<Mutex<Vec<(u64, Listener)>>>,
     next_listener: Arc<Mutex<u64>>,
 }
@@ -40,7 +37,15 @@ impl SharedCatalog {
 
     /// `setHarnessModels`. Listeners run after the write lock is released.
     pub fn set_harness_models(&self, harness: HarnessId, models: Vec<AgentModel>) {
-        self.catalog.write().set_harness_models(harness, models);
+        self.set_harness_catalog(harness, models, true);
+    }
+
+    /// `setHarnessModels` with its `complete` flag. See
+    /// [`ModelCatalog::set_harness_catalog`].
+    pub fn set_harness_catalog(&self, harness: HarnessId, models: Vec<AgentModel>, complete: bool) {
+        self.catalog
+            .write()
+            .set_harness_catalog(harness, models, complete);
         let listeners: Vec<Listener> = self
             .listeners
             .lock()
@@ -52,15 +57,17 @@ impl SharedCatalog {
         }
     }
 
+    /// `setProjectHarnessModels`: the catalog read in `cwd`. Listeners run
+    /// after the write lock is released.
     pub fn set_project_harness_models(
         &self,
         harness: HarnessId,
         cwd: &str,
         models: Vec<AgentModel>,
     ) {
-        self.project_models
+        self.catalog
             .write()
-            .insert((harness, cwd.into()), models);
+            .set_project_harness_models(harness, cwd, models);
         let listeners: Vec<Listener> = self
             .listeners
             .lock()
@@ -72,21 +79,12 @@ impl SharedCatalog {
         }
     }
 
-    pub fn project_models_for(&self, harness: HarnessId, cwd: &str) -> Option<Vec<AgentModel>> {
-        self.project_models
+    /// `projectHarnessModels`: whether a catalog for `cwd` has loaded.
+    pub fn has_project_harness_models(&self, harness: HarnessId, cwd: &str) -> bool {
+        self.catalog
             .read()
-            .get(&(harness, cwd.into()))
-            .cloned()
-    }
-
-    pub fn snapshot_for_directory(&self, cwd: &str) -> ModelCatalog {
-        let mut catalog = self.snapshot();
-        for ((harness, directory), models) in self.project_models.read().iter() {
-            if directory == cwd {
-                catalog.replace_harness_models(*harness, models.clone());
-            }
-        }
-        catalog
+            .project_harness_models(harness, cwd)
+            .is_some()
     }
 
     /// `hasLiveCatalog`.
@@ -97,7 +95,6 @@ impl SharedCatalog {
     /// `resetHarnessModelOverlays`. Test seam.
     pub fn reset_overlays(&self) {
         self.catalog.write().reset_overlays();
-        self.project_models.write().clear();
     }
 
     /// Call `listener` after each `set_harness_models`. Returns an id for
@@ -130,34 +127,24 @@ mod tests {
         catalog.set_project_harness_models(HarnessId::Opencode, "/a", vec![model("a")]);
         catalog.set_project_harness_models(HarnessId::Opencode, "/b", vec![model("b")]);
         catalog.set_project_harness_models(HarnessId::Opencode, "/empty", vec![]);
-        assert_eq!(catalog.read().models_for(HarnessId::Opencode)[0].id, "home");
-        assert_eq!(
-            catalog
-                .snapshot_for_directory("/a")
-                .models_for(HarnessId::Opencode)[0]
-                .id,
-            "a"
-        );
-        assert_eq!(
-            catalog
-                .snapshot_for_directory("/b")
-                .models_for(HarnessId::Opencode)[0]
-                .id,
-            "b"
-        );
-        assert!(
-            catalog
-                .snapshot_for_directory("/empty")
-                .models_for(HarnessId::Opencode)
-                .is_empty()
-        );
-        assert_eq!(
-            catalog
-                .snapshot_for_directory("/unknown")
-                .models_for(HarnessId::Opencode)[0]
-                .id,
-            "home"
-        );
+        let read = catalog.read();
+        let ids = |cwd: &str| {
+            read.project_harness_models(HarnessId::Opencode, cwd)
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>()
+                })
+        };
+        assert_eq!(read.models_for(HarnessId::Opencode)[0].id, "home");
+        assert_eq!(ids("/a"), Some(vec!["a".to_string()]));
+        assert_eq!(ids("/b"), Some(vec!["b".to_string()]));
+        assert_eq!(ids("/empty"), Some(Vec::new()));
+        assert_eq!(ids("/unknown"), None);
+        drop(read);
+        assert!(catalog.has_project_harness_models(HarnessId::Opencode, "/empty"));
+        assert!(!catalog.has_project_harness_models(HarnessId::Opencode, "/unknown"));
     }
 
     #[test]

@@ -2,12 +2,16 @@
 //! droidAdapter.ts: the live Factory Droid adapter. It spawns
 //! `droid exec --output-format acp`.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
+use futures::FutureExt;
 use futures::channel::oneshot;
+use futures::future::Shared;
 use parking_lot::Mutex;
+use regex::Regex;
 use serde_json::{Value, json};
 
 use monocode_core::block::TurnIntent;
@@ -23,13 +27,13 @@ use crate::core::catalog::SharedCatalog;
 use crate::core::child::{ChildHandlers, Children};
 use crate::core::register::HarnessContext;
 use crate::core::registry::{AcceptedHook, AdapterCapabilities, EventSink, HarnessAdapter};
-use crate::core::task::{BoxFuture, SharedSpawner};
+use crate::core::task::{self, BoxFuture, SharedSpawner};
 use crate::providers::grok::adapter::decided;
 use crate::providers::grok::protocol::{
     events_from_acp_update, permission_option_id, permission_request_from_acp, pick_auto_option,
 };
 use crate::providers::grok::shared::{
-    Wiring, initialize_params, respond_method_not_found, selected_outcome, spawn_method_not_found,
+    Wiring, initialize_params, permission_outcome, respond_method_not_found, spawn_method_not_found,
 };
 
 use super::catalog::DroidCatalog;
@@ -48,27 +52,27 @@ const PROMPT_TIMEOUT_MS: i64 = 30 * 60_000;
 struct LiveState {
     model_id: String,
     mode_id: String,
+    /// Counts mode changes Droid reported, so a control reply does not
+    /// overwrite a newer `current_mode_update`.
+    mode_revision: u64,
     mute_updates: bool,
     cancelled: bool,
+    /// The connection is gone. Permission replies are skipped.
+    closed: bool,
     runtime_mode: RuntimeMode,
     planning: bool,
     on_event: EventSink,
+    /// The kind of each tool call this turn, for permission requests that
+    /// omit it.
+    tool_kinds: HashMap<String, String>,
 }
 
 /// Droid's config options, with a count of whole-list replacements. The
-/// TypeScript updated `current.currentValue` on the option object it read
-/// before awaiting, which only shows if the list was not replaced meanwhile.
+/// count is the TypeScript `configRevision`.
 #[derive(Default)]
 struct ConfigOptions {
     generation: u64,
     options: Vec<DroidConfigOption>,
-}
-
-impl ConfigOptions {
-    fn replace(&mut self, options: Vec<DroidConfigOption>) {
-        self.generation += 1;
-        self.options = options;
-    }
 }
 
 /// `Live`.
@@ -79,8 +83,10 @@ struct Live {
     cwd: String,
     config: Mutex<ConfigOptions>,
     state: Mutex<LiveState>,
-    approvals: Mutex<HashMap<i64, oneshot::Sender<ApprovalDecision>>>,
-    turns: smol::lock::Mutex<()>,
+    approvals: Mutex<HashMap<i64, oneshot::Sender<Option<ApprovalDecision>>>>,
+    /// `permissionTasks`. Each request handler holds a read guard, and
+    /// stopping takes the write lock to wait for their replies.
+    permission_tasks: Arc<smol::lock::RwLock<()>>,
 }
 
 impl Live {
@@ -93,14 +99,49 @@ impl Live {
         self.state.lock().cancelled
     }
 
+    /// Cancelled or closed.
+    fn retired(&self) -> bool {
+        let state = self.state.lock();
+        state.cancelled || state.closed
+    }
+
     fn options(&self) -> Vec<DroidConfigOption> {
         self.config.lock().options.clone()
     }
 
-    /// `resolveApprovals`.
+    fn config_generation(&self) -> u64 {
+        self.config.lock().generation
+    }
+
+    /// `resolveApprovals`: pending approvals end without a decision.
     fn resolve_approvals(&self) {
         for (_, waiter) in self.approvals.lock().drain() {
-            let _ = waiter.send(ApprovalDecision::Deny);
+            let _ = waiter.send(None);
+        }
+    }
+
+    /// `syncConfig`: a config snapshot also carries the model and mode in
+    /// effect.
+    fn sync_config(&self, options: Vec<DroidConfigOption>) {
+        let model = droid_model_config(&options).and_then(|config| config.current_value.clone());
+        let mode = options
+            .iter()
+            .find(|option| {
+                option.category.as_deref() == Some("mode") || option.id == "autonomy_level"
+            })
+            .and_then(|option| option.current_value.clone());
+        {
+            let mut config = self.config.lock();
+            config.generation += 1;
+            config.options = options;
+        }
+        let mut state = self.state.lock();
+        if let Some(model) = model {
+            state.model_id = model;
+        }
+        if let Some(mode) = mode {
+            state.mode_id = mode;
+            state.mode_revision += 1;
         }
     }
 }
@@ -111,11 +152,78 @@ struct Resume {
     cwd: String,
 }
 
+type Tail = Shared<BoxFuture<'static, ()>>;
+
 #[derive(Default)]
 struct Threads {
     live_by_thread: HashMap<String, Arc<Live>>,
+    /// `startingByThread`: clients whose session is not live yet, so a stop
+    /// can close them.
+    starting_by_thread: HashMap<String, AcpClient>,
     resume_by_thread: HashMap<String, Resume>,
-    cancelled_threads: HashSet<String>,
+    /// `generations`. Queued turns share their thread's generation, and a
+    /// stop or cancel drops it so every queued step bails out.
+    generations: HashMap<String, u64>,
+    next_generation: u64,
+    /// `queues`: the last turn or stop per thread, tagged so its owner can
+    /// remove only its own entry.
+    queues: HashMap<String, (u64, Tail)>,
+    next_queue: u64,
+}
+
+/// A place in a thread's queue. Dropping `done` lets the next entry run.
+struct Queued {
+    id: u64,
+    previous: Option<Tail>,
+    tail: Tail,
+    done: oneshot::Sender<()>,
+}
+
+impl Threads {
+    fn generation(&mut self, session_id: &str) -> u64 {
+        if let Some(generation) = self.generations.get(session_id) {
+            return *generation;
+        }
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        self.generations.insert(session_id.to_string(), generation);
+        generation
+    }
+
+    /// Queue behind the thread's last entry.
+    fn enqueue(&mut self, session_id: &str) -> Queued {
+        let previous = self.queues.get(session_id).map(|(_, tail)| tail.clone());
+        let (done, finished) = oneshot::channel::<()>();
+        let before = previous.clone();
+        let tail: Tail = async move {
+            if let Some(before) = before {
+                before.await;
+            }
+            let _ = finished.await;
+        }
+        .boxed()
+        .shared();
+        self.next_queue += 1;
+        let id = self.next_queue;
+        self.queues
+            .insert(session_id.to_string(), (id, tail.clone()));
+        Queued {
+            id,
+            previous,
+            tail,
+            done,
+        }
+    }
+
+    fn dequeue(&mut self, session_id: &str, id: u64) {
+        if self
+            .queues
+            .get(session_id)
+            .is_some_and(|(entry, _)| *entry == id)
+        {
+            self.queues.remove(session_id);
+        }
+    }
 }
 
 struct Inner {
@@ -165,105 +273,152 @@ pub fn register(ctx: &HarnessContext) {
 }
 
 impl Inner {
-    /// `sendDroidTurn`.
+    fn is_current(&self, session_id: &str, generation: u64) -> bool {
+        self.threads.lock().generations.get(session_id) == Some(&generation)
+    }
+
+    /// `checkGeneration`.
+    fn check_generation(&self, session_id: &str, generation: u64) -> Result<()> {
+        if self.is_current(session_id, generation) {
+            Ok(())
+        } else {
+            Err(anyhow!("cancelled"))
+        }
+    }
+
+    /// `sendDroidTurn`. Turns on one thread run in order, and a stop or
+    /// cancel drops every turn still waiting.
     async fn send_turn(&self, input: SendTurnInput, on_event: EventSink) -> Result<()> {
         let session_id = input.session.session_id.clone();
-        let live = match self.ensure_live(&input.session, on_event.clone()).await {
-            Ok(live) => live,
-            Err(error) => {
-                self.threads.lock().cancelled_threads.remove(&session_id);
-                return Err(error);
-            }
+        let (generation, queued) = {
+            let mut threads = self.threads.lock();
+            (
+                threads.generation(&session_id),
+                threads.enqueue(&session_id),
+            )
         };
-        if self.threads.lock().cancelled_threads.remove(&session_id) {
+        if let Some(previous) = queued.previous {
+            previous.await;
+        }
+        let result = self.run_turn(&input, on_event, generation).await;
+        drop(queued.done);
+        self.threads.lock().dequeue(&session_id, queued.id);
+        result
+    }
+
+    async fn run_turn(
+        &self,
+        input: &SendTurnInput,
+        on_event: EventSink,
+        generation: u64,
+    ) -> Result<()> {
+        let session_id = &input.session.session_id;
+        if !self.is_current(session_id, generation) {
             return Ok(());
         }
+        let live = match self
+            .ensure_live(&input.session, on_event.clone(), generation)
+            .await
         {
-            let mut state = live.state.lock();
-            state.on_event = on_event;
-            state.runtime_mode = input.session.runtime_mode;
-            state.planning = input.session.intent == Some(TurnIntent::Plan);
-        }
-        let result = {
-            let _turn = live.turns.lock().await;
+            Ok(live) => live,
+            Err(error) => return self.fail_turn(session_id, generation, None, error).await,
+        };
+        let run = async {
+            self.check_generation(session_id, generation)?;
             {
                 let mut state = live.state.lock();
+                state.on_event = on_event;
+                state.runtime_mode = input.session.runtime_mode;
+                state.planning = input.session.intent == Some(TurnIntent::Plan);
                 state.cancelled = false;
                 state.mute_updates = false;
+                state.tool_kinds.clear();
             }
-            let run = async {
-                self.apply_model_selection(&live, &input.session).await?;
-                if live.cancelled() {
-                    return Ok(());
-                }
-                let (runtime_mode, planning) = {
-                    let state = live.state.lock();
-                    (state.runtime_mode, state.planning)
-                };
-                self.apply_runtime_mode(&live, runtime_mode, planning)
-                    .await?;
-                if live.cancelled() {
-                    return Ok(());
-                }
-                prompt(&live, &input).await
+            self.apply_model_selection(&live, &input.session).await?;
+            self.check_generation(session_id, generation)?;
+            let (runtime_mode, planning) = {
+                let state = live.state.lock();
+                (state.runtime_mode, state.planning)
             };
-            match run.await {
-                Err(_) if live.cancelled() => Ok(()),
-                other => other,
-            }
+            self.apply_runtime_mode(&live, runtime_mode, planning)
+                .await?;
+            self.check_generation(session_id, generation)?;
+            prompt(&live, input).await
         };
-        if let Err(error) = result {
-            let current = self.threads.lock().live_by_thread.get(&session_id).cloned();
-            if current.is_some_and(|current| Arc::ptr_eq(&current, &live)) {
-                self.stop_session(&session_id).await;
+        match run.await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.fail_turn(session_id, generation, Some(&live), error)
+                    .await
             }
-            return Err(error);
         }
-        Ok(())
+    }
+
+    /// The `catch` of `sendDroidTurn`: a cancelled turn ends quietly, and a
+    /// failed one stops the connection it owns.
+    async fn fail_turn(
+        &self,
+        session_id: &str,
+        generation: u64,
+        live: Option<&Arc<Live>>,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        if !self.is_current(session_id, generation) || live.is_some_and(|live| live.cancelled()) {
+            return Ok(());
+        }
+        let current = self.threads.lock().live_by_thread.get(session_id).cloned();
+        let owned = match (live, current) {
+            (None, _) => true,
+            (Some(live), Some(current)) => Arc::ptr_eq(live, &current),
+            (Some(_), None) => false,
+        };
+        if owned {
+            self.stop_session(session_id, true, false).await;
+        }
+        Err(error)
     }
 
     fn respond_approval(&self, session_id: &str, request_id: i64, decision: ApprovalDecision) {
         let live = self.threads.lock().live_by_thread.get(session_id).cloned();
         if let Some(waiter) = live.and_then(|live| live.approvals.lock().remove(&request_id)) {
-            let _ = waiter.send(decision);
+            let _ = waiter.send(Some(decision));
         }
     }
 
-    /// `cancelDroidTurn`.
-    async fn cancel_turn(&self, session_id: &str) {
-        let live = {
+    /// `stopDroidSession`. `invalidate` drops the thread's queued turns.
+    /// Turns queued after this call wait for the connection to close.
+    async fn stop_session(&self, session_id: &str, invalidate: bool, send_cancel: bool) {
+        let queued = {
             let mut threads = self.threads.lock();
-            match threads.live_by_thread.get(session_id).cloned() {
-                Some(live) => live,
-                None => {
-                    threads.cancelled_threads.insert(session_id.to_string());
-                    return;
-                }
+            if invalidate {
+                threads.generations.remove(session_id);
             }
+            threads.enqueue(session_id)
         };
-        {
-            let mut state = live.state.lock();
-            state.cancelled = true;
-            state.mute_updates = true;
-        }
-        live.resolve_approvals();
-        let _ = live
-            .acp
-            .notify(
-                "session/cancel",
-                Some(json!({ "sessionId": live.acp_session_id })),
-            )
-            .await;
-        live.acp.reject_pending(Some("cancelled"));
+        self.stop_connection(session_id, send_cancel).await;
+        drop(queued.done);
+        let threads = self.threads.clone();
+        let session_id = session_id.to_string();
+        let tail = queued.tail;
+        self.spawner.spawn(Box::pin(async move {
+            tail.await;
+            threads.lock().dequeue(&session_id, queued.id);
+        }));
     }
 
-    /// `stopDroidSession`.
-    async fn stop_session(&self, session_id: &str) {
-        let live = {
+    /// `stopConnection`. The flags are set before the first await, so a
+    /// permission handler running now sees the stop.
+    async fn stop_connection(&self, session_id: &str, send_cancel: bool) {
+        let (live, starting) = {
             let mut threads = self.threads.lock();
-            threads.cancelled_threads.remove(session_id);
-            threads.live_by_thread.remove(session_id)
+            (
+                threads.live_by_thread.remove(session_id),
+                threads.starting_by_thread.remove(session_id),
+            )
         };
+        if let Some(starting) = starting {
+            starting.close(None);
+        }
         if let Some(live) = &live {
             {
                 let mut state = live.state.lock();
@@ -271,6 +426,18 @@ impl Inner {
                 state.cancelled = true;
             }
             live.resolve_approvals();
+            if send_cancel {
+                let _ = live
+                    .acp
+                    .notify(
+                        "session/cancel",
+                        Some(json!({ "sessionId": live.acp_session_id })),
+                    )
+                    .await;
+            }
+            // Let in-flight permission handlers send their replies first.
+            drop(live.permission_tasks.write().await);
+            live.state.lock().closed = true;
             live.acp.close(None);
         }
         self.children.unwatch_child(session_id);
@@ -279,7 +446,7 @@ impl Inner {
 
     async fn forget_session(&self, session_id: &str) {
         self.threads.lock().resume_by_thread.remove(session_id);
-        self.stop_session(session_id).await;
+        self.stop_session(session_id, true, false).await;
     }
 
     fn bind_session(&self, thread_id: &str, acp_session_id: &str, cwd: &str) {
@@ -301,21 +468,19 @@ impl Inner {
         &self,
         input: &HarnessSessionInput,
         on_event: EventSink,
+        generation: u64,
     ) -> Result<Arc<Live>> {
         let session_id = input.session_id.clone();
         let existing = self.threads.lock().live_by_thread.get(&session_id).cloned();
         if let Some(existing) = &existing
             && existing.cwd == input.cwd
         {
-            let mut state = existing.state.lock();
-            state.on_event = on_event;
-            state.runtime_mode = input.runtime_mode;
-            state.planning = input.intent == Some(TurnIntent::Plan);
             return Ok(existing.clone());
         }
         if existing.is_some() {
             self.threads.lock().resume_by_thread.remove(&session_id);
-            self.stop_session(&session_id).await;
+            self.stop_session(&session_id, false, false).await;
+            self.check_generation(&session_id, generation)?;
         }
 
         let resume = {
@@ -331,6 +496,7 @@ impl Inner {
         };
 
         let path = self.children.resolve_droid_binary().await?.path;
+        self.check_generation(&session_id, generation)?;
         let wiring: Arc<Wiring<Live>> = Wiring::new();
         let handlers = AcpHandlers::default()
             .on_notification({
@@ -342,7 +508,7 @@ impl Inner {
                         && method == "session/update"
                         && let Some(options) = droid_config_options_from(&params)
                     {
-                        live.config.lock().replace(options);
+                        live.sync_config(options);
                         return;
                     }
                     if wiring.muted() {
@@ -367,9 +533,19 @@ impl Inner {
                         }
                     }
                     Some(live) => {
+                        // Taken here, before the task runs, so a stop that
+                        // starts now still waits for this reply.
+                        let guard = live.permission_tasks.try_read_arc();
                         let method = method.to_string();
                         spawner.spawn(Box::pin(async move {
-                            handle_request(&live, id, &method, &params).await;
+                            let _guard = guard;
+                            if let Err(error) = handle_request(&live, id, &method, &params).await
+                                && !live.retired()
+                            {
+                                live.emit(HarnessEvent::SessionError {
+                                    message: droid_error_message(&error),
+                                });
+                            }
                         }));
                     }
                 }
@@ -401,10 +577,24 @@ impl Inner {
                     move |code| {
                         let live = wiring.live();
                         if let Some(live) = &live {
-                            live.state.lock().cancelled = true;
+                            {
+                                let mut state = live.state.lock();
+                                state.closed = true;
+                                state.mute_updates = true;
+                            }
+                            live.resolve_approvals();
                         }
                         acp.close(Some("Factory Droid exited"));
-                        threads.lock().live_by_thread.remove(&session_id);
+                        if let Some(live) = &live {
+                            let mut threads = threads.lock();
+                            if threads
+                                .live_by_thread
+                                .get(&session_id)
+                                .is_some_and(|current| Arc::ptr_eq(current, live))
+                            {
+                                threads.live_by_thread.remove(&session_id);
+                            }
+                        }
                         let ended = HarnessEvent::SessionEnded {
                             code: code.map(i64::from),
                         };
@@ -428,32 +618,37 @@ impl Inner {
             },
         );
 
-        self.children
-            .spawn_child(
-                &session_id,
-                &path,
-                DROID_ACP_ARGS.iter().map(|arg| arg.to_string()).collect(),
-                &input.cwd,
-                None,
-                Some(HarnessId::Droid),
-            )
-            .await?;
-
-        match self
-            .start_session(input, &acp, &wiring, resume.as_ref(), on_event)
-            .await
-        {
+        self.threads
+            .lock()
+            .starting_by_thread
+            .insert(session_id.clone(), acp.clone());
+        let started = async {
+            self.children
+                .spawn_child(
+                    &session_id,
+                    &path,
+                    DROID_ACP_ARGS.iter().map(|arg| arg.to_string()).collect(),
+                    &input.cwd,
+                    None,
+                    Some(HarnessId::Droid),
+                )
+                .await?;
+            self.start_session(input, &acp, &wiring, resume.as_ref(), on_event, generation)
+                .await
+        };
+        match started.await {
             Ok(live) => Ok(live),
             Err(error) => {
                 acp.close(Some(&error.to_string()));
                 wiring.clear();
-                self.stop_session(&session_id).await;
+                // Keep the resume binding: the next turn retries the load.
+                self.stop_session(&session_id, false, false).await;
                 Err(error)
             }
         }
     }
 
-    /// The `try` block of `ensureLive`.
+    /// The `try` block of `ensureLive`, after the spawn.
     async fn start_session(
         &self,
         input: &HarnessSessionInput,
@@ -461,7 +656,10 @@ impl Inner {
         wiring: &Arc<Wiring<Live>>,
         resume: Option<&Resume>,
         on_event: EventSink,
+        generation: u64,
     ) -> Result<Arc<Live>> {
+        let session_id = &input.session_id;
+        self.check_generation(session_id, generation)?;
         acp.request_value(
             "initialize",
             Some(initialize_params("monocode")),
@@ -470,10 +668,13 @@ impl Inner {
         .await
         .map_err(|error| droid_startup_error(&error))?;
 
+        self.check_generation(session_id, generation)?;
         let mut setup = Value::Null;
         let mut acp_session_id: Option<String> = None;
         let mut did_load = false;
         if let Some(resume) = resume {
+            // A failed load fails the turn instead of starting a new session,
+            // so a transient error does not lose the conversation.
             wiring.set_muted(true);
             let loaded = acp
                 .request_value(
@@ -486,16 +687,15 @@ impl Inner {
                     SESSION_TIMEOUT_MS,
                 )
                 .await;
-            if let Ok(result) = loaded {
-                acp_session_id = Some(
-                    droid_session_id(&result).unwrap_or_else(|| resume.acp_session_id.clone()),
-                );
-                setup = result;
-                did_load = true;
-            }
             wiring.set_muted(false);
+            let result = loaded?;
+            acp_session_id =
+                Some(droid_session_id(&result).unwrap_or_else(|| resume.acp_session_id.clone()));
+            setup = result;
+            did_load = true;
         }
 
+        self.check_generation(session_id, generation)?;
         if acp_session_id.is_none() {
             setup = acp
                 .request_value(
@@ -507,6 +707,7 @@ impl Inner {
                 .map_err(|error| droid_startup_error(&error))?;
             acp_session_id = droid_session_id(&setup);
         }
+        self.check_generation(session_id, generation)?;
         let Some(acp_session_id) = acp_session_id else {
             return Err(anyhow!("Factory Droid did not return a session id"));
         };
@@ -523,48 +724,59 @@ impl Inner {
             state: Mutex::new(LiveState {
                 model_id: droid_current_model_id(&setup).unwrap_or_default(),
                 mode_id: String::new(),
+                mode_revision: 0,
                 mute_updates: did_load,
                 cancelled: false,
+                closed: false,
                 runtime_mode: input.runtime_mode,
                 planning: input.intent == Some(TurnIntent::Plan),
                 on_event,
+                tool_kinds: HashMap::new(),
             }),
             approvals: Mutex::default(),
-            turns: smol::lock::Mutex::new(()),
+            permission_tasks: Arc::new(smol::lock::RwLock::new(())),
         });
-        wiring.set_live(&live);
         {
             let mut threads = self.threads.lock();
+            threads.starting_by_thread.remove(session_id);
             threads
                 .live_by_thread
-                .insert(input.session_id.clone(), live.clone());
+                .insert(session_id.clone(), live.clone());
             threads.resume_by_thread.insert(
-                input.session_id.clone(),
+                session_id.clone(),
                 Resume {
                     acp_session_id: acp_session_id.clone(),
                     cwd: input.cwd.clone(),
                 },
             );
         }
+        wiring.set_live(&live);
         live.emit(HarnessEvent::SessionProviderBound {
             provider_session_id: acp_session_id,
         });
+        self.check_generation(session_id, generation)?;
         live.emit(HarnessEvent::SessionStarted);
+        self.check_generation(session_id, generation)?;
         if !self.catalog.has_live_catalog(HarnessId::Droid) {
             // A running session already knows Droid's models; show them now
             // and let the catalog probe fill in per-model reasoning levels.
             let models = models_from_droid_session(&setup, &HashMap::new());
             if !models.is_empty() {
-                self.catalog.set_harness_models(HarnessId::Droid, models);
+                self.catalog
+                    .set_harness_catalog(HarnessId::Droid, models, false);
             }
-            let probe = self.models.clone();
-            self.spawner
-                .spawn(Box::pin(async move { probe.refresh().await }));
+            // Remote hosts discover catalogs with their project directory.
+            if !self.children.has_headless_child_backend() {
+                let probe = self.models.clone();
+                self.spawner
+                    .spawn(Box::pin(async move { probe.refresh().await }));
+            }
         }
         Ok(live)
     }
 
-    /// `setConfigOption`.
+    /// `setConfigOption`. A snapshot in the reply must show the requested
+    /// value for any setting other than the model.
     async fn set_config_option(&self, live: &Live, config_id: &str, value: &str) -> Result<()> {
         let (generation, current) = {
             let config = live.config.lock();
@@ -589,11 +801,26 @@ impl Inner {
                 CONTROL_TIMEOUT_MS,
             )
             .await?;
-        let mut config = live.config.lock();
         if let Some(options) = droid_config_options_from(&result) {
-            config.replace(options);
-        } else if current.is_some()
+            let is_model = droid_model_config(&options).is_some_and(|model| model.id == config_id);
+            let effective = options
+                .iter()
+                .find(|option| option.id == config_id)
+                .and_then(|option| option.current_value.clone());
+            live.sync_config(options);
+            if !is_model && effective.is_some_and(|effective| effective != value) {
+                return Err(anyhow!(
+                    "Factory Droid did not apply the requested {config_id}"
+                ));
+            }
+            return Ok(());
+        }
+        let mut config = live.config.lock();
+        let is_model =
+            droid_model_config(&config.options).is_some_and(|model| model.id == config_id);
+        if current.is_some()
             && config.generation == generation
+            && !is_model
             && let Some(option) = config
                 .options
                 .iter_mut()
@@ -608,16 +835,24 @@ impl Inner {
     async fn apply_model_selection(&self, live: &Live, input: &HarnessSessionInput) -> Result<()> {
         let native = self.catalog.read().native_model_id_for(&input.model);
         let model_id = js::trim(&native).to_string();
+        let requested_effort = input.model_settings.as_ref().and_then(|settings| {
+            settings
+                .get("effort")
+                .or_else(|| settings.get("reasoning"))
+                .cloned()
+        });
         let current = live.state.lock().model_id.clone();
-        if !model_id.is_empty() && model_id != "default" && model_id != current {
+        let switching = !model_id.is_empty() && model_id != "default" && model_id != current;
+        if switching {
+            let generation = live.config_generation();
             let config_id = droid_model_config(&live.options())
                 .map(|config| config.id.clone())
                 .unwrap_or_else(|| "model".into());
-            if self
-                .set_config_option(live, &config_id, &model_id)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.set_config_option(live, &config_id, &model_id).await {
+                // Older Droid builds only have session/set_model.
+                if !UNSUPPORTED_CONTROL.is_match(&error.to_string()) {
+                    return Err(error);
+                }
                 live.acp
                     .request_value(
                         "session/set_model",
@@ -626,17 +861,43 @@ impl Inner {
                     )
                     .await?;
             }
-            live.state.lock().model_id = model_id;
+            if live.config_generation() == generation {
+                live.state.lock().model_id = model_id.clone();
+            }
         }
 
-        // Reasoning levels are per model, so apply effort after the model switch.
+        // Reasoning levels are per model, so apply effort once Droid reports
+        // the new model's options.
+        if switching && requested_effort.is_some() {
+            let deadline = Instant::now() + task::ms(CONTROL_TIMEOUT_MS);
+            while droid_model_config(&live.options())
+                .and_then(|config| config.current_value.clone())
+                .as_deref()
+                != Some(model_id.as_str())
+            {
+                if live.retired() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(anyhow!(
+                        "Factory Droid did not confirm the selected model configuration"
+                    ));
+                }
+                task::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let options = live.options();
         let effort = droid_effort_config(&options);
         let value = droid_effort_value(effort, input.model_settings.as_ref());
-        if let (Some(effort), Some(value)) = (effort, value)
-            && let Err(error) = self.set_config_option(live, &effort.id, &value).await
+        if let Some(requested) = &requested_effort
+            && value.is_none()
         {
-            log::debug!("[monocode] droid effort {error:#}");
+            return Err(anyhow!(
+                "Factory Droid does not support reasoning effort {requested} for the selected model"
+            ));
+        }
+        if let (Some(effort), Some(value)) = (effort, value) {
+            self.set_config_option(live, &effort.id, &value).await?;
         }
         Ok(())
     }
@@ -649,9 +910,13 @@ impl Inner {
         planning: bool,
     ) -> Result<()> {
         let mode_id = droid_mode_id(runtime_mode, planning).as_str();
-        if live.state.lock().mode_id == mode_id {
-            return Ok(());
-        }
+        let revision = {
+            let state = live.state.lock();
+            if state.mode_id == mode_id {
+                return Ok(());
+            }
+            state.mode_revision
+        };
         let set = live
             .acp
             .request_value(
@@ -664,10 +929,16 @@ impl Inner {
             self.set_config_option(live, "autonomy_level", mode_id)
                 .await?;
         }
-        live.state.lock().mode_id = mode_id.to_string();
+        let mut state = live.state.lock();
+        if state.mode_revision == revision {
+            state.mode_id = mode_id.to_string();
+        }
         Ok(())
     }
 }
+
+static UNSUPPORTED_CONTROL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)method not found|unsupported").unwrap());
 
 /// `prompt`.
 async fn prompt(live: &Live, input: &SendTurnInput) -> Result<()> {
@@ -706,30 +977,71 @@ async fn prompt(live: &Live, input: &SendTurnInput) -> Result<()> {
 
 /// `handleNotification`.
 fn handle_notification(live: &Live, method: &str, params: &Value) {
-    if method != "session/update" || is_droid_error_echo(params) {
+    if method != "session/update" {
+        return;
+    }
+    let update = &params["update"];
+    if update["sessionUpdate"] == "current_mode_update"
+        && let Some(mode) = update["currentModeId"].as_str()
+    {
+        let mut state = live.state.lock();
+        state.mode_id = mode.to_string();
+        state.mode_revision += 1;
+    }
+    if is_droid_error_echo(params) {
         return;
     }
     let events = events_from_acp_update(params);
     let routed = live.subagents.lock().route(params, events);
     for event in routed {
+        if let HarnessEvent::ToolStarted {
+            call_id,
+            kind: Some(kind),
+            ..
+        }
+        | HarnessEvent::ToolUpdated {
+            call_id,
+            kind: Some(kind),
+            ..
+        } = &event
+        {
+            live.state
+                .lock()
+                .tool_kinds
+                .insert(call_id.clone(), kind.clone());
+        }
         live.emit(event);
     }
 }
 
 /// `handleRequest`.
-async fn handle_request(live: &Live, id: i64, method: &str, params: &Value) {
+async fn handle_request(live: &Live, id: i64, method: &str, params: &Value) -> Result<()> {
     if method == "session/request_permission" {
-        if let Err(error) = handle_permission(live, id, params).await {
-            log::debug!("[monocode] droid permission reply {error:#}");
-        }
-        return;
+        return handle_permission(live, id, params).await;
     }
     respond_method_not_found(&live.acp, id, method).await;
+    Ok(())
 }
 
-/// `handlePermission`.
+/// `handlePermission`. A cancelled turn answers `cancelled`, and a closed
+/// connection gets no reply.
 async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
-    let request = permission_request_from_acp(params);
+    let (closed, cancelled) = {
+        let state = live.state.lock();
+        (state.closed, state.cancelled)
+    };
+    if closed {
+        return Ok(());
+    }
+    if cancelled {
+        return respond_permission(live, id, None).await;
+    }
+    let mut request = permission_request_from_acp(params);
+    if request.kind.is_none()
+        && let Some(call_id) = &request.call_id
+    {
+        request.kind = live.state.lock().tool_kinds.get(call_id).cloned();
+    }
     if let Some(call_id) = &request.call_id {
         live.emit(HarnessEvent::ToolUpdated {
             agent_model: None,
@@ -741,6 +1053,9 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
             preview: request.preview.clone(),
             paths: None,
         });
+    }
+    if live.retired() {
+        return respond_permission(live, id, None).await;
     }
 
     let (planning, runtime_mode) = {
@@ -764,21 +1079,34 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         } else {
             ApprovalDecision::Deny
         };
-        return live
-            .acp
-            .respond(
-                id,
-                selected_outcome(&permission_option_id(decision, &request.option_ids)),
-            )
-            .await;
+        let option_id = permission_option_id(decision, &request.option_ids, &request.option_kinds);
+        return respond_permission(live, id, option_id).await;
     }
 
-    if let Some(automatic) =
-        pick_auto_option(runtime_mode, request.kind.as_deref(), &request.option_ids)
-    {
-        return live.acp.respond(id, selected_outcome(&automatic)).await;
+    if let Some(automatic) = pick_auto_option(
+        runtime_mode,
+        request.kind.as_deref(),
+        &request.option_ids,
+        &request.option_kinds,
+    ) {
+        return respond_permission(live, id, Some(automatic)).await;
     }
 
+    // Register the waiter under the state lock, so a stop either sees it or
+    // this sees the stop.
+    let waiter = {
+        let state = live.state.lock();
+        if state.cancelled || state.closed {
+            None
+        } else {
+            let (tx, rx) = oneshot::channel();
+            live.approvals.lock().insert(id, tx);
+            Some(rx)
+        }
+    };
+    let Some(waiter) = waiter else {
+        return respond_permission(live, id, None).await;
+    };
     live.emit(HarnessEvent::ApprovalRequested {
         request_id: id,
         title: request.title.clone(),
@@ -786,19 +1114,32 @@ async fn handle_permission(live: &Live, id: i64, params: &Value) -> Result<()> {
         call_id: request.call_id.clone(),
         preview: request.preview.clone(),
     });
-    let (tx, rx) = oneshot::channel();
-    live.approvals.lock().insert(id, tx);
-    let decision = rx.await.unwrap_or(ApprovalDecision::Deny);
+    let decision = waiter.await.ok().flatten();
     live.approvals.lock().remove(&id);
     live.emit(HarnessEvent::ApprovalResolved {
         request_id: id,
-        decision: decided(decision),
+        decision: decided(decision.unwrap_or(ApprovalDecision::Deny)),
     });
+    let option_id = match decision {
+        Some(decision) if !live.cancelled() => {
+            permission_option_id(decision, &request.option_ids, &request.option_kinds)
+        }
+        _ => None,
+    };
+    respond_permission(live, id, option_id).await
+}
+
+/// `respondPermission`.
+async fn respond_permission(live: &Live, id: i64, option_id: Option<String>) -> Result<()> {
+    let option_id = {
+        let state = live.state.lock();
+        if state.closed {
+            return Ok(());
+        }
+        option_id.filter(|_| !state.cancelled)
+    };
     live.acp
-        .respond(
-            id,
-            selected_outcome(&permission_option_id(decision, &request.option_ids)),
-        )
+        .respond(id, permission_outcome(option_id.as_deref()))
         .await
 }
 
@@ -834,7 +1175,9 @@ impl HarnessAdapter for DroidAdapter {
 
     fn cancel_turn(&self, session_id: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.inner.cancel_turn(&session_id).await;
+            // `cancelDroidTurn`: tell Droid, then retire the connection. The
+            // next turn resumes the session on a fresh process.
+            self.inner.stop_session(&session_id, true, true).await;
             Ok(())
         })
     }
@@ -846,7 +1189,7 @@ impl HarnessAdapter for DroidAdapter {
 
     fn stop_session(&self, session_id: String) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.inner.stop_session(&session_id).await;
+            self.inner.stop_session(&session_id, true, false).await;
             Ok(())
         })
     }

@@ -8,8 +8,8 @@ use monocode_harness::core::provider_accounts::ProviderAccount;
 use serde::{Deserialize, Serialize};
 
 use super::rate_limits::{
-    ProviderRateLimits, RateLimitStatus, clamp_used_percent, exhausted_window_reset_at,
-    format_reset_duration,
+    ProviderRateLimits, RateLimitStatus, clamp_used_percent, exhausted_window_reset_at_for,
+    format_reset_duration, relevant_rate_limit_windows,
 };
 use monocode_core::js;
 
@@ -52,10 +52,19 @@ pub struct AccountStatus {
 /// without usage data. A window whose reset time has passed counts as fully
 /// available.
 pub fn account_headroom(limits: Option<&ProviderRateLimits>, now: i64) -> Option<f64> {
+    account_headroom_for(limits, now, None)
+}
+
+/// [`account_headroom`] over the windows that limit `model`, so a used-up
+/// Opus quota does not hold back a Sonnet session.
+pub fn account_headroom_for(
+    limits: Option<&ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<f64> {
     let limits = limits?;
-    [limits.session, limits.weekly, limits.monthly]
+    relevant_rate_limit_windows(limits, model)
         .into_iter()
-        .flatten()
         .map(|window| {
             if window.resets_at.is_some_and(|resets_at| resets_at <= now) {
                 100.0
@@ -68,7 +77,16 @@ pub fn account_headroom(limits: Option<&ProviderRateLimits>, now: i64) -> Option
 
 /// `accountStatus`: Ready, Running low, or Exhausted, shared by every view.
 pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountStatus {
-    let headroom = account_headroom(limits, now);
+    account_status_for(limits, now, None)
+}
+
+/// [`account_status`] for a session running `model`.
+pub fn account_status_for(
+    limits: Option<&ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> AccountStatus {
+    let headroom = account_headroom_for(limits, now, model);
     let (Some(limits), Some(headroom)) = (limits, headroom) else {
         if limits.is_none_or(|limits| {
             matches!(
@@ -98,7 +116,7 @@ pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountS
         return AccountStatus {
             tone: AccountStatusTone::Exhausted,
             label: "Exhausted".into(),
-            detail: back_in(limits, now),
+            detail: back_in(limits, now, model),
         };
     }
     if headroom <= LOW_HEADROOM_PERCENT {
@@ -116,8 +134,8 @@ pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountS
 }
 
 /// "back in 31m" for the used-up window that stays blocked longest.
-fn back_in(limits: &ProviderRateLimits, now: i64) -> Option<String> {
-    let reset_at = exhausted_window_reset_at(limits)?;
+fn back_in(limits: &ProviderRateLimits, now: i64, model: Option<&str>) -> Option<String> {
+    let reset_at = exhausted_window_reset_at_for(limits, model)?;
     if reset_at <= now {
         return None;
     }
@@ -131,9 +149,19 @@ pub fn best_alternative_account(
     usage_for: impl Fn(&ProviderAccount) -> Option<ProviderRateLimits>,
     now: i64,
 ) -> Option<&ProviderAccount> {
+    best_alternative_account_for(accounts, usage_for, now, None)
+}
+
+/// [`best_alternative_account`] for a session running `model`.
+pub fn best_alternative_account_for<'a>(
+    accounts: &'a [ProviderAccount],
+    usage_for: impl Fn(&ProviderAccount) -> Option<ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<&'a ProviderAccount> {
     let mut best: Option<(&ProviderAccount, f64)> = None;
     for account in accounts {
-        let Some(headroom) = account_headroom(usage_for(account).as_ref(), now) else {
+        let Some(headroom) = account_headroom_for(usage_for(account).as_ref(), now, model) else {
             continue;
         };
         if headroom <= LOW_HEADROOM_PERCENT {
@@ -178,6 +206,8 @@ mod tests {
             weekly,
             monthly: None,
             reset_credits: None,
+            scoped_weekly: Vec::new(),
+            extra_usage: None,
             updated_at: NOW,
             error: None,
             status: RateLimitStatus::Ok,

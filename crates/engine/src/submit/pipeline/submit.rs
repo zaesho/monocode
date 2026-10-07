@@ -8,7 +8,8 @@ use futures::FutureExt;
 use gpui::{App, Context};
 use monocode_core::attachment::display_attachments;
 use monocode_core::block::{
-    Block, BlockNotice, BlockRole, PlanBlockMeta, PlanStatus, SecondOpinionKind, TurnIntent,
+    Block, BlockNotice, BlockRole, ModelTarget, PlanBlockMeta, PlanStatus, SecondOpinionKind,
+    TurnIntent,
 };
 use monocode_core::harness::HarnessId;
 use monocode_core::harness_event::SteerTurnInput;
@@ -18,6 +19,7 @@ use monocode_core::orchestration::{
     proposal_block,
 };
 use monocode_core::paths::path_key;
+use monocode_core::provider_context::running_provider_selection;
 use monocode_core::reducer::{
     SystemEnv, UserTurnExtra, append_steer_user_mut, append_user_mut, now_ms, stop_streaming_mut,
 };
@@ -32,20 +34,24 @@ use monocode_harness::core::provider_accounts::{
 };
 use monocode_harness::core::session_title::should_generate_session_title;
 
-use super::actions::{cancel_harness, forget_harness, sync_dock_badge};
+use super::actions::sync_dock_badge;
 use super::session_edits::{apply_user_turn_fields, with_plan_build_target};
 use super::turn::{TurnRun, Wrap, run_turn};
 use super::{Submit, SubmitOptions, settle};
 use crate::runtime::engine::Engine;
+use crate::runtime::session_links::is_link_message;
 use crate::submit::acceptance::{
     ControlOutcome, SubmissionAcceptance, SubmitError, submit_after_project_sync,
 };
-use crate::submit::edit_last_turn::{EditedResendAttempt, create_edited_resend_attempt};
+use crate::submit::app_access::TurnAppAccess;
+use crate::submit::edit_last_turn::{
+    EditedResendAttempt, create_edited_resend_attempt, last_user_turn_block,
+};
 use crate::submit::handoff::{
     append_preparing_handoff, handoff_turn_card, is_preparing_handoff, pending_handoff,
 };
 use crate::submit::message_queue::{
-    QueueSubmitMode, dequeue_queued_message, queued_message_for_submit,
+    QueueSubmitMode, can_steer_with_selection, dequeue_queued_message, queued_message_for_submit,
 };
 use crate::submit::operator_command::{
     OPERATOR_DEFAULT_PROMPT, consume_operator_command, operator_enabled_in_thread,
@@ -53,7 +59,20 @@ use crate::submit::operator_command::{
 use crate::submit::paths::{is_equal_or_inside, looks_like_project};
 use crate::submit::prefs::{KvStore, save_recent_model_choice};
 use crate::submit::prompt::compose_note_message;
+use crate::submit::provider_switch::{AcceptanceSubmission, SWITCH_BEFORE_COMMAND};
 use crate::submit::second_opinion::SECOND_OPINION_TITLE;
+use crate::submit::skills::SkillCatalogContext;
+
+fn matching_skill_classification(
+    context: &SkillCatalogContext,
+    classification: Option<&(SkillCatalogContext, bool)>,
+) -> Result<Option<bool>, ()> {
+    match classification {
+        Some((captured, raw)) if captured == context => Ok(Some(*raw)),
+        Some(_) => Err(()),
+        None => Ok(None),
+    }
+}
 
 /// Enqueue one event for a session and flush it now.
 pub(crate) fn report(session_id: &str, event: HarnessEvent, cx: &mut App) {
@@ -126,6 +145,18 @@ impl Submit {
         options: SubmitOptions,
         cx: &mut Context<Self>,
     ) -> SubmissionAcceptance {
+        self.submit_with_skill_classification(session_id, text, attachments, options, None, cx)
+    }
+
+    fn submit_with_skill_classification(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        attachments: Vec<Attachment>,
+        options: SubmitOptions,
+        classification: Option<(SkillCatalogContext, bool)>,
+        cx: &mut Context<Self>,
+    ) -> SubmissionAcceptance {
         let sessions = Engine::sessions(cx);
         let peers = self.peers.clone();
         if let Some(remote) = sessions.read(cx).get(session_id).cloned()
@@ -139,9 +170,51 @@ impl Submit {
                 cx,
             ));
         }
+        let busy_now = sessions
+            .read(cx)
+            .get(session_id)
+            .is_some_and(Session::is_busy);
+        match self.acceptance.submission_mode(session_id, busy_now) {
+            AcceptanceSubmission::Reconcile => {
+                self.reconcile_acceptance(session_id, cx);
+                return SubmissionAcceptance::Ready(false);
+            }
+            AcceptanceSubmission::Wait => return SubmissionAcceptance::Ready(false),
+            AcceptanceSubmission::Submit | AcceptanceSubmission::Queue => {}
+        }
+        let inspection = sessions
+            .read(cx)
+            .get(session_id)
+            .and_then(|session| session.provider_context.as_ref())
+            .and_then(|state| state.delivery.as_ref())
+            .filter(|delivery| delivery.needs_inspection())
+            .map(|delivery| delivery.switch_id.clone());
+        if let Some(switch_id) = inspection {
+            // The request may have run. A plain submit asks the user to
+            // confirm they inspected it, and sends nothing.
+            if !busy_now
+                && options.queued_message_id.is_none()
+                && !options.managed
+                && options.ci_repair.is_none()
+                && options.app_request_id.is_none()
+            {
+                self.confirm_delivery_inspection(session_id, &switch_id, cx);
+            }
+            return SubmissionAcceptance::Ready(false);
+        }
         if self.edited_resends.is_active(session_id) {
             return SubmissionAcceptance::Ready(false);
         }
+        // A message the user wrote resets the agent message budget of every
+        // link this session has. Agent calls carry a request id, and a link
+        // message keeps its header when it leaves the queue.
+        if options.app_request_id.is_none() && !is_link_message(text) {
+            Engine::links(cx).update(cx, |links, _| links.reset_budget(session_id));
+        }
+        // Output that already arrived belongs before the submitted user
+        // message. Flush before reading the session too, since a pending
+        // error can settle it.
+        sessions.update(cx, |sessions, cx| sessions.flush(cx));
         if let Some(error) = peers
             .orchestration
             .submission_error(session_id, options.managed, cx)
@@ -176,7 +249,11 @@ impl Submit {
             }
         }
         let stored = sessions.read(cx).get(session_id).cloned();
-        if options.app_request_id.is_some() && stored.as_ref().is_some_and(Session::is_busy) {
+        // A linked session's message to a busy session goes to its queue below.
+        if options.app_request_id.is_some()
+            && !is_link_message(text)
+            && stored.as_ref().is_some_and(Session::is_busy)
+        {
             return SubmissionAcceptance::Ready(false);
         }
         if options.ci_repair.is_some()
@@ -189,6 +266,33 @@ impl Submit {
         let Some(stored) = stored else {
             return SubmissionAcceptance::Ready(false);
         };
+        let acceptance_save_pending = match self
+            .acceptance
+            .submission_mode(session_id, stored.is_busy())
+        {
+            AcceptanceSubmission::Wait | AcceptanceSubmission::Reconcile => {
+                return SubmissionAcceptance::Ready(false);
+            }
+            AcceptanceSubmission::Queue => true,
+            AcceptanceSubmission::Submit => false,
+        };
+        if let Some(queued_id) = &options.queued_message_id {
+            let mode = if options.follow_up_behavior == Some(FollowUpBehavior::Steer) {
+                QueueSubmitMode::Steer
+            } else {
+                QueueSubmitMode::Dispatch
+            };
+            let active = running_provider_selection(&stored, self.running_selection(session_id));
+            let catalog = self.config.catalog.read();
+            let allowed =
+                queued_message_for_submit(&stored, queued_id, mode).is_some_and(|message| {
+                    mode == QueueSubmitMode::Dispatch
+                        || can_steer_with_selection(&stored, message, &active, &catalog)
+                });
+            if !allowed {
+                return SubmissionAcceptance::Ready(false);
+            }
+        }
         let removing_paths = peers.projects.removing_worktree_paths(cx);
         if stored.worktree_removed == Some(true)
             || removing_paths
@@ -250,16 +354,6 @@ impl Submit {
             && approved_plan.as_ref().is_none_or(|plan| blank(&plan.text))
         {
             return SubmissionAcceptance::Ready(false);
-        }
-        if let Some(queued_id) = &options.queued_message_id {
-            let mode = if options.follow_up_behavior == Some(FollowUpBehavior::Steer) {
-                QueueSubmitMode::Steer
-            } else {
-                QueueSubmitMode::Dispatch
-            };
-            if queued_message_for_submit(&current, queued_id, mode).is_none() {
-                return SubmissionAcceptance::Ready(false);
-            }
         }
         let note_card = match &options.note_card {
             Some(card) => card.clone(),
@@ -328,10 +422,50 @@ impl Submit {
         } else {
             submitted_text.clone()
         };
-        let raw_command = !operator.matched
+        let mut skill_context =
+            crate::submit::skills::SkillCatalogContext::new(current.harness, &initial_work_cwd)
+                .with_session(session_id);
+        if let Some(account) = &provider_account_id {
+            skill_context = skill_context.with_account(account);
+        }
+        let skill_context = (self.config.skill_context)(skill_context);
+        let classified = match matching_skill_classification(
+            &skill_context,
+            classification.as_ref(),
+        ) {
+            Ok(classified) => classified,
+            Err(()) => {
+                session_error(
+                    session_id,
+                    "The skill settings or provider account changed before this request could start. Submit the request again.",
+                    cx,
+                );
+                return SubmissionAcceptance::Ready(false);
+            }
+        };
+        if !operator.matched
+            && classified.is_none()
             && self
                 .skills
-                .is_native_command_prompt(&submitted_text, current.harness);
+                .is_native_command_prompt(&submitted_text, current.harness)
+            && self.skills.peek_skills(&skill_context).is_none()
+        {
+            return self.submit_after_skill_classification(
+                session_id,
+                text,
+                &submitted_text,
+                attachments,
+                options,
+                skill_context,
+                edited,
+                cx,
+            );
+        }
+        let raw_command = !operator.matched
+            && classified.unwrap_or_else(|| {
+                self.skills
+                    .is_native_command_prompt_cached(&submitted_text, &skill_context)
+            });
         let ci_context = options
             .ci_repair
             .as_ref()
@@ -346,10 +480,16 @@ impl Submit {
             .pending_switch
             .clone()
             .filter(|pending| pending.from != current.harness);
+        if pending_switch.is_some() && raw_command {
+            status(session_id, SWITCH_BEFORE_COMMAND, cx);
+            return SubmissionAcceptance::Ready(false);
+        }
 
-        if current.is_busy() && pending_switch.is_none() {
+        if current.is_busy() {
             return self.follow_up(
                 FollowUp {
+                    // A switch or an open acceptance save waits for the turn.
+                    force_queue: pending_switch.is_some() || acceptance_save_pending,
                     session_id,
                     text,
                     attachments,
@@ -476,12 +616,6 @@ impl Submit {
             None
         };
 
-        if let Some(pending) = &pending_switch
-            && current.is_busy()
-        {
-            cancel_harness(&registry, pending.from, session_id, cx);
-        }
-
         peers
             .attention
             .dismiss_notices_for_continued_session(session_id, cx);
@@ -511,9 +645,6 @@ impl Submit {
         }
 
         if !live {
-            if let Some(pending) = &pending_switch {
-                forget_harness(&registry, pending.from, session_id, cx);
-            }
             reject_edited(edited.as_deref(), &options, cx);
             settle(
                 &options,
@@ -536,11 +667,23 @@ impl Submit {
             });
         }
 
+        // Decided here, after every early return, so a note counts as sent
+        // only when a turn really starts.
+        let app_access = self.turn_app_access(&current, operator_access, cx);
+        let app_note = app_access.note();
+        let app_note = if self.app_notes.get(session_id) == app_note.as_ref() {
+            None
+        } else {
+            match &app_note {
+                Some(note) => self.app_notes.insert(session_id.to_string(), note.clone()),
+                None => self.app_notes.remove(session_id),
+            };
+            app_note
+        };
         let run = TurnRun {
             session_id: session_id.to_string(),
             generation,
             current: current.clone(),
-            text: text.to_string(),
             attachments,
             options: options.clone(),
             intent,
@@ -548,6 +691,8 @@ impl Submit {
             raw_command,
             operator_matched: operator.matched,
             operator_access,
+            app_access,
+            app_note,
             provider_account_id,
             initial_work_cwd,
             create_draft_worktree,
@@ -576,16 +721,52 @@ impl Submit {
             config: self.config.clone(),
             peers,
             skills: self.skills.clone(),
+            selection_revision: self.selection_revision(session_id),
+            submit: None,
         };
+        self.running_selections.insert(
+            session_id.to_string(),
+            ModelTarget {
+                harness: current.harness,
+                model: current.model.clone(),
+                model_settings: current.model_settings.clone(),
+            },
+        );
         cx.spawn(async move |this, cx| run_turn(this, run, cx).await)
             .detach();
         SubmissionAcceptance::Ready(true)
+    }
+
+    /// What this turn's agent may do with the app CLI.
+    fn turn_app_access(&self, current: &Session, operator: bool, cx: &App) -> TurnAppAccess {
+        let sessions = Engine::sessions(cx);
+        let sessions = sessions.read(cx);
+        let peers = Engine::links(cx)
+            .read(cx)
+            .peers(&current.id, cx)
+            .into_iter()
+            .map(|id| {
+                let title = sessions
+                    .get(&id)
+                    .map(|peer| peer.title.clone())
+                    .unwrap_or_default();
+                (id, title)
+            })
+            .collect();
+        TurnAppAccess::for_session(
+            current,
+            operator,
+            monocode_settings::settings_store::load_agent_sessions_enabled(&self.config.kv),
+            monocode_settings::settings_store::load_agent_sessions_review(&self.config.kv),
+            peers,
+        )
     }
 
     /// The busy branch of `submitSession`: queue the message, or hand it to
     /// the running turn.
     fn follow_up(&mut self, follow: FollowUp<'_>, cx: &mut Context<Self>) -> SubmissionAcceptance {
         let FollowUp {
+            force_queue,
             session_id,
             text,
             attachments,
@@ -611,7 +792,8 @@ impl Submit {
             );
             return SubmissionAcceptance::Ready(false);
         }
-        let behavior = if current.worktree_preparing == Some(true)
+        let behavior = if force_queue
+            || current.worktree_preparing == Some(true)
             || intent == TurnIntent::Plan
             || intent == TurnIntent::Orchestrate
             || operator_matched
@@ -634,12 +816,22 @@ impl Submit {
         let sessions = Engine::sessions(cx);
         if behavior == FollowUpBehavior::Queue {
             let message = QueuedMessage {
+                // The request keeps the provider and model it was sent with.
+                selection: Some(ModelTarget {
+                    harness: current.harness,
+                    model: current.model.clone(),
+                    model_settings: current.model_settings.clone(),
+                }),
                 id: uuid::Uuid::new_v4().to_string(),
                 text: text.to_string(),
                 attachments,
                 note_card,
                 handoff_card,
                 intent: Some(intent),
+                app_request_id: options
+                    .app_request_id
+                    .clone()
+                    .filter(|_| is_link_message(text)),
             };
             sessions.update(cx, |sessions, cx| {
                 sessions.update(session_id, cx, |session| {
@@ -648,10 +840,13 @@ impl Submit {
                         session.note_card = None;
                         session.handoff_card = None;
                     }
-                    session
-                        .queued_messages
-                        .get_or_insert_with(Vec::new)
-                        .push(message);
+                    // A queued row that waits again keeps its place.
+                    if options.queued_message_id.is_none() {
+                        session
+                            .queued_messages
+                            .get_or_insert_with(Vec::new)
+                            .push(message);
+                    }
                     session.queue_status = Some(
                         if session.queue_status == Some(MessageQueueStatus::Paused) {
                             MessageQueueStatus::Paused
@@ -667,8 +862,10 @@ impl Submit {
             return SubmissionAcceptance::Ready(true);
         }
         let registry = self.config.registry.clone();
-        if !registry.is_live_harness(current.harness)
-            || !registry.can_steer_harness(current.harness)
+        // The running turn keeps its provider and model while the picker
+        // changes.
+        let active = running_provider_selection(current, self.running_selection(session_id));
+        if !registry.is_live_harness(active.harness) || !registry.can_steer_harness(active.harness)
         {
             // Harnesses that cannot steer (fx) used to drop the message on the
             // floor here, so a follow-up sent mid-turn just vanished. Say so.
@@ -676,7 +873,7 @@ impl Submit {
                 session_id,
                 &format!(
                     "{} cannot take a follow-up mid-turn — wait for this turn to finish, or stop it first.",
-                    current.harness
+                    active.harness
                 ),
                 cx,
             );
@@ -705,31 +902,48 @@ impl Submit {
                     if let Some(queued_id) = &queued_id {
                         dequeue_queued_message(session, queued_id);
                     }
+                    // The steered turn is labeled with the running selection.
+                    let mut steered = session.clone();
+                    steered.harness = active.harness;
+                    steered.model = active.model.clone();
+                    steered.model_settings = active.model_settings.clone();
                     append_steer_user_mut(
                         &mut SystemEnv,
                         &catalog,
-                        session,
+                        &mut steered,
                         &submitted,
                         &visible,
                         has_cards.then_some(&cards),
                     );
+                    session.blocks = steered.blocks;
                 });
             });
         }
-        let harness = current.harness;
+        let harness = active.harness;
         let id = session_id.to_string();
-        let model = current.model.clone();
-        let model_settings = current.model_settings.clone();
+        let model = active.model.clone();
+        let model_settings = active.model_settings.clone();
         let inbox_ask = (!raw_command).then(|| current.inbox_ask.clone()).flatten();
         let io = self.config.attachment_io.clone();
         let skills = self.skills.clone();
         let peers = self.peers.clone();
+        let skill_context = self.config.skill_context.clone();
+        let account_id = current.provider_account_id.clone();
         cx.spawn(async move |_, cx| {
             let prepared =
                 crate::submit::attachments::prepare_attachments(io.as_ref(), &attachments).await;
-            let prompt =
-                super::turn::prepare(&harness_text, harness, &id, &work_cwd, &skills, &peers, cx)
-                    .await;
+            let prompt = super::turn::prepare(
+                &harness_text,
+                harness,
+                &id,
+                &work_cwd,
+                account_id.as_deref(),
+                &skill_context,
+                &skills,
+                &peers,
+                cx,
+            )
+            .await;
             let text = peers.inbox.ask_prompt(inbox_ask.as_ref(), prompt);
             let steer = registry.steer_harness_turn(
                 harness,
@@ -851,10 +1065,74 @@ impl Submit {
         .detach();
         acceptance
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_after_skill_classification(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        submitted_text: &str,
+        attachments: Vec<Attachment>,
+        options: SubmitOptions,
+        context: SkillCatalogContext,
+        edited: Option<Rc<EditedResendAttempt>>,
+        cx: &mut Context<Self>,
+    ) -> SubmissionAcceptance {
+        let (turn_generation, edited_target) = {
+            let sessions = Engine::sessions(cx);
+            let sessions = sessions.read(cx);
+            (
+                sessions.turn_gen(session_id),
+                edited.as_ref().and_then(|_| {
+                    sessions
+                        .get(session_id)
+                        .and_then(|session| last_user_turn_block(&session.blocks))
+                        .map(|block| block.id.clone())
+                }),
+            )
+        };
+        let (sender, acceptance) = SubmissionAcceptance::deferred();
+        let id = session_id.to_string();
+        let text = text.to_string();
+        let submitted_text = submitted_text.to_string();
+        let skills = self.skills.clone();
+        cx.spawn(async move |this, cx| {
+            let raw = skills.is_native_command_prompt_in_context(&submitted_text, &context).await;
+            let options_for_error = options.clone();
+            let retried = this.update(cx, |this, cx| {
+                let still_current = {
+                    let sessions = Engine::sessions(cx);
+                    let sessions = sessions.read(cx);
+                    sessions.turn_gen(&id) == turn_generation
+                        && sessions.get(&id).is_some_and(|session| {
+                            edited_target.as_ref().is_none_or(|target| {
+                                last_user_turn_block(&session.blocks)
+                                    .is_some_and(|block| &block.id == target)
+                            })
+                        })
+                };
+                if !still_current {
+                    return SubmissionAcceptance::Ready(false);
+                }
+                this.submit_with_skill_classification(&id, &text, attachments, options, Some((context, raw)), cx)
+            }).unwrap_or(SubmissionAcceptance::Ready(false));
+            let result = retried.resolve().await;
+            if !matches!(result, Ok(true)) {
+                cx.update(|cx| {
+                    reject_edited(edited.as_deref(), &options_for_error, cx);
+                    settle(&options_for_error, ControlOutcome::failed("The chat became unavailable before the request could start. Submit the request again when it is ready."), cx);
+                });
+            }
+            let _ = sender.send(result);
+        }).detach();
+        acceptance
+    }
 }
 
 /// Everything the busy branch needs.
 struct FollowUp<'a> {
+    /// Queue regardless of the follow-up setting.
+    force_queue: bool,
     session_id: &'a str,
     text: &'a str,
     attachments: Vec<Attachment>,
@@ -952,7 +1230,6 @@ impl CommitTurn {
         }
         if !self.live {
             session.title = titled;
-            session.pending_switch = None;
             session.busy = Some(false);
             let mut user = Block {
                 attachments: (!self.visible.is_empty()).then(|| self.visible.clone()),
@@ -979,7 +1256,7 @@ impl CommitTurn {
         }
         session.title = titled;
         if let Some(from) = self.pending_switch {
-            session.pending_switch = None;
+            // The switch stays armed until the target accepts the request.
             stop_streaming_mut(session, now_ms());
             let to = session.harness;
             *session = append_preparing_handoff(session, from, to);
@@ -992,5 +1269,41 @@ impl CommitTurn {
             &self.visible,
             Some(&self.cards),
         );
+    }
+}
+
+#[cfg(test)]
+mod skill_classification_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_the_classification_for_the_current_account_and_library_revision() {
+        let context = SkillCatalogContext::new(HarnessId::Omp, "/repo")
+            .with_session("session")
+            .with_account("work")
+            .with_home("/home")
+            .with_provider_home("omp", "/home/.omp")
+            .with_library_generation(3);
+        let file_classification = (context.clone(), false);
+        assert_eq!(
+            matching_skill_classification(&context, Some(&file_classification)),
+            Ok(Some(false))
+        );
+        assert_eq!(
+            matching_skill_classification(&context, Some(&(context.clone(), true))),
+            Ok(Some(true))
+        );
+        for changed in [
+            context.clone().with_library_generation(4),
+            context.clone().with_account("personal"),
+            context.clone().with_provider_home("omp", "/other/.omp"),
+            context.clone().with_session("other-session"),
+        ] {
+            assert_eq!(
+                matching_skill_classification(&changed, Some(&file_classification)),
+                Err(())
+            );
+        }
+        assert_eq!(matching_skill_classification(&context, None), Ok(None));
     }
 }

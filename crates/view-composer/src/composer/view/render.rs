@@ -13,6 +13,7 @@ use gpui::{
     prelude::FluentBuilder as _, relative,
 };
 use monocode_core::HarnessId;
+use monocode_ui::drag::PaneDragSource;
 use monocode_ui::styled::{UiStyled as _, glass_backdrop};
 use monocode_ui::{IconName, ProviderLogo, Theme, icon, provider_logo, u};
 
@@ -960,6 +961,9 @@ impl Render for Composer {
         if self.file_drag && !cx.has_active_drag() {
             self.file_drag = false;
         }
+        if self.session_drag && !cx.has_active_drag() {
+            self.session_drag = false;
+        }
         // The placeholder follows the chips and cards (it notifies only on
         // a change, so this does not loop).
         let placeholder = self.placeholder_text();
@@ -976,7 +980,7 @@ impl Render for Composer {
         let c = theme.colors;
         let focused = self.prompt.read(cx).is_focused(window);
         let accent = theme.user_accent_or_accent();
-        let border = if self.file_drag {
+        let border = if self.file_drag || self.session_drag {
             theme.accent(0.60)
         } else if self.resend_edited {
             gpui::Hsla { a: 0.32, ..accent }
@@ -1030,6 +1034,7 @@ impl Render for Composer {
             }
             r#box = r#box.child(chips);
         }
+        r#box = r#box.children(self.render_session_drop_choice(window, cx));
         if let Some(error) = self.paste_error.clone() {
             r#box = r#box.child(
                 div()
@@ -1069,6 +1074,7 @@ impl Render for Composer {
                     .child("Drop files to attach"),
             );
         }
+        r#box = r#box.children(self.render_session_drag_overlay(cx));
         let mut wrapper = div().relative().flex().flex_col().child(r#box);
         wrapper = wrapper.children(self.render_pickers(cx));
         if let Some(runner) = self.runner.clone() {
@@ -1138,9 +1144,22 @@ impl Render for Composer {
                 .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                     this.on_external_drop(paths, window, cx)
                 }))
+                .on_drag_move::<PaneDragSource>(cx.listener(
+                    |this, event: &DragMoveEvent<PaneDragSource>, _, cx| {
+                        let over = event.bounds.contains(&event.event.position)
+                            && this.accepts_session_drag(event.drag(cx));
+                        this.set_session_drag(over, cx);
+                    },
+                ))
+                .on_drop(
+                    cx.listener(|this, source: &PaneDragSource, _, cx| {
+                        this.on_pane_drop(source, cx)
+                    }),
+                )
             })
             .children(self.header_views.iter().cloned())
             .children(queue)
             .child(wrapper)
+            .children(self.render_attachment_preview(window, cx))
     }
 }

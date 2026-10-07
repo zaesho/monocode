@@ -74,8 +74,7 @@ pub fn compare_session_summaries(a: &SessionSummary, b: &SessionSummary) -> Orde
     pinned(b)
         .cmp(&pinned(a))
         .then_with(|| b.updated_at.cmp(&a.updated_at))
-        // TODO(port): `localeCompare` sorts by locale; this compares code points.
-        .then_with(|| a.id.cmp(&b.id))
+        .then_with(|| monocode_locale::compare(&a.id, &b.id))
 }
 
 /// `mergeHistorySummary`: put `summary` first, keeping the flags and
@@ -345,10 +344,25 @@ pub fn history_with_live_sessions(
                 .clone()
                 .filter(|id| !id.is_empty())
                 .or_else(|| stored.automation_id.clone());
-            if (stored.draft == Some(true)) != draft || stored.automation_id != automation_id {
+            // The live title and work item show before the next persist,
+            // for example mid-turn.
+            let linked_work_item = session
+                .linked_work_item
+                .clone()
+                .or_else(|| stored.linked_work_item.clone());
+            let stored_url = stored.linked_work_item.as_ref().map(|item| &item.url);
+            if (stored.draft == Some(true)) != draft
+                || stored.automation_id != automation_id
+                || stored.title != session.title
+                || stored_url != linked_work_item.as_ref().map(|item| &item.url)
+            {
+                stored.title = session.title.clone();
                 stored.draft = draft.then_some(true);
                 if automation_id.is_some() {
                     stored.automation_id = automation_id;
+                }
+                if linked_work_item.is_some() {
+                    stored.linked_work_item = linked_work_item;
                 }
             }
             continue;
@@ -425,6 +439,41 @@ mod tests {
     }
 
     const PROJECT_A: &str = "/tmp/project-a";
+
+    #[test]
+    fn matches_intl_history_ties_without_changing_pin_or_recency() {
+        for locale in ["en", "fr", "ja", "ar"] {
+            monocode_locale::with_locale(locale, || {
+                let mut pinned = summary("pinned", PROJECT_A, 0);
+                pinned.pinned = Some(true);
+                let mut rows = vec![
+                    summary("filez", PROJECT_A, 1),
+                    summary("fileé", PROJECT_A, 1),
+                    summary("filee", PROJECT_A, 1),
+                    summary("file.a", PROJECT_A, 1),
+                    summary("file-a", PROJECT_A, 1),
+                    summary("file_a", PROJECT_A, 1),
+                    summary("newest", PROJECT_A, 2),
+                    pinned,
+                ];
+                rows.sort_by(compare_session_summaries);
+                assert_eq!(
+                    ids(&rows),
+                    [
+                        "pinned", "newest", "file_a", "file-a", "file.a", "filee", "fileé", "filez"
+                    ]
+                );
+                assert_eq!(
+                    compare_session_summaries(
+                        &summary("fileé", PROJECT_A, 1),
+                        &summary("filee\u{301}", PROJECT_A, 1)
+                    ),
+                    Ordering::Equal
+                );
+            })
+            .unwrap();
+        }
+    }
 
     #[test]
     fn groups_live_and_already_saved_workers_under_their_lead_before_adoption_effects_run() {
@@ -588,6 +637,43 @@ mod tests {
             &[],
         );
         assert_eq!(rows[0].automation_id.as_deref(), Some("automation-1"));
+    }
+
+    #[test]
+    fn shows_a_live_generated_title_and_work_item_before_the_next_persist() {
+        let linked_work_item = monocode_core::session::LinkedWorkItem {
+            kind: monocode_core::inbox::WorkItemKind::Pr,
+            repo: "acme/app".into(),
+            number: 42,
+            url: "https://github.com/acme/app/pull/42".into(),
+            extra: Default::default(),
+        };
+        let mut session = Session {
+            title: "cursor · Fix tab title refresh".into(),
+            linked_work_item: Some(linked_work_item.clone()),
+            busy: Some(true),
+            ..chat("live", PROJECT_A)
+        };
+        session.blocks = vec![Block::new("u", BlockRole::User, "Fix PR #42")];
+        let rows = history_with_live_sessions(
+            &[summary("live", PROJECT_A, 1)],
+            std::slice::from_ref(&session),
+            PROJECT_A,
+            None,
+            &[],
+        );
+        assert_eq!(rows[0].title, "cursor · Fix tab title refresh");
+        assert_eq!(rows[0].linked_work_item, Some(linked_work_item.clone()));
+
+        // A live session without a work item keeps the stored one.
+        session.linked_work_item = None;
+        let stored = SessionSummary {
+            linked_work_item: Some(linked_work_item.clone()),
+            ..summary("live", PROJECT_A, 1)
+        };
+        let rows = history_with_live_sessions(&[stored], &[session], PROJECT_A, None, &[]);
+        assert_eq!(rows[0].title, "cursor · Fix tab title refresh");
+        assert_eq!(rows[0].linked_work_item, Some(linked_work_item));
     }
 
     fn hint(repo: &str, branch: &str) -> SessionGitHint {

@@ -14,15 +14,17 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 pub const HOST_PROTOCOL_VERSION: i64 = 1;
-/// The npm package a machine runs to host sessions for this desktop.
+/// The host takes `switchProvider` commands.
+pub const SESSION_PROVIDER_SWITCH_CAPABILITY: &str = "sessionProviderSwitchV1";
+/// The host takes `confirmProviderInspection` commands.
+pub const SESSION_PROVIDER_INSPECTION_CAPABILITY: &str = "sessionProviderInspectionV1";
+/// The native executable a machine runs to host sessions for this desktop.
 pub const HOST_PACKAGE: &str = "monocode-host";
 
-/// The command that installs, updates, or pairs a host for this desktop.
-pub fn host_connect_command(desktop_version: Option<&str>) -> String {
-    match desktop_version.filter(|version| !version.is_empty()) {
-        Some(version) => format!("npx {HOST_PACKAGE}@{version} connect"),
-        None => format!("npx {HOST_PACKAGE} connect"),
-    }
+/// Pairs an installed native host. SSH setup installs the desktop's version
+/// before pairing and checks the reported version against that desktop.
+pub fn host_connect_command(_desktop_version: Option<&str>) -> String {
+    "monocode-host connect".to_owned()
 }
 
 /// Compares `a.b.c` versions, ignoring prerelease suffixes.
@@ -129,6 +131,28 @@ pub struct HostDescriptor {
     /// Network addresses the host listens on, such as `https://10.0.0.5:3774`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<String>>,
+}
+
+/// `hostSupportsProviderSwitch`: a started session may change providers.
+/// Older hosts keep the model-only `configure` command.
+pub fn host_supports_provider_switch(host: Option<&HostDescriptor>) -> bool {
+    host.is_some_and(|host| {
+        host.capabilities
+            .iter()
+            .any(|entry| entry == SESSION_PROVIDER_SWITCH_CAPABILITY)
+    })
+}
+
+/// `hostSupportsProviderInspection`: the host can record that the user
+/// inspected an interrupted provider request.
+pub fn host_supports_provider_inspection(host: Option<&HostDescriptor>) -> bool {
+    host.is_some_and(|host| {
+        host.protocol_version == HOST_PROTOCOL_VERSION
+            && host
+                .capabilities
+                .iter()
+                .any(|entry| entry == SESSION_PROVIDER_INSPECTION_CAPABILITY)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +487,26 @@ pub enum HostCommand {
         model_settings: BTreeMap<String, String>,
         runtime_mode: RuntimeMode,
     },
+    /// Continue the session with another provider, or another model of the
+    /// same one. The host rejects it if the session changed since
+    /// `expected_revision`.
+    #[serde(rename = "switchProvider", rename_all = "camelCase")]
+    SwitchProvider {
+        command_id: String,
+        session_id: String,
+        expected_revision: i64,
+        harness: RemoteProvider,
+        model: String,
+        model_settings: BTreeMap<String, String>,
+        runtime_mode: RuntimeMode,
+    },
+    /// The user inspected a provider request that may already have run.
+    #[serde(rename = "confirmProviderInspection", rename_all = "camelCase")]
+    ConfirmProviderInspection {
+        command_id: String,
+        session_id: String,
+        expected_revision: i64,
+    },
     #[serde(rename = "compact", rename_all = "camelCase")]
     Compact {
         command_id: String,
@@ -791,11 +835,8 @@ mod tests {
         assert!(!host_needs_update(&host, None));
         assert!(host_needs_update(&host, Some("0.6.0")));
         assert!(!host_needs_update(&host, Some("0.5.0")));
-        assert_eq!(
-            host_connect_command(Some("0.6.0")),
-            "npx monocode-host@0.6.0 connect"
-        );
-        assert_eq!(host_connect_command(None), "npx monocode-host connect");
+        assert_eq!(host_connect_command(Some("0.6.0")), "monocode-host connect");
+        assert_eq!(host_connect_command(None), "monocode-host connect");
     }
 
     #[test]
@@ -818,5 +859,69 @@ mod tests {
         ] {
             assert!(require_host_descriptor(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// protocol.test.ts: "enables provider switching only when the host
+    /// advertises it".
+    #[test]
+    fn enables_provider_switching_only_when_the_host_advertises_it() {
+        let host = require_host_descriptor(&json!({
+            "protocolVersion": 1,
+            "environmentId": "host",
+            "name": "Host",
+            "providers": ["codex", "claude"],
+            "capabilities": [],
+        }))
+        .unwrap();
+        let with = |capability: &str| HostDescriptor {
+            capabilities: vec![capability.to_string()],
+            ..host.clone()
+        };
+        assert!(!host_supports_provider_switch(None));
+        assert!(!host_supports_provider_switch(Some(&host)));
+        assert!(!host_supports_provider_inspection(Some(&host)));
+        assert!(host_supports_provider_switch(Some(&with(
+            SESSION_PROVIDER_SWITCH_CAPABILITY
+        ))));
+        assert!(!host_supports_provider_inspection(Some(&with(
+            SESSION_PROVIDER_SWITCH_CAPABILITY
+        ))));
+        assert!(host_supports_provider_inspection(Some(&with(
+            SESSION_PROVIDER_INSPECTION_CAPABILITY
+        ))));
+        assert!(!host_supports_provider_inspection(Some(&HostDescriptor {
+            protocol_version: 2,
+            ..with(SESSION_PROVIDER_INSPECTION_CAPABILITY)
+        })));
+    }
+
+    #[test]
+    fn serializes_the_provider_switch_commands_with_their_expected_revision() {
+        let command = HostCommand::SwitchProvider {
+            command_id: "c".into(),
+            session_id: "s".into(),
+            expected_revision: 4,
+            harness: HarnessId::Claude,
+            model: "claude:test".into(),
+            model_settings: BTreeMap::new(),
+            runtime_mode: RuntimeMode::Supervised,
+        };
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            json!({
+                "type": "switchProvider", "commandId": "c", "sessionId": "s",
+                "expectedRevision": 4, "harness": "claude", "model": "claude:test",
+                "modelSettings": {}, "runtimeMode": "supervised",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HostCommand::ConfirmProviderInspection {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                expected_revision: 9,
+            })
+            .unwrap(),
+            json!({ "type": "confirmProviderInspection", "commandId": "c", "sessionId": "s", "expectedRevision": 9 })
+        );
     }
 }

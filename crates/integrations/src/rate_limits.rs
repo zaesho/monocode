@@ -4,8 +4,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use monocode_process::claude_keychain::KEYCHAIN_TIMEOUT;
 #[cfg(target_os = "macos")]
-use monocode_process::claude_keychain::{KEYCHAIN_TIMEOUT, claude_keychain_service};
+use monocode_process::claude_keychain::claude_keychain_service;
 use serde::Serialize;
 use serde_json::Value;
 

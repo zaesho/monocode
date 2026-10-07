@@ -381,7 +381,6 @@ impl Render for AddRemoteProjectDialog {
             };
         }
 
-        let overlay = with_alpha(c.modal_overlay, 0.3);
         deferred(
             div()
                 .id("add-remote-project-layer")
@@ -404,7 +403,6 @@ impl Render for AddRemoteProjectDialog {
                         .top_0()
                         .left_0()
                         .size_full()
-                        .bg(overlay)
                         .debug_selector(|| "dialog-backdrop".into())
                         .on_mouse_down(
                             MouseButton::Left,

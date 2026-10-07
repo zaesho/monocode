@@ -32,6 +32,8 @@ pub struct ChangeFeed {
     pub boot: String,
     log: Mutex<Log>,
     wake: Condvar,
+    /// How long a wait keeps collecting writes after the first one.
+    coalesce: Duration,
 }
 
 impl Default for ChangeFeed {
@@ -50,6 +52,7 @@ impl ChangeFeed {
                 generation: 0,
             }),
             wake: Condvar::new(),
+            coalesce: COALESCE,
         }
     }
 
@@ -133,7 +136,7 @@ impl ChangeFeed {
             }
             if !coalescing && log.generation != start {
                 coalescing = true;
-                deadline = now + COALESCE;
+                deadline = now + self.coalesce;
                 continue;
             }
             let pause = (deadline - now).min(LEFT_POLL);
@@ -221,7 +224,12 @@ mod tests {
 
     #[test]
     fn wakes_a_waiting_request_once_a_burst_of_writes_settles() {
-        let feed = Arc::new(ChangeFeed::new());
+        // A window far longer than the writer's 10 ms gap, so a loaded
+        // runner that oversleeps cannot split the burst.
+        let feed = Arc::new(ChangeFeed {
+            coalesce: Duration::from_secs(1),
+            ..ChangeFeed::new()
+        });
         let started = Instant::now();
         let writer = feed.clone();
         let thread = std::thread::spawn(move || {
@@ -231,9 +239,10 @@ mod tests {
             writer.record(change("a", 2));
         });
         let boot = json!(feed.boot);
-        let result = feed.wait(Some(&boot), Some(&json!(0)), 5_000, &|| false);
+        let result = feed.wait(Some(&boot), Some(&json!(0)), 20_000, &|| false);
         thread.join().unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The burst ended the wait, not the timeout.
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(result.sessions, vec![change("a", 2)]);
     }
 

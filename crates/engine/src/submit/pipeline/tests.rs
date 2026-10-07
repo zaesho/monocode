@@ -859,6 +859,7 @@ async fn puts_output_that_already_arrived_before_a_submitted_message(cx: &mut Te
     );
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut TestAppContext) {
     use crate::orchestration::engine_host::EngineHost;

@@ -32,7 +32,7 @@ use serde_json::{Map, Value, json};
 
 use super::backend::SessionBackend;
 use super::reducer::title_from_tool_input;
-use super::util::project_path::{is_remote_project_path, normalize_project_path};
+use super::util::project_path::{is_local_project, is_remote_project_path, normalize_project_path};
 
 /// One task in an orchestration summary row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -157,16 +157,23 @@ impl From<InFlightSession> for InFlightRef {
 /// `shouldPersistSession`: only real chats belong in project history. Blank
 /// tabs stay ephemeral.
 pub fn should_persist_session(session: &Session) -> bool {
-    is_storable_session(session)
+    in_storable_location(session)
         && session
             .blocks
             .iter()
             .any(|block| block.role == BlockRole::User)
 }
 
-/// `isStorableSession`: a local conversation the store can hold, with or
-/// without a message. Reminders save blank conversations this way.
+/// `isStorableSession`: a conversation in a local project folder, which the
+/// store can hold with or without a message. Reminders save blank
+/// conversations this way. `/` and the home folder are not projects, so a
+/// blank conversation there is not saved.
 pub fn is_storable_session(session: &Session) -> bool {
+    in_storable_location(session) && is_local_project(&session.cwd)
+}
+
+/// `inStorableLocation`.
+fn in_storable_location(session: &Session) -> bool {
     session.inbox_ask.is_none() && !is_remote_project_path(&session.cwd) && session.cwd != "~"
 }
 
@@ -1251,12 +1258,12 @@ impl SessionWriter {
     }
 
     /// `upsertSession(session, { allowEmpty: true })`: also saves a blank
-    /// local conversation, so a reminder can point at it.
+    /// conversation in a local project folder, so a reminder can point at it.
     pub fn upsert_session_allow_empty(
         &self,
         session: &Session,
     ) -> Task<Result<Option<SessionSummary>, String>> {
-        if !is_storable_session(session) {
+        if !should_persist_session(session) && !is_storable_session(session) {
             return Task::ready(Ok(None));
         }
         self.write_session(session)
@@ -1599,6 +1606,31 @@ mod tests {
         assert!(should_persist_session(&local));
         local.cwd = "~".into();
         assert!(!should_persist_session(&local));
+    }
+
+    #[test]
+    fn stores_a_blank_conversation_only_in_a_local_project_folder() {
+        assert!(is_storable_session(&session(
+            HarnessId::Codex,
+            "/work/repo"
+        )));
+        for cwd in [
+            "/",
+            "~",
+            "/Users/me",
+            "/home/me/",
+            "C:\\Users\\me",
+            "remote://env/home/me/repo",
+        ] {
+            assert!(
+                !is_storable_session(&session(HarnessId::Codex, cwd)),
+                "{cwd}"
+            );
+        }
+        // A chat with messages still saves outside a project folder.
+        let mut root = session(HarnessId::Codex, "/");
+        root.blocks = vec![Block::new("turn", BlockRole::User, "Continue")];
+        assert!(should_persist_session(&root));
     }
 
     #[test]

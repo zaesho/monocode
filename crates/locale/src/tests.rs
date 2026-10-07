@@ -219,3 +219,30 @@ fn unsupported_collation_language_uses_the_selected_default() {
     })
     .unwrap();
 }
+
+#[test]
+fn the_os_default_locale_is_borrowed_instead_of_copied_per_comparison() {
+    let api = api::get().unwrap();
+    let first = locale::os_default(api).unwrap();
+    let second = locale::os_default(api).unwrap();
+    assert_eq!(first.as_ptr(), second.as_ptr());
+    let resolved = with_cache(|cache| cache.resolve(None, locale::Service::Collation)).unwrap();
+    assert!(matches!(resolved, Cow::Borrowed(_)));
+}
+
+#[test]
+fn identical_strings_compare_equal_without_changing_other_results() {
+    for locale in ["en-US", "sv-SE", "ja-JP"] {
+        for value in ["", "a", "src/main.rs", "e\u{301}", "木"] {
+            assert_eq!(
+                compare_for_locale(value, value, locale).unwrap(),
+                Ordering::Equal
+            );
+        }
+        assert_eq!(
+            compare_for_locale("e\u{301}", "é", locale).unwrap(),
+            Ordering::Equal
+        );
+    }
+    assert!(compare_for_locale("a", "a", "fr_FR").is_err());
+}

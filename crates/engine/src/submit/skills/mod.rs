@@ -40,7 +40,7 @@ pub use slash_commands::{
 pub const DISABLED_SKILL_PATHS_KEY: &str = "monocode.disabledSkillPaths";
 
 const NATIVE_SKILL_TTL_MS: i64 = 30_000;
-const NATIVE_SKILL_RETRY_MS: i64 = 5_000;
+pub const NATIVE_SKILL_RETRY_MS: i64 = 5_000;
 
 /// `FileSkill.scope`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]

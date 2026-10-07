@@ -473,6 +473,18 @@ impl SkillManager {
         target: &ExportTarget,
         path: &Path,
     ) -> ExportStatus {
+        self.status_with(registry, entry, target, path, fingerprint(path))
+    }
+
+    /// `status_at` with the destination's fingerprint already read.
+    fn status_with(
+        &self,
+        registry: &Registry,
+        entry: &StoredSkill,
+        target: &ExportTarget,
+        path: &Path,
+        current: Fingerprint,
+    ) -> ExportStatus {
         let desired_here = entry.shared
             && registry.targets.iter().any(|current| {
                 current.key == target.key
@@ -481,7 +493,7 @@ impl SkillManager {
                         .join(&entry.name)
                         == path
             });
-        let (state, detail) = match fingerprint(path) {
+        let (state, detail) = match current {
             Fingerprint::Missing if !desired_here => (ExportState::Disabled, "Managed sharing is off. Unmanaged copies and existing conversations are unaffected.".into()),
             Fingerprint::Missing => (ExportState::Pending, "The managed copy has not been exported.".into()),
             Fingerprint::Present(digest) => match registry.owned.get(path) {
@@ -558,7 +570,12 @@ impl SkillManager {
                     && unchanged_owned
                     && previous.as_ref().is_some_and(|p| p.digest != entry.digest);
                 let should_remove = !entry.shared && unchanged_owned;
+                // Only `change_export` touches the destination. Otherwise the
+                // status below reuses `current` instead of reading and
+                // hashing the whole bundle a second time.
+                let mut unchanged = Some(current);
                 if should_install || should_replace || should_remove {
+                    unchanged = None;
                     let next = if entry.shared {
                         Some(OwnedExport {
                             skill_id: entry.id.clone(),
@@ -589,16 +606,17 @@ impl SkillManager {
                         }
                     }
                 } else if !entry.shared
-                    && matches!(current, Fingerprint::Missing)
+                    && matches!(unchanged, Some(Fingerprint::Missing))
                     && previous.is_some()
                 {
                     registry.owned.remove(&destination);
                     registry.generation = increment(registry.generation, "generation")?;
                     self.save(registry)?;
                 }
+                let current = unchanged.unwrap_or_else(|| fingerprint(&destination));
                 report.statuses.push(SkillExportStatus {
                     skill_id: entry.id.clone(),
-                    export: self.status_at(registry, entry, &target, &destination),
+                    export: self.status_with(registry, entry, &target, &destination, current),
                 });
             }
         }

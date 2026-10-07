@@ -3,14 +3,15 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Bounds, ElementId, Hsla, IntoElement as _,
-    ParentElement as _, Pixels, SharedString, Styled as _, Window, canvas, div, fill, point, px,
-    size,
+    AnyElement, App, Bounds, ElementId, Hsla, IntoElement as _, ParentElement as _, Pixels,
+    SharedString, Styled as _, Window, canvas, div, fill, point, px, size,
 };
 use monocode_core::HarnessId;
 use monocode_ui::color::{hsl_to_rgb, parse_hex};
 use monocode_ui::{ProviderLogo, provider_logo};
 use monocode_view_composer::composer::model::mascots::{self, MASCOT_GRID};
+
+use crate::motion::stepped_loop;
 
 /// `HarnessIcon` at `size` CSS px.
 pub fn harness_icon(harness: HarnessId, size: f32) -> AnyElement {
@@ -23,13 +24,7 @@ pub fn harness_icon(harness: HarnessId, size: f32) -> AnyElement {
 /// `ProjectMascot`: the 8 by 8 pixel mascot in `color`. An active mascot
 /// swaps to its talk frame and hops a pixel every other half beat
 /// (`.mascot-active`, 460ms).
-pub fn project_mascot(
-    id: impl Into<ElementId>,
-    project: &str,
-    name: Option<&str>,
-    color: Hsla,
-    active: bool,
-) -> AnyElement {
+pub fn project_mascot(project: &str, name: Option<&str>, color: Hsla, active: bool) -> AnyElement {
     let mascot = mascots::project_mascot(project, name);
     let sprite = move |talk: bool| {
         let rows = if talk { mascot.talk } else { mascot.rest };
@@ -57,13 +52,12 @@ pub fn project_mascot(
     if !active {
         return div().size_full().child(sprite(false)).into_any_element();
     }
+    // Two poses: a stepped loop redraws twice a beat, not every refresh.
     div()
         .size_full()
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(460)).repeat(),
-            move |el, t| el.child(sprite(t >= 0.5)),
-        )
+        .child(stepped_loop(Duration::from_millis(460), 2, move |beat| {
+            sprite(beat == 1)
+        }))
         .into_any_element()
 }
 

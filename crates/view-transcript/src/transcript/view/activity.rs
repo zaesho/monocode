@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _,
-    ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    ScrollWheelEvent, StatefulInteractiveElement as _, Styled as _, Window, div, point, px,
 };
 use monocode_core::Block;
 use monocode_core::block::InterjectionSeverity;
@@ -29,6 +29,10 @@ use super::parts::{
 };
 use super::shimmer::shimmer;
 use super::style::{LIVE_WINDOW_MAX_HEIGHT, MarkdownVariant, TextSizes as _};
+
+/// Steps the pinned live window builds. The window is 280 px tall and a
+/// step is at least one 20 px line, so this is about three windows' worth.
+const LIVE_PINNED_STEPS: usize = 40;
 use super::{MarkdownSlot, TranscriptView, eid};
 
 impl TranscriptView {
@@ -57,7 +61,7 @@ impl TranscriptView {
                 self.render_subagent_stack(&row.key, blocks, live, false, cx)
             }
             (TurnItem::Activity(_), ItemView::InitialThinking { live }) => {
-                self.render_initial_thinking(&row.key, live, cx)
+                self.render_initial_thinking(live, cx)
             }
             (TurnItem::Activity(blocks), ItemView::Activity { done }) => {
                 self.render_activity_phases(&row.key, blocks, done, true, cx)
@@ -94,21 +98,10 @@ impl TranscriptView {
     }
 
     /// `InitialThinking`: reasoning before the first response arrives.
-    fn render_initial_thinking(
-        &mut self,
-        key: &str,
-        live: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_initial_thinking(&mut self, live: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx);
         let label: AnyElement = if live {
-            shimmer(
-                eid(key, "thinking"),
-                "Thinking\u{2026}",
-                Duration::from_millis(1600),
-                theme,
-            )
-            .into_any_element()
+            shimmer("Thinking\u{2026}", Duration::from_millis(1600), theme).into_any_element()
         } else {
             div().child("Thinking\u{2026}").into_any_element()
         };
@@ -199,12 +192,7 @@ impl TranscriptView {
                 .min_w_0()
                 .font_family(theme.fonts.sans.clone())
                 .text_sm_ui()
-                .child(shimmer(
-                    part("title"),
-                    title.clone(),
-                    Duration::from_millis(1600),
-                    &theme,
-                ))
+                .child(shimmer(title.clone(), Duration::from_millis(1600), &theme))
                 .into_any_element()
         } else {
             div()
@@ -287,41 +275,72 @@ impl TranscriptView {
 
         let mut column = div().flex().flex_col().min_w_0().child(header);
         if open {
+            // The live phase is a short window pinned to its newest step.
+            // While pinned it can only show its newest steps, so the older
+            // ones are not built every frame. A long phase holds hundreds.
+            let scroll_key = format!("{key}/{}", phase.id);
+            let unpin_key = format!("unpin:{scroll_key}");
+            let pinned = active && !self.toggled(&unpin_key, false);
+            let skip = if pinned {
+                phase.steps.len().saturating_sub(LIVE_PINNED_STEPS)
+            } else {
+                0
+            };
             let mut steps = div().flex().flex_col().min_w_0();
             let count = phase.steps.len() + usize::from(headline.is_some());
-            let mut at = 0;
+            let mut at = skip;
             if let Some(headline) = headline {
-                let markdown = self.markdown_view(
-                    &headline.id,
-                    MarkdownSlot::Prose,
-                    &headline.text,
-                    false,
-                    MarkdownVariant::Normal,
-                    cx,
-                );
-                if headline.role == monocode_core::BlockRole::Reasoning {
-                    markdown.update(cx, |view, cx| view.set_reasoning(true, cx));
-                }
                 at += 1;
-                steps = steps.child(phase_step(
-                    at == count,
-                    &theme,
-                    div().py(u(4.)).child(markdown),
-                ));
+                if skip == 0 {
+                    let markdown = self.markdown_view(
+                        &headline.id,
+                        MarkdownSlot::Prose,
+                        &headline.text,
+                        false,
+                        MarkdownVariant::Normal,
+                        cx,
+                    );
+                    if headline.role == monocode_core::BlockRole::Reasoning {
+                        markdown.update(cx, |view, cx| view.set_reasoning(true, cx));
+                    }
+                    steps = steps.child(phase_step(
+                        at == count,
+                        &theme,
+                        div().py(u(4.)).child(markdown),
+                    ));
+                }
             }
-            for step in &phase.steps {
+            for step in &phase.steps[skip..] {
                 at += 1;
                 let row = self.render_activity_row(key, step, active, cx);
                 steps = steps.child(phase_step(at == count, &theme, row));
             }
             if active {
-                // The live phase is a short window pinned to its newest step.
-                let scroll_key = format!("{key}/{}", phase.id);
                 let handle = self.scroll_handle(&scroll_key);
-                let unpin_key = format!("unpin:{scroll_key}");
-                if !self.toggled(&unpin_key, false) {
+                if pinned {
                     handle.scroll_to_bottom();
+                } else {
+                    // Unpinning a cut-down window swaps its newest steps
+                    // for all of them. The first frame lays them all out
+                    // from the end; the next applies the wheel step that
+                    // unpinned it, now that the full height is known.
+                    match self.live_scroll_carry.get(&scroll_key).copied() {
+                        Some((step, false)) => {
+                            handle.scroll_to_bottom();
+                            self.live_scroll_carry
+                                .insert(scroll_key.clone(), (step, true));
+                            cx.notify();
+                        }
+                        Some((step, true)) => {
+                            self.live_scroll_carry.remove(&scroll_key);
+                            let end = -handle.max_offset().y;
+                            handle.set_offset(point(handle.offset().x, (end + step).min(px(0.))));
+                        }
+                        None => {}
+                    }
                 }
+                let truncated = skip > 0;
+                let carry_key = scroll_key.clone();
                 let wheel_handle = handle.clone();
                 column = column.child(
                     div()
@@ -336,8 +355,14 @@ impl TranscriptView {
                                     <= -wheel_handle.max_offset().y + px(2.);
                                 // Only a wheel away from the end unpins; reaching it again re-pins.
                                 if delta > px(0.) {
+                                    if truncated && !this.toggled(&unpin_key, false) {
+                                        this.live_scroll_carry
+                                            .insert(carry_key.clone(), (delta, false));
+                                    }
                                     this.toggles.insert(unpin_key.clone(), true);
-                                } else if at_bottom {
+                                } else if at_bottom
+                                    && !this.live_scroll_carry.contains_key(&carry_key)
+                                {
                                     this.toggles.remove(&unpin_key);
                                 }
                                 cx.notify();
@@ -362,7 +387,7 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if is_thinking_block(block) {
-            return self.render_thinking_row(key, block, cx);
+            return self.render_thinking_row(key, block, live, cx);
         }
         if block.interjection.is_some() {
             return self.render_interjection_row(key, block, cx);
@@ -409,6 +434,7 @@ impl TranscriptView {
         &mut self,
         key: &str,
         block: &BlockRef,
+        live: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let toggle = format!("think:{}", block.id);
@@ -429,8 +455,10 @@ impl TranscriptView {
             .text_color(theme.content(0.5))
             .group_hover("think", |s| s.text_color(theme.content(0.75)))
             .child(text.clone());
-        let label = if block.is_streaming() {
-            pulse(eid(key, &format!("pulse:{}", block.id)), label)
+        // Only the live phase pulses: a thought left marked as streaming in a
+        // finished turn would otherwise redraw the window every frame.
+        let label = if live && block.is_streaming() {
+            pulse(label)
         } else {
             label.into_any_element()
         };

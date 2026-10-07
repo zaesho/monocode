@@ -11,6 +11,7 @@
 //! rows from the start.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use monocode_core::block::TurnMetrics;
@@ -124,8 +125,10 @@ pub struct TurnFooter {
     pub label_hidden: bool,
     pub model_name: Option<String>,
     pub completed_at: Option<i64>,
-    /// `turnCopyText`, empty when the turn has nothing to copy.
-    pub copy_text: String,
+    /// `turnCopyText`, empty when the turn has nothing to copy. Shared, since
+    /// every plan and every frame clones the rows and this holds the whole
+    /// turn's text.
+    pub copy_text: Arc<str>,
     pub harness: Option<HarnessId>,
     /// The turn's own model id, so a same-harness second opinion can skip it.
     pub from_model: Option<String>,
@@ -161,6 +164,10 @@ pub struct Row {
     pub search_current: bool,
     pub kind: RowKind,
 }
+
+/// A shared [`Row`]. Every plan copies every turn's rows into one list, and
+/// every frame copies the rows it draws, so rows are shared, not cloned.
+pub type RowRef = Rc<Row>;
 
 impl Row {
     /// Whether two rows draw the same thing. Blocks compare by identity,
@@ -227,28 +234,44 @@ fn same_kind(a: &RowKind, b: &RowKind) -> bool {
 #[derive(Debug, Default)]
 pub struct BlockStore {
     blocks: Vec<BlockRef>,
-    by_id: HashMap<String, BlockRef>,
 }
 
 impl BlockStore {
     /// Take a new snapshot's blocks. Returns whether anything changed.
+    ///
+    /// This runs on every streamed event. Streaming changes the last blocks
+    /// in place, so each block is first matched with the one at its index,
+    /// and the id index is only built when the order changed.
     pub fn update(&mut self, blocks: &[Block]) -> bool {
         let mut changed = blocks.len() != self.blocks.len();
         let mut next = Vec::with_capacity(blocks.len());
-        let mut by_id = HashMap::with_capacity(blocks.len());
-        for (index, block) in blocks.iter().enumerate() {
-            let shared = match self.by_id.get(&block.id) {
-                Some(previous) if **previous == *block => previous.clone(),
-                _ => Arc::new(block.clone()),
-            };
-            if !changed && !Arc::ptr_eq(&shared, &self.blocks[index]) {
-                changed = true;
+        {
+            let current = &self.blocks;
+            let mut by_id: Option<HashMap<&str, &BlockRef>> = None;
+            for (index, block) in blocks.iter().enumerate() {
+                let previous = match current.get(index) {
+                    Some(previous) if previous.id == block.id => Some(previous),
+                    _ => by_id
+                        .get_or_insert_with(|| {
+                            current
+                                .iter()
+                                .map(|block| (block.id.as_str(), block))
+                                .collect()
+                        })
+                        .get(block.id.as_str())
+                        .copied(),
+                };
+                let shared = match previous {
+                    Some(previous) if **previous == *block => previous.clone(),
+                    _ => Arc::new(block.clone()),
+                };
+                if !changed && !Arc::ptr_eq(&shared, &current[index]) {
+                    changed = true;
+                }
+                next.push(shared);
             }
-            by_id.insert(block.id.clone(), shared.clone());
-            next.push(shared);
         }
         self.blocks = next;
-        self.by_id = by_id;
         changed
     }
 
@@ -296,10 +319,21 @@ struct TurnFlags {
     editing_last_turn: bool,
 }
 
-/// Rows of turns that have not changed since the last plan.
+/// Rows of turns that have not changed since the last plan, in turn order.
 #[derive(Debug, Default)]
 pub struct PlanCache {
-    turns: HashMap<String, (Vec<BlockRef>, TurnFlags, Vec<Row>)>,
+    turns: Vec<CachedTurn>,
+    /// How many rows the last plan had, to size the next one.
+    rows: usize,
+}
+
+#[derive(Debug)]
+struct CachedTurn {
+    /// The turn's first block id.
+    id: String,
+    blocks: Vec<BlockRef>,
+    flags: TurnFlags,
+    rows: Vec<RowRef>,
 }
 
 /// `harnessForTurn` for every turn in one pass: the recorded model wins, then
@@ -313,11 +347,6 @@ fn turn_harnesses(
         .iter()
         .find_map(|block| block.handoff.as_ref())
         .map(|handoff| handoff.from);
-    let position: HashMap<&str, usize> = blocks
-        .iter()
-        .enumerate()
-        .map(|(index, block)| (block.id.as_str(), index))
-        .collect();
     // The `to` of the last handoff at or before each block index.
     let mut last_to = Vec::with_capacity(blocks.len());
     let mut current = None;
@@ -327,9 +356,18 @@ fn turn_harnesses(
         }
         last_to.push(current);
     }
+    // Turns keep the blocks' order, so each turn's first block is found by
+    // walking forward from the last one instead of through an id index.
+    let mut cursor = 0;
     turns
         .iter()
         .map(|turn| {
+            let start = turn.first().and_then(|first| {
+                while cursor < blocks.len() && !Arc::ptr_eq(&blocks[cursor], first) {
+                    cursor += 1;
+                }
+                (cursor < blocks.len()).then_some(cursor)
+            });
             if let Some(recorded) = turn
                 .iter()
                 .find(|block| block.role == BlockRole::User)
@@ -337,10 +375,6 @@ fn turn_harnesses(
             {
                 return recorded.harness;
             }
-            let start = turn
-                .first()
-                .and_then(|first| position.get(first.id.as_str()))
-                .copied();
             if let Some(start) = start
                 && start > 0
                 && let Some(to) = last_to[start - 1]
@@ -359,7 +393,7 @@ pub fn build_plan(
     options: &PlanOptions,
     state: &PlanState,
     cache: Option<&mut PlanCache>,
-) -> Vec<Row> {
+) -> Vec<RowRef> {
     let turns = group_turns(blocks, options.managed);
     let waiting_for_approval =
         blocks.iter().any(|block| needs_approval(block)) || options.pending_question;
@@ -380,14 +414,27 @@ pub fn build_plan(
         None
     };
 
-    let mut fresh = PlanCache::default();
+    // This runs on every streamed event. Turns keep their places while the
+    // last one streams, so each turn is first matched with the cached turn
+    // at its index; the id index is only built when the order changed.
     let mut previous = cache;
-    let mut rows = Vec::new();
+    let mut cached_turns: Vec<Option<CachedTurn>> = previous
+        .as_deref_mut()
+        .map(|cache| {
+            std::mem::take(&mut cache.turns)
+                .into_iter()
+                .map(Some)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cached_by_id: Option<HashMap<String, usize>> = None;
     let count = turns.len();
+    let mut fresh = Vec::with_capacity(count);
+    let mut rows = Vec::with_capacity(previous.as_deref().map_or(0, |cache| cache.rows));
     for (turn_index, turn) in turns.into_iter().enumerate() {
         let is_last_turn = turn_index + 1 == count;
         let settled = !(options.busy && is_last_turn);
-        let turn_id = turn[0].id.clone();
+        let turn_id = &turn[0].id;
         let live = options.visible && !settled && !preparing_handoff;
         let flags = TurnFlags {
             turn_index,
@@ -395,11 +442,12 @@ pub fn build_plan(
             settled,
             visible: options.visible,
             live,
-            work_open: state.open_work.get(&turn_id).copied().unwrap_or(false),
+            work_open: state.open_work.get(turn_id).copied().unwrap_or(false),
             search_current: state
                 .search_current
-                .clone()
-                .filter(|id| turn.iter().any(|block| &block.id == id)),
+                .as_ref()
+                .filter(|id| turn.iter().any(|block| &block.id == *id))
+                .cloned(),
             turn_harness: harnesses.as_ref().map(|all| all[turn_index]),
             current_model_name: if live {
                 options.current_model_name.clone()
@@ -415,32 +463,55 @@ pub fn build_plan(
             },
             has_accessory: is_last_turn && options.has_accessory,
             editable_user_block_id: editable_user_block_id
-                .clone()
-                .filter(|id| turn.iter().any(|block| &block.id == id)),
+                .as_ref()
+                .filter(|id| turn.iter().any(|block| &block.id == *id))
+                .cloned(),
             can_edit_last_turn: options.can_edit_last_turn,
             editing_last_turn: options.editing_last_turn,
         };
-        let cached = previous
-            .as_deref_mut()
-            .and_then(|cache| cache.turns.remove(&turn_id))
-            .filter(|(blocks, cached_flags, _)| {
-                same_blocks(blocks, &turn) && *cached_flags == flags
-            });
-        let turn_rows = match cached {
-            Some((_, _, turn_rows)) => turn_rows,
-            None => turn_rows(&turn, &flags, options.managed),
+        let in_place = cached_turns
+            .get(turn_index)
+            .and_then(Option::as_ref)
+            .is_some_and(|cached| &cached.id == turn_id);
+        let slot = if in_place {
+            Some(turn_index)
+        } else {
+            cached_by_id
+                .get_or_insert_with(|| {
+                    cached_turns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, cached)| Some((cached.as_ref()?.id.clone(), index)))
+                        .collect()
+                })
+                .get(turn_id)
+                .copied()
+        };
+        let cached = slot.and_then(|index| cached_turns.get_mut(index)?.take());
+        let (id, turn_rows) = match cached {
+            Some(cached) if same_blocks(&cached.blocks, &turn) && cached.flags == flags => {
+                (cached.id, cached.rows)
+            }
+            Some(cached) => (cached.id, turn_rows(&turn, &flags, options.managed)),
+            None => (turn_id.clone(), turn_rows(&turn, &flags, options.managed)),
         };
         rows.extend(turn_rows.iter().cloned());
-        fresh.turns.insert(turn_id, (turn, flags, turn_rows));
+        fresh.push(CachedTurn {
+            id,
+            blocks: turn,
+            flags,
+            rows: turn_rows,
+        });
     }
     if let Some(cache) = previous {
-        *cache = fresh;
+        cache.turns = fresh;
+        cache.rows = rows.len();
     }
     rows
 }
 
 /// One turn's rows (the body of `visibleTurns.map` in AgentTranscript.tsx).
-fn turn_rows(turn: &[BlockRef], flags: &TurnFlags, managed: bool) -> Vec<Row> {
+fn turn_rows(turn: &[BlockRef], flags: &TurnFlags, managed: bool) -> Vec<RowRef> {
     let turn_id = turn[0].id.clone();
     let user_block = turn_user_block(turn, managed);
     let duration_ms = user_block.and_then(|block| block.duration_ms);
@@ -543,14 +614,14 @@ fn turn_rows(turn: &[BlockRef], flags: &TurnFlags, managed: bool) -> Vec<Row> {
 
     let mut rows = Vec::new();
     let mut push = |key: String, search: bool, kind: RowKind| {
-        rows.push(Row {
+        rows.push(Rc::new(Row {
             key: format!("{turn_id}/{key}"),
             turn_index: flags.turn_index,
             turn_id: turn_id.clone(),
             last_turn: flags.is_last_turn,
             search_current: search,
             kind,
-        });
+        }));
     };
     let fold_line = FoldLine {
         title: fold_title,
@@ -658,7 +729,7 @@ fn turn_rows(turn: &[BlockRef], flags: &TurnFlags, managed: bool) -> Vec<Row> {
                 label_hidden: show_fold_line,
                 model_name: turn_model_name,
                 completed_at: started_at.map(|started| started + elapsed_ms),
-                copy_text: turn_copy_text(turn),
+                copy_text: turn_copy_text(turn).into(),
                 harness: flags.turn_harness,
                 from_model: turn_model.map(|model| model.id.clone()),
             }),

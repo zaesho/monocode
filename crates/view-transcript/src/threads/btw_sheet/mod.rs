@@ -35,7 +35,7 @@ use monocode_ui::widgets::tooltip;
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 use monocode_view_composer::composer::model::clipboard::ClipboardFile;
 use monocode_view_composer::composer::model::mcp::McpTag;
-use monocode_view_composer::composer::model::mentions::{ProjectFile, RankedFile};
+use monocode_view_composer::composer::model::mentions::{MentionIndex, ProjectFile, RankedFile};
 use monocode_view_composer::composer::model::skills::Skill;
 use monocode_view_composer::composer::prompt_input::Escape;
 use monocode_view_composer::composer::{
@@ -45,7 +45,9 @@ use monocode_view_composer::composer::{
 use monocode_view_composer::pickers::ModelSource;
 use monocode_view_composer::pickers::anchor::BoundsCell;
 
-pub use conversation::{BtwConversation, BtwConversationProps, BtwTab, Seed, compact_question};
+pub use conversation::{
+    BtwConversation, BtwConversationProps, BtwTab, BtwTabLabel, Seed, compact_question,
+};
 pub use host::{BtwHost, BtwRequest, BtwThreadBlocksInput};
 
 use super::btw_burst::{BtwQuestionBurst, BtwQuestionBurstEvent, BurstRect};
@@ -325,8 +327,21 @@ impl ComposerHost for SheetComposerHost {
         self.inner.mention_files(cwd, cx)
     }
 
+    fn mention_index(&self, cwd: &str, cx: &mut App) -> std::sync::Arc<MentionIndex> {
+        self.inner.mention_index(cwd, cx)
+    }
+
     fn rank_mentions(&self, cwd: &str, query: &str, cx: &mut App) -> Vec<RankedFile> {
         self.inner.rank_mentions(cwd, query, cx)
+    }
+
+    fn rank_mentions_task(
+        &self,
+        cwd: &str,
+        query: &str,
+        cx: &mut App,
+    ) -> Option<Task<Vec<RankedFile>>> {
+        self.inner.rank_mentions_task(cwd, query, cx)
     }
 
     fn mentions_loading(&self, cwd: &str, cx: &mut App) -> bool {
@@ -474,7 +489,7 @@ impl BtwSheet {
             messages: &messages,
             pending_blocks: Some(&pending),
             running: conversation.running(),
-            updated_at: conversation.persisted().map(|thread| thread.updated_at),
+            updated_at: conversation.persisted_ref().map(|thread| thread.updated_at),
             harness: Some(conversation.harness(host)),
             model: Some(&model),
         })
@@ -884,7 +899,7 @@ impl BtwSheet {
             .items_center()
             .gap(u(4.))
             .overflow_x_scroll();
-        for tab in self.conversation.tabs() {
+        for tab in self.conversation.tab_labels() {
             let selected = active.as_deref() == Some(tab.id.as_str());
             let label = compact_question(tab.question.as_deref());
             let hover = theme.content(0.05);
@@ -898,7 +913,7 @@ impl BtwSheet {
             let close_id = tab.id.clone();
             let close_ink = theme.colors.content;
             let close_hover = theme.content(0.10);
-            let saved = tab.thread.is_some();
+            let saved = tab.saved;
             list = list.child(
                 div()
                     .id(SharedString::from(format!("btw-tab:{}", tab.id)))
@@ -1009,14 +1024,16 @@ impl BtwSheet {
     }
 
     fn render_error(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let persisted = self.conversation.persisted()?;
+        let persisted = self.conversation.persisted_ref()?;
         if persisted.status != BtwThreadStatus::Error {
             return None;
         }
         let harness = self.conversation.harness(self.host.as_ref());
         let message = persisted
             .error
+            .as_deref()
             .filter(|error| !error.is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| format!("{} could not answer this side question.", harness.title()));
         let hover = with_alpha(red_200(), 0.10);
         let hover_ink = red_50();

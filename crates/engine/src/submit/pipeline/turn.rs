@@ -1040,8 +1040,15 @@ impl TurnRun {
                 model_settings: self.current.model_settings.clone(),
             };
             let revisions = (self.selection_revision, self.current_selection_revision(cx));
-            let applies = self.latest(cx).is_some_and(|selected| {
-                can_apply_running_configuration(&selected, &running, Some(revisions))
+            // Context reports arrive several times a turn, so read the
+            // session in place instead of copying its transcript.
+            let applies = cx.update(|cx| {
+                Engine::sessions(cx)
+                    .read(cx)
+                    .get(&self.session_id)
+                    .is_some_and(|selected| {
+                        can_apply_running_configuration(selected, &running, Some(revisions))
+                    })
             });
             if !applies {
                 return;

@@ -105,7 +105,6 @@ impl RenderOnce for NoteCard {
                     .rounded(u(2.))
                     .into_any_element(),
                 None => crate::transcript::view::mascot::mascot(
-                    ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), "mascot".into()),
                     &project.name,
                     project.color.unwrap_or(theme.content(0.45)),
                     false,

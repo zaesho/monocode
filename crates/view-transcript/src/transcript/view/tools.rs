@@ -43,14 +43,13 @@ fn tool_preview(block: &Block) -> Option<&ToolPreview> {
     block.tool.as_ref().and_then(|tool| tool.preview.as_ref())
 }
 
-fn tool_detail(block: &Block) -> Option<String> {
+fn tool_detail(block: &Block) -> Option<&str> {
     block
         .tool
         .as_ref()
         .and_then(|tool| tool.detail.as_deref())
         .map(js::trim)
         .filter(|detail| !detail.is_empty())
-        .map(str::to_string)
 }
 
 /// `ToolCallStatusIcon`: failure stays marked; running and success get none.
@@ -87,17 +86,14 @@ impl TranscriptView {
         let theme = Theme::of(cx).clone();
         let summary = self.render_tool_summary(
             key,
-            &block.id,
+            block,
             &label,
-            tool_preview(block),
             bare,
             state == ToolCallState::Rejected,
             state,
             cx,
         );
-        let icon = (!bare).then(|| {
-            activity_tool_icon(eid(key, &format!("spin:{}", block.id)), state, live, &theme)
-        });
+        let icon = (!bare).then(|| activity_tool_icon(state, live, &theme));
         let mut column = div().flex().flex_col().min_w_0();
         if let Some(detail) = error_detail {
             let toggle = format!("error:{}", block.id);
@@ -132,7 +128,7 @@ impl TranscriptView {
                         )),
                 );
             if open {
-                column = column.child(error_text(&detail, &theme, !bare));
+                column = column.child(error_text(detail, &theme, !bare));
             }
         } else {
             column = column.child(
@@ -186,7 +182,7 @@ impl TranscriptView {
         let edit = is_edit_tool(tool_kind(block), title, preview);
         let compact = is_read_tool(tool_kind(block), Some(&label), preview)
             || is_search_tool(tool_kind(block), Some(&label), preview);
-        let expandable = !compact && detail.as_deref().is_some_and(|detail| detail != label);
+        let expandable = !compact && detail.is_some_and(|detail| detail != label);
 
         if edit {
             let body = if needs_approval(block) {
@@ -197,9 +193,8 @@ impl TranscriptView {
             } else {
                 let summary = self.render_tool_summary(
                     key,
-                    &block.id,
+                    block,
                     &label,
-                    preview,
                     false,
                     state == ToolCallState::Rejected,
                     state,
@@ -230,9 +225,8 @@ impl TranscriptView {
         };
         let summary = self.render_tool_summary(
             key,
-            &block.id,
+            block,
             &label,
-            preview,
             false,
             state == ToolCallState::Rejected,
             ToolCallState::Accepted,
@@ -272,7 +266,7 @@ impl TranscriptView {
                         .font_family(theme.fonts.mono.clone())
                         .text_px_l5(12.)
                         .text_color(theme.content(0.55))
-                        .child(detail.unwrap_or_default()),
+                        .child(detail.unwrap_or_default().to_string()),
                 );
             }
         } else {
@@ -297,14 +291,15 @@ impl TranscriptView {
     pub(super) fn render_tool_summary(
         &mut self,
         key: &str,
-        block_id: &str,
+        block: &BlockRef,
         label: &str,
-        preview: Option<&ToolPreview>,
         chip: bool,
         failed: bool,
         status: ToolCallState,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let block_id = block.id.as_str();
+        let preview = tool_preview(block);
         let cwd = self.cwd();
         let display = resolve_tool_call_display(label, preview, cwd.as_deref());
         let theme = Theme::of(cx).clone();
@@ -435,14 +430,17 @@ impl TranscriptView {
                 }));
         }
         target_el = if can_preview {
-            let preview = preview.cloned().expect("previewed write");
+            // Hold the block, not a copy of its preview: this runs every frame
+            // and a write's preview can carry the whole file.
+            let block = block.clone();
             let label = target.clone();
             let weak = cx.entity().downgrade();
             let cwd = cwd.clone();
             target_el
                 .hoverable_tooltip(move |_, cx| {
                     let weak = weak.clone();
-                    let (preview, label, cwd) = (preview.clone(), label.clone(), cwd.clone());
+                    let preview = tool_preview(&block).cloned().expect("previewed write");
+                    let (label, cwd) = (label.clone(), cwd.clone());
                     cx.new(|cx| {
                         ToolDiffPopover::new(preview, label, status, cwd, cx).on_open_file(
                             move |path, _, cx| {
@@ -479,7 +477,6 @@ impl TranscriptView {
                 .and_then(|preview| preview.output.as_deref())
                 .map(js::trim)
                 .filter(|output| !output.is_empty())
-                .map(str::to_string)
         });
         let has_error = state == ToolCallState::Rejected && output.is_some();
         let pending_approval = needs_approval(block);
@@ -566,7 +563,7 @@ impl TranscriptView {
             .min_w_0()
             .child(summary)
             .when(open && has_error, |el| {
-                el.child(error_text(output.as_deref().unwrap_or(""), &theme, true))
+                el.child(error_text(output.unwrap_or(""), &theme, true))
             })
             .when(pending_approval, |el| {
                 el.child(
@@ -691,14 +688,9 @@ impl TranscriptView {
 }
 
 /// `ActivityToolIcon`: a dashed ring while running, a dash once done.
-fn activity_tool_icon(
-    id: gpui::ElementId,
-    state: ToolCallState,
-    live: bool,
-    theme: &Theme,
-) -> AnyElement {
+fn activity_tool_icon(state: ToolCallState, live: bool, theme: &Theme) -> AnyElement {
     if state == ToolCallState::Pending {
-        return pending_ring(id, theme.content(0.4), live);
+        return pending_ring(theme.content(0.4), live);
     }
     icon(IconName::Minus)
         .size(u(14.))

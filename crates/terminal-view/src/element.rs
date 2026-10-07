@@ -8,19 +8,19 @@
 //! preedit text, and a scrollbar thumb. It also registers the window-level
 //! mouse listeners and the platform input handler.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ContentMask, CursorStyle, DispatchPhase, Element, ElementId, ElementInputHandler,
-    Entity, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, GlobalElementId, Hitbox,
-    HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
-    StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
-    px, quad, relative, size,
+    Entity, Font, FontStyle, FontWeight, GlobalElementId, Hitbox, HitboxBehavior,
+    InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PaintQuad, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, StrikethroughStyle,
+    Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, quad, relative,
+    size,
 };
 
-use crate::emulator::{CursorShape, FrameCell, Side, UnderlineKind};
-use crate::theme::{hsla, platform_family_name};
+use crate::emulator::{CursorShape, Emulator, Frame, FrameCell, Side, UnderlineKind};
+use crate::theme::hsla;
 use crate::view::TerminalView;
 
 /// `.monocode-terminal { padding: 8px 10px }` in src/styles/index.css. The
@@ -188,6 +188,126 @@ struct Segment {
     line: ShapedLine,
 }
 
+/// What one row was shaped from, and the result.
+struct CachedRow {
+    link_cols: Option<Vec<bool>>,
+    accent: Option<(usize, gpui::Hsla)>,
+    segments: Rc<Vec<Segment>>,
+}
+
+/// The last frame and its shaped rows, kept on the view between paints.
+///
+/// The app redraws the whole window whenever any view changes, so without
+/// this every keystroke in the composer or streamed transcript token would
+/// rebuild the terminal's frame and shape every row again. The frame is
+/// reused while the emulator's revision stays put, and a row is reshaped
+/// only when its cells, link underline, or cursor accent changed.
+#[derive(Default)]
+pub(crate) struct GridCache {
+    frame: Option<(u64, Rc<Frame>)>,
+    /// The frame the cached rows were shaped from.
+    shaped_from: Option<Rc<Frame>>,
+    shape_key: Option<(Font, Pixels, Pixels)>,
+    rows: Vec<CachedRow>,
+}
+
+impl GridCache {
+    /// The emulator's frame, rebuilt only after it changed.
+    fn frame(&mut self, emulator: &Emulator) -> Rc<Frame> {
+        let revision = emulator.revision();
+        if let Some((cached, frame)) = &self.frame
+            && *cached == revision
+        {
+            return frame.clone();
+        }
+        let frame = Rc::new(emulator.frame());
+        self.frame = Some((revision, frame.clone()));
+        frame
+    }
+
+    /// The shaped segments for each of the first `rows` rows of `frame`.
+    #[allow(clippy::too_many_arguments)]
+    fn shape(
+        &mut self,
+        emulator: &Emulator,
+        frame: &Rc<Frame>,
+        rows: usize,
+        font: &Font,
+        font_size: Pixels,
+        cell_width: Pixels,
+        hovered_link: Option<&crate::emulator::Link>,
+        block_cursor: Option<((usize, usize), gpui::Hsla)>,
+        window: &Window,
+    ) -> Vec<Rc<Vec<Segment>>> {
+        let same_font = self.shape_key.as_ref().is_some_and(|(f, size, width)| {
+            f == font && *size == font_size && *width == cell_width
+        });
+        if !same_font {
+            self.rows.clear();
+            self.shape_key = Some((font.clone(), font_size, cell_width));
+        }
+        let previous = self.shaped_from.take();
+        let mut out = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let cells = frame.row(row);
+            let link_cols = hovered_link.map(|link| {
+                let line = emulator.grid_point(row, 0).line;
+                (0..cells.len())
+                    .map(|col| link.contains(gpui_point(line, col)))
+                    .collect::<Vec<_>>()
+            });
+            let accent = block_cursor
+                .filter(|((r, _), _)| *r == row)
+                .map(|((_, c), color)| (c, color));
+            let same_cells = previous.as_ref().is_some_and(|old| {
+                Rc::ptr_eq(old, frame)
+                    || (old.cols == frame.cols && row < old.rows && old.row(row) == cells)
+            });
+            if let Some(cached) = self.rows.get(row)
+                && same_cells
+                && cached.link_cols == link_cols
+                && cached.accent == accent
+            {
+                out.push(cached.segments.clone());
+                continue;
+            }
+            let mut segments = Vec::new();
+            shape_row(
+                &mut segments,
+                row,
+                cells,
+                font,
+                font_size,
+                cell_width,
+                link_cols.as_deref(),
+                accent,
+                window,
+            );
+            let segments = Rc::new(segments);
+            let entry = CachedRow {
+                link_cols,
+                accent,
+                segments: segments.clone(),
+            };
+            if row < self.rows.len() {
+                self.rows[row] = entry;
+            } else {
+                self.rows.push(entry);
+            }
+            out.push(segments);
+        }
+        self.rows.truncate(rows);
+        self.shaped_from = Some(frame.clone());
+        out
+    }
+
+    /// The shaped rows from the last paint, for tests.
+    #[cfg(test)]
+    fn row_segments(&self) -> Vec<Rc<Vec<Segment>>> {
+        self.rows.iter().map(|row| row.segments.clone()).collect()
+    }
+}
+
 pub struct TerminalPrepaint {
     hitbox: Hitbox,
     layout: LayoutInfo,
@@ -198,7 +318,8 @@ pub struct TerminalPrepaint {
     /// underline, outline).
     cursor_under_text: Option<PaintQuad>,
     cursor_over_text: Option<PaintQuad>,
-    segments: Vec<Segment>,
+    /// Shaped text, one list per row.
+    segments: Vec<Rc<Vec<Segment>>>,
     preedit: Option<(PaintQuad, Point<Pixels>, ShapedLine)>,
     scrollbar: Option<ScrollbarMetrics>,
     pointer: CursorStyle,
@@ -251,28 +372,25 @@ impl Element for TerminalElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
-        let family = self.view.update(cx, |view, _| view.font_family(window));
-        let theme = self.view.read(cx).theme().clone();
-        let fallbacks: Vec<String> = theme
-            .font_families()
-            .filter_map(|f| platform_family_name(f))
-            .filter(|f| *f != family.as_ref())
-            .map(str::to_string)
-            .collect();
-        let font = Font {
-            family,
-            // A terminal is a fixed grid. Ligatures would draw several cells
-            // as fewer glyphs and shift the rest of the row.
-            features: FontFeatures(Arc::new(vec![
-                ("liga".into(), 0),
-                ("calt".into(), 0),
-                ("dlig".into(), 0),
-            ])),
-            fallbacks: (!fallbacks.is_empty()).then(|| FontFallbacks::from_fonts(fallbacks)),
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
+        let font = self.view.update(cx, |view, _| view.font(window));
+        let (
+            font_size,
+            theme_line_height,
+            selection_fill,
+            selection_inactive,
+            cursor_accent,
+            base_bg,
+        ) = {
+            let theme = self.view.read(cx).theme();
+            (
+                theme.font_size,
+                theme.line_height,
+                theme.selection,
+                theme.selection_inactive,
+                theme.cursor_accent,
+                theme.base_background,
+            )
         };
-        let font_size = theme.font_size;
         let scale = window.scale_factor();
         let (cell_width, line_height, ascent_minus_descent) = {
             let text_system = window.text_system();
@@ -282,7 +400,7 @@ impl Element for TerminalElement {
                 .unwrap_or(font_size * 0.6);
             let ascent = f32::from(text_system.ascent(font_id, font_size));
             let descent = f32::from(text_system.descent(font_id, font_size)).abs();
-            let natural = (ascent + descent) * theme.line_height;
+            let natural = (ascent + descent) * theme_line_height;
             // Whole device pixels, like xterm.js's cell height, so row
             // backgrounds meet without seams.
             let line_height = ((natural * scale).round() / scale).max(1.0);
@@ -330,28 +448,43 @@ impl Element for TerminalElement {
 
         let view = self.view.read(cx);
         let focused = view.focus_handle_ref().is_focused(window);
-        let frame = view.emulator().frame();
         let hovered_link = view.hovered_link().cloned();
         let marked_text = view.marked_text().map(str::to_string);
         let cursor_visible = view.cursor_visible(window) && marked_text.is_none();
         let reporting = view.mouse_reporting(&window.modifiers());
-        let emulator = view.emulator();
 
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
-        let background = (frame.background.a > 0.0).then(|| fill(bounds, hsla(frame.background)));
+        let (frame, cursor, segments) = self.view.update(cx, |view, _| {
+            let (emulator, cache) = view.paint_parts();
+            let frame = cache.frame(emulator);
+            let cursor = frame.cursor.filter(|_| cursor_visible);
+            let block_cursor = cursor.and_then(|c| {
+                (focused && c.shape == CursorShape::Block)
+                    .then_some(((c.row, c.col), hsla(cursor_accent)))
+            });
+            let segments = cache.shape(
+                emulator,
+                &frame,
+                frame.rows.min(rows),
+                &font,
+                font_size,
+                cell_width,
+                hovered_link.as_ref(),
+                block_cursor,
+                window,
+            );
+            (frame, cursor, segments)
+        });
 
-        let cursor = frame.cursor.filter(|_| cursor_visible);
-        let block_cursor = cursor
-            .and_then(|c| (focused && c.shape == CursorShape::Block).then_some((c.row, c.col)));
+        let background = (frame.background.a > 0.0).then(|| fill(bounds, hsla(frame.background)));
 
         let mut cell_backgrounds = Vec::new();
         let mut selection = Vec::new();
-        let mut segments = Vec::new();
         let selection_color = hsla(if focused {
-            theme.selection
+            selection_fill
         } else {
-            theme.selection_inactive
+            selection_inactive
         });
         for row in 0..frame.rows.min(rows) {
             let cells = frame.row(row);
@@ -361,26 +494,6 @@ impl Element for TerminalElement {
             push_runs(&mut selection, &layout, row, cells, |cell| {
                 cell.selected.then_some(selection_color)
             });
-            let link_cols = hovered_link.as_ref().map(|link| {
-                let line = emulator.grid_point(row, 0).line;
-                (0..cells.len())
-                    .map(|col| link.contains(gpui_point(line, col)))
-                    .collect::<Vec<_>>()
-            });
-            let accent = block_cursor
-                .filter(|(r, _)| *r == row)
-                .map(|(_, c)| (c, hsla(theme.cursor_accent)));
-            shape_row(
-                &mut segments,
-                row,
-                cells,
-                &font,
-                font_size,
-                cell_width,
-                link_cols.as_deref(),
-                accent,
-                window,
-            );
         }
 
         let (cursor_under_text, cursor_over_text) = match cursor {
@@ -421,7 +534,7 @@ impl Element for TerminalElement {
         };
 
         let preedit = marked_text.and_then(|text| {
-            let (row, col) = emulator.cursor_cell()?;
+            let (row, col) = self.view.read(cx).emulator().cursor_cell()?;
             let color = hsla(frame.foreground);
             let run = TextRun {
                 len: text.len(),
@@ -442,7 +555,7 @@ impl Element for TerminalElement {
             let origin = layout.cell_bounds(row, col, 1).origin;
             let cover = fill(
                 Bounds::new(origin, size(line.width.max(cell_width), line_height)),
-                hsla(theme.base_background),
+                hsla(base_bg),
             );
             Some((cover, origin, line))
         });
@@ -519,7 +632,7 @@ impl Element for TerminalElement {
             if let Some(cursor) = prepaint.cursor_under_text.take() {
                 window.paint_quad(cursor);
             }
-            for segment in &prepaint.segments {
+            for segment in prepaint.segments.iter().flat_map(|row| row.iter()) {
                 let mut origin = prepaint
                     .layout
                     .cell_bounds(segment.row, segment.col, 1)
@@ -770,6 +883,64 @@ fn register_mouse_listeners(view: &Entity<TerminalView>, hitbox: &Hitbox, window
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod cache {
+        use gpui::{TestAppContext, VisualTestContext};
+
+        use super::*;
+        use crate::pty::{PtyEvent, RecordingPty};
+        use crate::theme::TerminalTheme;
+
+        fn draw(cx: &mut VisualTestContext) {
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+
+        fn rows(view: &Entity<TerminalView>, cx: &mut VisualTestContext) -> Vec<Rc<Vec<Segment>>> {
+            view.read_with(cx, |view, _| view.grid_cache().row_segments())
+        }
+
+        #[gpui::test]
+        fn redraws_reuse_shaped_rows_until_their_cells_change(cx: &mut TestAppContext) {
+            let pty = RecordingPty::new();
+            let sender = pty.sender();
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                TerminalView::new(pty, TerminalTheme::dark(), window, cx)
+            });
+            let feed = |bytes: &[u8], cx: &mut VisualTestContext| {
+                sender
+                    .send_blocking(PtyEvent::Output(bytes.to_vec()))
+                    .unwrap();
+                cx.run_until_parked();
+            };
+            feed(b"hello\r\nworld", cx);
+            draw(cx);
+            let first = rows(&view, cx);
+            assert!(!first.is_empty());
+            assert!(!first[0].is_empty() && !first[1].is_empty());
+
+            // A redraw with nothing new in the terminal reshapes nothing.
+            let revision = view.read_with(cx, |view, _| view.emulator().revision());
+            draw(cx);
+            assert_eq!(
+                view.read_with(cx, |view, _| view.emulator().revision()),
+                revision
+            );
+            let second = rows(&view, cx);
+            assert_eq!(first.len(), second.len());
+            assert!(first.iter().zip(&second).all(|(a, b)| Rc::ptr_eq(a, b)));
+
+            // Output on the second row reshapes that row only.
+            feed(b"!", cx);
+            draw(cx);
+            let third = rows(&view, cx);
+            assert!(Rc::ptr_eq(&first[0], &third[0]));
+            assert!(!Rc::ptr_eq(&first[1], &third[1]));
+            assert_eq!(third[1][0].line.text.as_ref(), "world!");
+        }
+    }
 
     fn layout() -> LayoutInfo {
         // 10 by 20 cells, an 8 by 4 grid starting at (5, 5).

@@ -21,6 +21,7 @@ pub mod json_rpc;
 pub mod json_text;
 pub mod local_store;
 pub mod native_commands;
+pub mod partial_json;
 pub mod provider_account_credentials;
 pub mod provider_account_identity;
 pub mod provider_accounts;

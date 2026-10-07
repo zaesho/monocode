@@ -94,6 +94,20 @@ pub struct WorktreeRemoval {
 pub trait ProjectsBackend: Send + Sync + 'static {
     /// `git_diff_index`: changed files with branch and upstream state.
     fn git_diff_index(&self, cwd: &str) -> Result<GitDiffIndex, String>;
+    /// A value that changes when any ref, `HEAD`, or working copy of the
+    /// repository holding `cwd` changes, read from file stamps without
+    /// running git. `None` when it cannot tell.
+    fn git_refs_fingerprint(&self, cwd: &str) -> Option<u64> {
+        super::git_status::refs_fingerprint_on_disk(cwd)
+    }
+    /// `cwd` with symlinks resolved, so two spellings of one folder compare
+    /// equal. `None` when the folder cannot be resolved.
+    fn real_path(&self, cwd: &str) -> Option<String> {
+        let path = monocode_git::fs::expand_home(cwd);
+        std::fs::canonicalize(path)
+            .ok()
+            .map(|real| real.to_string_lossy().into_owned())
+    }
     /// `git_diff_stats`: uncommitted line counts.
     fn git_diff_stats(&self, cwd: &str) -> Result<GitDiffStats, String>;
     /// `git_branches`.

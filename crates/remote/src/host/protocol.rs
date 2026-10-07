@@ -393,10 +393,12 @@ pub fn apply_session_sync(
     known: Option<&HostSession>,
     sync: SessionSync,
 ) -> Result<HostSession, String> {
-    let base = match &sync {
-        SessionSync::Snapshot { value } => return Ok((**value).clone()),
-        SessionSync::Unchanged { revision } => *revision,
-        SessionSync::Delta { base, .. } => *base,
+    let base = match sync {
+        // The sync is owned, so the snapshot moves out instead of copying a
+        // whole transcript.
+        SessionSync::Snapshot { value } => return Ok(*value),
+        SessionSync::Unchanged { revision } => revision,
+        SessionSync::Delta { base, .. } => base,
     };
     let Some(known) = known.filter(|known| known.revision == base) else {
         return Err("Session sync base does not match".into());
@@ -459,6 +461,22 @@ pub fn apply_session_sync(
         block_revisions: None,
         extra,
     })
+}
+
+/// [`apply_session_sync`] for callers that hold the known session in an
+/// `Arc`. An unchanged sync returns `known` itself instead of a deep copy,
+/// so the caller can tell an unchanged poll by pointer and skip the copy.
+pub fn apply_shared_session_sync(
+    known: Option<&std::sync::Arc<HostSession>>,
+    sync: SessionSync,
+) -> Result<std::sync::Arc<HostSession>, String> {
+    if let SessionSync::Unchanged { revision } = sync {
+        return match known {
+            Some(known) if known.revision == revision => Ok(known.clone()),
+            _ => Err("Session sync base does not match".into()),
+        };
+    }
+    apply_session_sync(known.map(|known| &**known), sync).map(std::sync::Arc::new)
 }
 
 /// `HostCommand`: what `commands.dispatch` carries.
@@ -771,6 +789,28 @@ mod tests {
             apply_session_sync(Some(&known), SessionSync::Unchanged { revision: 4 }).unwrap(),
             known
         );
+    }
+
+    #[test]
+    fn the_shared_form_returns_the_same_arc_when_nothing_changed() {
+        let known = std::sync::Arc::new(known());
+        let same = apply_shared_session_sync(Some(&known), SessionSync::Unchanged { revision: 4 })
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&same, &known));
+        assert!(
+            apply_shared_session_sync(Some(&known), SessionSync::Unchanged { revision: 3 })
+                .is_err()
+        );
+        assert!(apply_shared_session_sync(None, SessionSync::Unchanged { revision: 4 }).is_err());
+        let snapshot = apply_shared_session_sync(
+            Some(&known),
+            SessionSync::Snapshot {
+                value: Box::new((*known).clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(*snapshot, *known);
+        assert!(!std::sync::Arc::ptr_eq(&snapshot, &known));
     }
 
     #[test]

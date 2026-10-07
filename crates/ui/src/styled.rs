@@ -1,6 +1,6 @@
 //! Small styling shortcuts for the Tailwind idioms the React views repeat.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use gpui::{
     Corners, FontFeatures, FontWeight, Hsla, IntoElement, ParentElement as _, Styled, canvas, div,
@@ -21,9 +21,11 @@ pub trait UiStyled: Styled + Sized {
         self.line_height(relative(multiple))
     }
 
-    /// `tabular-nums`.
+    /// `tabular-nums`. Shares one feature list instead of allocating per call.
     fn tabular(self) -> Self {
-        self.font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+        static TNUM: LazyLock<FontFeatures> =
+            LazyLock::new(|| FontFeatures(Arc::new(vec![("tnum".into(), 1)])));
+        self.font_features(TNUM.clone())
     }
 
     /// `font-medium`.

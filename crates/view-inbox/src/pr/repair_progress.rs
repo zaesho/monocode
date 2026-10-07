@@ -14,7 +14,7 @@ use crate::data::{
     TrackedCiRepair,
 };
 use crate::model::{date_parse, github_actions_job_id};
-use crate::style::{active_ink, negative_ink, positive_ink, spin_icon};
+use crate::style::{active_ink, motion_safe_spin_icon, negative_ink, positive_ink};
 
 /// `RepairState`: a check outcome, or where the repair itself stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -284,7 +284,7 @@ fn status_icon(id: ElementId, state: RepairState, theme: &Theme) -> AnyElement {
     let look = repair_look(state);
     let ink = repair_ink(state, theme);
     if look.spins {
-        spin_icon(id, look.icon, 14., ink)
+        motion_safe_spin_icon(id, look.icon, 14., ink)
     } else {
         icon(look.icon)
             .size(u(14.))

@@ -1328,7 +1328,9 @@ pub(crate) fn upsert_session(
         .map(|(value, _, _, _, _)| *value)
         .unwrap_or(now);
     let updated_at = match &existing {
-        Some((_, prev_updated, prev_blocks, _, _)) if json_eq(prev_blocks, &session.blocks) => {
+        Some((_, prev_updated, prev_blocks, _, _))
+            if blocks_unchanged(prev_blocks, &blocks_json, &session.blocks) =>
+        {
             *prev_updated
         }
         _ => now,
@@ -1865,6 +1867,14 @@ fn has_draft_block(blocks: &Value) -> bool {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+/// Whether the stored transcript equals the incoming one. Rows this store
+/// wrote hold `serde_json` output of the same kind of value, so equal bytes
+/// settle it without parsing a transcript that can run to megabytes under
+/// the store lock. Other rows fall back to comparing parsed values.
+fn blocks_unchanged(raw: &str, serialized: &str, incoming: &Value) -> bool {
+    raw == serialized || json_eq(raw, incoming)
 }
 
 fn json_eq(raw: &str, incoming: &Value) -> bool {

@@ -9,11 +9,11 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, Bounds, ContentMask, Context, Hsla, IntoElement, ParentElement as _, Pixels, Render,
-    Styled as _, WeakEntity, Window, canvas, deferred, div, fill, point, px, size,
+    Styled as _, Task, WeakEntity, Window, canvas, deferred, div, fill, point, px, size,
 };
 use monocode_ui::color::{hex, with_alpha};
 
@@ -42,6 +42,9 @@ pub struct RunnerGeometry {
     /// The jump-to-latest chevron, set by the transcript's owner.
     pub obstacle: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
+
+/// How often the sprite swaps between its rest and talk frames, in ms.
+const BEAT_MS: u64 = 460;
 
 struct LiveCoin {
     coin: Coin,
@@ -83,6 +86,10 @@ pub struct ComposerRunner {
     learned: bool,
     coins: Vec<LiveCoin>,
     seed: u64,
+    /// Wakes the runner for the next talk frame when nothing else moves.
+    _beat: Option<Task<()>>,
+    /// A frame was asked for to read the composer box's first bounds.
+    awaiting_bounds: bool,
 }
 
 impl ComposerRunner {
@@ -123,6 +130,8 @@ impl ComposerRunner {
             learned: props.reduced_motion,
             coins: Vec::new(),
             seed: 0x9e37_79b9_7f4a_7c15,
+            _beat: None,
+            awaiting_bounds: false,
         };
         let mut random = this.random();
         this.next_coin_at = next_coin_delay(true, &mut random);
@@ -130,13 +139,60 @@ impl ComposerRunner {
     }
 
     pub fn set_props(&mut self, props: &ComposerProps, cx: &mut Context<Self>) {
+        let mascot = project_mascot(&project_name(&props.cwd), props.runner_mascot.as_deref());
+        let color = props.runner_color.unwrap_or(self.color);
+        if self.busy == props.busy
+            && self.enabled == props.enabled
+            && self.mascot == mascot
+            && self.color == color
+        {
+            return;
+        }
         self.busy = props.busy;
         self.enabled = props.enabled;
-        self.mascot = project_mascot(&project_name(&props.cwd), props.runner_mascot.as_deref());
-        if let Some(color) = props.runner_color {
-            self.color = color;
-        }
+        self.mascot = mascot;
+        self.color = color;
+        // A composer shown again may paint its box for the first time.
+        self.awaiting_bounds = false;
         cx.notify();
+    }
+
+    /// Asks for the next frame only when something will change, because
+    /// each one redraws the whole window. A frame that drew no sprite asks
+    /// for nothing: the composer is hidden, or its box has no width, and a
+    /// layout change that gives it room redraws the window anyway. The one
+    /// exception is a box the composer has not painted yet, whose bounds
+    /// land during this frame; one more frame picks them up. With reduced
+    /// motion the sprite stands still and only swaps its talk frame every
+    /// `BEAT_MS`, so a timer wakes it instead.
+    fn schedule_next_frame(&mut self, drew: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self._beat = None;
+        if self.finished || !self.enabled {
+            return;
+        }
+        if !drew {
+            if self.geometry.r#box.get().is_none() {
+                if !self.awaiting_bounds {
+                    self.awaiting_bounds = true;
+                    window.request_animation_frame();
+                }
+            } else {
+                self.awaiting_bounds = false;
+            }
+            return;
+        }
+        self.awaiting_bounds = false;
+        let still = self.reduced && self.busy && !self.stunning && self.coins.is_empty();
+        if !still {
+            window.request_animation_frame();
+            return;
+        }
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        let wait = Duration::from_millis(BEAT_MS - elapsed % BEAT_MS + 1);
+        self._beat = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
     }
 
     /// A tiny xorshift stand-in for `Math.random`.
@@ -247,7 +303,7 @@ impl ComposerRunner {
                 size(px(RUNNER_SIZE), px(RUNNER_SIZE)),
             )
         };
-        let beat = (now / 460.) as u64 % 2 == 1;
+        let beat = (now / BEAT_MS as f32) as u64 % 2 == 1;
 
         if self.exiting {
             let t = if self.reduced {
@@ -431,9 +487,7 @@ fn paint_grid(
 impl Render for ComposerRunner {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame = self.tick(window, cx);
-        if !self.finished {
-            window.request_animation_frame();
-        }
+        self.schedule_next_frame(frame.sprite.is_some(), window, cx);
         let mascot = self.mascot;
         let color = self.color;
         let shadow = with_alpha(hex(0x000000), 0.45);

@@ -63,6 +63,8 @@ pub(crate) struct PreparedCode {
     pub fence: CodeFence,
     pub code: SharedString,
     pub line_count: usize,
+    /// The line number column's text, built on first render.
+    pub line_numbers: std::cell::OnceCell<SharedString>,
 }
 
 pub(crate) struct PreparedTable {
@@ -324,6 +326,7 @@ fn prepare_code(p: &mut Preparer, code: &CodeBlock) -> PreparedCode {
         fence: code.fence(),
         line_count: code.code.split('\n').count(),
         code: code.code.clone().into(),
+        line_numbers: std::cell::OnceCell::new(),
     }
 }
 

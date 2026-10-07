@@ -97,6 +97,33 @@ fn shows_a_worker_transcript_from_the_factory_and_keeps_it(cx: &mut TestAppConte
 }
 
 #[gpui::test]
+fn unchanged_props_do_not_notify_the_pane(cx: &mut TestAppContext) {
+    let (pane, _, _, cx) = mount(agent_pane(), FakeFiles::new(), cx);
+    let sessions = Rc::new(Vec::new());
+    pane.update_in(cx, |pane, window, cx| {
+        pane.set_sessions(sessions.clone(), window, cx)
+    });
+    cx.run_until_parked();
+    let notified = Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    let _observe = cx.update(|_, cx| cx.observe(&pane, move |_, _| count.set(count.get() + 1)));
+    pane.update_in(cx, |pane, window, cx| {
+        let model = pane.pane().clone();
+        pane.set_pane(model, window, cx);
+        pane.set_focused(false, window, cx);
+        pane.set_unified_diffs(false, window, cx);
+        pane.set_sessions(sessions.clone(), window, cx);
+        pane.set_settings(EditorSettings::default(), window, cx);
+        pane.set_show_tabs(true, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(notified.get(), 0);
+    pane.update_in(cx, |pane, window, cx| pane.set_focused(true, window, cx));
+    cx.run_until_parked();
+    assert!(notified.get() > 0, "a changed prop still notifies");
+}
+
+#[gpui::test]
 fn omits_the_tab_strip_when_the_title_bar_names_the_file(cx: &mut TestAppContext) {
     let (pane, _, _, cx) = mount(agent_pane(), FakeFiles::new(), cx);
     let strip: TabStrip = Rc::new(|_, _, _| div().into_any_element());

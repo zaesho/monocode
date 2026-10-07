@@ -64,7 +64,7 @@ impl TranscriptView {
                 .left(u(-4.))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.copy(copy_key.clone(), text.clone(), cx);
+                    this.copy(copy_key.clone(), text.to_string(), cx);
                 })),
             );
             if self.config.can_save_notes {
@@ -88,7 +88,9 @@ impl TranscriptView {
                         cx,
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.emit(TranscriptEvent::SaveNote { text: text.clone() });
+                        cx.emit(TranscriptEvent::SaveNote {
+                            text: text.to_string(),
+                        });
                         this.flash(save_key.clone(), cx);
                     })),
                 );

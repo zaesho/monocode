@@ -19,6 +19,7 @@ use regex::Regex;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::core::partial_json::PartialJson;
 use crate::core::registry::{EventSink, TextPromptInput};
 use crate::core::task::{AbortSignal, timeout};
 
@@ -154,7 +155,7 @@ struct InFlightTool {
     id: String,
     name: String,
     input: Record,
-    partial_json: String,
+    partial_json: PartialJson,
     title: String,
 }
 
@@ -643,7 +644,7 @@ fn handle_stream_event(live: &mut LiveText, rec: &Record) -> Option<HarnessEvent
             id: started.id,
             name: started.name,
             input: started.input,
-            partial_json: String::new(),
+            partial_json: PartialJson::default(),
         };
         if started.index >= 0 {
             live.tools_by_index.insert(started.index, tool.id.clone());
@@ -672,7 +673,10 @@ fn handle_stream_event(live: &mut LiveText, rec: &Record) -> Option<HarnessEvent
     let tool_id = live.tools_by_index.get(&json_delta.index).cloned()?;
     let tool = live.tools_by_id.get_mut(&tool_id)?;
     tool.partial_json.push_str(&json_delta.partial);
-    let parsed = try_parse_json_record(&tool.partial_json)?;
+    let parsed = tool
+        .partial_json
+        .complete()
+        .and_then(try_parse_json_record)?;
     tool.input = parsed.clone();
     tool.title = tool_title(&tool.name, &parsed);
     let tool = tool.clone();

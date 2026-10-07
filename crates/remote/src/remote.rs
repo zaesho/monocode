@@ -274,16 +274,32 @@ fn call(
     token: Option<&str>,
     environment_id: Option<&str>,
     method: &str,
-    params: Value,
+    params: impl std::borrow::Borrow<Value>,
 ) -> Result<Value, Failure> {
-    let payload = json!({ "version": 1, "environmentId": environment_id, "method": method, "params": params });
+    // Borrow the params into the body. Uploads carry megabytes of base64,
+    // and `json!` would deep-copy them before serializing.
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Payload<'a> {
+        environment_id: Option<&'a str>,
+        method: &'a str,
+        params: &'a Value,
+        version: u8,
+    }
+    let payload = serde_json::to_string(&Payload {
+        environment_id,
+        method,
+        params: params.borrow(),
+        version: 1,
+    })
+    .map_err(|_| Failure::Rejected("Invalid request parameters".into()))?;
     let mut request = agent
         .post(&format!("{base}/rpc"))
         .set("Content-Type", "application/json");
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    let response = match request.send_string(&payload.to_string()) {
+    let response = match request.send_string(&payload) {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
         Err(ureq::Error::Transport(error)) => {
@@ -343,10 +359,12 @@ fn call(
     if status != 200 {
         return Err(Failure::Rejected(format!("Host returned HTTP {status}")));
     }
-    value
-        .get("result")
-        .cloned()
-        .ok_or_else(|| Failure::Rejected("Invalid host response".into()))
+    // Move the result out instead of copying a response of up to 16 MB.
+    match value {
+        Value::Object(mut response) => response.remove("result"),
+        _ => None,
+    }
+    .ok_or_else(|| Failure::Rejected("Invalid host response".into()))
 }
 
 // Only a refused connection proves the local forwarding listener is gone.
@@ -409,7 +427,7 @@ fn call_route(
     machine: &StoredMachine,
     route: &Route,
     method: &str,
-    params: Value,
+    params: impl std::borrow::Borrow<Value>,
 ) -> Result<Value, Failure> {
     match route {
         Route::Direct(base) => {
@@ -559,7 +577,7 @@ fn request(
     let mut retried = false;
     loop {
         let route = resolve_route(remote, &machine)?;
-        match call_route(state, &machine, &route, method, params.clone()) {
+        match call_route(state, &machine, &route, method, &params) {
             Ok(result) => {
                 if method == "environment.describe"
                     && result.get("environmentId").and_then(Value::as_str)
@@ -718,7 +736,7 @@ fn exchange(
         .map_err(Failure::Rejected)?;
     let mut failures = Vec::new();
     for base in &link.endpoints {
-        match call(&agent, base, None, None, "pair.exchange", params.clone()) {
+        match call(&agent, base, None, None, "pair.exchange", &params) {
             Ok(result) => return accept(result, Route::Direct(base.clone()), None),
             // The host redeems a code once, so resending one that may have
             // arrived gets a clear "already used" answer at worst.

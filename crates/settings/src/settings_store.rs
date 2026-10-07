@@ -76,14 +76,59 @@ pub const APP_SETTINGS_KEYS: [&str; 53] = [
     project_providers::PROJECT_PROVIDER_SETTINGS_KEY,
 ];
 
+/// A value parsed from the store, valid while the store's generation holds.
+struct ParsedCache<T> {
+    kv: u64,
+    generation: u64,
+    platform: Platform,
+    value: T,
+}
+
+static APP_SETTINGS_CACHE: Mutex<Option<ParsedCache<AppSettings>>> = Mutex::new(None);
+static SETTINGS_CACHE: Mutex<Option<ParsedCache<Settings>>> = Mutex::new(None);
+
+/// Parse with `parse`, or return the copy parsed at the store's current
+/// generation. Views read settings while they draw, and a full parse reads
+/// and decodes every key.
+fn cached_parse<T: Clone>(
+    cache: &Mutex<Option<ParsedCache<T>>>,
+    kv: &Kv,
+    platform: Platform,
+    parse: impl FnOnce() -> T,
+) -> T {
+    let generation = kv.generation();
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(cached) = cache.as_ref()
+        && cached.kv == kv.id()
+        && cached.generation == generation
+        && cached.platform == platform
+    {
+        return cached.value.clone();
+    }
+    let value = parse();
+    // A change while parsing moves the generation past this entry, so a
+    // value that mixes old and new items is never served.
+    *cache = Some(ParsedCache {
+        kv: kv.id(),
+        generation,
+        platform,
+        value: value.clone(),
+    });
+    value
+}
+
 /// Every stored preference, read the way each `load*` function did.
 pub fn load_app_settings(kv: &Kv, platform: Platform) -> AppSettings {
-    AppSettings::from_local_storage(|key| kv.get_item(key), platform)
+    cached_parse(&APP_SETTINGS_CACHE, kv, platform, || {
+        AppSettings::from_local_storage(|key| kv.get_item(key), platform)
+    })
 }
 
 /// The app behavior settings from settings.ts.
 pub fn load_settings(kv: &Kv, platform: Platform) -> Settings {
-    Settings::from_local_storage(|key| kv.get_item(key), platform)
+    cached_parse(&SETTINGS_CACHE, kv, platform, || {
+        Settings::from_local_storage(|key| kv.get_item(key), platform)
+    })
 }
 
 fn on_change(
@@ -513,6 +558,26 @@ pub fn current_keybindings(kv: &Kv, platform: Platform) -> Vec<KeybindingRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_settings_follow_every_store_change() {
+        let kv = Kv::in_memory();
+        let other = Kv::in_memory();
+        assert!(load_app_settings(&kv, MAC).settings.notes_enabled);
+        save_notes_enabled(&kv, false);
+        assert!(!load_app_settings(&kv, MAC).settings.notes_enabled);
+        assert!(!load_settings(&kv, MAC).notes_enabled);
+        // Another store never sees this store's cached copy.
+        assert!(load_app_settings(&other, MAC).settings.notes_enabled);
+        save_notes_enabled(&kv, true);
+        assert!(load_app_settings(&kv, MAC).settings.notes_enabled);
+        assert!(load_settings(&kv, MAC).notes_enabled);
+        kv.remove_item(NOTES_ENABLED_KEY);
+        assert_eq!(
+            load_app_settings(&kv, MAC),
+            AppSettings::from_local_storage(|key| kv.get_item(key), MAC)
+        );
+    }
 
     #[test]
     fn agents_open_sessions_by_default_without_review() {

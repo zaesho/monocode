@@ -18,7 +18,7 @@ pub async fn session_checkpoint_ensure(
 ) -> Result<(), String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        checkpoint::session_checkpoint_ensure(&store, session_id, cwd)
+        checkpoint::session_checkpoint_ensure(&store, session_id, cwd, false)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -77,7 +77,7 @@ pub async fn session_checkpoint_apply(
 ) -> Result<CheckpointApplyResult, String> {
     let store = store.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        checkpoint::session_checkpoint_apply(&store, session_id, from_cwd, to_cwd)
+        checkpoint::session_checkpoint_apply(&store, session_id, from_cwd, to_cwd, None)
     })
     .await
     .map_err(|e| e.to_string())?

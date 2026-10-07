@@ -31,6 +31,9 @@ struct FakeState {
     diff_stats: HashMap<String, Result<GitDiffStats, String>>,
     branches: HashMap<String, Result<GitBranches, String>>,
     worktrees: HashMap<String, Result<Worktrees, String>>,
+    /// `git_refs_fingerprint` answers; folders not listed answer `Some(0)`.
+    refs: HashMap<String, Option<u64>>,
+    real_paths: HashMap<String, String>,
     failing: HashMap<String, String>,
     removal: Option<WorktreeRemoval>,
     saved_path: Option<String>,
@@ -117,6 +120,19 @@ impl FakeBackend {
         self.state.lock().branches.insert(cwd.to_string(), branches);
     }
 
+    /// What `git_refs_fingerprint` answers for `cwd`.
+    pub fn set_refs_fingerprint(&self, cwd: &str, fingerprint: Option<u64>) {
+        self.state.lock().refs.insert(cwd.to_string(), fingerprint);
+    }
+
+    /// What `real_path` answers for `cwd`; unset folders do not resolve.
+    pub fn set_real_path(&self, cwd: &str, real: &str) {
+        self.state
+            .lock()
+            .real_paths
+            .insert(cwd.to_string(), real.to_string());
+    }
+
     pub fn set_worktrees(&self, cwd: &str, worktrees: Result<Worktrees, String>) {
         self.state
             .lock()
@@ -144,6 +160,14 @@ impl FakeBackend {
 }
 
 impl ProjectsBackend for FakeBackend {
+    fn git_refs_fingerprint(&self, cwd: &str) -> Option<u64> {
+        self.state.lock().refs.get(cwd).copied().unwrap_or(Some(0))
+    }
+
+    fn real_path(&self, cwd: &str) -> Option<String> {
+        self.state.lock().real_paths.get(cwd).cloned()
+    }
+
     fn git_diff_index(&self, cwd: &str) -> Result<GitDiffIndex, String> {
         self.record("git_diff_index", json!({ "cwd": cwd }))?;
         self.state

@@ -19,6 +19,7 @@ use monocode_engine::attention::{Approvals, Queues};
 use monocode_engine::runtime::Engine;
 use monocode_engine::runtime::checkpoint::{ReviewChanged, notify_review_changed};
 use monocode_engine::submit::{Submit, SubmitOptions};
+use monocode_engine::workspace::files::ProjectFilesChanged;
 use monocode_engine::workspace::workspace::{DiffSession, FileOpenOptions};
 use monocode_engine::workspace::{Files, Workspace, paths::FileNavigation};
 use monocode_store::checkpoint::CheckpointStatus;
@@ -41,6 +42,9 @@ use crate::session_threads::{SessionBtwHost, SessionOrchestration};
 pub struct SessionPane {
     session_id: String,
     session: Option<Arc<Session>>,
+    /// `Sessions::session_revision` of `session`, to skip other sessions'
+    /// changes without comparing transcripts.
+    session_revision: u64,
     transcript: Entity<TranscriptView>,
     navigation: Entity<crate::session_navigation::SessionNavigation>,
     composer: Entity<Composer>,
@@ -56,6 +60,20 @@ pub struct SessionPane {
     centered: bool,
     visible: bool,
     btw_sheet: Option<Entity<BtwSheet>>,
+    /// The blocks the side-question sheet last got, and the session copy
+    /// they came from. The sheet regroups the turns whenever the blocks are
+    /// a new `Arc`, so the pane hands it the same one until the session
+    /// changes.
+    btw_blocks: Option<(Arc<Session>, Arc<Vec<monocode_core::Block>>)>,
+    /// What the side-question sheet's props were last built from. While the
+    /// sheet is closed, streamed output does not rebuild them (see
+    /// [`composer_inputs_differ`]).
+    btw_source: Option<BtwSource>,
+    /// The session copy the composer's props were last built from.
+    composer_source: Option<Arc<Session>>,
+    /// The settings revision and provider availability version the
+    /// transcript's model menus were last handed a source at.
+    menu_source_key: Option<(u64, Option<u64>)>,
     question: Option<Entity<QuestionForm>>,
     question_subscription: Option<Subscription>,
     revealed_search: Option<(String, String)>,
@@ -64,6 +82,10 @@ pub struct SessionPane {
     /// A workspace switch is moving this session (`workspaceSwitchingSessionId`).
     workspace_switching: bool,
     opening: bool,
+    /// The session changed while the pane was hidden. A hidden pane skips
+    /// session changes, because each one copies the whole session and
+    /// rebuilds the transcript, and catches up when it shows again.
+    stale: bool,
     changes: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _settings_watch: Option<(monocode_settings::Subscription, Task<()>)>,
@@ -85,8 +107,28 @@ impl Drop for CatalogWatch {
     }
 }
 
+/// The base transcript config and the [`crate::revisions::revision`] it was
+/// built at. Every pane rebuilds its transcript config on each session
+/// change, and a fresh build parses every stored setting and copies the
+/// model catalog.
+struct TranscriptConfigCache(u64, TranscriptConfig);
+
+impl gpui::Global for TranscriptConfigCache {}
+
 /// The transcript settings from the stored appearance settings.
-fn transcript_config(cx: &App) -> TranscriptConfig {
+pub(crate) fn transcript_config(cx: &mut App) -> TranscriptConfig {
+    let revision = crate::revisions::revision(cx);
+    if let Some(cache) = cx.try_global::<TranscriptConfigCache>()
+        && cache.0 == revision
+    {
+        return cache.1.clone();
+    }
+    let config = build_transcript_config(cx);
+    cx.set_global(TranscriptConfigCache(revision, config.clone()));
+    config
+}
+
+fn build_transcript_config(cx: &App) -> TranscriptConfig {
     let mut config = TranscriptConfig::default();
     if let Some(services) = AppServices::try_global(cx) {
         let appearance = monocode_settings::load_app_settings(
@@ -176,6 +218,54 @@ fn composer_props(session: Option<&Session>, focused: bool, cx: &App) -> Compose
         );
     }
     props
+}
+
+/// The inputs of the side-question sheet's props besides the session.
+struct BtwSource {
+    session: Arc<Session>,
+    focused: bool,
+    visible: bool,
+    editing_last_turn: bool,
+    revision: u64,
+}
+
+/// The blocks the composer's props read: the user turns (the draft, the last
+/// turn to recall or edit, and which turns can take a side question) and
+/// handoffs. Streamed output changes other blocks.
+fn composer_block(block: &&monocode_core::Block) -> bool {
+    matches!(block.role, BlockRole::User | BlockRole::Handoff)
+}
+
+/// Whether `after` differs from `before` in anything [`composer_props`]
+/// reads. Building the props regroups every block into turns and copies the
+/// last prompt, so a session that only streamed output skips it.
+fn composer_inputs_differ(before: &Session, after: &Session) -> bool {
+    before.id != after.id
+        || before.harness != after.harness
+        || before.model != after.model
+        || before.model_settings != after.model_settings
+        || before.runtime_mode != after.runtime_mode
+        || before.cwd != after.cwd
+        || before.worktree_cwd != after.worktree_cwd
+        || before.branch != after.branch
+        || before.context != after.context
+        || before.busy != after.busy
+        || before.queued_messages != after.queued_messages
+        || before.queue_status != after.queue_status
+        || before.editing_queued_message_id != after.editing_queued_message_id
+        || before.inbox_card != after.inbox_card
+        || before.note_card != after.note_card
+        || before.handoff_card != after.handoff_card
+        || before.worktree_removed != after.worktree_removed
+        || before.inbox_ask != after.inbox_ask
+        || before.orchestration_lead_id != after.orchestration_lead_id
+        || before.pending_question != after.pending_question
+        || before.blocks.is_empty() != after.blocks.is_empty()
+        || !before
+            .blocks
+            .iter()
+            .filter(composer_block)
+            .eq(after.blocks.iter().filter(composer_block))
 }
 
 impl SessionPane {
@@ -268,8 +358,24 @@ impl SessionPane {
             cx.subscribe_in(&composer, window, Self::on_composer_event),
             cx.subscribe_in(&transcript, window, Self::on_card_event),
             cx.observe_in(&sessions, window, |this, _, window, cx| {
-                this.sync(cx);
-                this.sync_composer(window, cx);
+                if !this.visible && this.session.is_some() {
+                    this.stale = true;
+                    return;
+                }
+                // Every session's change notifies; only this one's changes
+                // reach the composer and the controls, and streamed output
+                // reaches only the controls.
+                if this.sync(cx) {
+                    let composer_changed = match (&this.composer_source, &this.session) {
+                        (Some(before), Some(after)) => composer_inputs_differ(before, after),
+                        _ => true,
+                    };
+                    if composer_changed {
+                        this.sync_composer(window, cx);
+                    } else {
+                        this.sync_controls(window, cx);
+                    }
+                }
             }),
             cx.subscribe(&review, |this, _, event: &ReviewChanged, cx| {
                 if event.session_id.is_empty() || event.session_id == this.session_id {
@@ -295,17 +401,35 @@ impl SessionPane {
             ));
         }
         if let Some(files) = Files::try_global(cx) {
-            // The `@` index finished a scan: re-rank the open mention list.
+            // A scan of this composer's project found different files:
+            // re-read the `@` index and re-rank the open mention list.
+            // Listings of other projects do not concern this pane.
             let composer = composer.downgrade();
-            subscriptions.push(cx.observe(&files.index.clone(), move |_, _, cx| {
-                composer
-                    .update(cx, |composer, cx| composer.refresh_suggestions(cx))
-                    .ok();
-            }));
+            let sheet = btw_sheet.as_ref().map(|sheet| sheet.downgrade());
+            let host = host.clone();
+            subscriptions.push(cx.subscribe(
+                &files.index.clone(),
+                move |_, _, event: &ProjectFilesChanged, cx| {
+                    if !host.reads_listing_of(&event.cwd) {
+                        return;
+                    }
+                    composer
+                        .update(cx, |composer, cx| composer.refresh_suggestions(cx))
+                        .ok();
+                    // The side-question composer shares the session's project.
+                    let side = sheet
+                        .as_ref()
+                        .and_then(|sheet| sheet.read_with(cx, |sheet, _| sheet.composer()).ok());
+                    if let Some(side) = side.flatten() {
+                        side.update(cx, |composer, cx| composer.refresh_suggestions(cx));
+                    }
+                },
+            ));
         }
         let mut pane = Self {
             session_id,
             session: None,
+            session_revision: 0,
             transcript,
             navigation,
             composer,
@@ -321,6 +445,10 @@ impl SessionPane {
             centered: false,
             visible: true,
             btw_sheet,
+            btw_blocks: None,
+            btw_source: None,
+            composer_source: None,
+            menu_source_key: None,
             question: None,
             question_subscription: None,
             revealed_search: None,
@@ -328,6 +456,7 @@ impl SessionPane {
             workspace,
             workspace_switching: false,
             opening: false,
+            stale: false,
             changes: None,
             _subscriptions: subscriptions,
             _settings_watch: None,
@@ -335,18 +464,18 @@ impl SessionPane {
         };
         if let Some(services) = AppServices::try_global(cx) {
             let (tx, rx) = async_channel::bounded(1);
+            // `monocode.` settings and the `monocode:` project records the
+            // background and the empty state read (chat backgrounds,
+            // tab-group labels and colors); not drafts.
             let subscription = services.kv.subscribe(move |change| {
-                if change.key.starts_with("monocode.") && !change.key.contains("draft") {
+                if change.key.starts_with("monocode") && !change.key.contains("draft") {
                     let _ = tx.try_send(());
                 }
             });
             let watch = cx.spawn_in(window, async move |this, cx| {
                 while rx.recv().await.is_ok() {
                     if this
-                        .update_in(cx, |this, window, cx| {
-                            this.sync_composer(window, cx);
-                            this.sync_controls(window, cx);
-                        })
+                        .update_in(cx, |this, window, cx| this.sync_composer(window, cx))
                         .is_err()
                     {
                         break;
@@ -354,6 +483,15 @@ impl SessionPane {
                 }
             });
             pane._settings_watch = Some((subscription, watch));
+        }
+        // The chat background and the project label come from the projects
+        // package too.
+        if let Some(projects) = monocode_engine::projects::ProjectsGlobal::try_global(cx) {
+            let projects = projects.projects.clone();
+            pane._subscriptions
+                .push(cx.observe_in(&projects, window, |this, _, window, cx| {
+                    this.sync_controls(window, cx)
+                }));
         }
         if let Some(services) = AppServices::try_global(cx) {
             let catalog = services.catalog.clone();
@@ -467,7 +605,8 @@ impl SessionPane {
     }
 
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.visible != visible || self.centered != self.should_center(cx) {
+        let caught_up = visible && std::mem::take(&mut self.stale) && self.sync(cx);
+        if caught_up || self.visible != visible || self.centered != self.should_center(cx) {
             self.visible = visible;
             if !visible {
                 self.welcome.update(cx, |welcome, cx| welcome.dismiss(cx));
@@ -501,10 +640,28 @@ impl SessionPane {
             self.composer
                 .update(cx, |composer, cx| composer.set_props(props, window, cx));
         }
+        self.composer_source = self.session.clone();
         self.sync_controls(window, cx);
     }
 
     fn sync_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Handoff, Second opinion, and the build targets read provider
+        // availability and the hidden-providers setting through the model
+        // menu source while they draw. Neither is in the transcript config,
+        // so hand the cached transcript the source again when either moves;
+        // that redraws it and its menus.
+        let menu_key = (
+            crate::revisions::revision(cx),
+            AppServices::try_global(cx)
+                .map(|services| services.availability.get_harness_availability_snapshot()),
+        );
+        if self.menu_source_key != Some(menu_key) {
+            self.menu_source_key = Some(menu_key);
+            if let Some(source) = crate::session_threads::model_menu_source(cx) {
+                self.transcript
+                    .update(cx, |view, cx| view.set_model_menu_source(source, cx));
+            }
+        }
         let session = self.session.as_deref();
         self.navigation.update(cx, |navigation, cx| {
             navigation.set_session(session, self.visible, self.focused, cx)
@@ -540,7 +697,30 @@ impl SessionPane {
         self.transcript.update(cx, |view, cx| {
             view.set_config(config.clone(), cx);
         });
-        if let Some(sheet) = &self.btw_sheet {
+        let btw_source = self.session.clone().map(|session| BtwSource {
+            session,
+            focused: self.focused,
+            visible: self.visible,
+            editing_last_turn: config.editing_last_turn,
+            revision: crate::revisions::revision(cx),
+        });
+        // A closed sheet keeps its props while the session only streams
+        // output; rebuilding them copies and regroups every block.
+        let btw_current = self.btw_sheet.as_ref().is_some_and(|sheet| {
+            !sheet.read(cx).is_rendered()
+                && match (&self.btw_source, &btw_source) {
+                    (Some(before), Some(after)) => {
+                        before.focused == after.focused
+                            && before.visible == after.visible
+                            && before.editing_last_turn == after.editing_last_turn
+                            && before.revision == after.revision
+                            && !composer_inputs_differ(&before.session, &after.session)
+                    }
+                    _ => false,
+                }
+        });
+        if let Some(sheet) = self.btw_sheet.as_ref().filter(|_| !btw_current) {
+            self.btw_source = btw_source;
             let mut props = BtwSheetProps {
                 transcript: config,
                 ..BtwSheetProps::default()
@@ -550,7 +730,14 @@ impl SessionPane {
                 props.composer = composer_props(Some(session), self.focused, cx);
                 props.conversation = BtwConversationProps {
                     available: session.worktree_removed != Some(true),
-                    blocks: Arc::new(session.blocks.clone()),
+                    blocks: match &self.btw_blocks {
+                        Some((source, blocks)) if Arc::ptr_eq(source, session) => blocks.clone(),
+                        _ => {
+                            let blocks = Arc::new(session.blocks.clone());
+                            self.btw_blocks = Some((session.clone(), blocks.clone()));
+                            blocks
+                        }
+                    },
                     harness: session.harness,
                     managed: session.orchestration_lead_id.is_some(),
                     model: session.model.clone(),
@@ -736,24 +923,26 @@ impl SessionPane {
     }
 
     /// Follow the session in `Sessions`. A session that is not open yet (a
-    /// tab restored from the snapshot) opens from the store.
-    fn sync(&mut self, cx: &mut Context<Self>) {
+    /// tab restored from the snapshot) opens from the store. Returns whether
+    /// the pane took a new copy of the session.
+    fn sync(&mut self, cx: &mut Context<Self>) -> bool {
         let sessions = Engine::sessions(cx);
-        // Compare before cloning: every session's change notifies, and most
-        // are not this one.
-        let current = sessions.read(cx).get(&self.session_id);
-        let unchanged = current.is_some() && self.session.as_deref() == current;
-        if unchanged {
+        // Every session's change notifies, and most are not this one. The
+        // revision tells without comparing transcripts.
+        let revision = sessions.read(cx).session_revision(&self.session_id);
+        if revision != 0 && revision == self.session_revision && self.session.is_some() {
             self.opening = false;
-            return;
+            return false;
         }
-        let current = current.cloned();
+        // The shared copy for this revision: other views of the session
+        // reuse it instead of cloning the transcript again.
+        let current = sessions.read(cx).snapshot(&self.session_id);
         match current {
             Some(session) => {
                 self.opening = false;
+                self.session_revision = revision;
                 let finished = self.session.as_ref().is_some_and(|before| before.is_busy())
                     && !session.is_busy();
-                let session = Arc::new(session);
                 self.session = Some(session.clone());
                 self.transcript
                     .update(cx, |transcript, cx| transcript.set_session(session, cx));
@@ -762,6 +951,7 @@ impl SessionPane {
                     self.refresh_changes(cx);
                 }
                 cx.notify();
+                true
             }
             None if !self.opening => {
                 self.opening = true;
@@ -769,8 +959,9 @@ impl SessionPane {
                 sessions
                     .update(cx, |sessions, cx| sessions.ensure_open(&id, cx))
                     .detach();
+                false
             }
-            None => {}
+            None => false,
         }
     }
 
@@ -1019,6 +1210,29 @@ impl SessionPane {
     }
 }
 
+/// Hides the composer's "Drop files to attach" overlay when a file drag
+/// leaves the window. GPUI ends the drag without a redraw, and the composer
+/// clears the overlay only when it draws, so it stayed up.
+pub(crate) fn clear_file_drag_on_exit(composer: WeakEntity<Composer>) -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        move |_, _, window, _| {
+            let composer = composer.clone();
+            window.on_mouse_event(move |event: &gpui::FileDropEvent, phase, _, cx| {
+                if phase == gpui::DispatchPhase::Bubble
+                    && matches!(event, gpui::FileDropEvent::Exited)
+                {
+                    composer
+                        .update(cx, |composer, cx| composer.set_file_drag(false, cx))
+                        .ok();
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_0()
+}
+
 impl Render for SessionPane {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -1061,6 +1275,7 @@ impl Render for SessionPane {
                 }
             })
             .child(self.bounds.probe())
+            .child(clear_file_drag_on_exit(self.composer.downgrade()))
             .child(self.background.clone())
             .child(
                 div()
@@ -1075,7 +1290,14 @@ impl Render for SessionPane {
                         }) {
                             self.empty.clone().into_any_element()
                         } else {
-                            self.transcript.clone().into_any_element()
+                            // Cached: the composer's caret, the toolbar, and
+                            // the sidebar redraw without redrawing the
+                            // transcript, which redraws on its own changes.
+                            // Its root is `size_full`.
+                            self.transcript
+                                .clone()
+                                .cached(gpui::StyleRefinement::default().size_full())
+                                .into_any_element()
                         },
                     )
                     .child(self.navigation.clone()),

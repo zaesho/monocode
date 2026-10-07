@@ -75,7 +75,7 @@ pub enum Submenu {
 
 /// What the picker shows: the session's provider, model, and option
 /// values, plus where it sits.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModelPickerProps {
     pub harness: Option<HarnessId>,
     pub model: String,
@@ -212,7 +212,12 @@ impl ModelPicker {
         self
     }
 
+    /// The composer calls this whenever any of its own props change, so
+    /// props equal to the current ones change nothing and notify no one.
     pub fn set_props(&mut self, props: ModelPickerProps, cx: &mut Context<Self>) {
+        if props == self.props {
+            return;
+        }
         self.props = props;
         self.clamp_active();
         cx.notify();

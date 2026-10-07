@@ -127,10 +127,38 @@ pub struct WorkspaceArea {
     linked_panels: HashMap<String, Entity<LinkedWorkItemPanel>>,
     active_linked_panel: Option<String>,
     composer_target: Option<String>,
+    /// [`Self::sessions_key`] at the last sync.
+    sessions_key: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl WorkspaceArea {
+    /// A hash of what `sync` reads from `Sessions`: which sessions are open
+    /// and remote, and the active tab's pane titles. Streamed text leaves it
+    /// alone, so a busy session does not re-sync every pane each frame.
+    fn sessions_key(&self, cx: &gpui::App) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let sessions = Engine::sessions(cx).read(cx);
+        for session in sessions.all() {
+            session.id.hash(&mut hasher);
+            monocode_layout::paths::is_remote_project_path(&session.cwd).hash(&mut hasher);
+        }
+        if let Some(tab) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.read(cx).active_tab())
+        {
+            for id in leaf_ids(&tab.layout) {
+                sessions
+                    .get(&id)
+                    .map(|session| (&session.title, session.harness))
+                    .hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     fn focused_session_view(&self, cx: &gpui::App) -> Option<&SessionView> {
         let tab = self.workspace.as_ref()?.read(cx).active_tab()?;
         self.sessions.get(&tab.focused_id)
@@ -187,6 +215,7 @@ impl WorkspaceArea {
             linked_panels: HashMap::new(),
             active_linked_panel: None,
             composer_target: None,
+            sessions_key: None,
             _subscriptions: Vec::new(),
         }
     }
@@ -204,7 +233,9 @@ impl WorkspaceArea {
         let sessions = Engine::sessions(cx);
         self._subscriptions
             .push(cx.observe_in(&sessions, window, |this, _, window, cx| {
-                this.sync(window, cx)
+                if this.sessions_key != Some(this.sessions_key(cx)) {
+                    this.sync(window, cx)
+                }
             }));
         if let Some(inbox) = monocode_engine::inbox::inbox::Inbox::try_global(cx) {
             self._subscriptions
@@ -374,6 +405,7 @@ impl WorkspaceArea {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
+        self.sessions_key = Some(self.sessions_key(cx));
         let Some(tab) = workspace.read(cx).active_tab().cloned() else {
             return;
         };

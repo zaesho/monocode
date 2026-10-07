@@ -97,11 +97,12 @@ impl AgentModel {
         self.settings.as_deref().unwrap_or(&[])
     }
 
-    /// `model.nativeId ?? nativeIdFrom(model.id)`.
-    fn native_or_key(&self) -> String {
+    /// `model.nativeId ?? nativeIdFrom(model.id)`. Borrowed, because model
+    /// lookups compare it against every model in a catalog.
+    fn native_or_key(&self) -> &str {
         self.native_id
-            .clone()
-            .unwrap_or_else(|| native_id_from(&self.id))
+            .as_deref()
+            .unwrap_or_else(|| native_slug(&self.id))
     }
 }
 
@@ -419,20 +420,19 @@ impl ModelCatalog {
             let hits: Vec<&AgentModel> = available
                 .iter()
                 .filter(|model| {
-                    let key = model.native_or_key();
-                    let native = comparable_native_id(harness, &key);
+                    let native = comparable_native_id(harness, model.native_or_key());
                     native.starts_with(comparable_slug) || comparable_slug.starts_with(native)
                 })
                 .collect();
             if has_digit(comparable_slug) {
                 if let Some(same) = hits.iter().find(|model| {
-                    comparable_native_id(harness, &model.native_or_key()) == comparable_slug
+                    comparable_native_id(harness, model.native_or_key()) == comparable_slug
                 }) {
                     return (*same).clone();
                 }
                 if harness != HarnessId::Claude
                     && hits.len() == 1
-                    && !has_digit(comparable_native_id(harness, &hits[0].native_or_key()))
+                    && !has_digit(comparable_native_id(harness, hits[0].native_or_key()))
                 {
                     return hits[0].clone();
                 }
@@ -516,7 +516,7 @@ impl ModelCatalog {
             .and_then(|(cwd, harness)| self.project_harness_models(harness, cwd));
         let model = match scoped {
             Some(scoped) => scoped.iter().find(|model| model.id == id).or_else(|| {
-                let native = native_id_from(id);
+                let native = native_slug(id);
                 scoped.iter().find(|model| model.native_or_key() == native)
             }),
             None => global,
@@ -602,7 +602,7 @@ impl ModelCatalog {
 
 /// `nativeModelId` for a catalog entry.
 pub fn native_model_id(model: &AgentModel) -> String {
-    claude_native_id(model.harness, &model.native_or_key())
+    claude_native_id(model.harness, model.native_or_key())
 }
 
 /// `defaultModelSettings`.
@@ -676,14 +676,19 @@ fn compatible_setting_value(setting: &ModelSetting, value: Option<&String>) -> O
 
 /// `nativeIdFrom`: the key minus its harness prefix and any `[settings]`.
 fn native_id_from(id: &str) -> String {
+    native_slug(id).to_string()
+}
+
+/// [`native_id_from`] without the copy.
+fn native_slug(id: &str) -> &str {
     let trimmed = crate::js::trim(id);
     let slug = match trimmed.find(':') {
         Some(colon) => &trimmed[colon + 1..],
         None => trimmed,
     };
     match slug.find('[') {
-        Some(bracket) => slug[..bracket].to_string(),
-        None => slug.to_string(),
+        Some(bracket) => &slug[..bracket],
+        None => slug,
     }
 }
 

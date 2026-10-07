@@ -65,11 +65,19 @@ pub(crate) fn cancel_harness(
     .detach();
 }
 
-/// `syncDockBadge(sessionsRef.current)`.
+/// `syncDockBadge(sessionsRef.current)`. The badge counts the sessions
+/// waiting on the user, so only those are copied out of `Sessions`; copying
+/// every session cloned every transcript.
 pub(crate) fn sync_dock_badge(cx: &mut App) {
     let hooks = Engine::hooks(cx);
-    let sessions = Engine::sessions(cx).read(cx).all().to_vec();
-    hooks.attention.sync_dock_badge(&sessions, cx);
+    let waiting: Vec<monocode_core::Session> = Engine::sessions(cx)
+        .read(cx)
+        .all()
+        .iter()
+        .filter(|session| monocode_core::session::session_needs_input(session))
+        .cloned()
+        .collect();
+    hooks.attention.sync_dock_badge(&waiting, cx);
 }
 
 /// Refresh what a finished or stopped turn may have changed on disk.

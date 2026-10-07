@@ -74,8 +74,10 @@ impl LiveList {
         let client = Inbox::global(cx).read(cx).client().clone();
         let list = cx.new(|cx| InboxList::new(client, &recent, &cwd, None, cx));
         let subscriptions = vec![
-            cx.observe(&workspace, |this, _, cx| this.sync(cx)),
-            cx.observe(&projects, |this, _, cx| this.sync(cx)),
+            // A workspace change matters only when it moves the sidebar
+            // project; a projects change can also rename or recolor marks.
+            cx.observe(&workspace, |this, _, cx| this.sync(false, cx)),
+            cx.observe(&projects, |this, _, cx| this.sync(true, cx)),
             cx.observe(&Inbox::global(cx), |_, _, cx| cx.notify()),
             cx.observe(&HistoryPackage::history(cx), |_, _, cx| cx.notify()),
         ];
@@ -89,7 +91,7 @@ impl LiveList {
             list_subscription,
         }
     }
-    fn sync(&mut self, cx: &mut Context<Self>) {
+    fn sync(&mut self, marks_may_change: bool, cx: &mut Context<Self>) {
         let cwd = self.workspace.read(cx).sidebar_cwd(cx);
         let recent: Vec<_> = ProjectsGlobal::projects(cx)
             .read(cx)
@@ -102,7 +104,9 @@ impl LiveList {
             .collect();
         let recents: Vec<_> = recent.iter().map(|v| v.path.clone()).collect();
         if cwd == self.cwd && recents == self.recents {
-            cx.notify();
+            if marks_may_change {
+                cx.notify();
+            }
             return;
         }
         let client = Inbox::global(cx).read(cx).client().clone();

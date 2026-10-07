@@ -19,6 +19,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "macos")]
 const KEYCHAIN_FALLBACK_USER: &str = "claude-code-user";
 
+/// How long the Linux Secret Service lookup for Droid's key may take. It
+/// matches the macOS Keychain timeout, which lives in a macOS-only module.
+#[cfg(target_os = "linux")]
+const SECRET_SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeUsageFetch {
@@ -1004,7 +1009,7 @@ fn read_droid_keyring_key() -> Option<Vec<u8>> {
                     child.stdout.take()?.read_to_string(&mut out).ok()?;
                     return decode_droid_key(&out);
                 }
-                Ok(None) if started.elapsed() > KEYCHAIN_TIMEOUT => {
+                Ok(None) if started.elapsed() > SECRET_SERVICE_TIMEOUT => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return None;

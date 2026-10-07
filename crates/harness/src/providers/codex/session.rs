@@ -2362,10 +2362,10 @@ fn publish_codex_text(
             TextRole::Reasoning => &mut state.emitted_reasoning_by_item,
         };
         // Keep id-less notifications compatible without mixing them into known items.
-        let key = item_id.unwrap_or("").to_string();
-        let already = emitted.get(&key).cloned().unwrap_or_default();
+        let key = item_id.unwrap_or("");
+        let already = emitted.get(key).map_or("", String::as_str);
         let emit = if snapshot {
-            snapshot_remainder(&already, text)
+            snapshot_remainder(already, text)
         } else {
             text
         };
@@ -2374,8 +2374,14 @@ fn publish_codex_text(
         }
         // These are deltas (or a snapshot's missing suffix), so repeated
         // tokens count. Completed items stay until the turn ends, so repeated
-        // completions are ignored.
-        emitted.insert(key, already + emit);
+        // completions are ignored. Append in place: copying the item's text
+        // for every token made a long message O(n^2).
+        match emitted.get_mut(key) {
+            Some(already) => already.push_str(emit),
+            None => {
+                emitted.insert(key.to_string(), emit.to_string());
+            }
+        }
         emit.to_string()
     };
     live.emit(match role {

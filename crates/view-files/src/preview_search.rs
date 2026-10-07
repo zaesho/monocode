@@ -678,10 +678,15 @@ impl FilePreviewSearch {
     /// like the React MutationObserver.
     fn render_highlights(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let source = self.source.clone();
-        let matches = self.matches.clone();
         let current = self.current;
-        let expected = self.runs.clone();
         let searching = self.open && self.active && !self.query.read(cx).value().is_empty();
+        // The painter reads these only while searching; a closed bar does not
+        // copy one entry per run of the document on every frame.
+        let (matches, expected) = if searching {
+            (self.matches.clone(), self.runs.clone())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let theme = Theme::of(cx);
         let match_color = crate::editor_theme(cx).search_match;
         let current_color = theme.accent(0.62);

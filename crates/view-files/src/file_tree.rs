@@ -19,9 +19,10 @@ use std::time::Duration;
 use gpui::{
     App, AppContext as _, AsyncWindowContext, ClickEvent, ClipboardItem, Context, DragMoveEvent,
     ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable, Hsla,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, PromptLevel, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, WeakEntity, Window, actions, div, prelude::FluentBuilder as _, px,
+    InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListOffset, ListState, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, PromptLevel, Rems, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, actions, div, list,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::Input;
 use gpui_component::input::{Escape, InputEvent, InputState};
@@ -173,6 +174,21 @@ pub enum TreeRow {
         is_dir: bool,
     },
 }
+
+/// One item of the explorer's scrolling list: the last operation's error,
+/// then the tree rows.
+#[derive(Debug, Clone, PartialEq)]
+enum ListRow {
+    OpError(String),
+    Tree(TreeRow),
+}
+
+/// How far past the viewport the list lays out rows, so a short scroll
+/// does not show a gap.
+const LIST_OVERDRAW: Pixels = px(240.);
+
+/// The height of an entry row (`render_entry`'s `h(u(30.))`).
+const ENTRY_ROW: Rems = Rems(30. / 16.);
 
 /// `GIT_STATUS_COLOR`.
 fn git_status_color(status: &str, theme: &Theme) -> Option<Hsla> {
@@ -387,7 +403,13 @@ pub struct FileTree {
     platform: Platform,
     animate_menus: bool,
     focus_handle: FocusHandle,
-    scroll: ScrollHandle,
+    /// The rows draw through a `list`, so only the rows in view are built
+    /// each frame. `list_rows` is what the list state last heard about.
+    list: ListState,
+    list_rows: Vec<ListRow>,
+    /// A row keyboard navigation moved to, revealed on the next render once
+    /// the list knows the current rows.
+    pending_reveal: Option<String>,
     remote_poll: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -453,7 +475,9 @@ impl FileTree {
             platform: Platform::current(),
             animate_menus: true,
             focus_handle: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, LIST_OVERDRAW),
+            list_rows: Vec::new(),
+            pending_reveal: None,
             remote_poll: None,
             _subscriptions: vec![dirs, activation],
         };
@@ -1592,15 +1616,70 @@ impl FileTree {
         self.reveal_row(&path);
     }
 
-    /// Scroll so the row for `path` is visible.
-    fn reveal_row(&self, path: &str) {
-        let offset = usize::from(self.op_error.is_some());
-        if let Some(index) = self.rows().iter().position(|row| match row {
-            TreeRow::Entry { entry, .. } => entry.path == path,
-            _ => false,
-        }) {
-            self.scroll.scroll_to_item(index + offset);
+    /// Scroll so the row for `path` is visible, on the next render.
+    fn reveal_row(&mut self, path: &str) {
+        self.pending_reveal = Some(path.to_string());
+    }
+
+    /// The height of list row `index`. An entry row is always `ENTRY_ROW`
+    /// tall. Other rows use the list's measured height, or the entry height
+    /// until they are drawn. The list itself counts a row it never drew as
+    /// 0 px, so its own reveal lands short when rows above are unmeasured.
+    fn list_row_height(&self, index: usize, entry: Pixels) -> Pixels {
+        match self.list_rows.get(index) {
+            Some(ListRow::Tree(TreeRow::Entry { .. })) | None => entry,
+            Some(_) => {
+                let measured =
+                    self.list.offset_for_item(index + 1) - self.list.offset_for_item(index);
+                if measured > px(0.) { measured } else { entry }
+            }
         }
+    }
+
+    /// `scrollIntoView({ block: "nearest" })` for list row `index`: a row
+    /// above the view moves to the top, a row below it to the bottom.
+    fn reveal_index(&self, index: usize, window: &Window) {
+        let entry = ENTRY_ROW.to_pixels(window.rem_size());
+        let viewport = self.list.viewport_bounds().size.height;
+        let top = self.list.logical_scroll_top();
+        if index <= top.item_ix || viewport <= px(0.) {
+            self.list.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(0.),
+            });
+            return;
+        }
+        let mut row_top = -top.offset_in_item;
+        for row in top.item_ix..index {
+            row_top += self.list_row_height(row, entry);
+            if row_top >= viewport {
+                break;
+            }
+        }
+        let height = self.list_row_height(index, entry);
+        if row_top + height <= viewport {
+            return;
+        }
+        // Bottom-align: walk up from the row until the rows above fill the
+        // rest of the view.
+        let mut remaining = viewport - height;
+        let mut first = index;
+        while first > 0 && remaining > px(0.) {
+            let above = self.list_row_height(first - 1, entry);
+            if above > remaining {
+                self.list.scroll_to(ListOffset {
+                    item_ix: first - 1,
+                    offset_in_item: above - remaining,
+                });
+                return;
+            }
+            remaining -= above;
+            first -= 1;
+        }
+        self.list.scroll_to(ListOffset {
+            item_ix: first,
+            offset_in_item: px(0.),
+        });
     }
 
     fn on_select_next(&mut self, _: &SelectNextEntry, window: &mut Window, cx: &mut Context<Self>) {
@@ -1793,6 +1872,112 @@ impl FileTree {
         )
     }
 
+    /// Tell the list which rows changed since the last frame: the run
+    /// between the unchanged start and the unchanged end. Splicing only that
+    /// run keeps the scroll position and the measured heights of the rest.
+    fn sync_list(&mut self, cx: &App) {
+        let mut rows = Vec::new();
+        if let Some(error) = &self.op_error {
+            rows.push(ListRow::OpError(error.clone()));
+        }
+        rows.extend(self.rows().into_iter().map(ListRow::Tree));
+        if rows == self.list_rows {
+            return;
+        }
+        let old = &self.list_rows;
+        let prefix = old
+            .iter()
+            .zip(&rows)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        // A name input keeps its row drawn while it has focus, even when it
+        // scrolls out of view, so typing still reaches it.
+        let input_focus = self
+            .name_row
+            .as_ref()
+            .map(|row| row.input.read(cx).focus_handle(cx));
+        let focus = rows[prefix..rows.len() - suffix]
+            .iter()
+            .map(|row| match row {
+                ListRow::Tree(TreeRow::NameInput { .. }) => input_focus.clone(),
+                _ => None,
+            });
+        let old_end = old.len() - suffix;
+        let new_end = rows.len() - suffix;
+        // gpui moves the scroll to the start of a spliced run that holds the
+        // first visible row. Find that row again in the new rows, so a
+        // listing that changes above and below it leaves the view in place.
+        let top = self.list.logical_scroll_top();
+        let anchor = (prefix..old_end)
+            .contains(&top.item_ix)
+            .then(|| {
+                let same = |old: &ListRow, new: &ListRow| match (old, new) {
+                    (
+                        ListRow::Tree(TreeRow::Entry { entry: a, .. }),
+                        ListRow::Tree(TreeRow::Entry { entry: b, .. }),
+                    ) => a.path == b.path,
+                    _ => old == new,
+                };
+                // The first visible row, or else the next one that survived.
+                (top.item_ix..old_end).find_map(|old_index| {
+                    let found = (prefix..new_end).find(|&new| same(&old[old_index], &rows[new]))?;
+                    let offset = if old_index == top.item_ix {
+                        top.offset_in_item
+                    } else {
+                        px(0.)
+                    };
+                    Some(ListOffset {
+                        item_ix: found,
+                        offset_in_item: offset,
+                    })
+                })
+            })
+            .flatten();
+        self.list
+            .splice_focusable(prefix..old_end, focus.collect::<Vec<_>>());
+        if let Some(anchor) = anchor {
+            self.list.scroll_to(anchor);
+        }
+        self.list_rows = rows;
+    }
+
+    /// One list item, at its height: rows keep their height and the list
+    /// scrolls instead of shrinking them.
+    fn render_list_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(row) = self.list_rows.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        let element = match row {
+            ListRow::OpError(error) => {
+                let theme = Theme::of(cx);
+                div()
+                    .px(u(12.))
+                    .py(u(4.))
+                    .text_px(theme.text.label)
+                    .line_height(u(16.))
+                    .text_color(theme.colors.danger)
+                    .child(error)
+                    .into_any_element()
+            }
+            ListRow::Tree(TreeRow::Message {
+                depth,
+                text,
+                loading,
+            }) => self.render_message(depth, text, loading, cx),
+            ListRow::Tree(TreeRow::Entry { depth, entry }) => self.render_entry(depth, entry, cx),
+            ListRow::Tree(TreeRow::NameInput { depth, is_dir }) => {
+                self.render_name_row(depth, is_dir, cx)
+            }
+        };
+        div().w_full().flex_none().child(element).into_any_element()
+    }
+
     fn render_message(
         &self,
         depth: usize,
@@ -1878,7 +2063,7 @@ impl FileTree {
             })
             .flex()
             .w_full()
-            .h(u(30.))
+            .h(ENTRY_ROW)
             .items_center()
             .gap(u(4.))
             .pl(u(8. + depth as f32 * 12.))
@@ -2147,45 +2332,32 @@ impl Render for FileTree {
             self.dragging_path = None;
         }
         let theme = Theme::of(cx).clone();
-        let rows = self.rows();
-        let mut list = div()
+        self.sync_list(cx);
+        if let Some(path) = self.pending_reveal.take()
+            && let Some(index) = self.list_rows.iter().position(|row| {
+                matches!(row, ListRow::Tree(TreeRow::Entry { entry, .. }) if entry.path == path)
+            })
+        {
+            self.reveal_index(index, window);
+        }
+        let rows = list(
+            self.list.clone(),
+            cx.processor(|this, index: usize, _, cx| this.render_list_row(index, cx)),
+        )
+        .flex_1()
+        .min_h_0();
+        let list = div()
             .id("explorer-scroll")
             .flex()
             .flex_col()
             .min_h_0()
             .flex_1()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll)
             .on_scroll_wheel(cx.listener(|this, _, _, cx| {
                 if this.menu.take().is_some() {
                     cx.notify();
                 }
-            }));
-        if let Some(error) = self.op_error.clone() {
-            list = list.child(
-                div()
-                    .flex_none()
-                    .px(u(12.))
-                    .py(u(4.))
-                    .text_px(theme.text.label)
-                    .line_height(u(16.))
-                    .text_color(theme.colors.danger)
-                    .child(error),
-            );
-        }
-        for row in rows {
-            let element = match row {
-                TreeRow::Message {
-                    depth,
-                    text,
-                    loading,
-                } => self.render_message(depth, text, loading, cx),
-                TreeRow::Entry { depth, entry } => self.render_entry(depth, entry, cx),
-                TreeRow::NameInput { depth, is_dir } => self.render_name_row(depth, is_dir, cx),
-            };
-            // Rows keep their height; the list scrolls instead of shrinking them.
-            list = list.child(div().flex_none().child(element));
-        }
+            }))
+            .child(rows);
         let cwd = self.cwd.clone();
         let menu = self.menu.as_ref().map(|open| open.menu.clone());
         let _ = window;

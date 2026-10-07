@@ -13,6 +13,7 @@ pub mod file_icons;
 pub mod icons;
 pub mod styled;
 pub mod theme;
+pub mod ticker;
 pub mod units;
 pub mod widgets;
 
@@ -22,6 +23,7 @@ pub use file_icons::{FileTypeIcon, file_type_icon, folder_type_icon};
 pub use icons::{IconName, ProviderLogo, icon, provider_logo};
 pub use styled::UiStyled;
 pub use theme::{Theme, set_appearance, set_system_scheme, sync_window};
+pub use ticker::{SteppedAnimationExt, loading_step, looping_step, smooth_steps};
 pub use units::u;
 
 /// Installs the theme global, the gpui-component theme, and the widget state

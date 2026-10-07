@@ -110,6 +110,27 @@ impl JsonRpcMessage {
             error: map.get("error").cloned(),
         }
     }
+
+    /// [`Self::from_value`] that moves the fields out instead of copying
+    /// them. Every stdout line goes through here, and a completed item can
+    /// carry a whole file diff or command output.
+    pub fn from_owned(value: Value) -> Self {
+        let Value::Object(mut map) = value else {
+            return Self::default();
+        };
+        let string = |value: Option<Value>| match value {
+            Some(Value::String(text)) => Some(text),
+            _ => None,
+        };
+        Self {
+            jsonrpc: string(map.remove("jsonrpc")),
+            id: map.remove("id").filter(|id| !id.is_null()),
+            method: string(map.remove("method")).filter(|method| !method.is_empty()),
+            params: map.remove("params"),
+            result: map.remove("result"),
+            error: map.remove("error"),
+        }
+    }
 }
 
 /// A JSON-RPC error response. The structured `code` and `data` stay, because
@@ -283,7 +304,7 @@ impl JsonRpcClient {
             );
             return;
         };
-        self.handle(JsonRpcMessage::from_value(&value));
+        self.handle(JsonRpcMessage::from_owned(value));
     }
 
     /// `close`. Rejects every pending request with `error`, or "Harness
@@ -518,6 +539,25 @@ mod tests {
         JsonRpcClientOptions {
             write_timeout: task::ms(write_timeout_ms),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reads_owned_messages_like_borrowed_ones() {
+        use serde_json::json;
+        for value in [
+            json!({ "jsonrpc": "2.0", "id": 1, "result": null }),
+            json!({ "jsonrpc": "2.0", "id": null, "method": "item/agentMessage/delta", "params": { "delta": "hi" } }),
+            json!({ "id": "a", "method": "", "error": { "code": -1, "message": "no" } }),
+            json!({ "jsonrpc": 2, "method": 5, "params": [1, 2] }),
+            json!([1, 2]),
+            Value::Null,
+        ] {
+            assert_eq!(
+                JsonRpcMessage::from_owned(value.clone()),
+                JsonRpcMessage::from_value(&value),
+                "{value}"
+            );
         }
     }
 

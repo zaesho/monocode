@@ -1821,32 +1821,46 @@ fn handle_transcript_event(
             let (Some(part_id), false) = (part_id, delta.is_empty()) else {
                 return;
             };
-            let Some(existing) = s.part_by_id.get(part_id).cloned() else {
+            let Some(existing) = s.part_by_id.get(part_id) else {
                 return;
             };
             // An ended part's snapshot is final, so a late delta must not
             // grow it again.
-            if part_ended(&existing) || role_for_part(s, &existing) != Some(Role::Assistant) {
+            if part_ended(existing) || role_for_part(s, existing) != Some(Role::Assistant) {
                 return;
             }
-            let previous = s
-                .emitted_text_by_part_id
-                .get(part_id)
-                .cloned()
-                .or_else(|| existing.text.clone())
-                .unwrap_or_default();
-            let next = append_open_code_assistant_text_delta(&previous, &delta);
-            s.emitted_text_by_part_id
-                .insert(part_id.to_string(), next.next_text.clone());
+            // `appendOpenCodeAssistantTextDelta`, appended in place: copying
+            // the part's whole text several times per token made a long
+            // reply O(n^2). The delta is not empty, so it is always emitted.
+            let next_text = match s.emitted_text_by_part_id.get_mut(part_id) {
+                Some(previous) => {
+                    previous.push_str(&delta);
+                    previous.clone()
+                }
+                None => {
+                    let next_text = append_open_code_assistant_text_delta(
+                        existing.text.as_deref().unwrap_or_default(),
+                        &delta,
+                    )
+                    .next_text;
+                    s.emitted_text_by_part_id
+                        .insert(part_id.to_string(), next_text.clone());
+                    next_text
+                }
+            };
             let next_part = OpenCodePart {
-                text: Some(next.next_text),
-                ..existing
+                id: existing.id.clone(),
+                part_type: existing.part_type.clone(),
+                message_id: existing.message_id.clone(),
+                call_id: existing.call_id.clone(),
+                tool: existing.tool.clone(),
+                text: Some(next_text),
+                time: existing.time,
+                state: existing.state.clone(),
             };
             if next_part.part_type == "text" || next_part.part_type == "reasoning" {
-                s.part_by_id.set(next_part.clone());
-            }
-            if !next.delta_to_emit.is_empty() {
                 emit_assistant_snapshot(s, &next_part);
+                s.part_by_id.set(next_part);
             }
         }
         "message.part.updated" => {

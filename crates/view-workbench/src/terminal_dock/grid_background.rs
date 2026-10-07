@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, Context, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, ParentElement as _,
-    PathBuilder, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task,
-    Window, canvas, deferred, div, img, point, px, quad, relative, size, svg,
+    PathBuilder, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, canvas, deferred, div, img, point, px, quad, relative, size, svg,
 };
 use monocode_ui::styled::glass_backdrop;
 use monocode_ui::theme::CubicBezier;
@@ -127,7 +127,13 @@ pub struct TerminalGridBackground {
     still: bool,
     epoch: Instant,
     focus: FocusHandle,
-    _ticker: Task<()>,
+    /// The frame timer. It stops while the window is in the background, so
+    /// an idle board does not redraw a window nobody is using.
+    ticker: Option<Task<()>>,
+    window_active: bool,
+    /// Watches the window's activation. Render subscribes, since the
+    /// constructor has no window.
+    activation: Option<Subscription>,
 }
 
 impl Focusable for TerminalGridBackground {
@@ -152,16 +158,7 @@ impl TerminalGridBackground {
                 bubble_at: None,
             })
             .collect();
-        let ticker = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(FRAME_MS as u64))
-                    .await;
-                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
-                    break;
-                }
-            }
-        });
+        let ticker = Self::spawn_ticker(cx);
         let now = cx.background_executor().now();
         Self {
             boards,
@@ -182,7 +179,43 @@ impl TerminalGridBackground {
             still: false,
             epoch: now,
             focus: cx.focus_handle(),
-            _ticker: ticker,
+            ticker: Some(ticker),
+            window_active: true,
+            activation: None,
+        }
+    }
+
+    fn spawn_ticker(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(FRAME_MS as u64))
+                    .await;
+                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Whether the frame timer runs.
+    pub fn ticking(&self) -> bool {
+        self.ticker.is_some()
+    }
+
+    /// Stop the frame timer while the window is in the background and start
+    /// it again when the window comes back.
+    fn sync_window_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.window_active == active {
+            return;
+        }
+        self.window_active = active;
+        if active {
+            // Measure the first step from now, not from when the timer stopped.
+            self.last_frame = None;
+            self.ticker = Some(Self::spawn_ticker(cx));
+        } else {
+            self.ticker = None;
         }
     }
 
@@ -1071,6 +1104,13 @@ impl TerminalGridBackground {
 
 impl Render for TerminalGridBackground {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.activation.is_none() {
+            // Only activation changes pause the timer. A window that never
+            // became active (a test or a screenshot) keeps playing.
+            self.activation = Some(cx.observe_window_activation(window, |this, window, cx| {
+                this.sync_window_active(window.is_window_active(), cx);
+            }));
+        }
         let theme = Theme::of(cx).clone();
         let now = self.now(cx);
         let reduce_motion = cx.reduce_motion();
@@ -1087,7 +1127,12 @@ impl Render for TerminalGridBackground {
         let hover_fading = self.hover_changed.is_some_and(|at| {
             now.saturating_duration_since(at).as_secs_f32() * 1000.0 < HOVER_FADE_MS
         });
-        if self.motion.is_some() || hover_fading {
+        // Time-based, so a slide the paused timer never cleared does not keep
+        // asking for frames.
+        let sliding = self.motion.is_some_and(|motion| {
+            now.saturating_duration_since(motion.started).as_secs_f32() * 1000.0 < SLIDE_MS
+        });
+        if sliding || hover_fading {
             window.request_animation_frame();
         }
         let mask = Mask {

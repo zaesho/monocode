@@ -18,8 +18,10 @@ mod submit;
 #[cfg(test)]
 mod tests;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -38,9 +40,7 @@ use super::host::{ComposerHost, McpServers, ResendTicket, SessionFolder, SkillCo
 use super::model::chat_context::{ChatContextItem, compose_chat_context, split_chat_context};
 use super::model::commands::{self, consume_session_folder_command};
 use super::model::mcp::{McpTag, tagged_mcp_servers};
-use super::model::mentions::{
-    MentionIndex, MentionToken, RankedFile, build_mention_index, mention_token_at,
-};
+use super::model::mentions::{MentionIndex, MentionToken, RankedFile, mention_token_at};
 use super::model::mode_commands::{Mode, ModeCommandToken, leading_mode_command};
 use super::model::paths::looks_like_project;
 use super::model::quote_draft::{ComposerInsertRequest, consume_composer_insert};
@@ -258,6 +258,52 @@ pub(crate) struct PendingResend {
     pub mcp: Vec<McpTag>,
 }
 
+/// The props `slashItems` reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlashKey {
+    remote: bool,
+    remote_plan: bool,
+    hide_top_bar: bool,
+    can_save_draft: bool,
+    harness: HarnessId,
+}
+
+/// `slashItems` and `skillNames` for one catalog.
+struct SlashItems {
+    key: SlashKey,
+    /// The catalog the rows came from. A different catalog rebuilds them.
+    skills: Vec<Skill>,
+    items: Rc<[Skill]>,
+    names: Rc<HashSet<String>>,
+}
+
+/// `rankSkills` over one set of slash rows.
+struct RankedSkills {
+    /// Held so the pointer comparison cannot match a reused allocation.
+    items: Rc<[Skill]>,
+    query: String,
+    limit: usize,
+    ranked: Rc<[Skill]>,
+}
+
+#[derive(Default)]
+struct SlashCache {
+    items: Option<SlashItems>,
+    ranked: Option<RankedSkills>,
+}
+
+/// The working directory and query of an `@` ranking.
+pub(crate) type MentionQuery = (String, String);
+
+/// The state of the `@` picker's ranking.
+#[derive(Default)]
+pub(crate) struct MentionRank {
+    /// What `ranked_files` was ranked for.
+    pub shown: Option<MentionQuery>,
+    /// A background ranking and what it ranks.
+    pub pending: Option<(MentionQuery, Task<()>)>,
+}
+
 /// The session composer.
 pub struct Composer {
     pub(crate) host: Rc<dyn ComposerHost>,
@@ -298,8 +344,16 @@ pub struct Composer {
     pub(crate) runner_live: bool,
 
     pub(crate) skills: Vec<Skill>,
-    pub(crate) mention_index: MentionIndex,
+    /// Shared with every composer in the same project; the host rebuilds it
+    /// only when the listing changes.
+    pub(crate) mention_index: Arc<MentionIndex>,
     pub(crate) ranked_files: Vec<RankedFile>,
+    /// Slash rows, their names, and the last skill ranking. Render and
+    /// every keystroke read them several times, so they rebuild only when
+    /// the catalog or the props they read change.
+    slash_cache: RefCell<SlashCache>,
+    /// Which query `ranked_files` answers, and a ranking still running.
+    pub(crate) mention_rank: MentionRank,
 
     /// Bumped by every edit, so a late resend rejection cannot restore over
     /// newer text.
@@ -407,8 +461,10 @@ impl Composer {
             resend_edited: false,
             runner_live,
             skills: Vec::new(),
-            mention_index: MentionIndex::default(),
+            mention_index: Arc::default(),
             ranked_files: Vec::new(),
+            slash_cache: RefCell::new(SlashCache::default()),
+            mention_rank: MentionRank::default(),
             draft_revision: 0,
             paste_generation: 0,
             pastes_in_flight: 0,
@@ -571,12 +627,12 @@ impl Composer {
             self.host.skills(&context, cx)
         };
         let local = self.local_cwd();
-        let files = if local.is_empty() {
-            Vec::new()
+        let index = if local.is_empty() {
+            Arc::default()
         } else {
-            self.host.mention_files(&local, cx)
+            self.host.mention_index(&local, cx)
         };
-        self.mention_index = build_mention_index(&files);
+        self.mention_index = index;
         self.clamp_skill_active();
         self.refresh_ranked_files(cx);
         self.prompt
@@ -718,7 +774,40 @@ impl Composer {
 
     /// `slashItems`: MonoCode's commands, then the catalog without the names
     /// those commands own.
-    pub(crate) fn slash_items(&self) -> Vec<Skill> {
+    pub(crate) fn slash_items(&self) -> Rc<[Skill]> {
+        self.slash_items_and_names().0
+    }
+
+    /// The cached `slashItems` and `skillNames`, rebuilt when the catalog or
+    /// the props they read changed.
+    fn slash_items_and_names(&self) -> (Rc<[Skill]>, Rc<HashSet<String>>) {
+        let key = SlashKey {
+            remote: self.remote(),
+            remote_plan: self.props.remote_features.is_some_and(|f| f.plan),
+            hide_top_bar: self.props.hide_top_bar,
+            can_save_draft: self.props.can_save_draft,
+            harness: self.props.harness,
+        };
+        let mut cache = self.slash_cache.borrow_mut();
+        if let Some(built) = &cache.items
+            && built.key == key
+            && built.skills == self.skills
+        {
+            return (built.items.clone(), built.names.clone());
+        }
+        let items: Rc<[Skill]> = self.build_slash_items().into();
+        let names: Rc<HashSet<String>> =
+            Rc::new(items.iter().map(|skill| skill.invocation.clone()).collect());
+        cache.items = Some(SlashItems {
+            key,
+            skills: self.skills.clone(),
+            items: items.clone(),
+            names: names.clone(),
+        });
+        (items, names)
+    }
+
+    fn build_slash_items(&self) -> Vec<Skill> {
         if self.remote() {
             let mut items = Vec::new();
             if self.props.remote_features.is_some_and(|f| f.plan) {
@@ -765,22 +854,36 @@ impl Composer {
         items
     }
 
-    pub(crate) fn ranked_skills(&self) -> Vec<Skill> {
+    /// The picker rows for the current slash query, cached per query.
+    pub(crate) fn ranked_skills(&self) -> Rc<[Skill]> {
         let limit = if self.has_native_commands() {
             usize::MAX
         } else {
             MAX_PICKER
         };
         let query = self.slash.as_ref().map(|t| t.query.as_str()).unwrap_or("");
-        rank_skills(&self.slash_items(), query, limit)
+        let items = self.slash_items();
+        let mut cache = self.slash_cache.borrow_mut();
+        if let Some(ranked) = &cache.ranked
+            && Rc::ptr_eq(&ranked.items, &items)
+            && ranked.limit == limit
+            && ranked.query == query
+        {
+            return ranked.ranked.clone();
+        }
+        let ranked: Rc<[Skill]> = rank_skills(&items, query, limit).into();
+        cache.ranked = Some(RankedSkills {
+            items,
+            query: query.to_string(),
+            limit,
+            ranked: ranked.clone(),
+        });
+        ranked
     }
 
     /// `skillNames`: every invocation the picker lists.
-    pub(crate) fn skill_names(&self) -> HashSet<String> {
-        self.slash_items()
-            .into_iter()
-            .map(|skill| skill.invocation)
-            .collect()
+    pub(crate) fn skill_names(&self) -> Rc<HashSet<String>> {
+        self.slash_items_and_names().1
     }
 
     pub(crate) fn attachments_supported(&self) -> bool {
@@ -843,19 +946,78 @@ impl Composer {
         };
     }
 
+    /// Ranks the `@` picker rows again, for when the file index changed.
     pub(crate) fn refresh_ranked_files(&mut self, cx: &mut Context<Self>) {
+        self.rank_mentions(true, cx);
+    }
+
+    /// Ranks the `@` picker rows when the query or folder changed. Caret
+    /// moves inside the token keep the rows they have.
+    pub(crate) fn sync_ranked_files(&mut self, cx: &mut Context<Self>) {
+        self.rank_mentions(false, cx);
+    }
+
+    fn rank_mentions(&mut self, force: bool, cx: &mut Context<Self>) {
         if !self.mention_open() {
             self.ranked_files.clear();
             self.mention_active = 0;
+            self.mention_rank = MentionRank::default();
             return;
         }
-        let query = self
-            .mention
-            .as_ref()
-            .map(|t| t.query.clone())
-            .unwrap_or_default();
-        let cwd = self.props.execution_cwd.clone();
-        self.ranked_files = self.host.rank_mentions(&cwd, &query, cx);
+        let query: MentionQuery = (
+            self.props.execution_cwd.clone(),
+            self.mention
+                .as_ref()
+                .map(|t| t.query.clone())
+                .unwrap_or_default(),
+        );
+        if !force {
+            let current = match &self.mention_rank.pending {
+                Some((pending, _)) => Some(pending),
+                None => self.mention_rank.shown.as_ref(),
+            };
+            if current == Some(&query) {
+                return;
+            }
+        }
+        match self.host.rank_mentions_task(&query.0, &query.1, cx) {
+            Some(ranking) => {
+                let key = query.clone();
+                let task = cx.spawn(async move |this, cx| {
+                    let files = ranking.await;
+                    this.update(cx, |this, cx| {
+                        let current =
+                            matches!(&this.mention_rank.pending, Some((q, _)) if *q == key);
+                        if current {
+                            this.mention_rank.pending = None;
+                            this.apply_ranked_files(key, files);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+                self.mention_rank.pending = Some((query, task));
+            }
+            None => {
+                self.mention_rank.pending = None;
+                let files = self.host.rank_mentions(&query.0, &query.1, cx);
+                self.apply_ranked_files(query, files);
+            }
+        }
+    }
+
+    /// Finishes a background ranking now, so Enter, Tab, and the arrows act
+    /// on rows for the typed query.
+    pub(crate) fn flush_ranked_files(&mut self, cx: &mut Context<Self>) {
+        if let Some((query, _ranking)) = self.mention_rank.pending.take() {
+            let files = self.host.rank_mentions(&query.0, &query.1, cx);
+            self.apply_ranked_files(query, files);
+        }
+    }
+
+    fn apply_ranked_files(&mut self, query: MentionQuery, files: Vec<RankedFile>) {
+        self.ranked_files = files;
+        self.mention_rank.shown = Some(query);
         self.mention_active = if self.ranked_files.is_empty() {
             0
         } else {
@@ -983,7 +1145,7 @@ impl Composer {
             self.host.reload_skills(&context, refresh, cx);
         }
         self.clamp_skill_active();
-        self.refresh_ranked_files(cx);
+        self.sync_ranked_files(cx);
     }
 
     /// The draft-reset effect (`draftResetToken`).
@@ -1066,14 +1228,16 @@ impl Composer {
 
     fn apply_prompt_style(&mut self, cx: &mut Context<Self>) {
         let theme = monocode_ui::Theme::of(cx).clone();
-        let props = self.props.clone();
+        // Only two props matter here; cloning all of them would copy the
+        // queue and the recalled turn's attachments on every prop change.
+        let (shell, disabled) = (self.props.shell, self.props.disabled);
         let placeholder = self.placeholder_text();
         self.prompt.update(cx, |prompt, cx| {
-            let y = if props.shell { 16. } else { 12. };
+            let y = if shell { 16. } else { 12. };
             prompt.set_padding([y, 12., y, 12.], cx);
             prompt.set_max_height(Some(COMPOSER_MAX_HEIGHT), cx);
             prompt.set_placeholder(placeholder, cx);
-            prompt.set_disabled(props.disabled, cx);
+            prompt.set_disabled(disabled, cx);
             prompt.set_colors(
                 super::prompt_input::PromptColors {
                     selection: monocode_ui::color::with_alpha(theme.user_accent_or_accent(), 0.30),
@@ -1121,8 +1285,7 @@ impl Composer {
                     }));
             }
             (Some(runner), true) => {
-                let props = self.props.clone();
-                runner.update(cx, |runner, cx| runner.set_props(&props, cx));
+                runner.update(cx, |runner, cx| runner.set_props(&self.props, cx));
             }
             (Some(_), false) => self.runner = None,
             (None, false) => {}

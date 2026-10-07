@@ -1264,6 +1264,21 @@ fn context_from_record(used: Option<i64>, window: Option<i64>) -> Option<Context
     })
 }
 
+/// What a queued session write did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PersistOutcome {
+    /// The write finished. `fingerprint` is the saved session's
+    /// `persist_fingerprint` when the caller asked for a comparison.
+    Saved {
+        summary: Box<SessionSummary>,
+        fingerprint: Option<String>,
+    },
+    /// The fingerprint matched the last save, so nothing was written.
+    Unchanged { fingerprint: String },
+    /// The session does not persist, or it was deleted.
+    Skipped,
+}
+
 type Tail = Shared<BoxFuture<'static, ()>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1279,6 +1294,11 @@ struct WriterState {
     lead_by_id: HashMap<String, String>,
     deleted: HashSet<String>,
     next_id: u64,
+    /// What this writer last left in the store for each session it wrote:
+    /// the `persist_fingerprint` of a compared write, or `None` after a write
+    /// whose fingerprint it did not take. Writes for one session run in
+    /// order, so inside the queue this is the row as it stands.
+    stored: HashMap<String, Option<String>>,
 }
 
 /// Ordered writes to the session store.
@@ -1381,10 +1401,48 @@ impl SessionWriter {
     }
 
     fn write_session(&self, session: &Session) -> Task<Result<Option<SessionSummary>, String>> {
-        if self.is_deleted(&session.id) {
-            return Task::ready(Ok(None));
+        // Cloning is a copy. Sanitizing builds a JSON value per block, so it
+        // runs on the background executor with the write.
+        let write = self.write_owned(session.clone(), None);
+        self.executor.spawn(async move {
+            Ok(match write.await? {
+                PersistOutcome::Saved { summary, .. } => Some(*summary),
+                PersistOutcome::Unchanged { .. } | PersistOutcome::Skipped => None,
+            })
+        })
+    }
+
+    /// `persistSession`'s write: save `session` unless the store already holds
+    /// it. `last_fingerprint` is the caller's record of the last save; `None`
+    /// always writes. The comparison runs inside the queue, after earlier
+    /// writes for the session, against what this writer last stored there,
+    /// and falls back to `last_fingerprint` only for a session it has not
+    /// written. A fingerprint read when the write was queued could be older
+    /// than a write still running ahead of it.
+    ///
+    /// The fingerprint and the sanitized payload are both O(transcript), so
+    /// they run on the background executor.
+    pub fn upsert_session_if_changed(
+        &self,
+        session: Session,
+        last_fingerprint: Option<String>,
+    ) -> Task<Result<PersistOutcome, String>> {
+        if !should_persist_session(&session) {
+            return Task::ready(Ok(PersistOutcome::Skipped));
         }
-        let payload = sanitize_session_for_persist(session);
+        self.write_owned(session, Some(last_fingerprint))
+    }
+
+    /// Queue one session write. `compare` is `Some` when the write should
+    /// be skipped if the session's fingerprint equals the value inside it.
+    fn write_owned(
+        &self,
+        session: Session,
+        compare: Option<Option<String>>,
+    ) -> Task<Result<PersistOutcome, String>> {
+        if self.is_deleted(&session.id) {
+            return Task::ready(Ok(PersistOutcome::Skipped));
+        }
         {
             let mut state = self.state.lock();
             match session.orchestration_lead_id.as_ref() {
@@ -1397,11 +1455,33 @@ impl SessionWriter {
         let session_id = session.id.clone();
         self.enqueue(QueueKey::Session(session.id.clone()), move || {
             async move {
-                let mut payload = payload;
+                if state.lock().deleted.contains(&session_id) {
+                    return Ok(PersistOutcome::Skipped);
+                }
+                let fingerprint = match compare {
+                    Some(last) => {
+                        let fingerprint = persist_fingerprint(&session);
+                        // Leaving a session flushes it. An unchanged one would
+                        // still rewrite and re-diff its whole transcript under
+                        // the store lock.
+                        let basis = match (&last, state.lock().stored.get(&session_id)) {
+                            (None, _) => None,
+                            (Some(_), Some(stored)) => stored.clone(),
+                            (Some(last), None) => Some(last.clone()),
+                        };
+                        if basis.as_ref() == Some(&fingerprint) {
+                            return Ok(PersistOutcome::Unchanged { fingerprint });
+                        }
+                        Some(fingerprint)
+                    }
+                    None => None,
+                };
+                let mut payload = sanitize_session_for_persist(&session);
+                drop(session);
                 {
                     let state = state.lock();
                     if state.deleted.contains(&session_id) {
-                        return Ok(None);
+                        return Ok(PersistOutcome::Skipped);
                     }
                     if let Some(blocks) = payload.blocks.as_array_mut() {
                         for block in blocks {
@@ -1414,10 +1494,18 @@ impl SessionWriter {
                         }
                     }
                 }
-                backend
-                    .upsert(payload)
-                    .await
-                    .map(|summary| Some(normalize_summary(summary)))
+                // Until this write lands the row is not known, and a write
+                // without a fingerprint leaves it unknown.
+                state.lock().stored.insert(session_id.clone(), None);
+                let summary = backend.upsert(payload).await?;
+                state
+                    .lock()
+                    .stored
+                    .insert(session_id.clone(), fingerprint.clone());
+                Ok(PersistOutcome::Saved {
+                    summary: Box::new(normalize_summary(summary)),
+                    fingerprint,
+                })
             }
             .boxed()
         })
@@ -1542,6 +1630,7 @@ impl SessionWriter {
         let pending: Vec<Tail> = {
             let mut state = self.state.lock();
             state.deleted.insert(session_id.to_string());
+            state.stored.remove(session_id);
             let mut pending = Vec::new();
             for (key, (_, tail)) in &state.queues {
                 let QueueKey::Session(queued) = key else {
@@ -1652,8 +1741,12 @@ impl SessionWriter {
     /// open session id usable for its next request, unlike a delete.
     pub fn discard_draft_session_record(&self, session_id: &str) -> Task<Result<(), String>> {
         let backend = self.backend.clone();
+        let state = self.state.clone();
         let id = session_id.to_string();
         self.enqueue(QueueKey::Session(session_id.to_string()), move || {
+            // The record may be gone or changed, so the next compared write
+            // must not skip against the fingerprint stored before.
+            state.lock().stored.insert(id.clone(), None);
             backend.discard_draft(id)
         })
     }

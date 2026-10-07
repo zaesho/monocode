@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, BoxShadow, Context, ElementId, EventEmitter,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, WeakEntity, Window, div, px,
+    AnyElement, BoxShadow, Context, ElementId, EventEmitter, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, WeakEntity, Window, div, px,
 };
 use monocode_core::HarnessId;
 use monocode_layout::paths::{project_key, project_name};
@@ -18,6 +18,7 @@ use monocode_ui::widgets::spinner;
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 
 use super::parts::{css_color, eid, harness_icon, now_ms, project_mascot};
+use crate::motion::smooth_loop;
 
 /// Fewer working agents than this hide the panel.
 pub const LIVE_AGENT_MIN: usize = 2;
@@ -364,7 +365,6 @@ impl LiveAgentsPreview {
                     .items_center()
                     .gap(u(8.))
                     .child(div().flex_none().size(u(8.)).child(project_mascot(
-                        eid(&card.id, "mascot"),
                         &card.seed,
                         card.mascot.as_deref(),
                         color,
@@ -422,26 +422,29 @@ impl LiveAgentsPreview {
     }
 }
 
-/// The header dot: `bg-accent` with an 8px glow, pulsing.
-fn working_dot(theme: &Theme) -> impl IntoElement + use<> {
+/// The header dot: `bg-accent` with an 8px glow, pulsing while an agent
+/// works. When every agent listed is done or waiting, it holds still: the
+/// pulse redraws the whole window every frame, and the list can stay up with
+/// only finished agents until they are seen.
+fn working_dot(theme: &Theme, pulsing: bool) -> AnyElement {
     let accent = theme.colors.accent;
-    div()
+    let dot = div()
         .flex_none()
         .size(u(6.))
         .rounded_full()
         .bg(accent)
         .shadow(vec![
             BoxShadow::new(px(0.), px(0.), accent).blur_radius(px(8.)),
-        ])
-        .with_animation(
-            "live-agents-pulse",
-            Animation::new(Duration::from_secs(2)).repeat(),
-            // Tailwind `animate-pulse`: 1, 0.5 at the half, 1.
-            |el, t| {
-                let dip = if t < 0.5 { t * 2. } else { (1. - t) * 2. };
-                el.opacity(1. - 0.5 * dip)
-            },
-        )
+        ]);
+    if !pulsing {
+        return dot.into_any_element();
+    }
+    // Tailwind `animate-pulse`: 1, 0.5 at the half, 1.
+    smooth_loop(Duration::from_secs(2), move |t| {
+        let dip = if t < 0.5 { t * 2. } else { (1. - t) * 2. };
+        dot.opacity(1. - 0.5 * dip)
+    })
+    .into_any_element()
 }
 
 impl Render for LiveAgentsPreview {
@@ -511,7 +514,12 @@ impl Render for LiveAgentsPreview {
                             .gap(u(8.))
                             .px(u(14.))
                             .py(u(6.))
-                            .child(working_dot(&theme))
+                            .child(working_dot(
+                                &theme,
+                                self.agents
+                                    .iter()
+                                    .any(|agent| !agent.done && !agent.needs_approval),
+                            ))
                             .child(
                                 div()
                                     .min_w_0()

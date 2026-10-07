@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, AppContext as _, Context, InteractiveElement as _,
-    IntoElement, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use monocode_core::task_list::legacy_task_list_from_text;
 use monocode_core::transcript::BlockRef;
@@ -20,6 +20,7 @@ use monocode_ui::{Theme, u};
 use crate::cards::generated_image::GeneratedImage;
 use crate::cards::plan_preview::{build_disabled, plan_preview};
 use crate::cards::task_list::task_list_preview;
+use crate::motion::spinner_loop;
 use crate::threads::{
     OrchestrationPreview, SecondOpinionButton, SecondOpinionEvent, SecondOpinionProps,
 };
@@ -67,7 +68,8 @@ impl TranscriptView {
                 Some(list) => gutter(div().py(u(4.)))
                     .child(
                         task_list_preview(eid(key, "tasks"), list.items.clone())
-                            .explanation(list.explanation.clone()),
+                            .explanation(list.explanation.clone())
+                            .spinning(self.turn_is_live(row)),
                     )
                     .into_any_element(),
                 None => div().into_any_element(),
@@ -78,7 +80,10 @@ impl TranscriptView {
                 }
                 if let Some(items) = legacy_task_list_from_text(&block.text) {
                     return gutter(div().py(u(4.)))
-                        .child(task_list_preview(eid(key, "tasks"), items))
+                        .child(
+                            task_list_preview(eid(key, "tasks"), items)
+                                .spinning(self.turn_is_live(row)),
+                        )
                         .into_any_element();
                 }
                 let card = self.render_plan(key, block, cx);
@@ -147,19 +152,13 @@ impl TranscriptView {
                         .flex_none()
                         .text_px(11.)
                         .text_color(theme.content(0.45))
-                        .with_animation(
-                            eid(key, "spinner"),
-                            Animation::new(Duration::from_millis(80 * SPINNER.len() as u64))
-                                .repeat(),
-                            |el, delta| {
-                                let frame = ((delta * SPINNER.len() as f32) as usize)
-                                    .min(SPINNER.len() - 1);
-                                el.child(SPINNER[frame])
-                            },
-                        ),
+                        .child(spinner_loop(
+                            Duration::from_millis(80 * SPINNER.len() as u64),
+                            SPINNER.len() as u32,
+                            |frame| SPINNER[frame as usize % SPINNER.len()],
+                        )),
                 )
                 .child(shimmer(
-                    eid(key, "preparing"),
                     chrome.label.clone(),
                     Duration::from_millis(1400),
                     &theme,

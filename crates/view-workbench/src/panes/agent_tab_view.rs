@@ -113,16 +113,26 @@ impl AgentTabView {
         }
     }
 
-    /// The worker, or `None` once it stopped running.
+    /// The worker, or `None` once it stopped running. The host sends it on
+    /// every session change, so the same worker again does not redraw.
     pub fn set_session(&mut self, session: Option<AgentTabSession>, cx: &mut Context<Self>) {
-        self.session = session;
-        cx.notify();
+        if self.session != session {
+            self.session = session;
+            cx.notify();
+        }
     }
 
     /// The worker's transcript (with `TranscriptFind` over it).
     pub fn set_transcript(&mut self, transcript: Option<AnyView>, cx: &mut Context<Self>) {
+        let same = match (&self.transcript, &transcript) {
+            (Some(old), Some(new)) => old.entity_id() == new.entity_id(),
+            (None, None) => true,
+            _ => false,
+        };
         self.transcript = transcript;
-        cx.notify();
+        if !same {
+            cx.notify();
+        }
     }
 }
 

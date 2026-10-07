@@ -455,7 +455,7 @@ pub struct SessionSummary {
 }
 
 /// The props SettingsView took besides its callbacks.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SettingsProps {
     pub cwd: String,
     /// Recent project paths, newest first.

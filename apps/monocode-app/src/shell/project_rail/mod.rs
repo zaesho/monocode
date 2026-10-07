@@ -196,6 +196,15 @@ pub(super) fn inbox_unseen(cx: &App) -> bool {
     Inbox::try_global(cx).is_some_and(|inbox| inbox.read(cx).unseen())
 }
 
+/// The rail's projects per sidebar project, without their git stats, and
+/// the [`crate::revisions::revision`] they were built at. The sidebar, the
+/// rail, and the compact rail read them on every frame; building them parses
+/// five settings records and scans every open session.
+#[derive(Default)]
+struct RailProjectsCache(std::collections::HashMap<String, (u64, Vec<Project>, Option<usize>)>);
+
+impl gpui::Global for RailProjectsCache {}
+
 /// The rail's projects, pinned first, and the index of the sidebar's one.
 pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
     let Some(global) = ProjectsGlobal::try_global(cx) else {
@@ -203,6 +212,45 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
     };
     let projects = global.projects.clone();
     let git = global.git.clone();
+    let revision = crate::revisions::revision(cx);
+    let cached = cx
+        .try_global::<RailProjectsCache>()
+        .and_then(|cache| cache.0.get(cwd))
+        .filter(|(built, _, _)| *built == revision)
+        .map(|(_, list, active)| (list.clone(), *active));
+    let (mut list, active) = match cached {
+        Some(cached) => cached,
+        None => {
+            let built = build_rail_projects(cwd, &projects, cx);
+            let cache = cx.default_global::<RailProjectsCache>();
+            // One entry per window's project; drop the rest when it grows.
+            if cache.0.len() > 32 {
+                cache.0.clear();
+            }
+            cache
+                .0
+                .insert(cwd.to_string(), (revision, built.0.clone(), built.1));
+            built
+        }
+    };
+    // Diff stats come from each project's git status entity, which the rail
+    // observes; reading them is cheap.
+    for project in &mut list {
+        let stats = git
+            .read(cx)
+            .get(&project.path)
+            .and_then(|status| status.read(cx).diff_stats().cloned());
+        project.additions = stats.as_ref().map_or(0, |stats| stats.additions);
+        project.deletions = stats.as_ref().map_or(0, |stats| stats.deletions);
+    }
+    (list, active)
+}
+
+fn build_rail_projects(
+    cwd: &str,
+    projects: &gpui::Entity<monocode_engine::projects::Projects>,
+    cx: &mut App,
+) -> (Vec<Project>, Option<usize>) {
     let (items, labels, colors, custom, logos, mascots) = projects.update(cx, |projects, _| {
         (
             projects.rail_items(cwd),
@@ -213,16 +261,20 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
             projects.mascots(),
         )
     });
-    let sessions = Engine::sessions(cx).read(cx).all().to_vec();
+    // Only busy sessions matter here; borrow them instead of cloning every
+    // session with its transcript.
+    let busy: Vec<String> = Engine::sessions(cx)
+        .read(cx)
+        .all()
+        .iter()
+        .filter(|session| session.is_busy())
+        .map(|session| session.cwd.clone())
+        .collect();
     let list: Vec<Project> = items
         .into_iter()
         .map(|item| {
             let key = project_key(&item.path);
             let seed = project_name(&item.path);
-            let stats = git
-                .read(cx)
-                .get(&item.path)
-                .and_then(|status| status.read(cx).diff_stats().cloned());
             Project {
                 name: labels
                     .get(&key)
@@ -236,11 +288,9 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
                     Some(&custom),
                     Some(&seed),
                 )),
-                busy: sessions.iter().any(|session| {
-                    session.is_busy() && same_project_path(&session.cwd, &item.path)
-                }),
-                additions: stats.as_ref().map_or(0, |stats| stats.additions),
-                deletions: stats.as_ref().map_or(0, |stats| stats.deletions),
+                busy: busy.iter().any(|cwd| same_project_path(cwd, &item.path)),
+                additions: 0,
+                deletions: 0,
                 path: item.path,
             }
         })
@@ -254,6 +304,9 @@ pub fn rail_projects(cwd: &str, cx: &mut App) -> (Vec<Project>, Option<usize>) {
 /// The project rail of one window.
 pub struct ProjectRail {
     shell: WeakEntity<Shell>,
+    /// The shell draws the rail cached; this redraws it on the shell's and
+    /// the sessions' changes.
+    region: super::CachedRegion,
     git_watches: std::collections::HashMap<
         String,
         (
@@ -274,6 +327,7 @@ impl ProjectRail {
         }
         Self {
             shell,
+            region: Default::default(),
             git_watches: Default::default(),
         }
     }
@@ -319,6 +373,7 @@ impl Render for ProjectRail {
                 shell.layout.rail_width,
             )
         };
+        self.region.sync(&self.shell, None, cx);
         let (projects, active) = rail_projects(&cwd, cx);
         self.git_watches
             .retain(|path, _| projects.iter().any(|project| &project.path == path));

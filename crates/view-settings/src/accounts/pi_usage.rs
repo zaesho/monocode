@@ -24,7 +24,7 @@ use super::model::{
     PiUsageProvider, ProviderRateLimits, RATE_LIMIT_MIN_REFETCH_MS, RATE_LIMIT_POLL_MS,
     RateLimitStatus, idle_rate_limits, pi_billing_provider, pi_usage_provider,
 };
-use super::style::{spin_icon, text};
+use super::style::{motion_safe_spin_icon, text};
 use super::usage_chip::{ChipActions, ChipProps, Presentation, UsageProviderChip};
 use crate::settings::providers::harness_logo;
 
@@ -266,7 +266,7 @@ impl Render for PiUsage {
         let theme = Theme::of(cx).clone();
         let ink = theme.content(0.40);
         let glyph = if fetching {
-            spin_icon("pi-refresh-spin", IconName::RefreshCw, 10., ink)
+            motion_safe_spin_icon("pi-refresh-spin", IconName::RefreshCw, 10., ink)
         } else {
             icon(IconName::RefreshCw)
                 .size(u(10.))

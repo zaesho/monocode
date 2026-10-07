@@ -523,6 +523,21 @@ impl OrchestrationHost for Rc<EngineHost> {
         Engine::sessions(cx).read(cx).all().to_vec()
     }
 
+    fn read_session(&self, id: &str, cx: &App, read: &mut dyn FnMut(&Session)) {
+        if let Some(session) = Engine::sessions(cx).read(cx).get(id) {
+            read(session);
+        }
+    }
+
+    fn find_session(&self, cx: &App, matches: &mut dyn FnMut(&Session) -> bool) -> Option<Session> {
+        Engine::sessions(cx)
+            .read(cx)
+            .all()
+            .iter()
+            .find(|session| matches(session))
+            .cloned()
+    }
+
     fn choices(&self, cx: &App) -> Vec<HarnessChoice> {
         let Some(config) = submit_config(cx) else {
             return Vec::new();

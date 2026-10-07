@@ -216,7 +216,7 @@ pub fn append_problems(title: &str, errors: usize) -> String {
 }
 
 /// What the strip shows.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SurfaceTabsProps {
     pub files: Vec<FilePaneTab>,
     pub active_file_id: String,
@@ -345,7 +345,12 @@ impl SurfaceTabs {
     }
 
     /// New props from the pane. Closed and new tabs start their motion here.
+    /// The pane sends props on every workspace and session change, so the
+    /// same props again change nothing and do not redraw.
     pub fn set_props(&mut self, props: SurfaceTabsProps, cx: &mut Context<Self>) {
+        if props == self.props {
+            return;
+        }
         let skip_motion = cx.reduce_motion() || !props.tab_animations;
         {
             let measured = self.measured.borrow();

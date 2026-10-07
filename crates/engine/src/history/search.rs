@@ -159,7 +159,14 @@ impl Search {
     ) -> Self {
         let observers = vec![
             cx.observe(&history, |_, _, cx| cx.notify()),
-            cx.observe(&Engine::sessions(cx), |_, _, cx| cx.notify()),
+            // Open sessions only feed `hits`, which is empty while the page
+            // is closed or the query is blank. `Sessions` changes once per
+            // frame while an agent streams, so skip those notifications.
+            cx.observe(&Engine::sessions(cx), |this: &mut Self, _, cx| {
+                if this.open && !js::trim(&this.query).is_empty() {
+                    cx.notify();
+                }
+            }),
         ];
         Self {
             history,

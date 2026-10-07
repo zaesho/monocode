@@ -14,13 +14,13 @@ impl Shell {
             UsageFooterProps {
                 providers: RateLimitProvider::ALL.to_vec(),
                 session: workspace
-                    .active_session(cx)
+                    .active_session_ref(cx)
                     .map(|session| UsageFooterSession {
-                        id: Some(session.id),
+                        id: Some(session.id.clone()),
                         harness: session.harness,
-                        model: Some(session.model),
+                        model: Some(session.model.clone()),
                         auth_required: false,
-                        provider_account_id: session.provider_account_id,
+                        provider_account_id: session.provider_account_id.clone(),
                         environment_id: monocode_layout::paths::parse_remote_path(&session.cwd)
                             .map(|remote| remote.environment_id),
                     }),

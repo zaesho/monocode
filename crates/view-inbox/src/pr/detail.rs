@@ -318,6 +318,8 @@ pub struct InboxDetailView {
     scroll: ScrollHandle,
     animate: bool,
     tasks: Vec<Task<()>>,
+    /// The header and the timeline show "2m ago".
+    minute_tick: crate::pr::linked_notice::MinuteTick,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -387,6 +389,7 @@ impl InboxDetailView {
             scroll: ScrollHandle::new(),
             animate: true,
             tasks: Vec::new(),
+            minute_tick: Default::default(),
             _subscriptions: vec![field_events],
         };
         view.subscribe_data(cx);
@@ -1651,8 +1654,8 @@ impl InboxDetailView {
             now: self.services.now_ms(),
             clamps: self.clamps.clone(),
         };
-        let thread = self.state.thread.clone();
-        if let Some(comments) = inbox_comments(&thread, &props, &mut self.markdown, cx) {
+        // Borrows the thread: a clone copied every comment body per frame.
+        if let Some(comments) = inbox_comments(&self.state.thread, &props, &mut self.markdown, cx) {
             body = body.child(comments);
         }
         let weak = cx.entity().downgrade();
@@ -1708,6 +1711,7 @@ impl InboxDetailView {
 
 impl Render for InboxDetailView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.minute_tick.drawn(cx);
         let replying = self.state.reply_to.is_some();
         if replying != self.placeholder_replying {
             self.placeholder_replying = replying;

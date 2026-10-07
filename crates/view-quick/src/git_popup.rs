@@ -8,6 +8,7 @@
 //! the branch of the current checkout. The popup finishes once, with or
 //! without a new choice, and the composer applies the result.
 
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
     InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, canvas, div,
+    uniform_list,
 };
 use monocode_core::session::WorkspaceMode;
 use monocode_layout::paths::pretty_cwd;
@@ -865,89 +867,120 @@ impl QuickGitPopup {
             .into_any_element()
     }
 
+    /// One row of the branch list.
+    fn render_branch_row(
+        &self,
+        index: usize,
+        row: crate::model::launch::GitBranchInfo,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let highlighted = index == self.active || row.current;
+        let hover = theme.content(0.05);
+        let mut item = row_base(
+            SharedString::from(format!(
+                "quick-git-branch-{}-{}",
+                row.remote.as_deref().unwrap_or("local"),
+                row.name
+            )),
+            theme,
+        )
+        .h(u(32.))
+        .text_color(theme.colors.content)
+        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+            if this.active != index {
+                this.active = index;
+                cx.notify();
+            }
+        }))
+        .on_click(cx.listener(move |this, _, window, cx| this.pick_branch(index, window, cx)));
+        item = if highlighted {
+            item.bg(theme.colors.selection)
+        } else {
+            item.hover(move |style| style.bg(hover))
+        };
+        if self.busy {
+            item = item.opacity(0.6);
+        }
+        item = item.child(if row.current {
+            icon(IconName::Check)
+                .size(u(14.))
+                .text_color(theme.colors.content)
+        } else {
+            icon(IconName::GitBranch)
+                .size(u(14.))
+                .text_color(theme.content(0.50))
+        });
+        let mut name = div().min_w_0().flex_1().truncate().child(row.name.clone());
+        if row.current {
+            name = name.medium();
+        }
+        item = item.child(name);
+        if let Some(remote) = &row.remote {
+            item = item.child(
+                div()
+                    .flex_none()
+                    .rounded(u(theme.radius.sm))
+                    .bg(theme.content(0.06))
+                    .px(u(6.))
+                    .py(u(2.))
+                    .text_px(10.)
+                    .text_color(theme.content(0.40))
+                    .child(remote.clone()),
+            );
+        }
+        item.into_any_element()
+    }
+
     fn render_branch_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let rows = self.branch_rows(cx);
         let query = self.search.read(cx).text().to_string();
-        let mut list = div()
-            .id("quick-git-branches")
-            .flex()
-            .flex_col()
+        // A repository can list thousands of remote branches. The list draws
+        // only the rows in view, so hovering a row does not lay out all of them.
+        let list = if rows.is_empty() {
+            div()
+                .id("quick-git-branches")
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px(u(6.))
+                .py(u(6.))
+                .child(
+                    div()
+                        .px(u(12.))
+                        .py(u(16.))
+                        .text_px(12.)
+                        .text_color(theme.content(0.50))
+                        .child(if query.trim().is_empty() {
+                            "No branches"
+                        } else {
+                            "No matching branches"
+                        }),
+                )
+                .into_any_element()
+        } else {
+            uniform_list(
+                "quick-git-branches",
+                rows.len(),
+                cx.processor(|this, range: Range<usize>, _, cx| {
+                    let theme = Theme::of(cx).clone();
+                    let rows = this.branch_rows(cx);
+                    rows.into_iter()
+                        .enumerate()
+                        .skip(range.start)
+                        .take(range.len())
+                        .map(|(index, row)| this.render_branch_row(index, row, &theme, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
             .px(u(6.))
-            .py(u(6.));
-        if rows.is_empty() {
-            list = list.child(
-                div()
-                    .px(u(12.))
-                    .py(u(16.))
-                    .text_px(12.)
-                    .text_color(theme.content(0.50))
-                    .child(if query.trim().is_empty() {
-                        "No branches"
-                    } else {
-                        "No matching branches"
-                    }),
-            );
-        }
-        for (index, row) in rows.into_iter().enumerate() {
-            let highlighted = index == self.active || row.current;
-            let hover = theme.content(0.05);
-            let mut item = row_base(
-                SharedString::from(format!(
-                    "quick-git-branch-{}-{}",
-                    row.remote.as_deref().unwrap_or("local"),
-                    row.name
-                )),
-                theme,
-            )
-            .h(u(32.))
-            .text_color(theme.colors.content)
-            .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                if this.active != index {
-                    this.active = index;
-                    cx.notify();
-                }
-            }))
-            .on_click(cx.listener(move |this, _, window, cx| this.pick_branch(index, window, cx)));
-            item = if highlighted {
-                item.bg(theme.colors.selection)
-            } else {
-                item.hover(move |style| style.bg(hover))
-            };
-            if self.busy {
-                item = item.opacity(0.6);
-            }
-            item = item.child(if row.current {
-                icon(IconName::Check)
-                    .size(u(14.))
-                    .text_color(theme.colors.content)
-            } else {
-                icon(IconName::GitBranch)
-                    .size(u(14.))
-                    .text_color(theme.content(0.50))
-            });
-            let mut name = div().min_w_0().flex_1().truncate().child(row.name.clone());
-            if row.current {
-                name = name.medium();
-            }
-            item = item.child(name);
-            if let Some(remote) = &row.remote {
-                item = item.child(
-                    div()
-                        .flex_none()
-                        .rounded(u(theme.radius.sm))
-                        .bg(theme.content(0.06))
-                        .px(u(6.))
-                        .py(u(2.))
-                        .text_px(10.)
-                        .text_color(theme.content(0.40))
-                        .child(remote.clone()),
-                );
-            }
-            list = list.child(item);
-        }
+            .py(u(6.))
+            .into_any_element()
+        };
         let mut picker = div()
             .flex()
             .flex_col()

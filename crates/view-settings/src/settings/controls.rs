@@ -447,17 +447,19 @@ impl SecondaryButton {
     }
 }
 
-/// The spinning loader icon.
-pub fn spinner_icon(id: impl Into<ElementId>, size: f32, color: gpui::Hsla) -> AnyElement {
-    use gpui::{Animation, AnimationExt as _, Transformation, percentage};
+/// The spinning loader icon, redrawn at [`monocode_ui::ticker::SMOOTH_FPS`]
+/// instead of every display refresh. It keeps turning with reduced motion,
+/// as `animate-spin` did.
+pub fn spinner_icon(_id: impl Into<ElementId>, size: f32, color: gpui::Hsla) -> AnyElement {
+    use gpui::{Transformation, percentage};
+    use monocode_ui::{SteppedAnimationExt as _, smooth_steps};
+    let period = std::time::Duration::from_secs(1);
     icon(IconName::Loader)
         .size(u(size))
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_secs(1)).repeat(),
-            |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_loading_animation(period, smooth_steps(period), |svg, t| {
+            svg.with_transformation(Transformation::rotate(percentage(t)))
+        })
         .into_any_element()
 }
 

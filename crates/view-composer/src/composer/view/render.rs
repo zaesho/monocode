@@ -883,9 +883,7 @@ impl Composer {
                 .as_ref()
                 .map(|t| t.query.clone())
                 .unwrap_or_default();
-            let cwd = self.props.execution_cwd.clone();
-            let loading = super::super::model::paths::looks_like_project(&cwd)
-                && self.host.mentions_loading(&cwd, cx);
+            let loading = self.mention_picker_loading(cx);
             file_mention_picker("composer-mention-picker", files, query, self.mention_active)
                 .loading(loading)
                 .include_notes(self.props.notes_enabled)
@@ -921,6 +919,17 @@ impl Composer {
                 .child(picker)
                 .into_any_element(),
         )
+    }
+
+    /// The `@` picker shows its loading line instead of "no matches": the
+    /// project is still being listed, or a background ranking has not
+    /// landed and there are no rows from an earlier query to show.
+    pub(crate) fn mention_picker_loading(&self, cx: &mut Context<Self>) -> bool {
+        if self.mention_rank.pending.is_some() && self.ranked_files.is_empty() {
+            return true;
+        }
+        let cwd = &self.props.execution_cwd;
+        super::super::model::paths::looks_like_project(cwd) && self.host.mentions_loading(cwd, cx)
     }
 
     /// SkillPicker's create row: the starter-skill form.
@@ -1018,7 +1027,6 @@ impl Render for Composer {
         };
         r#box = r#box.children(self.render_top_bar(window, cx));
         if !self.context_items.is_empty() || !self.attachments.is_empty() {
-            let items = self.context_items.clone();
             let mut chips = div()
                 .flex()
                 .flex_wrap()
@@ -1026,12 +1034,16 @@ impl Render for Composer {
                 .gap(u(6.))
                 .px(u(12.))
                 .pt(u(8.));
-            for item in &items {
+            for item in &self.context_items {
                 chips = chips.child(self.render_context_chip(item, window, cx));
             }
-            for file in self.attachments.clone() {
-                chips = chips.child(self.render_attachment_chip(&file, cx));
+            // Attachments can hold megabytes of base64, so the chips borrow
+            // the list instead of cloning it each frame.
+            let attachments = std::mem::take(&mut self.attachments);
+            for file in &attachments {
+                chips = chips.child(self.render_attachment_chip(file, cx));
             }
+            self.attachments = attachments;
             r#box = r#box.child(chips);
         }
         r#box = r#box.children(self.render_session_drop_choice(window, cx));

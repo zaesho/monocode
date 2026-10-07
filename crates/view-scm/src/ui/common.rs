@@ -8,16 +8,17 @@ use std::time::Duration;
 
 use gpui::Entity;
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, ClickEvent, ElementId, Hsla,
-    InteractiveElement as _, IntoElement, ParentElement as _, RenderOnce, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Transformation, Window, anchored, deferred, div,
-    percentage, point, px, svg,
+    Anchor, AnyElement, App, ClickEvent, ElementId, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Transformation, Window, anchored, deferred, div, percentage, point, px, svg,
 };
 use gpui_base::input::{InputEditorStyle, Textarea as BaseTextarea, TextareaState};
 use monocode_editor::{ColorScheme as EditorScheme, EditorTheme};
 use monocode_ui::color::hex;
 use monocode_ui::widgets::tooltip;
-use monocode_ui::{ColorScheme, IconName, Theme, UiStyled as _, icon, u};
+use monocode_ui::{
+    ColorScheme, IconName, SteppedAnimationExt as _, Theme, UiStyled as _, icon, smooth_steps, u,
+};
 
 use crate::model::changes::StatusTone;
 
@@ -87,18 +88,20 @@ pub fn mix(a: Hsla, b: Hsla, weight: f32) -> Hsla {
     monocode_ui::color::mix(a, b, weight)
 }
 
-/// The `Loader` icon spinning (`animate-spin`, 1 s per turn).
-pub fn spin_icon(id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+/// The `Loader` icon spinning (`animate-spin`, 1 s per turn), redrawn at
+/// `monocode_ui::ticker::SMOOTH_FPS` instead of on every display refresh.
+/// Callers show it only while their work runs. `_id` stays so call sites
+/// keep naming their spinners; the step clock needs no element id.
+pub fn spin_icon(_id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+    let period = Duration::from_secs(1);
     svg()
         .path(IconName::Loader.path())
         .flex_none()
         .size(u(size))
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(1)).repeat(),
-            |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_stepped_animation(period, smooth_steps(period), |svg, t| {
+            svg.with_transformation(Transformation::rotate(percentage(t)))
+        })
 }
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;

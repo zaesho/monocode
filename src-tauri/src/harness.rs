@@ -5,8 +5,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use monocode_process::harness::{
-    self as host, AntigravityBinary, ConfiguredBinary, CursorBinary, HarnessAccount, HarnessEvents,
-    HarnessHttpResponse,
+    self as host, AntigravityBinary, ClaudeMcpProfile, ConfiguredBinary, CursorBinary,
+    HarnessAccount, HarnessEvents, HarnessHttpResponse,
 };
 pub(crate) use monocode_process::harness::{reap_orphaned_harness_processes, HarnessHost};
 
@@ -49,7 +49,7 @@ struct HarnessSseEnd {
 pub(crate) struct TauriHarnessEvents(pub AppHandle);
 
 impl HarnessEvents for TauriHarnessEvents {
-    fn stdout(&self, session_id: &str, line: String) {
+    fn stdout(&self, session_id: &str, line: String, _pid: u32) {
         let _ = self.0.emit(
             STDOUT_EVENT,
             HarnessLine {
@@ -59,7 +59,7 @@ impl HarnessEvents for TauriHarnessEvents {
         );
     }
 
-    fn stderr(&self, session_id: &str, line: String) {
+    fn stderr(&self, session_id: &str, line: String, _pid: u32) {
         let _ = self.0.emit(
             STDERR_EVENT,
             HarnessLine {
@@ -141,16 +141,28 @@ pub fn harness_resolve_claude() -> Result<CursorBinary, String> {
     host::harness_resolve_claude()
 }
 
+/// The default Claude account's MCP profile. The Tauri app has no account
+/// picker, so its MCP commands always run under the default account.
+pub(crate) fn default_claude_mcp_profile(app: &AppHandle) -> Result<ClaudeMcpProfile, String> {
+    host::claude_mcp_profile(&crate::app_data_dir(app)?, None)
+}
+
 #[tauri::command]
-pub async fn claude_mcp_list(host: State<'_, HarnessHost>, cwd: String) -> Result<String, String> {
+pub async fn claude_mcp_list(
+    app: AppHandle,
+    host: State<'_, HarnessHost>,
+    cwd: String,
+) -> Result<String, String> {
     let host = host.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || host::claude_mcp_list(&host, cwd))
+    let data_dir = crate::app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || host::claude_mcp_list(&host, &data_dir, cwd, None))
         .await
         .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn claude_mcp_add(
+    app: AppHandle,
     host: State<'_, HarnessHost>,
     cwd: String,
     name: String,
@@ -158,8 +170,9 @@ pub async fn claude_mcp_add(
     scope: String,
 ) -> Result<(), String> {
     let host = host.inner().clone();
+    let profile = default_claude_mcp_profile(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        host::claude_mcp_add(&host, cwd, name, config, scope)
+        host::claude_mcp_add(&host, &profile, cwd, name, config, scope)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -167,27 +180,33 @@ pub async fn claude_mcp_add(
 
 #[tauri::command]
 pub async fn claude_mcp_remove(
+    app: AppHandle,
     host: State<'_, HarnessHost>,
     cwd: String,
     name: String,
     scope: String,
 ) -> Result<(), String> {
     let host = host.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || host::claude_mcp_remove(&host, cwd, name, scope))
-        .await
-        .map_err(|e| e.to_string())?
+    let profile = default_claude_mcp_profile(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        host::claude_mcp_remove(&host, &profile, cwd, name, scope)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn mcp_provider_login(
+    app: AppHandle,
     host: State<'_, HarnessHost>,
     cwd: String,
     provider: String,
     name: String,
 ) -> Result<(), String> {
     let host = host.inner().clone();
+    let profile = default_claude_mcp_profile(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        host::mcp_provider_login(&host, cwd, provider, name)
+        host::mcp_provider_login(&host, Some(&profile), cwd, provider, name)
     })
     .await
     .map_err(|e| e.to_string())?

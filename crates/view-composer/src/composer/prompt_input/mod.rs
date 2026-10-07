@@ -211,7 +211,7 @@ pub struct PromptDecorations {
 pub type Decorator = Rc<dyn Fn(&str, &App) -> PromptDecorations>;
 
 /// Paint colors the theme provides.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PromptColors {
     pub selection: Hsla,
     pub placeholder: Hsla,
@@ -245,7 +245,18 @@ pub struct PromptInput {
     pub(crate) caret_visible: bool,
     blink_epoch: usize,
     _blink: Option<Task<()>>,
+    /// The OS window has key focus. The caret neither shows nor blinks
+    /// while it does not, so a window in the background does not redraw
+    /// twice a second.
+    window_active: bool,
     selecting: bool,
+    /// The text as a `SharedString` for `version`, so a frame does not copy
+    /// the whole draft.
+    text_cache: Option<(u64, SharedString)>,
+    /// The last layout and what it was built from. A frame that changes
+    /// none of it (the caret blink, a redraw elsewhere in the window)
+    /// reuses it instead of wrapping and shaping every row again.
+    pub(crate) layout_cache: Option<(element::LayoutKey, Rc<TextLayout>)>,
     pub(crate) last_layout: Option<Rc<TextLayout>>,
     pub(crate) last_text_origin: Point<Pixels>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
@@ -269,6 +280,14 @@ impl PromptInput {
                 this.selecting = false;
                 cx.emit(PromptInputEvent::Blurred);
                 cx.notify();
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.window_active = window.is_window_active();
+                if this.window_active && this.focus_handle.is_focused(window) {
+                    this.restart_blink(cx);
+                } else if !this.window_active {
+                    this.stop_blink(cx);
+                }
             }),
         ];
         Self {
@@ -295,7 +314,10 @@ impl PromptInput {
             caret_visible: false,
             blink_epoch: 0,
             _blink: None,
+            window_active: window.is_window_active(),
             selecting: false,
+            text_cache: None,
+            layout_cache: None,
             last_layout: None,
             last_text_origin: point(px(0.), px(0.)),
             last_bounds: None,
@@ -334,20 +356,26 @@ impl PromptInput {
 
     /// Top, right, bottom, left padding in CSS px. The text scrolls under it.
     pub fn set_padding(&mut self, padding: [f32; 4], cx: &mut Context<Self>) {
-        self.padding = padding;
-        cx.notify();
+        if padding != self.padding {
+            self.padding = padding;
+            cx.notify();
+        }
     }
 
     /// The element grows with its text up to this height (CSS px, padding
     /// included), then scrolls. `resizeComposer` in the React code.
     pub fn set_max_height(&mut self, max_height: Option<f32>, cx: &mut Context<Self>) {
-        self.max_height = max_height;
-        cx.notify();
+        if max_height != self.max_height {
+            self.max_height = max_height;
+            cx.notify();
+        }
     }
 
     pub fn set_colors(&mut self, colors: PromptColors, cx: &mut Context<Self>) {
-        self.colors = colors;
-        cx.notify();
+        if colors != self.colors {
+            self.colors = colors;
+            cx.notify();
+        }
     }
 
     pub fn set_decorator(&mut self, decorator: Option<Decorator>, cx: &mut Context<Self>) {
@@ -381,6 +409,23 @@ impl PromptInput {
 
     pub fn text(&self) -> &str {
         self.buffer.text()
+    }
+
+    /// The text as a `SharedString`, copied once per change.
+    pub(crate) fn shared_text(&mut self) -> SharedString {
+        if let Some((version, text)) = &self.text_cache
+            && *version == self.version
+        {
+            return text.clone();
+        }
+        let text = SharedString::from(self.buffer.text().to_string());
+        self.text_cache = Some((self.version, text.clone()));
+        text
+    }
+
+    /// Bumps on every text change and decoration invalidation.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn buffer(&self) -> &PromptBuffer {
@@ -511,7 +556,18 @@ impl PromptInput {
         cx.notify();
     }
 
+    fn stop_blink(&mut self, cx: &mut Context<Self>) {
+        self.blink_epoch += 1;
+        self._blink = None;
+        self.caret_visible = false;
+        cx.notify();
+    }
+
     fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            self.stop_blink(cx);
+            return;
+        }
         self.caret_visible = true;
         self.blink_epoch += 1;
         let epoch = self.blink_epoch;

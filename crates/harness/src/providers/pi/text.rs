@@ -26,7 +26,7 @@ use crate::core::registry::{EventSink, TextPromptInput};
 use crate::core::task::{ms, sleep};
 
 use super::client::{DEFAULT_REQUEST_TIMEOUT_MS, PiRpc};
-use super::deps::{Rec, join_stream_text};
+use super::deps::{Rec, join_stream_text_into};
 use super::flavor::PiFlavor;
 use super::protocol::{
     PiDeltaKind, PiSpawnOptions, agent_end_will_retry, as_record, assistant_delta_from_event,
@@ -451,7 +451,7 @@ fn handle_frame(session: &LiveText, rec: &Rec) {
         if let Some(delta) = assistant_delta_from_event(rec) {
             match delta.kind {
                 PiDeltaKind::Text => {
-                    state.output = join_stream_text(&state.output, &delta.text);
+                    join_stream_text_into(&mut state.output, &delta.text);
                     events.push(HarnessEvent::MessageDelta {
                         text: delta.text,
                         append: None,

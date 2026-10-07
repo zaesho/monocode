@@ -43,17 +43,17 @@ fn options(busy: bool) -> PlanOptions {
     }
 }
 
-fn plan(blocks: Vec<Block>, busy: bool) -> Vec<Row> {
+fn plan(blocks: Vec<Block>, busy: bool) -> Vec<RowRef> {
     plan_with(blocks, options(busy))
 }
 
-fn plan_with(blocks: Vec<Block>, options: PlanOptions) -> Vec<Row> {
+fn plan_with(blocks: Vec<Block>, options: PlanOptions) -> Vec<RowRef> {
     let blocks = visible_blocks(&refs(blocks), options.harness);
     build_plan(&blocks, &options, &PlanState::default(), None)
 }
 
 /// Every block id the rows draw, in order.
-fn drawn(rows: &[Row]) -> Vec<String> {
+fn drawn(rows: &[RowRef]) -> Vec<String> {
     rows.iter()
         .flat_map(|row| match &row.kind {
             RowKind::Item { item, .. } => {
@@ -67,7 +67,7 @@ fn drawn(rows: &[Row]) -> Vec<String> {
         .collect()
 }
 
-fn fold_line(rows: &[Row]) -> &FoldLine {
+fn fold_line(rows: &[RowRef]) -> &FoldLine {
     rows.iter()
         .find_map(|row| match &row.kind {
             RowKind::FoldLine(line) => Some(line),
@@ -76,14 +76,14 @@ fn fold_line(rows: &[Row]) -> &FoldLine {
         .expect("a fold line")
 }
 
-fn fold_text(rows: &[Row]) -> String {
+fn fold_text(rows: &[RowRef]) -> String {
     match &fold_line(rows).title {
         FoldTitle::Text(text) => text.clone(),
         FoldTitle::Live { .. } => "<live>".into(),
     }
 }
 
-fn footer(rows: &[Row]) -> &TurnFooter {
+fn footer(rows: &[RowRef]) -> &TurnFooter {
     rows.iter()
         .find_map(|row| match &row.kind {
             RowKind::Footer(footer) => Some(footer),
@@ -93,7 +93,7 @@ fn footer(rows: &[Row]) -> &TurnFooter {
 }
 
 /// The index of the row that draws `id`.
-fn position(rows: &[Row], id: &str) -> usize {
+fn position(rows: &[RowRef], id: &str) -> usize {
     rows.iter()
         .position(|row| {
             drawn(std::slice::from_ref(row))
@@ -125,7 +125,7 @@ fn keeps_the_completed_time_beside_actions() {
     let footer = footer(&rows);
     assert!(footer.label_hidden);
     assert_eq!(footer.completed_at, Some(3_000));
-    assert_eq!(footer.copy_text, "Done");
+    assert_eq!(&*footer.copy_text, "Done");
 }
 
 #[test]
@@ -650,6 +650,62 @@ fn reuses_rows_of_unchanged_turns() {
         .unwrap();
     assert!(!before[changed].same_as(&after[changed]));
     assert!(!store.update(&second));
+}
+
+#[test]
+fn a_cached_plan_matches_a_fresh_one_when_turns_are_inserted_or_removed() {
+    let mut store = BlockStore::default();
+    let mut cache = PlanCache::default();
+    let state = PlanState::default();
+    let first = vec![
+        user("u1", "one"),
+        note("a1", "first"),
+        user("u3", "three"),
+        note("a3", "third"),
+    ];
+    store.update(&first);
+    let before = build_plan(store.blocks(), &options(false), &state, Some(&mut cache));
+    let mut second = first.clone();
+    second.splice(2..2, [user("u2", "two"), note("a2", "second")]);
+    for blocks in [second, first] {
+        store.update(&blocks);
+        let cached = build_plan(store.blocks(), &options(false), &state, Some(&mut cache));
+        let fresh = build_plan(store.blocks(), &options(false), &state, None);
+        assert_eq!(cached.len(), fresh.len());
+        for (cached, fresh) in cached.iter().zip(&fresh) {
+            assert!(cached.same_as(fresh), "{} != {}", cached.key, fresh.key);
+        }
+        // The first turn did not move or change: it hands back its rows.
+        assert!(Rc::ptr_eq(&before[0], &cached[0]));
+    }
+}
+
+#[test]
+fn block_store_keeps_shared_blocks_when_blocks_move() {
+    let mut store = BlockStore::default();
+    let first = vec![user("u1", "one"), note("a1", "answer"), note("a2", "more")];
+    assert!(store.update(&first));
+    let before: Vec<_> = store.blocks().to_vec();
+    // A block inserted in the middle shifts the ones after it.
+    let second = vec![
+        user("u1", "one"),
+        note("new", "inserted"),
+        note("a1", "answer"),
+        note("a2", "more"),
+    ];
+    assert!(store.update(&second));
+    let after: Vec<_> = store.blocks().to_vec();
+    assert!(Arc::ptr_eq(&before[0], &after[0]));
+    assert!(Arc::ptr_eq(&before[1], &after[2]));
+    assert!(Arc::ptr_eq(&before[2], &after[3]));
+    // An edited block gets a new one; the rest stay shared.
+    let mut third = second.clone();
+    third[3].text.push('!');
+    assert!(store.update(&third));
+    assert!(Arc::ptr_eq(&after[2], &store.blocks()[2]));
+    assert!(!Arc::ptr_eq(&after[3], &store.blocks()[3]));
+    assert_eq!(store.blocks()[3].text, "more!");
+    assert!(!store.update(&third));
 }
 
 #[test]

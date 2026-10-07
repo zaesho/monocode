@@ -20,7 +20,7 @@ use monocode_view_workbench::panes::{
     pane_tree::PaneTree,
     surface_tabs::{SurfaceTabActions, SurfaceTabs, SurfaceTabsEvent, SurfaceTabsProps},
 };
-use std::{rc::Rc, sync::Arc};
+use std::rc::Rc;
 
 pub struct FilePane {
     pane_id: String,
@@ -28,7 +28,40 @@ pub struct FilePane {
     pane: Option<Entity<NativeFilePane>>,
     tabs: Entity<SurfaceTabs>,
     tree: Option<WeakEntity<PaneTree>>,
+    /// The sessions this pane's plan tabs show, as last handed to the pane.
+    /// Only plan tabs read sessions.
+    plan_sessions: Rc<Vec<monocode_core::Session>>,
+    /// The id and `Sessions::session_revision` of each of `plan_sessions`.
+    plan_revisions: Vec<(String, u64)>,
     _subscriptions: Vec<Subscription>,
+    _settings_watch: Option<(monocode_settings::Subscription, Task<()>)>,
+    /// The settings revision and provider availability version the plan
+    /// tabs' build-target menus were last handed a source at.
+    plan_source_key: Option<(u64, Option<u64>)>,
+    _availability_watch: Option<AvailabilityWatch>,
+}
+
+/// Unsubscribes the plan source's availability listener.
+struct AvailabilityWatch {
+    availability: monocode_harness::HarnessAvailabilityStore,
+    id: u64,
+    _task: Task<()>,
+}
+
+impl Drop for AvailabilityWatch {
+    fn drop(&mut self) {
+        self.availability.unsubscribe_harness_availability(self.id);
+    }
+}
+
+/// The sessions the pane's plan tabs come from.
+fn plan_session_ids(model: &EditorPane) -> Vec<String> {
+    model
+        .files
+        .iter()
+        .filter_map(|file| file.plan.as_ref())
+        .map(|plan| plan.session_id.clone())
+        .collect()
 }
 
 impl FilePane {
@@ -46,7 +79,12 @@ impl FilePane {
             pane: None,
             tabs: tabs.clone(),
             tree: None,
+            plan_sessions: Rc::default(),
+            plan_revisions: Vec::new(),
             _subscriptions: Vec::new(),
+            _settings_watch: None,
+            plan_source_key: None,
+            _availability_watch: None,
         };
         this._subscriptions.push(cx.subscribe_in(
             &tabs,
@@ -127,10 +165,114 @@ impl FilePane {
         let sessions = Engine::sessions(cx);
         this._subscriptions
             .push(cx.observe_in(&sessions, window, |this, _, window, cx| {
-                this.sync(window, cx)
+                // Every session's streamed text notifies, and only plan tabs
+                // read sessions.
+                if this.plan_sessions_changed(cx) {
+                    this.sync(window, cx)
+                }
             }));
+        if let Some(services) = AppServices::try_global(cx) {
+            use monocode_core::settings::{AUTOSAVE_KEY, DIFF_VIEWER_KEY, FORMAT_ON_SAVE_KEY};
+            let (tx, rx) = async_channel::bounded(1);
+            let subscription = services.kv.subscribe(move |change| {
+                if [DIFF_VIEWER_KEY, AUTOSAVE_KEY, FORMAT_ON_SAVE_KEY]
+                    .contains(&change.key.as_str())
+                {
+                    let _ = tx.try_send(());
+                }
+            });
+            let watch = cx.spawn_in(window, async move |this, cx| {
+                while rx.recv().await.is_ok() {
+                    if this
+                        .update_in(cx, |this, window, cx| this.sync(window, cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            this._settings_watch = Some((subscription, watch));
+        }
+        // A plan's build-target menu reads provider availability and the
+        // hidden-providers setting while it draws, and the pane is drawn
+        // cached; hand it the source again when either moves.
+        this._subscriptions
+            .push(crate::revisions::observe(cx, |this, cx| {
+                this.refresh_plan_source(cx)
+            }));
+        if let Some(services) = AppServices::try_global(cx) {
+            let availability = services.availability.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            let id = availability.subscribe_harness_availability(move || {
+                let _ = tx.try_send(());
+            });
+            let task = cx.spawn(async move |this, cx| {
+                while rx.recv().await.is_ok() {
+                    if this
+                        .update(cx, |this, cx| this.refresh_plan_source(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            this._availability_watch = Some(AvailabilityWatch {
+                availability,
+                id,
+                _task: task,
+            });
+        }
         this.sync(window, cx);
         this
+    }
+
+    fn refresh_plan_source(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane.clone() else {
+            return;
+        };
+        let has_plan = self
+            .model(cx)
+            .is_some_and(|model| model.files.iter().any(|file| file.plan.is_some()));
+        if !has_plan {
+            return;
+        }
+        let key = (
+            crate::revisions::revision(cx),
+            AppServices::try_global(cx)
+                .map(|services| services.availability.get_harness_availability_snapshot()),
+        );
+        if self.plan_source_key == Some(key) {
+            return;
+        }
+        self.plan_source_key = Some(key);
+        if let Some(source) = crate::session_threads::model_menu_source(cx) {
+            pane.update(cx, |pane, cx| pane.set_plan_model_source(source, cx));
+        }
+    }
+
+    /// The id and revision of each open session behind one of this pane's
+    /// plan tabs, in `Sessions` order.
+    fn plan_revisions(model: &EditorPane, cx: &App) -> Vec<(String, u64)> {
+        let ids = plan_session_ids(model);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let sessions = Engine::sessions(cx).read(cx);
+        sessions
+            .all()
+            .iter()
+            .filter(|session| ids.contains(&session.id))
+            .map(|session| (session.id.clone(), sessions.session_revision(&session.id)))
+            .collect()
+    }
+
+    /// Whether a session behind one of this pane's plan tabs changed since
+    /// the last sync. Compares revisions, not transcripts.
+    fn plan_sessions_changed(&self, cx: &App) -> bool {
+        let Some(model) = self.model(cx) else {
+            return false;
+        };
+        Self::plan_revisions(&model, cx) != self.plan_revisions
     }
 
     pub fn pane_id(&self) -> &str {
@@ -191,7 +333,18 @@ impl FilePane {
                 format_on_save: monocode_settings::settings_store::load_format_on_save(kv),
             })
             .unwrap_or_default();
-        let sessions = Rc::new(Engine::sessions(cx).read(cx).all().to_vec());
+        let revisions = Self::plan_revisions(&model, cx);
+        if revisions != self.plan_revisions {
+            let sessions = Engine::sessions(cx).read(cx);
+            self.plan_sessions = Rc::new(
+                revisions
+                    .iter()
+                    .filter_map(|(id, _)| sessions.get(id).cloned())
+                    .collect(),
+            );
+            self.plan_revisions = revisions;
+        }
+        let sessions = self.plan_sessions.clone();
         let show_tabs = self.is_dock(cx)
             || workspace.read(cx).active_tab().is_none_or(|tab| {
                 tab.editor_panes.len() + tab.terminal_panes.len() != 1
@@ -303,13 +456,20 @@ impl FilePane {
 
 impl Render for FilePane {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // Cached: the pane tree redraws every leaf when any leaf changes (a
+        // streamed token in a session beside this pane), and the editor or
+        // terminal here redraws on its own changes. Its root is `size_full`.
         div()
             .flex()
             .flex_col()
             .size_full()
             .min_h_0()
             .min_w_0()
-            .children(self.pane.clone())
+            .children(
+                self.pane
+                    .clone()
+                    .map(|pane| pane.cached(gpui::StyleRefinement::default().size_full())),
+            )
     }
 }
 
@@ -450,6 +610,9 @@ fn native_open(path: &str, cx: &App) -> Task<Result<(), String>> {
 
 struct WorkerSurface {
     session_id: String,
+    /// `Sessions::session_revision` of the copy the transcript shows, to
+    /// skip other sessions' changes.
+    revision: u64,
     view: Entity<monocode_view_workbench::panes::agent_tab_view::AgentTabView>,
     transcript: Entity<monocode_view_transcript::transcript::TranscriptView>,
     _subscription: Subscription,
@@ -463,6 +626,7 @@ impl WorkerSurface {
         let subscription = cx.observe(&sessions, |this, _, cx| this.sync(cx));
         let mut this = Self {
             session_id,
+            revision: 0,
             view,
             transcript,
             _subscription: subscription,
@@ -471,8 +635,14 @@ impl WorkerSurface {
         this
     }
     fn sync(&mut self, cx: &mut Context<Self>) {
-        let session = Engine::sessions(cx).read(cx).get(&self.session_id).cloned();
-        if let Some(session) = session {
+        // Every session's change notifies; the revision tells which.
+        let sessions = Engine::sessions(cx).read(cx);
+        let revision = sessions.session_revision(&self.session_id);
+        if revision != 0 && revision == self.revision {
+            return;
+        }
+        self.revision = revision;
+        if let Some(session) = sessions.snapshot(&self.session_id) {
             let model = monocode_view_workbench::panes::agent_tab_view::AgentTabSession {
                 id: session.id.clone(),
                 title: session.title.clone(),
@@ -488,7 +658,7 @@ impl WorkerSurface {
                     },
                     cx,
                 );
-                view.set_session(Arc::new(session), cx);
+                view.set_session(session.clone(), cx);
             });
             let transcript = self.transcript.clone().into();
             self.view.update(cx, |view, cx| {
@@ -517,6 +687,7 @@ mod tests {
     use monocode_ui::{AppearanceSettings, ThemePreference, set_appearance};
     use monocode_view_files::{LocalFiles, file_pane::Surface};
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     #[derive(Debug, PartialEq, Eq)]
     enum PtyCall {

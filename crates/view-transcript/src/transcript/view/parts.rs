@@ -6,12 +6,13 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, ElementId, Hsla, Image, ImageFormat, IntoElement,
-    ParentElement as _, Styled as _, Transformation, div, img, percentage, px,
+    AnyElement, Hsla, Image, ImageFormat, IntoElement, ParentElement as _, Styled as _,
+    Transformation, div, img, percentage, px,
 };
 use monocode_core::HarnessId;
 use monocode_ui::{IconName, ProviderLogo, Theme, icon, provider_logo, u};
 
+use crate::motion::smooth_loop;
 use crate::transcript::model::ActivityPhaseKind;
 
 use super::style::rail_color;
@@ -64,34 +65,24 @@ pub fn chevron(open: bool, color: Hsla) -> gpui::Svg {
 }
 
 /// `CircleDashed` that turns slowly while the call runs (`.zen-tool-spin`).
-pub fn pending_ring(id: impl Into<ElementId>, color: Hsla, spin: bool) -> AnyElement {
+pub fn pending_ring(color: Hsla, spin: bool) -> AnyElement {
     let ring = icon(IconName::CircleDashed).size(u(14.)).text_color(color);
     if !spin {
         return ring.into_any_element();
     }
-    ring.with_animation(
-        id,
-        Animation::new(Duration::from_millis(3600)).repeat(),
-        |ring, delta| ring.with_transformation(Transformation::rotate(percentage(delta))),
-    )
+    smooth_loop(Duration::from_millis(3600), move |delta| {
+        ring.with_transformation(Transformation::rotate(percentage(delta)))
+    })
     .into_any_element()
 }
 
 /// `.zen-thinking-pulse`: opacity breathing between 35% and 90%.
-pub fn pulse<E: IntoElement + gpui::Styled + 'static>(
-    id: impl Into<ElementId>,
-    element: E,
-) -> AnyElement {
-    element
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(1800)).repeat(),
-            |el, delta| {
-                let wave = 1. - (delta * 2. - 1.).abs();
-                el.opacity(0.35 + 0.55 * wave)
-            },
-        )
-        .into_any_element()
+pub fn pulse<E: IntoElement + gpui::Styled + 'static>(element: E) -> AnyElement {
+    smooth_loop(Duration::from_millis(1800), move |delta| {
+        let wave = 1. - (delta * 2. - 1.).abs();
+        element.opacity(0.35 + 0.55 * wave)
+    })
+    .into_any_element()
 }
 
 /// The curve a step branches off a spine on: a quarter circle from the

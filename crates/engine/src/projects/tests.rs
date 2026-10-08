@@ -26,7 +26,9 @@ use super::actions::{
     open_projects,
 };
 use super::backend::{ProjectLocation, Worktree, WorktreeRemoval, Worktrees};
-use super::git_status::{DIFF_STATS_RESUME_TTL_MS, GIT_POLL, WatchKind};
+use super::git_status::{
+    DIFF_STATS_RESUME_TTL_MS, GIT_POLL, GIT_POLL_UNFOCUSED_TICKS, GitStatus, GitWatch, WatchKind,
+};
 use super::hooks::SessionFolderTarget;
 use super::project_chat_background::ProjectChatBackgroundSettings;
 use super::project_groups::ProjectGroup;
@@ -613,6 +615,25 @@ fn the_diff_index_polls_while_watched_and_visible(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_index_poll_slows_down_while_no_window_has_focus(cx: &mut TestAppContext) {
+    let setup = init(cx);
+    setup
+        .backend
+        .set_diff_index("/repo", Ok(index(vec![changed("/repo/a.ts", "a.ts")])));
+    let status = cx.update(|cx| ProjectsGlobal::git_status("/repo", cx));
+    let _watch = status.update(cx, |status, cx| status.watch(WatchKind::Index, cx));
+    cx.run_until_parked();
+    assert_eq!(setup.backend.count("git_diff_index"), 1);
+    // A window exists and none has focus.
+    cx.add_empty_window().deactivate_window();
+    let tick = GIT_POLL.as_millis() as i64;
+    setup.advance(cx, tick * (GIT_POLL_UNFOCUSED_TICKS as i64 - 1));
+    assert_eq!(setup.backend.count("git_diff_index"), 1);
+    setup.advance(cx, tick);
+    assert_eq!(setup.backend.count("git_diff_index"), 2);
+}
+
+#[gpui::test]
 fn an_index_change_announces_a_git_change_to_other_watchers(cx: &mut TestAppContext) {
     let setup = init(cx);
     setup
@@ -633,10 +654,205 @@ fn an_index_change_announces_a_git_change_to_other_watchers(cx: &mut TestAppCont
     );
     status.update(cx, |status, cx| status.reload_index(cx));
     cx.run_until_parked();
-    // The changed index announced a git change; branches reloaded once, and
-    // the index reload it caused found nothing new.
+    // Only files changed, so no ref moved and the branch list stands. The
+    // folder that read the index does not read it again.
+    assert_eq!(setup.backend.count("git_branches"), 1);
+    assert_eq!(setup.backend.count("git_diff_index"), 2);
+
+    // A new commit moves a ref, which reaches every folder.
+    setup.backend.set_diff_index(
+        "/repo",
+        Ok(GitDiffIndex {
+            head: Some("def".into()),
+            ..index(vec![changed("/repo/a.ts", "a.ts")])
+        }),
+    );
+    status.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
     assert_eq!(setup.backend.count("git_branches"), 2);
     assert_eq!(setup.backend.count("git_diff_index"), 3);
+    // A later change from elsewhere still reloads the index.
+    cx.update(super::notify_git_changed);
+    cx.run_until_parked();
+    assert_eq!(setup.backend.count("git_diff_index"), 4);
+}
+
+fn calls_in(setup: &Setup, command: &str, cwd: &str) -> usize {
+    setup
+        .backend
+        .calls(command)
+        .iter()
+        .filter(|args| args["cwd"] == cwd)
+        .count()
+}
+
+#[gpui::test]
+fn edited_files_reload_only_the_folders_and_working_copies_they_can_change(
+    cx: &mut TestAppContext,
+) {
+    let setup = init(cx);
+    let repo_trees = Worktrees {
+        worktrees: vec![Worktree::new("/repo", Some("main"))],
+        ..Worktrees::default()
+    };
+    let other_trees = Worktrees {
+        worktrees: vec![Worktree::new("/other", Some("main"))],
+        ..Worktrees::default()
+    };
+    setup.backend.set_worktrees("/repo", Ok(repo_trees));
+    setup.backend.set_worktrees("/other", Ok(other_trees));
+    setup
+        .backend
+        .set_diff_index("/repo", Ok(index(vec![changed("/repo/a.ts", "a.ts")])));
+    let repo = cx.update(|cx| ProjectsGlobal::git_status("/repo", cx));
+    let sub = cx.update(|cx| ProjectsGlobal::git_status("/repo/sub", cx));
+    let other = cx.update(|cx| ProjectsGlobal::git_status("/other", cx));
+    let mut watches = Vec::new();
+    for kind in [WatchKind::Index, WatchKind::Branches, WatchKind::Worktrees] {
+        watches.push(repo.update(cx, |status, cx| status.watch(kind, cx)));
+    }
+    for kind in [WatchKind::FileStatuses, WatchKind::DiffStats] {
+        watches.push(sub.update(cx, |status, cx| status.watch(kind, cx)));
+    }
+    for kind in [
+        WatchKind::FileStatuses,
+        WatchKind::Branches,
+        WatchKind::Worktrees,
+        WatchKind::DiffStats,
+    ] {
+        watches.push(other.update(cx, |status, cx| status.watch(kind, cx)));
+    }
+    cx.run_until_parked();
+    setup.backend.clear_calls();
+
+    // An edit inside /repo/sub while /repo already had changes.
+    setup.backend.set_diff_index(
+        "/repo",
+        Ok(index(vec![
+            changed("/repo/a.ts", "a.ts"),
+            changed("/repo/sub/b.ts", "sub/b.ts"),
+        ])),
+    );
+    repo.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_diff_index", "/repo"), 1);
+    assert_eq!(calls_in(&setup, "git_diff_index", "/repo/sub"), 1);
+    assert_eq!(calls_in(&setup, "git_diff_stats", "/repo/sub"), 1);
+    // The working copy was dirty before and after, and no ref moved.
+    assert_eq!(setup.backend.count("git_worktrees"), 0);
+    assert_eq!(setup.backend.count("git_branches"), 0);
+    // Another repository is untouched.
+    assert_eq!(calls_in(&setup, "git_diff_index", "/other"), 0);
+    assert_eq!(calls_in(&setup, "git_diff_stats", "/other"), 0);
+
+    // The last change goes away, so the working copy may now be clean.
+    setup.backend.clear_calls();
+    setup.backend.set_diff_index("/repo", Ok(index(Vec::new())));
+    repo.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_worktrees", "/repo"), 1);
+    assert_eq!(calls_in(&setup, "git_worktrees", "/other"), 0);
+    assert_eq!(setup.backend.count("git_branches"), 0);
+}
+
+/// Watch `kinds` on the folder and return its entity and guards.
+fn watch_folder(
+    cx: &mut TestAppContext,
+    cwd: &str,
+    kinds: &[WatchKind],
+) -> (Entity<GitStatus>, Vec<GitWatch>) {
+    let status = cx.update(|cx| ProjectsGlobal::git_status(cwd, cx));
+    let watches = kinds
+        .iter()
+        .map(|kind| status.update(cx, |status, cx| status.watch(*kind, cx)))
+        .collect();
+    (status, watches)
+}
+
+#[gpui::test]
+fn a_moved_ref_reaches_every_folder_even_when_files_changed_too(cx: &mut TestAppContext) {
+    let setup = init(cx);
+    setup
+        .backend
+        .set_diff_index("/repo", Ok(index(vec![changed("/repo/a.ts", "a.ts")])));
+    let (repo, _repo) = watch_folder(cx, "/repo", &[WatchKind::Index, WatchKind::Branches]);
+    let (_other, _watches) = watch_folder(cx, "/other", &[WatchKind::Branches]);
+    cx.run_until_parked();
+    setup.backend.clear_calls();
+    // `git branch foo` plus an edit: HEAD stays, the ref stamps move.
+    setup.backend.set_refs_fingerprint("/repo", Some(1));
+    setup.backend.set_diff_index(
+        "/repo",
+        Ok(index(vec![
+            changed("/repo/a.ts", "a.ts"),
+            changed("/repo/b.ts", "b.ts"),
+        ])),
+    );
+    repo.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_branches", "/repo"), 1);
+    assert_eq!(calls_in(&setup, "git_branches", "/other"), 1);
+    // A folder whose refs cannot be stamped reloads everything too.
+    setup.backend.clear_calls();
+    setup.backend.set_refs_fingerprint("/repo", None);
+    setup
+        .backend
+        .set_diff_index("/repo", Ok(index(vec![changed("/repo/a.ts", "a.ts")])));
+    repo.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_branches", "/repo"), 1);
+}
+
+#[gpui::test]
+fn every_spelling_of_the_changed_folder_reloads(cx: &mut TestAppContext) {
+    let setup = init(cx);
+    setup.backend.set_real_path("/link/repo", "/real/repo");
+    setup.backend.set_diff_index(
+        "/link/repo",
+        Ok(index(vec![changed("/link/repo/a.ts", "a.ts")])),
+    );
+    let (source, _source) = watch_folder(cx, "/link/repo", &[WatchKind::Index]);
+    // The same folder with a trailing slash, and a folder inside it named
+    // through the resolved path.
+    let (_slash, _slash_watch) = watch_folder(cx, "/link/repo/", &[WatchKind::FileStatuses]);
+    let (_real, _real_watch) = watch_folder(cx, "/real/repo/sub", &[WatchKind::DiffStats]);
+    cx.run_until_parked();
+    setup.backend.clear_calls();
+    setup.backend.set_diff_index(
+        "/link/repo",
+        Ok(index(vec![
+            changed("/link/repo/a.ts", "a.ts"),
+            changed("/link/repo/b.ts", "b.ts"),
+        ])),
+    );
+    source.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_diff_index", "/link/repo"), 1);
+    assert_eq!(calls_in(&setup, "git_diff_index", "/link/repo/"), 1);
+    assert_eq!(calls_in(&setup, "git_diff_stats", "/real/repo/sub"), 1);
+}
+
+#[gpui::test]
+fn a_rename_out_of_a_subfolder_reloads_that_subfolder(cx: &mut TestAppContext) {
+    let setup = init(cx);
+    setup
+        .backend
+        .set_diff_index("/repo", Ok(index(vec![changed("/repo/a.ts", "a.ts")])));
+    let (repo, _repo) = watch_folder(cx, "/repo", &[WatchKind::Index]);
+    let (_sub, _sub_watch) = watch_folder(cx, "/repo/sub", &[WatchKind::DiffStats]);
+    cx.run_until_parked();
+    setup.backend.clear_calls();
+    // `git mv sub/old.ts new.ts`: the root index lists only the new path.
+    setup.backend.set_diff_index(
+        "/repo",
+        Ok(index(vec![
+            changed("/repo/a.ts", "a.ts"),
+            changed("/repo/new.ts", "new.ts"),
+        ])),
+    );
+    repo.update(cx, |status, cx| status.reload_index(cx));
+    cx.run_until_parked();
+    assert_eq!(calls_in(&setup, "git_diff_stats", "/repo/sub"), 1);
 }
 
 #[gpui::test]
@@ -872,6 +1088,8 @@ async fn worktree_changes_refuse_busy_queued_and_orchestrated_sessions(cx: &mut 
     setup.insert(cx, busy);
     let mut queued = chat("queued", "/repo");
     queued.queued_messages = Some(vec![QueuedMessage {
+        selection: None,
+        app_request_id: None,
         id: "q".into(),
         text: "later".into(),
         attachments: Vec::new(),

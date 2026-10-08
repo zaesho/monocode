@@ -2,6 +2,9 @@
 //! copy controls, attachment chips, the prompt, the toolbar, and the list
 //! that opens under it.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -243,7 +246,7 @@ impl QuickComposer {
     /// `AttachmentChip`: images show a 36px thumbnail, other files their
     /// icon and name.
     fn render_chip(&self, file: &Attachment, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let preview = attachment_image(file);
+        let preview = attachment_image(file, &self.previews);
         let image = file.kind == AttachmentKind::Image && preview.is_some();
         let mut chip = div()
             .relative()
@@ -721,16 +724,58 @@ impl QuickComposer {
     }
 }
 
+/// Inline attachment previews, decoded once per attachment. Decoding the
+/// base64 payload and hashing the bytes on every render cost milliseconds
+/// per frame for a pasted screenshot.
+#[derive(Default)]
+pub(crate) struct PreviewCache(RefCell<HashMap<String, (usize, Arc<gpui::Image>)>>);
+
+impl PreviewCache {
+    /// The decoded image for `file`'s inline data, keyed by id and payload
+    /// length so a replaced payload decodes again.
+    fn image(&self, file: &Attachment, data: &str) -> Option<Arc<gpui::Image>> {
+        if let Some((len, image)) = self.0.borrow().get(&file.id)
+            && *len == data.len()
+        {
+            return Some(image.clone());
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .ok()?;
+        let format = ImageFormat::from_mime_type(&file.mime_type).unwrap_or(ImageFormat::Png);
+        let image = Arc::new(gpui::Image::from_bytes(format, bytes));
+        self.0
+            .borrow_mut()
+            .insert(file.id.clone(), (data.len(), image.clone()));
+        Some(image)
+    }
+
+    /// Drops previews for attachments the draft no longer has.
+    fn retain(&self, files: &[Attachment]) {
+        let mut cache = self.0.borrow_mut();
+        if !cache.is_empty() {
+            cache.retain(|id, _| files.iter().any(|file| &file.id == id));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get(&self, id: &str) -> Option<Arc<gpui::Image>> {
+        self.0.borrow().get(id).map(|(_, image)| image.clone())
+    }
+}
+
 /// `attachmentPreviewSrc` as an image source: inline bytes, else the file.
-fn attachment_image(file: &Attachment) -> Option<gpui::ImageSource> {
+fn attachment_image(file: &Attachment, previews: &PreviewCache) -> Option<gpui::ImageSource> {
     if let Some(data) = file.data.as_deref().filter(|data| !data.is_empty())
         && file.kind == AttachmentKind::Image
-        && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+        && let Some(image) = previews.image(file, data)
     {
-        let format = ImageFormat::from_mime_type(&file.mime_type).unwrap_or(ImageFormat::Png);
-        return Some(gpui::ImageSource::Image(std::sync::Arc::new(
-            gpui::Image::from_bytes(format, bytes),
-        )));
+        return Some(gpui::ImageSource::Image(image));
     }
     file.path
         .as_deref()
@@ -901,8 +946,8 @@ impl Render for QuickComposer {
                 .child(project_button),
         );
 
+        self.previews.retain(&self.attachments.files);
         if !self.attachments.files.is_empty() {
-            let files = self.attachments.files.clone();
             let mut chips = div()
                 .id("quick-attachments")
                 .flex()
@@ -914,7 +959,8 @@ impl Render for QuickComposer {
                 .px(u(20.))
                 .pt(u(16.))
                 .pb(u(4.));
-            for file in &files {
+            // Borrows the files: a clone copied every base64 payload per frame.
+            for file in &self.attachments.files {
                 chips = chips.child(self.render_chip(file, &theme, cx));
             }
             body = body.child(chips);

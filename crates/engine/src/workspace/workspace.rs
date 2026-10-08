@@ -37,7 +37,9 @@ use monocode_layout::tab_visit_history::{
     prune_tab_visit_history, record_tab_visit, tab_visit_back, tab_visit_forward,
 };
 use monocode_layout::terminal_close::{close_terminals_prompt, running_terminals};
-use monocode_layout::terminal_tab::{RunningTerminal, TerminalMetaPatch, list_running_terminals};
+use monocode_layout::terminal_tab::{
+    RunningTerminal, TerminalMetaPatch, list_running_terminals, new_terminal_cwd,
+};
 use monocode_layout::workspace_tab_groups::{
     PlaceSessionOnPane, WorkspaceTabClosePlan, WorkspaceTabCloseScope, apply_detach_pane_to_tab,
     apply_place_session_on_pane, apply_place_tab_on_pane, filter_tabs_for_project,
@@ -258,15 +260,25 @@ fn sessions_entity(cx: &App) -> Option<Entity<Sessions>> {
     Engine::try_global(cx).map(|engine| engine.sessions.clone())
 }
 
-/// Every open session (`sessionsRef.current`).
-fn all_sessions(cx: &App) -> Vec<Session> {
-    sessions_entity(cx)
-        .map(|sessions| sessions.read(cx).all().to_vec())
-        .unwrap_or_default()
+/// Every open session (`sessionsRef.current`), borrowed. The title bar and
+/// the sidebar read this while they draw, and a copy would clone every
+/// transcript.
+fn all_sessions(cx: &App) -> &[Session] {
+    match Engine::try_global(cx) {
+        Some(engine) => engine.sessions.read(cx).all(),
+        None => &[],
+    }
 }
 
 fn find_session(session_id: &str, cx: &App) -> Option<Session> {
-    sessions_entity(cx).and_then(|sessions| sessions.read(cx).get(session_id).cloned())
+    session_ref(session_id, cx).cloned()
+}
+
+/// `find_session` without the copy, for reading a few fields.
+fn session_ref<'a>(session_id: &str, cx: &'a App) -> Option<&'a Session> {
+    all_sessions(cx)
+        .iter()
+        .find(|session| session.id == session_id)
 }
 
 fn has_session(session_id: &str, cx: &App) -> bool {
@@ -472,19 +484,34 @@ impl Workspace {
 
     /// `active`: the focused chat of the active tab, or its first chat.
     pub fn active_session(&self, cx: &App) -> Option<Session> {
+        self.active_session_ref(cx).cloned()
+    }
+
+    /// `active` without the copy. Views ask for the active chat's id or
+    /// folder while they draw; cloning it copied the whole transcript.
+    pub fn active_session_ref<'a>(&self, cx: &'a App) -> Option<&'a Session> {
         let tab = self.active_tab()?;
-        find_session(&tab.focused_id, cx).or_else(|| {
-            let ids = leaf_ids(&tab.layout);
-            all_sessions(cx)
-                .into_iter()
-                .find(|session| ids.contains(&session.id))
-        })
+        let sessions = all_sessions(cx);
+        sessions
+            .iter()
+            .find(|session| session.id == tab.focused_id)
+            .or_else(|| {
+                let ids = leaf_ids(&tab.layout);
+                sessions.iter().find(|session| ids.contains(&session.id))
+            })
+    }
+
+    /// The active chat's id.
+    pub fn active_session_id(&self, cx: &App) -> Option<String> {
+        self.active_session_ref(cx)
+            .map(|session| session.id.clone())
     }
 
     /// `sessionDefaults`: the active chat, else the first open one.
     pub fn session_defaults(&self, cx: &App) -> Option<Session> {
-        self.active_session(cx)
-            .or_else(|| all_sessions(cx).into_iter().next())
+        self.active_session_ref(cx)
+            .or_else(|| all_sessions(cx).first())
+            .cloned()
     }
 
     /// `sidebarCwd`: the project the sidebar and new files belong to.
@@ -492,8 +519,8 @@ impl Workspace {
         if let Some(file) = self.active_tab().and_then(focused_file_tab) {
             return file.project_cwd.clone().unwrap_or_else(|| file.cwd.clone());
         }
-        self.active_session(cx)
-            .map(|session| session.cwd)
+        self.active_session_ref(cx)
+            .map(|session| session.cwd.clone())
             .unwrap_or_else(|| self.project_cwd.clone())
     }
 
@@ -502,19 +529,30 @@ impl Workspace {
         if let Some(file) = self.active_tab().and_then(focused_file_tab) {
             return file.cwd.clone();
         }
-        match self.active_session(cx) {
+        match self.active_session_ref(cx) {
             Some(session) => self
                 .delegate
                 .remote_working_cwd(&session.cwd, &session.id, cx)
-                .unwrap_or_else(|| session_work_cwd(&session).to_string()),
+                .unwrap_or_else(|| session_work_cwd(session).to_string()),
             None => self.sidebar_cwd(cx),
         }
+    }
+
+    /// `terminalCwd`: where the general New Terminal commands open. Unlike
+    /// `git_cwd`, the active session's worktree wins over the focused pane.
+    pub fn terminal_cwd(&self, cx: &App) -> String {
+        let session = self.active_session_ref(cx);
+        new_terminal_cwd(
+            self.active_tab().and_then(focused_file_tab),
+            session,
+            &self.sidebar_cwd(cx),
+        )
     }
 
     /// `projectOfTab`: the project folder name the title bar shows.
     pub fn project_of_tab(&self, id: &str, cx: &App) -> Option<String> {
         let tab = self.tabs.iter().find(|tab| tab.id == id)?;
-        Some(title_tab_project(tab, &all_sessions(cx)))
+        Some(title_tab_project(tab, all_sessions(cx)))
     }
 
     /// `deckProjectTabs`: the tabs of the current project's workspace, or
@@ -548,7 +586,7 @@ impl Workspace {
             .map(|tab| {
                 to_title_tab(
                     tab,
-                    &sessions,
+                    sessions,
                     &self.dirty_files,
                     unseen_finished_ids,
                     self.delegate.as_ref(),
@@ -605,7 +643,7 @@ impl Workspace {
             .iter()
             .find(|tab| tab.id == id)
             .is_some_and(|tab| {
-                is_blank_workspace_tab(tab, &all_sessions(cx), self.delegate.as_ref(), cx)
+                is_blank_workspace_tab(tab, all_sessions(cx), self.delegate.as_ref(), cx)
             })
     }
 
@@ -838,7 +876,7 @@ impl Workspace {
             }
             tabs.iter()
                 .find(|entry| entry.id == id)
-                .map(|entry| title_tab_project(entry, &sessions))
+                .map(|entry| title_tab_project(entry, sessions))
         };
         insert_tab_beside_active(tabs, tab, Some(&self.active_tab_id), Some(&lookup))
     }
@@ -878,7 +916,7 @@ impl Workspace {
                 self.tabs
                     .iter()
                     .find(|entry| entry.id == id)
-                    .map(|entry| title_tab_project(entry, &sessions))
+                    .map(|entry| title_tab_project(entry, sessions))
             }
         };
         self.tabs = insert_tab_beside_active(&self.tabs, tab, Some(anchor), Some(&lookup));
@@ -913,6 +951,13 @@ impl Workspace {
         Files::set_hidden(all_hidden, cx);
         if let Some(terminals) = Terminals::try_global(cx) {
             terminals.set_hidden(all_hidden, cx);
+        }
+        // The changes panel's git poll stops while every window is hidden,
+        // and reloads what is watched when one shows again.
+        #[cfg(feature = "projects")]
+        if let Some(projects) = crate::projects::ProjectsGlobal::try_global(cx) {
+            let git = projects.git.clone();
+            git.update(cx, |git, cx| git.set_hidden(all_hidden, cx));
         }
     }
 
@@ -1016,8 +1061,8 @@ impl Workspace {
     pub fn new_session_tab(&mut self, cx: &mut Context<Self>) -> String {
         let defaults = self.session_defaults(cx);
         let cwd = self
-            .active_session(cx)
-            .map(|session| session.cwd)
+            .active_session_ref(cx)
+            .map(|session| session.cwd.clone())
             .or_else(|| defaults.as_ref().map(|session| session.cwd.clone()))
             .unwrap_or_else(|| self.project_cwd.clone());
         let mut session = self
@@ -1481,7 +1526,7 @@ impl Workspace {
                     };
                     return Some(self.close_tab(&tab.id, &confirmed, cx));
                 }
-                let seed = all_sessions(cx).into_iter().next();
+                let seed = all_sessions(cx).first().cloned();
                 let cwd = if file.cwd.is_empty() {
                     self.project_cwd.clone()
                 } else {
@@ -1624,7 +1669,7 @@ impl Workspace {
         let Some(tab) = self.tabs.iter().find(|entry| entry.id == id).cloned() else {
             return Task::ready(());
         };
-        if is_blank_workspace_tab(&tab, &all_sessions(cx), self.delegate.as_ref(), cx) {
+        if is_blank_workspace_tab(&tab, all_sessions(cx), self.delegate.as_ref(), cx) {
             return Task::ready(());
         }
         let closing_files = pane_files(&tab);
@@ -1735,7 +1780,7 @@ impl Workspace {
         let factory = self.factory.clone();
         let project_cwd = self.project_cwd.clone();
         let seed_session = move |cwd: &str, cx: &App| {
-            let seed = all_sessions(cx).into_iter().next();
+            let seed = all_sessions(cx).first().cloned();
             session_seeded_from(factory.as_ref(), seed.as_ref(), cwd)
         };
 
@@ -2262,7 +2307,7 @@ impl Workspace {
                 let lookup = |id: &str| {
                     tabs.iter()
                         .find(|tab| tab.id == id)
-                        .map(|tab| title_tab_project(tab, &sessions))
+                        .map(|tab| title_tab_project(tab, sessions))
                 };
                 apply_grouped_reorder(&visible, ids, moved, Some(&lookup))
                     .and_then(|reordered| merge_ordered_subset(&self.tabs, &reordered))
@@ -2327,7 +2372,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workdir = if cwd.is_empty() {
-            self.git_cwd(cx)
+            self.terminal_cwd(cx)
         } else {
             cwd.to_string()
         };
@@ -2373,27 +2418,23 @@ impl Workspace {
 
     /// `onNewTerminal`.
     pub fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, false, None, cx);
     }
 
     /// `onNewTerminalTab`.
     pub fn new_terminal_tab(&mut self, cx: &mut Context<Self>) {
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, true, None, cx);
     }
 
     /// `onNewTerminalInSession`: a terminal in a chat's working copy.
     pub fn new_terminal_in_session(&mut self, session_id: &str, cx: &mut Context<Self>) {
-        let session = find_session(session_id, cx);
-        if session
-            .as_ref()
-            .is_some_and(|session| session.worktree_removed == Some(true))
-        {
+        let session = session_ref(session_id, cx);
+        if session.is_some_and(|session| session.worktree_removed == Some(true)) {
             return;
         }
         let cwd = session
-            .as_ref()
             .map(|session| session_work_cwd(session).to_string())
             .unwrap_or_else(|| self.project_cwd.clone());
         self.open_terminal(&cwd, false, Some(session_id), cx);
@@ -2409,16 +2450,16 @@ impl Workspace {
             self.focus_project_terminal(cx);
             return;
         }
-        let cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.open_terminal(&cwd, false, None, cx);
     }
 
     /// `onToggleProjectTerminal`.
     pub fn toggle_project_terminal(&mut self, cx: &mut Context<Self>) {
         let project = self.project_cwd.clone();
-        let git_cwd = self.git_cwd(cx);
+        let cwd = self.terminal_cwd(cx);
         self.terminals
-            .update(cx, |terminals, cx| terminals.toggle(&project, &git_cwd, cx));
+            .update(cx, |terminals, cx| terminals.toggle(&project, &cwd, cx));
         if self.terminals.read(cx).is_focused() {
             self.set_composer_focused(false, cx);
         }
@@ -2635,7 +2676,7 @@ impl Workspace {
             .map(|session| session.cwd.clone())
             .unwrap_or_else(|| self.git_cwd(cx));
         let diff_project_cwd = match &session {
-            Some(session) => find_session(&session.session_id, cx).map(|entry| entry.cwd),
+            Some(session) => session_ref(&session.session_id, cx).map(|entry| entry.cwd.clone()),
             None => Some(self.sidebar_cwd(cx)),
         };
         let resolving = match (path, Self::file_index(cx)) {
@@ -2852,7 +2893,7 @@ impl Workspace {
             .tabs
             .iter()
             .find(|entry| entry.id == tab_id)
-            .and_then(|entry| find_session(&entry.focused_id, cx))
+            .and_then(|entry| session_ref(&entry.focused_id, cx))
             .is_some_and(|session| session.blocks.is_empty());
         self.map_tab(&tab_id, cx, |entry| {
             open_editor_tab(
@@ -3057,7 +3098,7 @@ impl Workspace {
         let defaults = self.session_defaults(cx);
         let result = apply_add_to_chat_request(
             AddToChatRequest {
-                sessions: &sessions,
+                sessions,
                 tabs: &self.tabs,
                 active_tab_id: Some(&self.active_tab_id),
                 project_cwd: &self.project_cwd,
@@ -3100,7 +3141,7 @@ impl Workspace {
         remove_session_from_workspace(
             RemoveSession {
                 tabs: &self.tabs,
-                sessions: &sessions,
+                sessions,
                 session_id,
                 active_tab_id: &self.active_tab_id,
                 scope: TAB_CLOSE_SCOPE,
@@ -3123,8 +3164,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let known: HashSet<String> = all_sessions(cx)
-            .into_iter()
-            .map(|session| session.id)
+            .iter()
+            .map(|session| session.id.clone())
             .collect();
         let created: Vec<Session> = removal
             .sessions
@@ -3183,12 +3224,12 @@ impl Workspace {
             self.terminals.read(cx).docks(),
             &moving,
             &remaining,
-            &sessions,
+            sessions,
         )
         .0;
         collect_window_transfer(
             &self.tabs,
-            &sessions,
+            sessions,
             tab_ids,
             &self.active_tab_id,
             &self.dirty_files,
@@ -3236,7 +3277,7 @@ impl Workspace {
     pub fn worktree_tab_stats(&self, cx: &App) -> HashMap<String, WorktreeTabStats> {
         worktree_tab_stats(
             &self.tabs,
-            &all_sessions(cx),
+            all_sessions(cx),
             &self.sidebar_cwd(cx),
             &self.pins,
         )
@@ -3331,7 +3372,7 @@ impl Workspace {
     /// pending. Its composer is disabled until the switch ends.
     pub fn switching_session_id(&self, cx: &App) -> Option<String> {
         self.navigation.request.as_ref()?;
-        self.active_session(cx).map(|session| session.id)
+        self.active_session_id(cx)
     }
 
     /// `workspaceSwitchPending` for the switcher of `project`.
@@ -3458,7 +3499,7 @@ impl Workspace {
                 &self.project_cwd,
                 &self.tabs,
                 &self.active_tab_id,
-                &sessions,
+                sessions,
                 &self.pins,
                 &self.navigation.memory,
             );

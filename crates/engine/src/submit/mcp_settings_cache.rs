@@ -32,21 +32,43 @@ pub struct McpSettingsSnapshot {
     pub claude_error: String,
 }
 
-/// The two backend calls: `mcp_discover` and `claude_mcp_list`.
+/// The two backend calls: `mcp_discover` and `claude_mcp_list`, for a
+/// project and the Claude account whose profile to read (`None` for the
+/// default account).
 pub trait McpSources: Send + Sync {
-    fn mcp_discover(&self, cwd: String) -> BoxFuture<'static, Result<Vec<McpConnection>, String>>;
-    fn claude_mcp_list(&self, cwd: String) -> BoxFuture<'static, Result<String, String>>;
+    fn mcp_discover(
+        &self,
+        cwd: String,
+        account: Option<String>,
+    ) -> BoxFuture<'static, Result<Vec<McpConnection>, String>>;
+    fn claude_mcp_list(
+        &self,
+        cwd: String,
+        account: Option<String>,
+    ) -> BoxFuture<'static, Result<String, String>>;
 }
 
 /// The real sources over the process crate, on smol's blocking pool.
 pub struct ProcessMcpSources {
     pub host: monocode_process::harness::HarnessHost,
+    /// Where named provider profiles live.
+    pub data_dir: std::path::PathBuf,
 }
 
 impl McpSources for ProcessMcpSources {
-    fn mcp_discover(&self, cwd: String) -> BoxFuture<'static, Result<Vec<McpConnection>, String>> {
+    fn mcp_discover(
+        &self,
+        cwd: String,
+        account: Option<String>,
+    ) -> BoxFuture<'static, Result<Vec<McpConnection>, String>> {
+        let data_dir = self.data_dir.clone();
         smol::unblock(move || {
-            let found = monocode_process::mcp::mcp_discover(cwd)?;
+            let claude_dir = monocode_process::harness::provider_account_dir(
+                &data_dir,
+                "claude",
+                account.as_deref(),
+            )?;
+            let found = monocode_process::mcp::mcp_discover(cwd, claude_dir)?;
             serde_json::to_value(found)
                 .and_then(serde_json::from_value)
                 .map_err(|error| error.to_string())
@@ -54,9 +76,35 @@ impl McpSources for ProcessMcpSources {
         .boxed()
     }
 
-    fn claude_mcp_list(&self, cwd: String) -> BoxFuture<'static, Result<String, String>> {
-        let host = self.host.clone();
-        smol::unblock(move || monocode_process::harness::claude_mcp_list(&host, cwd)).boxed()
+    fn claude_mcp_list(
+        &self,
+        cwd: String,
+        account: Option<String>,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        let (host, data_dir) = (self.host.clone(), self.data_dir.clone());
+        smol::unblock(move || {
+            monocode_process::harness::claude_mcp_list(&host, &data_dir, cwd, account.as_deref())
+        })
+        .boxed()
+    }
+}
+
+const ACCOUNT_SEPARATOR: &str = "\0account:";
+
+/// The cache key for a project under a Claude account. The default account
+/// keys by the project alone.
+pub fn mcp_scope_key(cwd: &str, account: Option<&str>) -> String {
+    match account.filter(|account| !account.is_empty() && *account != "default") {
+        Some(account) => format!("{cwd}{ACCOUNT_SEPARATOR}{account}"),
+        None => cwd.to_string(),
+    }
+}
+
+/// The project and account a key names.
+fn split_scope_key(key: &str) -> (String, Option<String>) {
+    match key.split_once(ACCOUNT_SEPARATOR) {
+        Some((cwd, account)) => (cwd.to_string(), Some(account.to_string())),
+        None => (key.to_string(), None),
     }
 }
 
@@ -212,8 +260,9 @@ impl McpSettingsCache {
         .boxed()
     }
 
-    async fn fetch_mcp_settings(&self, cwd: &str) -> McpSettingsSnapshot {
-        match self.inner.sources.mcp_discover(cwd.to_string()).await {
+    async fn fetch_mcp_settings(&self, key: &str) -> McpSettingsSnapshot {
+        let (cwd, account) = split_scope_key(key);
+        match self.inner.sources.mcp_discover(cwd, account).await {
             Ok(configured) => McpSettingsSnapshot {
                 servers: configured
                     .into_iter()
@@ -246,7 +295,8 @@ impl McpSettingsCache {
         }
         let cache = self.clone();
         let key = cwd.to_string();
-        let request = self.inner.sources.claude_mcp_list(cwd.to_string());
+        let (project, account) = split_scope_key(cwd);
+        let request = self.inner.sources.claude_mcp_list(project, account);
         self.inner.spawner.spawn(
             async move {
                 let output = request.await;
@@ -355,18 +405,25 @@ mod tests {
         health: Mutex<VecDeque<oneshot::Receiver<Result<String, String>>>>,
         health_now: Mutex<Option<Result<String, String>>>,
         calls: AtomicUsize,
+        places: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl McpSources for FakeSources {
         fn mcp_discover(
             &self,
-            _cwd: String,
+            cwd: String,
+            account: Option<String>,
         ) -> BoxFuture<'static, Result<Vec<McpConnection>, String>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.places.lock().push((cwd, account));
             futures::future::ready(Ok(self.configured.lock().clone())).boxed()
         }
 
-        fn claude_mcp_list(&self, _cwd: String) -> BoxFuture<'static, Result<String, String>> {
+        fn claude_mcp_list(
+            &self,
+            _cwd: String,
+            _account: Option<String>,
+        ) -> BoxFuture<'static, Result<String, String>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(now) = self.health_now.lock().clone() {
                 return futures::future::ready(now).boxed();
@@ -398,6 +455,7 @@ mod tests {
             health: Mutex::default(),
             health_now: Mutex::new(health_now),
             calls: AtomicUsize::new(0),
+            places: Mutex::default(),
         });
         let cache = McpSettingsCache::new(sources.clone(), Arc::new(SmolSpawner));
         (sources, cache)
@@ -516,5 +574,24 @@ mod tests {
         let snapshot = cache.get_cached_mcp_settings("/repo").unwrap();
         assert_eq!(snapshot.servers[0].status, "Disabled");
         assert_eq!(snapshot.error, "");
+    }
+
+    #[test]
+    fn keeps_each_claude_accounts_servers_apart() {
+        let (sources, cache) = setup(None, None);
+        let work = mcp_scope_key("/repo", Some("account-work"));
+        assert_eq!(mcp_scope_key("/repo", Some("default")), "/repo");
+        smol::block_on(async {
+            cache.load_mcp_settings("/repo", false, false).await;
+            cache.load_mcp_settings(&work, false, false).await;
+        });
+        assert_eq!(
+            *sources.places.lock(),
+            vec![
+                ("/repo".to_string(), None),
+                ("/repo".to_string(), Some("account-work".to_string())),
+            ]
+        );
+        assert!(cache.get_cached_mcp_settings(&work).is_some());
     }
 }

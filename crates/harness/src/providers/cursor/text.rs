@@ -13,7 +13,7 @@ use monocode_core::block::ModelSettings;
 use monocode_core::harness::HarnessId;
 use monocode_core::harness_event::HarnessEvent;
 use monocode_core::js;
-use monocode_core::reducer::join_stream_text;
+use monocode_core::reducer::join_stream_text_into;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use smol::lock::Mutex as AsyncMutex;
@@ -226,8 +226,7 @@ impl TextRunner {
                             return;
                         }
                         let previous_len = state.output.len();
-                        let next = join_stream_text(&state.output, &text_from_update(&params));
-                        state.output = next;
+                        join_stream_text_into(&mut state.output, &text_from_update(&params));
                         // `joinStreamText` keeps the old text as a prefix.
                         let delta = state.output.get(previous_len..).unwrap_or("").to_string();
                         (delta, state.on_event.clone())
@@ -235,7 +234,10 @@ impl TextRunner {
                     if !delta.is_empty()
                         && let Some(sink) = sink
                     {
-                        sink(HarnessEvent::MessageDelta { text: delta });
+                        sink(HarnessEvent::MessageDelta {
+                            text: delta,
+                            append: None,
+                        });
                     }
                 }
             })

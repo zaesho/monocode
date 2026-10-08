@@ -610,3 +610,24 @@ fn the_custom_accent_picker_saves_a_typed_hex(cx: &mut TestAppContext) {
         Some("#123456")
     );
 }
+
+#[gpui::test]
+fn equal_props_do_not_notify_the_page(cx: &mut TestAppContext) {
+    let setup = Setup::new(LINUX);
+    let (page, cx) = mount(cx, SettingsSectionId::General, &setup);
+    draw(cx);
+    let notified = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    let _observe = cx.update(|_, cx| cx.observe(&page, move |_, _| count.set(count.get() + 1)));
+
+    // The owner resends the same props after unrelated workspace changes.
+    page.update(cx, |page, cx| page.set_props(setup.props.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(notified.get(), 0);
+
+    let mut props = setup.props.clone();
+    props.cwd = "/another".into();
+    page.update(cx, |page, cx| page.set_props(props, cx));
+    cx.run_until_parked();
+    assert!(notified.get() > 0);
+}

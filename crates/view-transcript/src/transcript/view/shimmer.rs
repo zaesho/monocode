@@ -7,10 +7,12 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, ElementId, HighlightStyle, Hsla, IntoElement, ParentElement as _,
-    SharedString, Styled as _, StyledText, div,
+    HighlightStyle, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, StyledText,
+    div,
 };
 use monocode_ui::Theme;
+
+use crate::motion::smooth_loop;
 
 /// Band half-width as a share of the text width. CSS uses 2px per character
 /// on each side; at about 7.5px per character that is a quarter.
@@ -60,9 +62,9 @@ fn highlights(
     runs
 }
 
-/// `<Shimmer duration={…}>`: `text` swept once every `duration`.
+/// `<Shimmer duration={…}>`: `text` swept once every `duration`, drawn as a
+/// [`smooth_loop`] so the sweep does not redraw the window every refresh.
 pub fn shimmer(
-    id: impl Into<ElementId>,
     text: impl Into<SharedString>,
     duration: Duration,
     theme: &Theme,
@@ -73,16 +75,10 @@ pub fn shimmer(
         .min_w_0()
         .truncate()
         .text_color(theme.content(0.4))
-        .with_animation(
-            id,
-            Animation::new(duration).repeat(),
-            move |el, progress| {
-                el.child(
-                    StyledText::new(text.clone())
-                        .with_highlights(highlights(&text, content, progress)),
-                )
-            },
-        )
+        .child(smooth_loop(duration, move |progress| {
+            let highlights = highlights(&text, content, progress);
+            StyledText::new(text).with_highlights(highlights)
+        }))
 }
 
 #[cfg(test)]

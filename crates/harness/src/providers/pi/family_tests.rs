@@ -1055,9 +1055,12 @@ mod omp_command_lifecycle {
             assert_eq!(
                 interjections,
                 [&HarnessEvent::Interjection {
+                    id: None,
                     text: "Minor note\n\nStop here".into(),
                     custom_type: "advisor".into(),
                     severity: Some(monocode_core::block::InterjectionSeverity::Blocker),
+                    model: None,
+                    status: None,
                 }]
             );
             assert!(
@@ -1111,9 +1114,12 @@ mod omp_command_lifecycle {
             setup.frame("omp-test", json!({ "type": "agent_end" }));
             running.turn.await.unwrap();
             assert!(setup.events().contains(&HarnessEvent::Interjection {
+                id: None,
                 text: "Extension changed the plan.\nReview it.".into(),
                 custom_type: "extension-notice".into(),
                 severity: None,
+                model: None,
+                status: None,
             }));
         });
     }

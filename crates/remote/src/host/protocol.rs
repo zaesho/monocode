@@ -14,6 +14,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 pub const HOST_PROTOCOL_VERSION: i64 = 1;
+/// The host takes `switchProvider` commands.
+pub const SESSION_PROVIDER_SWITCH_CAPABILITY: &str = "sessionProviderSwitchV1";
+/// The host takes `confirmProviderInspection` commands.
+pub const SESSION_PROVIDER_INSPECTION_CAPABILITY: &str = "sessionProviderInspectionV1";
 /// The native executable a machine runs to host sessions for this desktop.
 pub const HOST_PACKAGE: &str = "monocode-host";
 
@@ -127,6 +131,28 @@ pub struct HostDescriptor {
     /// Network addresses the host listens on, such as `https://10.0.0.5:3774`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoints: Option<Vec<String>>,
+}
+
+/// `hostSupportsProviderSwitch`: a started session may change providers.
+/// Older hosts keep the model-only `configure` command.
+pub fn host_supports_provider_switch(host: Option<&HostDescriptor>) -> bool {
+    host.is_some_and(|host| {
+        host.capabilities
+            .iter()
+            .any(|entry| entry == SESSION_PROVIDER_SWITCH_CAPABILITY)
+    })
+}
+
+/// `hostSupportsProviderInspection`: the host can record that the user
+/// inspected an interrupted provider request.
+pub fn host_supports_provider_inspection(host: Option<&HostDescriptor>) -> bool {
+    host.is_some_and(|host| {
+        host.protocol_version == HOST_PROTOCOL_VERSION
+            && host
+                .capabilities
+                .iter()
+                .any(|entry| entry == SESSION_PROVIDER_INSPECTION_CAPABILITY)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,10 +393,12 @@ pub fn apply_session_sync(
     known: Option<&HostSession>,
     sync: SessionSync,
 ) -> Result<HostSession, String> {
-    let base = match &sync {
-        SessionSync::Snapshot { value } => return Ok((**value).clone()),
-        SessionSync::Unchanged { revision } => *revision,
-        SessionSync::Delta { base, .. } => *base,
+    let base = match sync {
+        // The sync is owned, so the snapshot moves out instead of copying a
+        // whole transcript.
+        SessionSync::Snapshot { value } => return Ok(*value),
+        SessionSync::Unchanged { revision } => revision,
+        SessionSync::Delta { base, .. } => base,
     };
     let Some(known) = known.filter(|known| known.revision == base) else {
         return Err("Session sync base does not match".into());
@@ -435,6 +463,22 @@ pub fn apply_session_sync(
     })
 }
 
+/// [`apply_session_sync`] for callers that hold the known session in an
+/// `Arc`. An unchanged sync returns `known` itself instead of a deep copy,
+/// so the caller can tell an unchanged poll by pointer and skip the copy.
+pub fn apply_shared_session_sync(
+    known: Option<&std::sync::Arc<HostSession>>,
+    sync: SessionSync,
+) -> Result<std::sync::Arc<HostSession>, String> {
+    if let SessionSync::Unchanged { revision } = sync {
+        return match known {
+            Some(known) if known.revision == revision => Ok(known.clone()),
+            _ => Err("Session sync base does not match".into()),
+        };
+    }
+    apply_session_sync(known.map(|known| &**known), sync).map(std::sync::Arc::new)
+}
+
 /// `HostCommand`: what `commands.dispatch` carries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -460,6 +504,26 @@ pub enum HostCommand {
         model: String,
         model_settings: BTreeMap<String, String>,
         runtime_mode: RuntimeMode,
+    },
+    /// Continue the session with another provider, or another model of the
+    /// same one. The host rejects it if the session changed since
+    /// `expected_revision`.
+    #[serde(rename = "switchProvider", rename_all = "camelCase")]
+    SwitchProvider {
+        command_id: String,
+        session_id: String,
+        expected_revision: i64,
+        harness: RemoteProvider,
+        model: String,
+        model_settings: BTreeMap<String, String>,
+        runtime_mode: RuntimeMode,
+    },
+    /// The user inspected a provider request that may already have run.
+    #[serde(rename = "confirmProviderInspection", rename_all = "camelCase")]
+    ConfirmProviderInspection {
+        command_id: String,
+        session_id: String,
+        expected_revision: i64,
     },
     #[serde(rename = "compact", rename_all = "camelCase")]
     Compact {
@@ -728,6 +792,28 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_form_returns_the_same_arc_when_nothing_changed() {
+        let known = std::sync::Arc::new(known());
+        let same = apply_shared_session_sync(Some(&known), SessionSync::Unchanged { revision: 4 })
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&same, &known));
+        assert!(
+            apply_shared_session_sync(Some(&known), SessionSync::Unchanged { revision: 3 })
+                .is_err()
+        );
+        assert!(apply_shared_session_sync(None, SessionSync::Unchanged { revision: 4 }).is_err());
+        let snapshot = apply_shared_session_sync(
+            Some(&known),
+            SessionSync::Snapshot {
+                value: Box::new((*known).clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(*snapshot, *known);
+        assert!(!std::sync::Arc::ptr_eq(&snapshot, &known));
+    }
+
+    #[test]
     fn rejects_deltas_that_do_not_apply_so_the_caller_loads_a_snapshot() {
         let known = known();
         assert!(apply_session_sync(Some(&known), SessionSync::Unchanged { revision: 3 }).is_err());
@@ -813,5 +899,69 @@ mod tests {
         ] {
             assert!(require_host_descriptor(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// protocol.test.ts: "enables provider switching only when the host
+    /// advertises it".
+    #[test]
+    fn enables_provider_switching_only_when_the_host_advertises_it() {
+        let host = require_host_descriptor(&json!({
+            "protocolVersion": 1,
+            "environmentId": "host",
+            "name": "Host",
+            "providers": ["codex", "claude"],
+            "capabilities": [],
+        }))
+        .unwrap();
+        let with = |capability: &str| HostDescriptor {
+            capabilities: vec![capability.to_string()],
+            ..host.clone()
+        };
+        assert!(!host_supports_provider_switch(None));
+        assert!(!host_supports_provider_switch(Some(&host)));
+        assert!(!host_supports_provider_inspection(Some(&host)));
+        assert!(host_supports_provider_switch(Some(&with(
+            SESSION_PROVIDER_SWITCH_CAPABILITY
+        ))));
+        assert!(!host_supports_provider_inspection(Some(&with(
+            SESSION_PROVIDER_SWITCH_CAPABILITY
+        ))));
+        assert!(host_supports_provider_inspection(Some(&with(
+            SESSION_PROVIDER_INSPECTION_CAPABILITY
+        ))));
+        assert!(!host_supports_provider_inspection(Some(&HostDescriptor {
+            protocol_version: 2,
+            ..with(SESSION_PROVIDER_INSPECTION_CAPABILITY)
+        })));
+    }
+
+    #[test]
+    fn serializes_the_provider_switch_commands_with_their_expected_revision() {
+        let command = HostCommand::SwitchProvider {
+            command_id: "c".into(),
+            session_id: "s".into(),
+            expected_revision: 4,
+            harness: HarnessId::Claude,
+            model: "claude:test".into(),
+            model_settings: BTreeMap::new(),
+            runtime_mode: RuntimeMode::Supervised,
+        };
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            json!({
+                "type": "switchProvider", "commandId": "c", "sessionId": "s",
+                "expectedRevision": 4, "harness": "claude", "model": "claude:test",
+                "modelSettings": {}, "runtimeMode": "supervised",
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(HostCommand::ConfirmProviderInspection {
+                command_id: "c".into(),
+                session_id: "s".into(),
+                expected_revision: 9,
+            })
+            .unwrap(),
+            json!({ "type": "confirmProviderInspection", "commandId": "c", "sessionId": "s", "expectedRevision": 9 })
+        );
     }
 }

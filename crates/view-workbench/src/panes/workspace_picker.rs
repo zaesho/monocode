@@ -98,12 +98,19 @@ pub fn branch_ref(branch: &BaseBranch) -> String {
 /// earlier one in place, as a `Map` did), filtered by `query`.
 pub fn base_branch_rows(branches: &[BaseBranch], query: &str) -> Vec<BaseBranch> {
     let needle = query.trim().to_lowercase();
-    let mut unique: Vec<(String, BaseBranch)> = Vec::new();
+    // The popover renders this every frame, so look keys up in a map rather
+    // than scanning the list for each branch.
+    let mut unique: Vec<(String, BaseBranch)> = Vec::with_capacity(branches.len());
+    let mut index_of: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(branches.len());
     for branch in branches {
         let key = branch_ref(branch);
-        match unique.iter_mut().find(|(existing, _)| *existing == key) {
-            Some(entry) => entry.1 = branch.clone(),
-            None => unique.push((key, branch.clone())),
+        match index_of.get(&key) {
+            Some(&index) => unique[index].1 = branch.clone(),
+            None => {
+                index_of.insert(key.clone(), unique.len());
+                unique.push((key, branch.clone()));
+            }
         }
     }
     unique

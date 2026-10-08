@@ -395,6 +395,46 @@ fn shows_and_drops_an_outside_drag_on_a_pane_edge(cx: &mut TestAppContext) {
     assert!(h.events().is_empty());
 }
 
+#[gpui::test]
+fn the_same_layout_and_leaves_again_do_not_redraw(cx: &mut TestAppContext) {
+    let layout = split(SplitDir::Right, &["a", "b"]);
+    let h = mount(layout.clone(), PaneLeafKind::Surface, cx);
+    let notified = Rc::new(RefCell::new(0));
+    let count = notified.clone();
+    h.cx.update(|_, cx| {
+        cx.observe(&h.tree, move |_, _| *count.borrow_mut() += 1)
+            .detach();
+    });
+    let leaves = h.tree.read_with(h.cx, |tree, _| {
+        ["a", "b"]
+            .iter()
+            .map(|id| tree.leaves[*id].clone())
+            .collect::<Vec<_>>()
+    });
+
+    h.tree.update(h.cx, |tree, cx| {
+        tree.set_layout(layout.clone(), "a", cx);
+        tree.set_leaves(leaves.clone(), cx);
+        tree.set_visible(true, cx);
+    });
+    h.cx.run_until_parked();
+    assert_eq!(*notified.borrow(), 0);
+
+    h.tree
+        .update(h.cx, |tree, cx| tree.set_layout(layout.clone(), "b", cx));
+    h.cx.run_until_parked();
+    assert_eq!(*notified.borrow(), 1);
+    h.tree.update(h.cx, |tree, cx| {
+        let mut renamed = leaves.clone();
+        renamed[0].kind = PaneLeafKind::Session {
+            title: "Chat".into(),
+        };
+        tree.set_leaves(renamed, cx);
+    });
+    h.cx.run_until_parked();
+    assert_eq!(*notified.borrow(), 2);
+}
+
 /// Port of PaneTreeEnter.test.ts.
 mod pane_enter {
     use super::*;

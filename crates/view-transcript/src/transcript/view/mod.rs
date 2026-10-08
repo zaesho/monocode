@@ -55,7 +55,7 @@ use crate::threads::{
     OrchestrationRuns, OrchestratorConstellation, SecondOpinionButton,
 };
 use crate::transcript::model::plan::{
-    BlockStore, FoldTitle, PlanCache, PlanOptions, PlanState, Row, RowKind, build_plan,
+    BlockStore, FoldTitle, PlanCache, PlanOptions, PlanState, Row, RowKind, RowRef, build_plan,
     visible_blocks,
 };
 use crate::transcript::model::turn::ElapsedClock;
@@ -82,7 +82,7 @@ pub struct ChangedFile {
 
 /// What the host offers and how the transcript is shown: the
 /// `AgentTranscript` props that are not the session itself.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TranscriptConfig {
     pub layout: TranscriptLayout,
     /// `monocode.transcriptAnchor`: a sent prompt sits at the top.
@@ -109,6 +109,50 @@ pub struct TranscriptConfig {
     /// The host takes selected text into the composer
     /// ([`TranscriptCardEvent::AddToChat`]).
     pub can_add_to_chat: bool,
+}
+
+impl PartialEq for TranscriptConfig {
+    /// Field by field, except that a shared catalog compares by pointer
+    /// first. Hosts pass the same `Arc` on every sync, and comparing the
+    /// whole catalog each time walks every provider's model list.
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            layout,
+            anchor_prompts,
+            managed,
+            visible,
+            parked,
+            catalog,
+            approvals,
+            can_edit_last_turn,
+            editing_last_turn,
+            can_save_notes,
+            can_second_opinion,
+            can_handoff,
+            can_open_plans,
+            can_build_plans,
+            can_build_plan_targets,
+            can_send_drafts,
+            can_add_to_chat,
+        } = self;
+        *layout == other.layout
+            && *anchor_prompts == other.anchor_prompts
+            && *managed == other.managed
+            && *visible == other.visible
+            && *parked == other.parked
+            && *approvals == other.approvals
+            && *can_edit_last_turn == other.can_edit_last_turn
+            && *editing_last_turn == other.editing_last_turn
+            && *can_save_notes == other.can_save_notes
+            && *can_second_opinion == other.can_second_opinion
+            && *can_handoff == other.can_handoff
+            && *can_open_plans == other.can_open_plans
+            && *can_build_plans == other.can_build_plans
+            && *can_build_plan_targets == other.can_build_plan_targets
+            && *can_send_drafts == other.can_send_drafts
+            && *can_add_to_chat == other.can_add_to_chat
+            && (Arc::ptr_eq(catalog, &other.catalog) || catalog == &other.catalog)
+    }
 }
 
 impl Default for TranscriptConfig {
@@ -227,18 +271,25 @@ pub struct TranscriptView {
     store: BlockStore,
     pub(crate) blocks: Vec<BlockRef>,
     plan_cache: PlanCache,
-    pub(crate) rows: Vec<Row>,
+    pub(crate) rows: Vec<RowRef>,
     list: ListState,
     pub(crate) state: PlanState,
     search_query: String,
     /// Disclosure overrides by key, such as `phase:<id>`.
     toggles: HashMap<String, bool>,
+    /// A wheel step that unpinned a cut-down live window, by scroll key,
+    /// and whether the window has laid out every step since. See
+    /// `render_phase`.
+    live_scroll_carry: HashMap<String, (Pixels, bool)>,
     /// When a copy or save button last succeeded, by key.
     feedback: HashMap<String, Instant>,
     markdown: HashMap<MarkdownKey, MarkdownEntry>,
     styles: HashMap<MarkdownVariant, MarkdownStyle>,
     clocks: HashMap<String, ElapsedClock>,
     scrolls: HashMap<String, ScrollHandle>,
+    /// Subagent trails as blocks, by the run's block id, with the block they
+    /// were made from.
+    step_blocks: HashMap<String, (BlockRef, Rc<[BlockRef]>)>,
     pub(crate) changes: Vec<ChangedFile>,
     pub(crate) undo_locked: bool,
     pub(crate) changes_busy: bool,
@@ -328,11 +379,13 @@ impl TranscriptView {
             state: PlanState::default(),
             search_query: String::new(),
             toggles: HashMap::new(),
+            live_scroll_carry: HashMap::new(),
             feedback: HashMap::new(),
             markdown: HashMap::new(),
             styles: HashMap::new(),
             clocks: HashMap::new(),
             scrolls: HashMap::new(),
+            step_blocks: HashMap::new(),
             changes: Vec::new(),
             undo_locked: false,
             changes_busy: false,
@@ -380,6 +433,7 @@ impl TranscriptView {
             self.state = PlanState::default();
             self.clocks.clear();
             self.markdown.clear();
+            self.step_blocks.clear();
             self.link_cards.clear();
             self.image_cards.clear();
             self.attachment_cards.clear();
@@ -401,10 +455,20 @@ impl TranscriptView {
                 || current.pending_question.is_some() != session.pending_question.is_some()
                 || current.model != session.model
                 || current.harness != session.harness
+                // Tool labels, file paths, and link chips resolve against it.
+                || current.cwd != session.cwd
         });
+        // Render reads other session fields too. The pane caches this view,
+        // so a new snapshot redraws it even when no rows changed.
+        let other_changed = self
+            .session
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, &session));
         self.session = Some(session);
         if switched || changed || busy_changed {
             self.rebuild(cx);
+        } else if other_changed {
+            cx.notify();
         }
     }
 
@@ -587,7 +651,7 @@ impl TranscriptView {
     }
 
     /// Plan rows, for tests and tools that inspect the layout.
-    pub fn rows(&self) -> &[Row] {
+    pub fn rows(&self) -> &[RowRef] {
         &self.rows
     }
 
@@ -667,16 +731,19 @@ impl TranscriptView {
 
     /// Splice only the rows that changed. A row that kept its key at the
     /// same place is remeasured instead, which keeps its height estimate.
-    fn apply_rows(&mut self, rows: Vec<Row>) {
+    fn apply_rows(&mut self, rows: Vec<RowRef>) {
+        // Rows of a turn the plan reused are the same rows, so most compare
+        // by pointer.
+        let same = |a: &RowRef, b: &RowRef| Rc::ptr_eq(a, b) || a.same_as(b);
         let old = std::mem::take(&mut self.rows);
         let mut prefix = 0;
-        while prefix < old.len() && prefix < rows.len() && old[prefix].same_as(&rows[prefix]) {
+        while prefix < old.len() && prefix < rows.len() && same(&old[prefix], &rows[prefix]) {
             prefix += 1;
         }
         let mut suffix = 0;
         while suffix < old.len() - prefix
             && suffix < rows.len() - prefix
-            && old[old.len() - 1 - suffix].same_as(&rows[rows.len() - 1 - suffix])
+            && same(&old[old.len() - 1 - suffix], &rows[rows.len() - 1 - suffix])
         {
             suffix += 1;
         }
@@ -736,7 +803,10 @@ impl TranscriptView {
 
     /// Drop markdown views of blocks that left the transcript.
     fn prune_markdown(&mut self) {
-        if self.markdown.len() < 64 && self.attachment_cards.is_empty() {
+        if self.markdown.len() < 64
+            && self.attachment_cards.is_empty()
+            && self.step_blocks.len() < 64
+        {
             return;
         }
         let mut live: HashSet<&str> = HashSet::new();
@@ -750,6 +820,7 @@ impl TranscriptView {
         }
         self.markdown
             .retain(|key, _| live.contains(key.id.as_str()));
+        self.step_blocks.retain(|id, _| live.contains(id.as_str()));
         self.link_cards.retain(|id, _| live.contains(id.as_str()));
         self.image_cards.retain(|id, _| live.contains(id.as_str()));
         self.attachment_cards
@@ -928,6 +999,17 @@ impl TranscriptView {
                 }
             }
         }));
+    }
+
+    /// Whether a row's turn is still running on screen, the `live` its fold
+    /// line shows. Spinners in other turns hold still.
+    pub(crate) fn turn_is_live(&self, row: &Row) -> bool {
+        row.last_turn
+            && self.config.visible
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.is_busy())
     }
 
     pub(crate) fn toggled(&self, key: &str, default: bool) -> bool {

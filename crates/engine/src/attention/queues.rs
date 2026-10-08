@@ -134,6 +134,8 @@ impl Queues {
             note_card: head.note_card.clone(),
             handoff_card: head.handoff_card.clone(),
             intent: head.intent,
+            app_request_id: head.app_request_id.clone(),
+            build_target: head.selection.clone(),
         })
     }
 
@@ -212,6 +214,8 @@ impl Queues {
             note_card: message.note_card,
             handoff_card: message.handoff_card,
             intent: message.intent,
+            app_request_id: message.app_request_id,
+            build_target: None,
         };
         Attention::submit(cx).submit(request, cx);
     }

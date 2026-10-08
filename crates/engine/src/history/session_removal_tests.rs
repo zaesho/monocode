@@ -113,6 +113,8 @@ impl Fixture {
             },
         ];
         closing.queued_messages = Some(vec![QueuedMessage {
+            selection: None,
+            app_request_id: None,
             id: "queued".into(),
             text: "next".into(),
             attachments: Vec::new(),

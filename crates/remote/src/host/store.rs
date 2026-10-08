@@ -259,6 +259,7 @@ impl HostStore {
       CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), snapshot TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY, signature TEXT NOT NULL, receipt TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events (session_id TEXT NOT NULL REFERENCES sessions(id), revision INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(session_id, revision));
+      CREATE TABLE IF NOT EXISTS context_history_cleanup (session_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, pending INTEGER NOT NULL CHECK (pending IN (0, 1)));
       CREATE TABLE IF NOT EXISTS devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, hash TEXT NOT NULL UNIQUE);
       CREATE TABLE IF NOT EXISTS pairings (hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);",
         )
@@ -288,7 +289,7 @@ impl HostStore {
                 |row| row.get(0),
             )
             .map_err(sql)?;
-        Ok(Self {
+        let store = Self {
             inner: ReentrantMutex::new(Inner {
                 db: RefCell::new(Some(db)),
                 cache: RefCell::new(VecDeque::new()),
@@ -298,7 +299,10 @@ impl HostStore {
             changes: ChangeFeed::new(),
             #[cfg(test)]
             auth_checks: Default::default(),
-        })
+        };
+        // A crash after a deletion committed leaves its files behind.
+        store.retry_context_cleanup()?;
+        Ok(store)
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
@@ -483,6 +487,7 @@ impl HostStore {
     /// Returns the saved value, stamped with per-block change revisions.
     pub fn save(&self, input: HostSession, event: &Value) -> Result<Arc<HostSession>, String> {
         let _guard = self.inner.lock();
+        self.assert_context_writable(&input.session.id)?;
         let previous = self.find(&input.session.id)?;
         let mut value = input;
         value.created_at = value
@@ -548,13 +553,24 @@ impl HostStore {
         })
     }
 
+    /// Deletes the session and records that its context history files
+    /// need removal, in one transaction. Deleting it again does nothing.
     pub fn delete_session(&self, id: &str) -> Result<(), String> {
         self.transaction(|| {
+            if self.deleted_session_project(id)?.is_some() {
+                return Ok(());
+            }
             let current = self.session(id)?;
             if current.status == HostSessionStatus::Running {
                 return Err("Stop this session before deleting it".into());
             }
             self.with_db(|db| {
+                // The row stays after cleanup, so delayed writes for this ID
+                // keep failing.
+                db.execute(
+                    "INSERT INTO context_history_cleanup (session_id, project_id, pending) VALUES (?, ?, 1)",
+                    params![id, current.project_id],
+                )?;
                 db.execute("DELETE FROM events WHERE session_id=?", [id])?;
                 db.execute("DELETE FROM sessions WHERE id=?", [id])
             })?;
@@ -569,6 +585,99 @@ impl HostStore {
             });
             Ok(())
         })
+    }
+
+    /// The project a deleted session belonged to, or `None` when this host
+    /// never deleted it.
+    pub fn deleted_session_project(&self, id: &str) -> Result<Option<String>, String> {
+        self.with_db(|db| {
+            db.query_row(
+                "SELECT project_id FROM context_history_cleanup WHERE session_id=?",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+    }
+
+    /// Fails for a session this host deleted, so a late write cannot bring
+    /// it or its files back.
+    pub fn assert_context_writable(&self, id: &str) -> Result<(), String> {
+        if self.deleted_session_project(id)?.is_some() {
+            return Err("Session was deleted on this machine".into());
+        }
+        Ok(())
+    }
+
+    /// `<data dir>/context-history/<id>`: the shared history and attachment
+    /// copies that provider switches saved for one session.
+    pub fn context_directory(&self, id: &str) -> Result<PathBuf, String> {
+        let valid = !id.is_empty()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+        if !valid {
+            return Err("Invalid session ID for context cleanup".into());
+        }
+        Ok(self
+            .attachment_dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("context-history")
+            .join(id))
+    }
+
+    fn pending_context_cleanup(&self) -> Result<Vec<String>, String> {
+        self.with_db(|db| {
+            db.prepare("SELECT session_id FROM context_history_cleanup WHERE pending=1")?
+                .query_map([], |row| row.get(0))?
+                .collect()
+        })
+    }
+
+    /// Removes the context history of each deleted session that still has
+    /// files. A failed removal is logged and stays pending for the next
+    /// start or deletion.
+    pub fn retry_context_cleanup(&self) -> Result<(), String> {
+        for id in self.pending_context_cleanup()? {
+            let removed = self.context_directory(&id).and_then(|directory| {
+                match std::fs::remove_dir_all(&directory) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        Err(error.to_string())
+                    }
+                    _ => Ok(()),
+                }
+            });
+            match removed {
+                Ok(()) => {
+                    self.with_db(|db| {
+                        db.execute(
+                            "UPDATE context_history_cleanup SET pending=0 WHERE session_id=?",
+                            [&id],
+                        )
+                    })?;
+                }
+                Err(error) => {
+                    eprintln!("Context history cleanup failed after session deletion {id}: {error}")
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a deleted session's files still need removal.
+    #[cfg(test)]
+    pub(crate) fn context_cleanup_pending(&self, id: &str) -> Option<bool> {
+        self.with_db(|db| {
+            db.query_row(
+                "SELECT pending FROM context_history_cleanup WHERE session_id=?",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })
+        .unwrap()
+        .map(|pending| pending == 1)
     }
 
     pub fn receipt(&self, id: &str, signature: &str) -> Result<Option<CommandReceipt>, String> {
@@ -1084,5 +1193,106 @@ pub(crate) mod tests {
         let saved: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(saved["providerSessionId"], Value::Null);
         assert_eq!(saved["title"], "Renamed");
+    }
+
+    /// context-cleanup.test.ts `setup`: a saved session with a history file.
+    fn deleted_fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        HostStore,
+        String,
+        PathBuf,
+    ) {
+        let directory = temporary("monocode-context-cleanup-");
+        let path = directory.path().join("host.db");
+        let store = HostStore::open(&path).unwrap();
+        let project = store
+            .add_project(directory.path().to_str().unwrap(), "Test")
+            .unwrap();
+        store
+            .transaction(|| {
+                store.save(
+                    host_session(&project.id, "deleted-session", 1),
+                    &json!({ "type": "created" }),
+                )
+            })
+            .unwrap();
+        let history = directory
+            .path()
+            .join("context-history")
+            .join("deleted-session");
+        std::fs::create_dir_all(&history).unwrap();
+        std::fs::write(history.join("history.md"), "Retained context").unwrap();
+        (directory, path, store, project.id, history)
+    }
+
+    #[test]
+    fn records_cleanup_with_deletion_and_recovers_a_crash_before_filesystem_removal() {
+        let (_directory, path, store, project_id, history) = deleted_fixture();
+        store.delete_session("deleted-session").unwrap();
+        assert_eq!(store.context_cleanup_pending("deleted-session"), Some(true));
+        assert!(history.exists());
+        let reopened = HostStore::open(&path).unwrap();
+        assert!(!history.exists());
+        assert_eq!(
+            reopened.context_cleanup_pending("deleted-session"),
+            Some(false)
+        );
+        let late = reopened.transaction(|| {
+            reopened.save(
+                host_session(&project_id, "deleted-session", 2),
+                &json!({ "type": "late-write" }),
+            )
+        });
+        assert_eq!(late.unwrap_err(), "Session was deleted on this machine");
+        reopened.delete_session("deleted-session").unwrap();
+        assert_eq!(
+            reopened
+                .deleted_session_project("deleted-session")
+                .unwrap()
+                .as_deref(),
+            Some(project_id.as_str())
+        );
+        reopened.close();
+    }
+
+    #[test]
+    fn rolls_back_the_cleanup_obligation_when_the_session_deletion_fails() {
+        let (_directory, _path, store, _project_id, history) = deleted_fixture();
+        store
+            .execute(
+                "CREATE TRIGGER prevent_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'deletion rejected'); END;",
+                &[],
+            )
+            .unwrap();
+        let error = store.delete_session("deleted-session").unwrap_err();
+        assert!(error.contains("deletion rejected"), "{error}");
+        assert_eq!(store.session("deleted-session").unwrap().revision, 1);
+        let count: i64 = store
+            .with_db(|db| {
+                db.query_row("SELECT COUNT(*) FROM context_history_cleanup", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(history.exists());
+    }
+
+    #[test]
+    fn refuses_to_delete_a_running_session_or_clean_up_an_invalid_id() {
+        let directory = temporary("monocode-context-cleanup-");
+        let store = HostStore::open(&directory.path().join("host.db")).unwrap();
+        let project = store.add_project("/repo", "repo").unwrap();
+        let mut running = host_session(&project.id, "busy", 1);
+        running.status = HostSessionStatus::Running;
+        store.save(running, &json!({})).unwrap();
+        assert_eq!(
+            store.delete_session("busy").unwrap_err(),
+            "Stop this session before deleting it"
+        );
+        assert_eq!(store.context_cleanup_pending("busy"), None);
+        assert!(store.context_directory("../escape").is_err());
+        assert!(store.context_directory("").is_err());
     }
 }

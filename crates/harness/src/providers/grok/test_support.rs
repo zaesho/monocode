@@ -344,7 +344,7 @@ impl ChildBackend for FileBackend {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()> {
+    ) -> ChildFuture<String> {
         self.fake.update_cli(command, provider, binary_path)
     }
     fn home_dir(&self) -> ChildFuture<String> {
@@ -427,7 +427,7 @@ pub fn reply_text(events: &[HarnessEvent]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()

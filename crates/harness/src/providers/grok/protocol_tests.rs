@@ -148,39 +148,118 @@ fn never_authenticates_with_the_browser_grok_com_method() {
     );
 }
 
+fn kinds(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(id, kind)| (id.to_string(), kind.to_string()))
+        .collect()
+}
+
 #[test]
 fn parks_supervised_permissions_and_auto_allows_full_access() {
     let options = ids(&["allow-once", "reject-once"]);
+    let none = HashMap::new();
     assert_eq!(
-        pick_auto_option(RuntimeMode::Supervised, Some("execute"), &options),
+        pick_auto_option(RuntimeMode::Supervised, Some("execute"), &options, &none),
         None
     );
     assert_eq!(
-        pick_auto_option(RuntimeMode::AutoAcceptEdits, Some("edit"), &options).as_deref(),
+        pick_auto_option(RuntimeMode::AutoAcceptEdits, Some("edit"), &options, &none).as_deref(),
         Some("allow-once")
     );
     assert_eq!(
-        pick_auto_option(RuntimeMode::AutoAcceptEdits, Some("execute"), &options),
+        pick_auto_option(
+            RuntimeMode::AutoAcceptEdits,
+            Some("execute"),
+            &options,
+            &none
+        ),
         None
     );
     assert_eq!(
-        pick_auto_option(RuntimeMode::FullAccess, Some("execute"), &options).as_deref(),
+        pick_auto_option(RuntimeMode::FullAccess, Some("execute"), &options, &none).as_deref(),
         Some("allow-once")
     );
 }
 
 #[test]
 fn picks_allow_reject_option_ids_from_acp_permission_options() {
+    let none = HashMap::new();
     assert_eq!(
         permission_option_id(
             ApprovalDecision::Allow,
-            &ids(&["allow_once", "reject_once"])
-        ),
-        "allow_once"
+            &ids(&["allow_once", "reject_once"]),
+            &none
+        )
+        .as_deref(),
+        Some("allow_once")
     );
     assert_eq!(
-        permission_option_id(ApprovalDecision::Deny, &ids(&["allow-once", "reject-once"])),
-        "reject-once"
+        permission_option_id(
+            ApprovalDecision::Deny,
+            &ids(&["allow-once", "reject-once"]),
+            &none
+        )
+        .as_deref(),
+        Some("reject-once")
+    );
+}
+
+#[test]
+fn edit_only_mode_requires_review_for_unresolved_and_non_edit_kinds() {
+    let options = ids(&["allow-once", "reject-once"]);
+    for kind in [
+        None,
+        Some("delete"),
+        Some("move"),
+        Some("switch_mode"),
+        Some("execute"),
+        Some("other"),
+    ] {
+        assert_eq!(
+            pick_auto_option(
+                RuntimeMode::AutoAcceptEdits,
+                kind,
+                &options,
+                &HashMap::new()
+            ),
+            None,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn uses_offered_kinds_and_never_invents_option_ids() {
+    let options = ids(&["proceed_once", "cancel"]);
+    let offered = kinds(&[("proceed_once", "allow_once"), ("cancel", "reject_once")]);
+    assert_eq!(
+        permission_option_id(ApprovalDecision::Allow, &options, &offered).as_deref(),
+        Some("proceed_once")
+    );
+    assert_eq!(
+        permission_option_id(ApprovalDecision::Deny, &options, &offered).as_deref(),
+        Some("cancel")
+    );
+    assert_eq!(
+        pick_auto_option(RuntimeMode::FullAccess, Some("execute"), &options, &offered).as_deref(),
+        Some("proceed_once")
+    );
+    assert_eq!(
+        permission_option_id(
+            ApprovalDecision::Deny,
+            &ids(&["allow-once"]),
+            &HashMap::new()
+        ),
+        None
+    );
+    assert_eq!(
+        permission_option_id(
+            ApprovalDecision::Allow,
+            &ids(&["allow-once"]),
+            &kinds(&[("allow-once", "reject_once")])
+        ),
+        None
     );
 }
 
@@ -193,11 +272,15 @@ fn reads_grok_tool_metadata_from_permission_payloads() {
             "title": "Execute `git status`",
             "rawInput": { "variant": "Bash", "command": "git status" },
         },
-        "options": [{ "optionId": "allow-once" }, { "optionId": "reject-once" }],
+        "options": [
+            { "optionId": "allow-once", "kind": "allow_once" },
+            { "optionId": "reject-once" },
+        ],
     }));
     assert_eq!(request.call_id.as_deref(), Some("call-1"));
     assert!(request.title.contains("git status"), "{}", request.title);
     assert_eq!(request.option_ids, ids(&["allow-once", "reject-once"]));
+    assert_eq!(request.option_kinds, kinds(&[("allow-once", "allow_once")]));
 }
 
 #[test]
@@ -207,14 +290,20 @@ fn maps_agent_message_thought_and_grok_tool_updates() {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "Hi" },
         })),
-        vec![HarnessEvent::MessageDelta { text: "Hi".into() }]
+        vec![HarnessEvent::MessageDelta {
+            text: "Hi".into(),
+            append: None
+        }]
     );
     assert_eq!(
         events_from_acp_update(&json!({
             "sessionUpdate": "agent_thought_chunk",
             "content": { "type": "text", "text": "Hmm" },
         })),
-        vec![HarnessEvent::ReasoningDelta { text: "Hmm".into() }]
+        vec![HarnessEvent::ReasoningDelta {
+            text: "Hmm".into(),
+            append: None
+        }]
     );
 
     let early = events_from_acp_update(&json!({

@@ -47,6 +47,12 @@ pub struct WorktreeSwitcher {
     /// The deleted focus a fallback was already requested for.
     fallback_for: Option<String>,
     trigger_bounds: BoundsCell,
+    /// Counts changes of the observed worktree list and workspace.
+    observed: u64,
+    /// The last data and its (revision, observed, cwd). The switcher draws
+    /// on every frame, and `data` copies every open session to count tabs
+    /// per worktree.
+    data_cache: Option<((u64, u64, String), std::rc::Rc<SwitcherData>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -61,8 +67,32 @@ impl WorktreeSwitcher {
             shown_error: None,
             fallback_for: None,
             trigger_bounds: BoundsCell::default(),
+            observed: 0,
+            data_cache: None,
             _subscriptions: Vec::new(),
         }
+    }
+
+    fn observed_changed<T>(&mut self, _: Entity<T>, cx: &mut Context<Self>) {
+        self.observed += 1;
+        cx.notify();
+    }
+
+    /// The data for this frame: the last one when nothing it reads changed.
+    fn cached_data(&mut self, cx: &mut Context<Self>) -> std::rc::Rc<SwitcherData> {
+        let key = (
+            crate::revisions::revision(cx),
+            self.observed,
+            self.cwd.clone(),
+        );
+        if let Some((built, data)) = &self.data_cache
+            && *built == key
+        {
+            return data.clone();
+        }
+        let data = std::rc::Rc::new(self.data(cx));
+        self.data_cache = Some((key, data.clone()));
+        data
     }
 
     fn workspace(&self, cx: &App) -> Option<Entity<Workspace>> {
@@ -90,10 +120,10 @@ impl WorktreeSwitcher {
         let status = ProjectsGlobal::git_status(&cwd, cx);
         self._watch = Some(status.update(cx, |status, cx| status.watch(WatchKind::Worktrees, cx)));
         self._subscriptions
-            .push(cx.observe(&status, |_, _, cx| cx.notify()));
+            .push(cx.observe(&status, Self::observed_changed));
         if let Some(workspace) = self.workspace(cx) {
             self._subscriptions
-                .push(cx.observe(&workspace, |_, _, cx| cx.notify()));
+                .push(cx.observe(&workspace, Self::observed_changed));
         }
         self.status = Some(status);
     }
@@ -243,7 +273,7 @@ fn open_tabs(stats: Option<&WorktreeTabStats>, theme: &Theme) -> Option<gpui::An
 impl Render for WorktreeSwitcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync(cx);
-        let data = self.data(cx);
+        let data = self.cached_data(cx);
         self.react(&data, cx);
         let theme = Theme::of(cx).clone();
         let c = theme.colors;

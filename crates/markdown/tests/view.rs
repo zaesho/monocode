@@ -301,6 +301,42 @@ fn streaming_reveals_words_then_settles_to_the_written_tree() {
 }
 
 #[test]
+fn an_idle_stream_stops_asking_for_frames() {
+    let _serial = common::serial();
+    let mut cx = app();
+    let (window, markdown) = open(&mut cx, 640., 400., MarkdownView::new);
+    cx.update(|cx| {
+        markdown.update(cx, |view, cx| {
+            view.set_streaming(true, cx);
+            view.push_str("one two three ", cx);
+        })
+    });
+    let frames = |cx: &mut HeadlessAppContext| {
+        cx.update_window(window.into(), |_, window, cx| {
+            window.simulate_next_frame(cx)
+        })
+        .expect("frame")
+    };
+    draw(&mut cx, window);
+    // The reveal and the fade ask for frames.
+    assert!(frames(&mut cx) > 0);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(800) {
+        draw(&mut cx, window);
+        frames(&mut cx);
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    // Still streaming, but every word is out and faded in: nothing moves.
+    draw(&mut cx, window);
+    assert_eq!(frames(&mut cx), 0);
+    assert!(cx.read_entity(&markdown, |view, _| view.is_streaming()));
+    // The next token wakes it up again.
+    cx.update(|cx| markdown.update(cx, |view, cx| view.push_str("four ", cx)));
+    draw(&mut cx, window);
+    assert!(frames(&mut cx) > 0);
+}
+
+#[test]
 fn reduced_motion_still_reveals_text() {
     let _serial = common::serial();
     let mut cx = app();

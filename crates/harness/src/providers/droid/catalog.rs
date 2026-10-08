@@ -69,9 +69,9 @@ impl DroidCatalog {
                     let inner = self.inner.clone();
                     let run = async move {
                         let catalog = inner.catalog.clone();
-                        let publish = move |models: Vec<AgentModel>| {
+                        let publish = move |models: Vec<AgentModel>, complete: bool| {
                             if !models.is_empty() {
-                                catalog.set_harness_models(HarnessId::Droid, models);
+                                catalog.set_harness_catalog(HarnessId::Droid, models, complete);
                             }
                         };
                         if let Err(error) =
@@ -99,7 +99,7 @@ impl DroidCatalog {
         probe_droid_models(
             &self.inner.children,
             &self.inner.spawner,
-            move |models| *sink.lock() = models,
+            move |models, _| *sink.lock() = models,
             working_directory,
         )
         .await?;
@@ -107,11 +107,12 @@ impl DroidCatalog {
     }
 }
 
-/// `probeDroidModels`.
+/// `probeDroidModels`. `publish` gets `complete = false` until every model's
+/// settings were read.
 async fn probe_droid_models(
     children: &Children,
     spawner: &SharedSpawner,
-    publish: impl Fn(Vec<AgentModel>),
+    publish: impl Fn(Vec<AgentModel>, bool),
     working_directory: Option<&str>,
 ) -> Result<()> {
     let path = children.resolve_droid_binary().await?.path;
@@ -197,7 +198,7 @@ async fn probe_droid_models(
                 )
                 .await?;
             let models = models_from_droid_session(&created, &HashMap::new());
-            publish(models.clone());
+            publish(models.clone(), false);
             let Some(session_id) = droid_session_id(&created) else {
                 return Ok(());
             };
@@ -206,6 +207,7 @@ async fn probe_droid_models(
             }
 
             let mut efforts: HashMap<String, DroidConfigOption> = HashMap::new();
+            let mut complete = true;
             let initial = droid_effort_config(&droid_config_options_from(&created).unwrap_or_default()).cloned();
             for model in &models {
                 let native = model.native_id.clone().unwrap_or_default();
@@ -213,8 +215,9 @@ async fn probe_droid_models(
                     continue;
                 }
                 latest_config.lock().take();
-                // Keep the model without effort choices rather than drop it.
-                if let Ok(result) = acp
+                // Keep the model without effort choices rather than drop it,
+                // and mark the catalog incomplete.
+                match acp
                     .request_value(
                         "session/set_config_option",
                         Some(json!({ "sessionId": session_id, "configId": "model", "value": native })),
@@ -222,13 +225,20 @@ async fn probe_droid_models(
                     )
                     .await
                 {
-                    let options = match droid_config_options_from(&result) {
-                        Some(options) => Some(options),
-                        None => settled_config(&latest_config).await,
-                    };
-                    if let Some(effort) = options.as_deref().and_then(droid_effort_config) {
-                        efforts.insert(native, effort.clone());
+                    Ok(result) => {
+                        let options = match droid_config_options_from(&result) {
+                            Some(options) => Some(options),
+                            None => settled_config(&latest_config).await,
+                        };
+                        if let Some(effort) = options.as_deref().and_then(droid_effort_config) {
+                            efforts.insert(native, effort.clone());
+                        }
+                        if options.is_none() {
+                            complete = false;
+                        }
+                        publish(models_from_droid_session(&created, &efforts), false);
                     }
+                    Err(_) => complete = false,
                 }
             }
             if efforts.is_empty()
@@ -237,7 +247,7 @@ async fn probe_droid_models(
             {
                 efforts.insert(current, initial);
             }
-            publish(models_from_droid_session(&created, &efforts));
+            publish(models_from_droid_session(&created, &efforts), complete);
             Ok(())
         };
         match task::timeout(task::ms(DISCOVERY_TIMEOUT_MS), probe).await {

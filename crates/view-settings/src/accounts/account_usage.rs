@@ -116,9 +116,13 @@ pub fn account_usage_refresh(
         .into_any_element()
 }
 
+/// One meter: its title, its window, and whether it is a model-scoped
+/// weekly limit, which keeps its full title in compact rows.
+pub type MeterWindow = (String, RateLimitWindow, bool);
+
 /// `meterWindows`: the titled 5h, weekly, and monthly windows an account
-/// has data for.
-pub fn meter_windows(limits: Option<&ProviderRateLimits>) -> Vec<(&'static str, RateLimitWindow)> {
+/// has data for, then Claude's model-scoped weekly limits.
+pub fn meter_windows(limits: Option<&ProviderRateLimits>) -> Vec<MeterWindow> {
     let Some(limits) = limits else {
         return Vec::new();
     };
@@ -128,7 +132,13 @@ pub fn meter_windows(limits: Option<&ProviderRateLimits>) -> Vec<(&'static str, 
         ("Monthly", limits.monthly),
     ]
     .into_iter()
-    .filter_map(|(title, window)| window.map(|window| (title, window)))
+    .filter_map(|(title, window)| window.map(|window| (title.to_string(), window, false)))
+    .chain(
+        limits
+            .scoped_weekly
+            .iter()
+            .map(|scoped| (format!("Weekly {}", scoped.label), scoped.window, true)),
+    )
     .collect()
 }
 
@@ -297,10 +307,10 @@ pub fn account_usage_meters(
         });
     }
     Some(
-        row.children(windows.into_iter().map(|(title, window)| {
+        row.children(windows.into_iter().map(|(title, window, _)| {
             usage_meter(
-                child(title),
-                title,
+                ElementId::NamedChild(std::sync::Arc::new(id.clone()), title.clone().into()),
+                &title,
                 &window,
                 now,
                 MeterWidth::Fixed,
@@ -383,11 +393,22 @@ mod tests {
             monthly: Some(window),
             ..idle_rate_limits(RateLimitProvider::Claude)
         };
-        let titles: Vec<&str> = meter_windows(Some(&limits))
+        let titles: Vec<String> = meter_windows(Some(&limits))
             .into_iter()
-            .map(|(title, _)| title)
+            .map(|(title, _, _)| title)
             .collect();
         assert_eq!(titles, ["5h", "Monthly"]);
         assert!(meter_windows(None).is_empty());
+        // Model-scoped weekly limits follow, with their model in the title.
+        let mut scoped = idle_rate_limits(RateLimitProvider::Claude);
+        scoped.scoped_weekly = vec![crate::accounts::model::ScopedRateLimitWindow {
+            window,
+            label: "Fable 5.1".into(),
+            model: "Fable 5.1".into(),
+        }];
+        let rows = meter_windows(Some(&scoped));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "Weekly Fable 5.1");
+        assert!(rows[0].2);
     }
 }

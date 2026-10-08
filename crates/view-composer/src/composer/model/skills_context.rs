@@ -26,10 +26,9 @@ pub fn next_skill_context_token(
     }
 }
 
-/// `pickerSkillLoadOptions`: opening the picker re-reads skill files from
-/// disk, except for providers that report their own commands on a TTL.
-pub fn picker_skill_refresh(has_native_commands: bool) -> bool {
-    !has_native_commands
+/// Opening the picker re-reads skill files. The engine caches native commands separately.
+pub fn picker_skill_refresh(_has_native_commands: bool) -> bool {
+    true
 }
 
 /// `visibleComposerSkills`: loaded rows only for their owning context.
@@ -78,8 +77,8 @@ mod tests {
     }
 
     #[test]
-    fn preserves_filesystem_refresh_while_native_providers_use_their_ttl() {
-        assert!(!picker_skill_refresh(true));
+    fn refreshes_filesystem_skills_for_every_provider() {
+        assert!(picker_skill_refresh(true));
         assert!(picker_skill_refresh(false));
     }
 

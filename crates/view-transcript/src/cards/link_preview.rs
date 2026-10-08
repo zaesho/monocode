@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Anchor, Animation, AnimationExt as _, AnyElement, App, Context, ElementId, EventEmitter,
-    FocusHandle, Focusable, Global, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Subscription, Task, Window, div, img, point, px, relative,
+    Anchor, AnyElement, App, Context, ElementId, EventEmitter, FocusHandle, Focusable, Global,
+    Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription,
+    Task, Window, div, img, point, px, relative,
 };
 use monocode_ui::color::{parse_hex, with_alpha};
 use monocode_ui::styled::UiStyled as _;
@@ -29,6 +29,7 @@ use monocode_ui::widgets::{PopoverSide, popover_at, popover_frame};
 use monocode_ui::{IconName, Theme, icon, u};
 use regex::Regex;
 
+use crate::motion::smooth_loop;
 use crate::transcript::model::link::{GithubWorkItem as ParsedWorkItem, UserLink};
 
 use super::style;
@@ -1125,28 +1126,25 @@ pub fn github_work_item_card(
 
 /// `GithubWorkItemCardSkeleton`: three pulsing bars.
 fn skeleton(theme: &Theme) -> AnyElement {
-    let bar = |id: &'static str, height: f32, width: f32, alpha: f32| {
-        div()
+    let bar = |height: f32, width: f32, alpha: f32| {
+        let bar = div()
             .h(u(height))
             .w(relative(width))
             .rounded(u(4.))
-            .bg(theme.content(alpha))
-            .with_animation(
-                id,
-                Animation::new(Duration::from_secs(2))
-                    .repeat()
-                    .with_easing(monocode_ui::theme::CubicBezier(0.4, 0., 0.6, 1.).easing()),
-                |el, t| el.opacity(1. - 0.5 * (1. - (t * 2. - 1.).abs())),
-            )
+            .bg(theme.content(alpha));
+        smooth_loop(Duration::from_secs(2), move |t| {
+            let t = monocode_ui::theme::CubicBezier(0.4, 0., 0.6, 1.).ease(t);
+            bar.opacity(1. - 0.5 * (1. - (t * 2. - 1.).abs()))
+        })
     };
     div()
         .mt(u(10.))
         .flex()
         .flex_col()
         .gap(u(8.))
-        .child(bar("skeleton-title", 12., 0.8, 0.1))
-        .child(bar("skeleton-line-1", 8., 1., 0.07))
-        .child(bar("skeleton-line-2", 8., 2. / 3., 0.07))
+        .child(bar(12., 0.8, 0.1))
+        .child(bar(8., 1., 0.07))
+        .child(bar(8., 2. / 3., 0.07))
         .into_any_element()
 }
 

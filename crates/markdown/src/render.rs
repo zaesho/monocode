@@ -639,6 +639,9 @@ pub(crate) struct Frame<'a> {
     pub code: &'a mut CodeState,
     pub view: WeakEntity<MarkdownView>,
     pub images: Option<&'a ImageResolver>,
+    /// Resolved image sources by URL. A `data:` URL decodes its bytes, so
+    /// it resolves once instead of every frame.
+    pub image_sources: &'a mut HashMap<String, Option<ImageSource>>,
     pub text_system: Arc<gpui::WindowTextSystem>,
 }
 
@@ -961,11 +964,17 @@ fn render_image(image: &Arc<ImageRef>, key: ElementKey, frame: &mut Frame) -> An
     };
     let resolved = if image.url == crate::parse::mend::PENDING_LINK_URL {
         None
+    } else if let Some(source) = frame.image_sources.get(&image.url) {
+        source.clone()
     } else {
-        match frame.images {
+        let source = match frame.images {
             Some(resolve) => resolve(&image.url),
             None => default_image_source(&image.url),
-        }
+        };
+        frame
+            .image_sources
+            .insert(image.url.clone(), source.clone());
+        source
     };
     let Some(source) = resolved else {
         return div()
@@ -1426,14 +1435,18 @@ fn render_code(code: &PreparedCode, frame: &mut Frame) -> AnyElement {
     let fence = &code.fence;
     let line_numbers = fence.line_numbers && !fence.is_mermaid();
     let numbers = line_numbers.then(|| {
-        let first = fence.start_line.unwrap_or(1).max(1) as usize;
-        let mut text = String::with_capacity(code.line_count * 4);
-        for n in 0..code.line_count {
-            if n > 0 {
-                text.push('\n');
+        // Built once per prepared block, not every frame.
+        let text = code.line_numbers.get_or_init(|| {
+            let first = fence.start_line.unwrap_or(1).max(1) as usize;
+            let mut text = String::with_capacity(code.line_count * 4);
+            for n in 0..code.line_count {
+                if n > 0 {
+                    text.push('\n');
+                }
+                text.push_str(&(first + n).to_string());
             }
-            text.push_str(&(first + n).to_string());
-        }
+            text.into()
+        });
         div()
             .flex_none()
             .w(style.line_number_width)
@@ -1443,7 +1456,7 @@ fn render_code(code: &PreparedCode, frame: &mut Frame) -> AnyElement {
             .text_size(style.line_number_size)
             .line_height(style.code_line_height)
             .text_color(style.line_number)
-            .child(SharedString::from(text))
+            .child(text.clone())
     });
 
     let code_text = div()
@@ -1666,6 +1679,7 @@ mod tests {
             fence: crate::parse::CodeFence::parse("mermaid"),
             code: "flowchart LR; A-->B".into(),
             line_count: 1,
+            line_numbers: Default::default(),
         };
         assert!(state.diagram(&code, true).is_none());
         let first = state.diagram_jobs.pop().unwrap();
@@ -1700,6 +1714,7 @@ mod tests {
             fence: crate::parse::CodeFence::parse("ts"),
             code: SharedString::default(),
             line_count: 0,
+            line_numbers: Default::default(),
         };
         let mut end = 20;
         while end <= source.len() {
@@ -1724,6 +1739,7 @@ mod tests {
                 fence: crate::parse::CodeFence::parse("ts"),
                 code: text.clone(),
                 line_count: 21,
+                line_numbers: Default::default(),
             };
             // 21 lines is past the frame's sync limit, so the block goes to a
             // background job. Finish it the way the view does, then cache.

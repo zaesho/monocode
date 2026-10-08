@@ -6,20 +6,20 @@
 //! the way it places the toast stack.
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, Context, EventEmitter, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window,
-    canvas, div, prelude::FluentBuilder as _,
+    AnyElement, App, Context, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, canvas, div, prelude::FluentBuilder as _,
 };
 use monocode_core::HarnessId;
 use monocode_ui::styled::glass_backdrop;
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, provider_logo, u};
 
+use super::harness_update_store::HarnessUpdateStore;
 use super::host::HarnessUpdateHost;
-use super::model::{HarnessUpdate, compare_semver, parse_version};
+use super::model::{HarnessUpdate, is_harness_version_behind, parse_harness_version};
 use super::style::{spin_icon, text};
 use crate::settings::providers::harness_logo;
 
@@ -45,11 +45,13 @@ pub enum HarnessUpdateNoticeEvent {
 pub struct HarnessUpdateNotice {
     host: Rc<dyn HarnessUpdateHost>,
     updates: Vec<HarnessUpdate>,
-    rows: HashMap<HarnessId, RowState>,
+    /// Row states live in the shared store, so Settings shows the same runs.
+    store: Entity<HarnessUpdateStore>,
     top_offset: f32,
     height: Rc<Cell<f32>>,
     _check: Task<()>,
     _updated: Option<Subscription>,
+    _store: Subscription,
 }
 
 impl EventEmitter<HarnessUpdateNoticeEvent> for HarnessUpdateNotice {}
@@ -65,7 +67,9 @@ impl HarnessUpdateNotice {
             Box::new(move |harness, cx| listener.refresh_catalogs(harness, cx).detach()),
             cx,
         );
-        let check = host.check_for_updates(cx);
+        let store = HarnessUpdateStore::global(host.clone(), cx);
+        let observe = cx.observe(&store, |_, _, cx| cx.notify());
+        let check = HarnessUpdateStore::launch_check(host.clone(), cx);
         let check = cx.spawn(async move |this, cx| {
             let updates = check.await;
             this.update(cx, |this, cx| {
@@ -77,11 +81,12 @@ impl HarnessUpdateNotice {
         Self {
             host,
             updates: Vec::new(),
-            rows: HashMap::new(),
+            store,
             top_offset,
             height: Rc::new(Cell::new(0.)),
             _check: check,
             _updated: updated,
+            _store: observe,
         }
     }
 
@@ -89,8 +94,8 @@ impl HarnessUpdateNotice {
         &self.updates
     }
 
-    pub fn row(&self, harness: HarnessId) -> RowState {
-        self.rows.get(&harness).cloned().unwrap_or_default()
+    pub fn row(&self, harness: HarnessId, cx: &App) -> RowState {
+        self.store.read(cx).run(harness)
     }
 
     pub fn set_top_offset(&mut self, top_offset: f32, cx: &mut Context<Self>) {
@@ -100,20 +105,7 @@ impl HarnessUpdateNotice {
 
     /// `start`: update these harnesses side by side.
     pub fn start(&mut self, targets: Vec<HarnessUpdate>, cx: &mut Context<Self>) {
-        for update in targets {
-            self.rows.insert(update.harness, RowState::Updating);
-            let run = run_update(self.host.clone(), update.clone(), cx);
-            cx.spawn(async move |this, cx| {
-                let result = run.await;
-                this.update(cx, |this, cx| {
-                    this.rows.insert(update.harness, result);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-        }
-        cx.notify();
+        self.store.update(cx, |store, cx| store.start(targets, cx));
     }
 
     /// `dismiss`: only for this run; the next launch checks and offers again.
@@ -123,12 +115,12 @@ impl HarnessUpdateNotice {
         cx.notify();
     }
 
-    fn pending(&self) -> Vec<HarnessUpdate> {
+    fn pending(&self, cx: &App) -> Vec<HarnessUpdate> {
         self.updates
             .iter()
             .filter(|update| {
                 matches!(
-                    self.row(update.harness),
+                    self.row(update.harness, cx),
                     RowState::Idle | RowState::Failed(_)
                 )
             })
@@ -147,7 +139,7 @@ impl HarnessUpdateNotice {
 
     fn render_row(&self, update: &HarnessUpdate, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let state = self.row(update.harness);
+        let state = self.row(update.harness, cx);
         let harness = update.harness;
         let mut line = div()
             .flex()
@@ -255,32 +247,38 @@ impl HarnessUpdateNotice {
 /// `runUpdate`. Some updaters exit cleanly without installing anything, so
 /// success is the version the CLI reports afterwards, not the exit code. Its
 /// models reload before the row says so, so the picker is current by then.
-fn run_update(
+pub(super) fn run_update(
     host: Rc<dyn HarnessUpdateHost>,
     update: HarnessUpdate,
-    cx: &mut Context<HarnessUpdateNotice>,
+    cx: &mut App,
 ) -> Task<RowState> {
     let harness = update.harness;
     let run = host.update_cli(harness, cx);
-    cx.spawn(async move |_, cx| {
-        if let Err(error) = run.await {
-            return RowState::Failed(error);
-        }
+    cx.spawn(async move |cx| {
+        let printed = match run.await {
+            Ok(printed) => printed,
+            Err(error) => return RowState::Failed(error),
+        };
         let after = match cx.update(|cx| host.installed_version(harness, cx)).await {
             Ok(after) => after,
             Err(error) => return RowState::Failed(error),
         };
-        let version = parse_version(after.as_deref().unwrap_or(""));
+        let version = parse_harness_version(harness, after.as_deref().unwrap_or(""));
         match version {
-            Some(version) if compare_semver(&version, &update.latest) >= 0 => {
+            Some(version) if !is_harness_version_behind(harness, &version, &update.latest) => {
                 cx.update(|cx| host.refresh_catalogs(harness, cx)).await;
                 cx.update(|cx| host.announce_updated(harness, cx));
                 RowState::Updated(version)
             }
-            version => RowState::Failed(format!(
-                "Still on {} after updating.",
-                version.unwrap_or(update.installed)
-            )),
+            // A CLI installed by a package manager prints how to update it
+            // and leaves the version as it was.
+            version => RowState::Failed(match monocode_core::js::trim(&printed) {
+                "" => format!(
+                    "Still on {} after updating.",
+                    version.unwrap_or(update.installed)
+                ),
+                instructions => instructions.to_string(),
+            }),
         }
     })
 }
@@ -295,12 +293,12 @@ impl Render for HarnessUpdateNotice {
         let busy = self
             .updates
             .iter()
-            .any(|update| self.row(update.harness) == RowState::Updating);
-        let pending = self.pending();
+            .any(|update| self.row(update.harness, cx) == RowState::Updating);
+        let pending = self.pending(cx);
         let any_updated = self
             .updates
             .iter()
-            .any(|update| matches!(self.row(update.harness), RowState::Updated(_)));
+            .any(|update| matches!(self.row(update.harness, cx), RowState::Updated(_)));
         let viewport =
             f32::from(window.viewport_size().width) / f32::from(window.rem_size()) * 16.0;
         let width = 340f32.min(viewport - 24.);

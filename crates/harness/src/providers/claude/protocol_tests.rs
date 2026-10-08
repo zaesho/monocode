@@ -148,6 +148,8 @@ fn speaks_stream_json_with_stdio_permissions_like_the_agent_sdk() {
         "--input-format",
         "--permission-prompt-tool",
         "stdio",
+        "--forward-subagent-text",
+        "--replay-user-messages",
         "--include-partial-messages",
         "--setting-sources=user,project,local",
     ] {
@@ -187,6 +189,25 @@ fn skips_permissions_and_mcp_for_isolated_text_sessions() {
     assert!(contains_all(&args, &["--max-turns", "1"]));
     assert_eq!(settings_arg(&args)["disableAllHooks"], json!(true));
     assert!(!args.iter().any(|arg| arg == "--permission-prompt-tool"));
+    assert!(!args.iter().any(|arg| arg == "--forward-subagent-text"));
+    assert!(!args.iter().any(|arg| arg == "--replay-user-messages"));
+    assert!(!args.iter().any(|arg| arg == "--tools"));
+}
+
+#[test]
+fn passes_the_helper_tool_list_even_when_it_is_empty() {
+    let none = build_claude_spawn_args(&ClaudeSpawnOptions {
+        isolated: true,
+        tools: Some(Vec::new()),
+        ..Default::default()
+    });
+    assert!(contains_all(&none, &["--tools", ""]));
+    let read_only = build_claude_spawn_args(&ClaudeSpawnOptions {
+        isolated: true,
+        tools: Some(vec!["Read".into(), "Glob".into(), "Grep".into()]),
+        ..Default::default()
+    });
+    assert!(contains_all(&read_only, &["--tools", "Read,Glob,Grep"]));
 }
 
 #[test]
@@ -219,6 +240,15 @@ fn adds_bypass_flag_for_full_access() {
 // describe("buildClaudeUserMessage")
 
 #[test]
+fn names_a_request_with_its_uuid_only_when_given() {
+    let named = build_claude_user_message("Run once", &[], None, Some("request-1")).unwrap();
+    assert_eq!(named["uuid"], "request-1");
+    assert_eq!(named["parent_tool_use_id"], Value::Null);
+    let plain = build_claude_user_message("Run once", &[], None, None).unwrap();
+    assert!(plain.get("uuid").is_none());
+}
+
+#[test]
 fn embeds_vision_images_as_base64_source_blocks() {
     let message = build_claude_user_message(
         "look",
@@ -231,6 +261,7 @@ fn embeds_vision_images_as_base64_source_blocks() {
             data: Some("AQIDBA==".into()),
             ..Default::default()
         }],
+        None,
         None,
     )
     .unwrap();
@@ -319,6 +350,130 @@ fn reads_tool_use_content_blocks() {
     );
 }
 
+// describe("advisor consults")
+
+#[test]
+fn reads_an_advisor_call_from_the_stream_and_the_snapshot() {
+    let start = rec(json!({
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {} },
+        },
+    }));
+    assert_eq!(
+        advisor_call_from_event(&start).as_deref(),
+        Some("srvtoolu_1")
+    );
+    let snapshot = rec(json!({
+        "type": "assistant",
+        "message": { "id": "msg_1", "content": [
+            { "type": "server_tool_use", "id": "srvtoolu_1", "name": "advisor", "input": {} },
+            { "type": "server_tool_use", "id": "srvtoolu_2", "name": "web_search", "input": { "query": "q" } },
+            { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {} },
+        ] },
+    }));
+    let uses = assistant_tool_uses(&snapshot);
+    assert_eq!(
+        uses.iter()
+            .map(|tool| (tool.id.as_str(), tool.server, tool.is_advisor()))
+            .collect::<Vec<_>>(),
+        [
+            ("srvtoolu_1", true, true),
+            ("srvtoolu_2", true, false),
+            ("toolu_1", false, false),
+        ]
+    );
+    assert_eq!(
+        message_id_from_stream_start(&rec(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "msg_1", "content": [] } },
+        })))
+        .as_deref(),
+        Some("msg_1")
+    );
+}
+
+#[test]
+fn reads_the_three_advisor_result_types() {
+    let snapshot = rec(json!({
+        "type": "assistant",
+        "message": { "content": [
+            { "type": "advisor_tool_result", "tool_use_id": "a",
+              "content": { "type": "advisor_result", "text": "Check the fallback.", "stop_reason": "end_turn" } },
+            { "type": "advisor_tool_result", "tool_use_id": "b",
+              "content": { "type": "advisor_redacted_result", "encrypted_content": "EvwD" } },
+            { "type": "advisor_tool_result", "tool_use_id": "c",
+              "content": { "type": "advisor_tool_result_error", "error_code": "max_uses_exceeded" } },
+            { "type": "text", "text": "Done." },
+        ] },
+    }));
+    assert_eq!(
+        assistant_advisor_results(&snapshot),
+        vec![
+            ClaudeAdvisorResult {
+                tool_use_id: "a".into(),
+                outcome: ClaudeAdvisorOutcome::Advice("Check the fallback.".into()),
+            },
+            ClaudeAdvisorResult {
+                tool_use_id: "b".into(),
+                outcome: ClaudeAdvisorOutcome::Redacted,
+            },
+            ClaudeAdvisorResult {
+                tool_use_id: "c".into(),
+                outcome: ClaudeAdvisorOutcome::Error("max_uses_exceeded".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn reads_the_advisor_model_from_message_delta_iterations() {
+    let delta = rec(json!({
+        "type": "stream_event",
+        "event": {
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "input_tokens": 4, "output_tokens": 54, "iterations": [
+                { "type": "message", "input_tokens": 2, "output_tokens": 26 },
+                { "type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 39219, "output_tokens": 128 },
+                { "type": "message", "input_tokens": 2, "output_tokens": 28 },
+            ] },
+        },
+    }));
+    assert_eq!(
+        advisor_usages_from_message_delta(&delta),
+        vec![ClaudeAdvisorUsage {
+            model: Some("claude-fable-5-1".into()),
+            input_tokens: 39219,
+            output_tokens: 128,
+        }]
+    );
+    assert!(
+        advisor_usages_from_message_delta(&rec(json!({
+            "type": "stream_event",
+            "event": { "type": "message_start", "message": { "id": "m" } },
+        })))
+        .is_empty()
+    );
+}
+
+#[test]
+fn skips_advisor_iterations_when_reading_context() {
+    let result = rec(json!({
+        "type": "result",
+        "usage": { "iterations": [
+            { "type": "message", "input_tokens": 2, "cache_read_input_tokens": 37639, "output_tokens": 28 },
+            { "type": "advisor_message", "model": "claude-fable-5-1", "input_tokens": 39219, "output_tokens": 128 },
+        ] },
+    }));
+    assert_eq!(
+        context_from_result(&result, None).unwrap().used,
+        Some(37669)
+    );
+}
+
 // describe("usage limits")
 
 #[test]
@@ -384,6 +539,61 @@ fn treats_aborted_terminals_as_interrupted() {
         turn_status_from_result(&rec(json!({ "type": "result", "subtype": "success" }))).status,
         ClaudeTurnStatus::Completed
     );
+}
+
+#[test]
+fn fails_a_success_result_that_carries_an_api_error() {
+    let result = turn_status_from_result(&rec(json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": true,
+        "result": "API Error: 529 Overloaded",
+        "errors": [],
+    })));
+    assert_eq!(result.status, ClaudeTurnStatus::Failed);
+    assert_eq!(result.error.as_deref(), Some("API Error: 529 Overloaded"));
+    assert_eq!(
+        turn_status_from_result(&rec(json!({
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "max_turns",
+        })))
+        .status,
+        ClaudeTurnStatus::Failed
+    );
+    assert_eq!(
+        turn_status_from_result(&rec(json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "terminal_reason": "end_turn",
+        })))
+        .status,
+        ClaudeTurnStatus::Completed
+    );
+}
+
+#[test]
+fn recognizes_the_missing_conversation_result() {
+    let missing = json!({
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "session_id": "gone",
+        "errors": ["No conversation found with session ID: gone"],
+    });
+    assert!(is_missing_conversation_result(&rec(missing.clone())));
+    let mut not_error = missing.clone();
+    not_error["is_error"] = json!(false);
+    assert!(!is_missing_conversation_result(&rec(not_error)));
+    let mut other_error = missing;
+    other_error["errors"] = json!(["Claude turn failed."]);
+    assert!(!is_missing_conversation_result(&rec(other_error)));
+    assert!(!is_missing_conversation_result(&rec(json!({
+        "type": "assistant",
+        "is_error": true,
+        "errors": ["No conversation found with session ID: gone"],
+    }))));
 }
 
 // describe("modelsForClaudeVersion")
@@ -811,6 +1021,19 @@ fn keeps_status_messages_that_carry_real_prose() {
 }
 
 #[test]
+fn retains_provider_notifications_about_usage_credits() {
+    assert_eq!(
+        status_text_from_system(&rec(json!({
+            "type": "system",
+            "subtype": "notification",
+            "message": "Fable is now using usage credits instead of your plan limits",
+        })))
+        .as_deref(),
+        Some("Fable is now using usage credits instead of your plan limits")
+    );
+}
+
+#[test]
 fn still_marks_a_compact_boundary_that_carries_no_prose() {
     assert_eq!(
         status_text_from_system(&rec(json!({
@@ -876,13 +1099,39 @@ fn reads_the_window_the_cli_reports_rather_than_a_model_table() {
         },
         "modelUsage": { "claude-sonnet-5": { "contextWindow": 1_000_000, "maxOutputTokens": 64000 } },
     }));
+    // Top-level usage without iterations sums the turn, so it is no reading.
     assert_eq!(
-        context_from_result(&result),
+        context_from_result(&result, None),
         Some(ClaudeContextReading {
-            used: Some(29608),
+            used: None,
             window: Some(1_000_000)
         })
     );
+}
+
+#[test]
+fn reads_the_main_models_window_when_a_turn_used_several() {
+    let result = rec(json!({
+        "type": "result",
+        "usage": { "iterations": [{ "input_tokens": 5, "output_tokens": 5 }] },
+        "modelUsage": {
+            "claude-haiku-4-5": { "contextWindow": 200_000 },
+            "claude-opus-5[1m]": { "contextWindow": 1_000_000 },
+        },
+    }));
+    assert_eq!(
+        context_from_result(&result, Some("claude-opus-5"))
+            .unwrap()
+            .window,
+        Some(1_000_000)
+    );
+    assert_eq!(
+        context_from_result(&result, Some("claude-haiku-4-5"))
+            .unwrap()
+            .window,
+        Some(200_000)
+    );
+    assert_eq!(context_from_result(&result, None).unwrap().window, None);
 }
 
 #[test]
@@ -901,7 +1150,7 @@ fn uses_the_last_iteration_since_top_level_usage_sums_the_whole_turn() {
         "modelUsage": { "claude-opus-5": { "contextWindow": 200_000 } },
     }));
     assert_eq!(
-        context_from_result(&result),
+        context_from_result(&result, None),
         Some(ClaudeContextReading {
             used: Some(70_305),
             window: Some(200_000)
@@ -912,7 +1161,7 @@ fn uses_the_last_iteration_since_top_level_usage_sums_the_whole_turn() {
 #[test]
 fn has_nothing_to_report_for_a_turn_that_never_called_the_api() {
     assert_eq!(
-        context_from_result(&rec(json!({ "type": "result", "usage": {} }))),
+        context_from_result(&rec(json!({ "type": "result", "usage": {} })), None),
         None
     );
 }
@@ -939,6 +1188,17 @@ fn normalizes_aggregate_input_output_and_cache_usage() {
             extra: Default::default(),
         })
     );
+}
+
+#[test]
+fn keeps_zero_token_fields_so_totals_can_sum_them() {
+    let metrics = turn_metrics_from_result(&rec(json!({
+        "usage": { "input_tokens": 3, "output_tokens": 7 },
+    })))
+    .unwrap();
+    assert_eq!(metrics.cache_read_tokens, Some(0));
+    assert_eq!(metrics.cache_write_tokens, Some(0));
+    assert_eq!(metrics.cache_hit_percent, None);
 }
 
 // describe("subagent messages")
@@ -1160,7 +1420,7 @@ mod file_attachments {
     }
 
     fn claude_content(text: &str, attachments: &[Attachment]) -> Vec<Value> {
-        let message = build_claude_user_message(text, attachments, None).unwrap();
+        let message = build_claude_user_message(text, attachments, None, None).unwrap();
         user_message_content(&message).to_vec()
     }
 
@@ -1276,8 +1536,50 @@ mod file_attachments {
             path: None,
             ..document()
         }];
-        let error = build_claude_user_message("Review", &files, None).unwrap_err();
+        let error = build_claude_user_message("Review", &files, None, None).unwrap_err();
         assert!(error.contains("report.pdf"), "{error}");
         assert!(error.contains("no local file path"), "{error}");
     }
+}
+
+// describe("release catalog regression probes")
+
+#[test]
+fn preserves_a_custom_gateway_id_advertised_by_the_installed_cli() {
+    let models = models_from_claude_list_models(&json!([
+        { "value": "my-gateway/claude-opus-5-5", "displayName": "Audit custom gateway" },
+        { "value": "us.anthropic.claude-sonnet-4-5-v1.0", "displayName": "Bedrock Sonnet" },
+        { "value": "opus-5-5", "displayName": "Opus 5.5" },
+    ]));
+    let native = |name: &str| {
+        models
+            .iter()
+            .find(|model| model.name == name)
+            .and_then(|model| model.native_id.clone())
+    };
+    assert_eq!(
+        native("Audit custom gateway").as_deref(),
+        Some("my-gateway/claude-opus-5-5")
+    );
+    assert_eq!(
+        native("Bedrock Sonnet").as_deref(),
+        Some("us.anthropic.claude-sonnet-4-5-v1.0")
+    );
+    assert_eq!(native("Opus 5.5").as_deref(), Some("claude-opus-5-5"));
+}
+
+#[test]
+fn retains_the_1m_option_when_base_and_extended_context_rows_coexist() {
+    let models = models_from_claude_list_models(&json!([
+        { "value": "opus", "resolvedModel": "claude-opus-4-6", "displayName": "Opus" },
+        { "value": "opus[1m]", "resolvedModel": "claude-opus-4-6", "displayName": "Opus 1M" },
+    ]));
+    let options: Vec<String> = models[0]
+        .settings
+        .iter()
+        .flatten()
+        .filter(|setting| setting.id == "context")
+        .flat_map(|setting| setting.options.iter().map(|option| option.value.clone()))
+        .collect();
+    assert!(options.contains(&"1m".to_string()), "{options:?}");
 }

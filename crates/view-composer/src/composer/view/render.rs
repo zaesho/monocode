@@ -13,6 +13,7 @@ use gpui::{
     prelude::FluentBuilder as _, relative,
 };
 use monocode_core::HarnessId;
+use monocode_ui::drag::PaneDragSource;
 use monocode_ui::styled::{UiStyled as _, glass_backdrop};
 use monocode_ui::{IconName, ProviderLogo, Theme, icon, provider_logo, u};
 
@@ -882,9 +883,7 @@ impl Composer {
                 .as_ref()
                 .map(|t| t.query.clone())
                 .unwrap_or_default();
-            let cwd = self.props.execution_cwd.clone();
-            let loading = super::super::model::paths::looks_like_project(&cwd)
-                && self.host.mentions_loading(&cwd, cx);
+            let loading = self.mention_picker_loading(cx);
             file_mention_picker("composer-mention-picker", files, query, self.mention_active)
                 .loading(loading)
                 .include_notes(self.props.notes_enabled)
@@ -920,6 +919,17 @@ impl Composer {
                 .child(picker)
                 .into_any_element(),
         )
+    }
+
+    /// The `@` picker shows its loading line instead of "no matches": the
+    /// project is still being listed, or a background ranking has not
+    /// landed and there are no rows from an earlier query to show.
+    pub(crate) fn mention_picker_loading(&self, cx: &mut Context<Self>) -> bool {
+        if self.mention_rank.pending.is_some() && self.ranked_files.is_empty() {
+            return true;
+        }
+        let cwd = &self.props.execution_cwd;
+        super::super::model::paths::looks_like_project(cwd) && self.host.mentions_loading(cwd, cx)
     }
 
     /// SkillPicker's create row: the starter-skill form.
@@ -960,6 +970,9 @@ impl Render for Composer {
         if self.file_drag && !cx.has_active_drag() {
             self.file_drag = false;
         }
+        if self.session_drag && !cx.has_active_drag() {
+            self.session_drag = false;
+        }
         // The placeholder follows the chips and cards (it notifies only on
         // a change, so this does not loop).
         let placeholder = self.placeholder_text();
@@ -976,7 +989,7 @@ impl Render for Composer {
         let c = theme.colors;
         let focused = self.prompt.read(cx).is_focused(window);
         let accent = theme.user_accent_or_accent();
-        let border = if self.file_drag {
+        let border = if self.file_drag || self.session_drag {
             theme.accent(0.60)
         } else if self.resend_edited {
             gpui::Hsla { a: 0.32, ..accent }
@@ -1014,7 +1027,6 @@ impl Render for Composer {
         };
         r#box = r#box.children(self.render_top_bar(window, cx));
         if !self.context_items.is_empty() || !self.attachments.is_empty() {
-            let items = self.context_items.clone();
             let mut chips = div()
                 .flex()
                 .flex_wrap()
@@ -1022,14 +1034,19 @@ impl Render for Composer {
                 .gap(u(6.))
                 .px(u(12.))
                 .pt(u(8.));
-            for item in &items {
+            for item in &self.context_items {
                 chips = chips.child(self.render_context_chip(item, window, cx));
             }
-            for file in self.attachments.clone() {
-                chips = chips.child(self.render_attachment_chip(&file, cx));
+            // Attachments can hold megabytes of base64, so the chips borrow
+            // the list instead of cloning it each frame.
+            let attachments = std::mem::take(&mut self.attachments);
+            for file in &attachments {
+                chips = chips.child(self.render_attachment_chip(file, cx));
             }
+            self.attachments = attachments;
             r#box = r#box.child(chips);
         }
+        r#box = r#box.children(self.render_session_drop_choice(window, cx));
         if let Some(error) = self.paste_error.clone() {
             r#box = r#box.child(
                 div()
@@ -1069,6 +1086,7 @@ impl Render for Composer {
                     .child("Drop files to attach"),
             );
         }
+        r#box = r#box.children(self.render_session_drag_overlay(cx));
         let mut wrapper = div().relative().flex().flex_col().child(r#box);
         wrapper = wrapper.children(self.render_pickers(cx));
         if let Some(runner) = self.runner.clone() {
@@ -1138,6 +1156,18 @@ impl Render for Composer {
                 .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                     this.on_external_drop(paths, window, cx)
                 }))
+                .on_drag_move::<PaneDragSource>(cx.listener(
+                    |this, event: &DragMoveEvent<PaneDragSource>, _, cx| {
+                        let over = event.bounds.contains(&event.event.position)
+                            && this.accepts_session_drag(event.drag(cx));
+                        this.set_session_drag(over, cx);
+                    },
+                ))
+                .on_drop(
+                    cx.listener(|this, source: &PaneDragSource, _, cx| {
+                        this.on_pane_drop(source, cx)
+                    }),
+                )
             })
             .children(self.header_views.iter().cloned())
             .children(queue)

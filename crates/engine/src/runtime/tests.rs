@@ -43,7 +43,10 @@ fn busy(id: &str) -> Session {
 }
 
 fn delta(text: &str) -> HarnessEvent {
-    HarnessEvent::MessageDelta { text: text.into() }
+    HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: None,
+    }
 }
 
 /// Records harness registry calls.
@@ -607,6 +610,164 @@ fn saves_the_workspace_snapshot_after_its_debounce(cx: &mut TestAppContext) {
     t.open(cx, vec![chat("s1"), chat("s2")]);
     cx.executor().advance_clock(WORKSPACE_SNAPSHOT_DEBOUNCE);
     assert_eq!(t.count("workspace_set_snapshot"), 1);
+}
+
+#[gpui::test]
+fn streaming_collects_the_workspace_snapshot_once_per_debounce(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    *t.workspace.snapshot.borrow_mut() = Some(json!({ "tabs": [] }));
+    t.tabs(&["s1"]);
+    t.open(cx, vec![busy("s1")]);
+    // Ten frames of output inside one debounce.
+    for _ in 0..10 {
+        t.sessions
+            .update(cx, |state, cx| state.enqueue_event("s1", delta("x"), cx));
+        cx.executor().advance_clock(FRAME_FLUSH);
+    }
+    assert_eq!(t.applied(), 10);
+    assert_eq!(t.workspace.collects.get(), 0);
+    cx.executor().advance_clock(WORKSPACE_SNAPSHOT_DEBOUNCE);
+    assert_eq!(t.workspace.collects.get(), 1);
+    assert_eq!(t.count("workspace_set_snapshot"), 1);
+}
+
+#[gpui::test]
+fn a_layout_change_inside_the_debounce_is_saved(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    *t.workspace.snapshot.borrow_mut() = Some(json!({ "tabs": [] }));
+    t.open(cx, vec![chat("s1")]);
+    cx.executor().advance_clock(Duration::from_millis(100));
+    t.open(cx, vec![chat("s1"), chat("s2")]);
+    cx.executor().advance_clock(WORKSPACE_SNAPSHOT_DEBOUNCE);
+    assert_eq!(
+        t.backend.workspace_snapshot().unwrap()["sessionIds"],
+        json!(["s1", "s2"])
+    );
+}
+
+// Change tracking for views.
+
+#[gpui::test]
+fn a_change_moves_only_the_changed_sessions_revision(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    t.open(cx, vec![chat("s1"), chat("s2")]);
+    let (first, second, all) = t.sessions.read_with(cx, |state, _| {
+        (
+            state.session_revision("s1"),
+            state.session_revision("s2"),
+            state.revision(),
+        )
+    });
+    assert_ne!(first, 0);
+    assert_ne!(second, 0);
+    t.sessions.update(cx, |state, cx| {
+        state.update("s1", cx, |session| session.title = "Renamed".into());
+    });
+    t.sessions.read_with(cx, |state, _| {
+        assert!(state.session_revision("s1") > first);
+        assert_eq!(state.session_revision("s2"), second);
+        assert!(state.revision() > all);
+        assert_eq!(state.session_revision("missing"), 0);
+    });
+}
+
+#[gpui::test]
+fn snapshots_share_one_copy_until_the_session_changes(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    t.open(cx, vec![chat("s1")]);
+    let (first, second) = t.sessions.read_with(cx, |state, _| {
+        (state.snapshot("s1").unwrap(), state.snapshot("s1").unwrap())
+    });
+    assert!(Arc::ptr_eq(&first, &second));
+    t.sessions.update(cx, |state, cx| {
+        state.update("s1", cx, |session| session.title = "Renamed".into());
+    });
+    let third = t
+        .sessions
+        .read_with(cx, |state, _| state.snapshot("s1").unwrap());
+    assert!(!Arc::ptr_eq(&first, &third));
+    assert_eq!(third.title, "Renamed");
+    assert!(
+        t.sessions
+            .read_with(cx, |state, _| state.snapshot("missing"))
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn a_reopened_session_never_repeats_an_old_revision(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    t.open(cx, vec![chat("s1")]);
+    let before = t
+        .sessions
+        .read_with(cx, |state, _| state.session_revision("s1"));
+    t.sessions.update(cx, |state, cx| {
+        state.remove("s1", cx);
+    });
+    assert_eq!(
+        t.sessions
+            .read_with(cx, |state, _| state.session_revision("s1")),
+        0
+    );
+    t.sessions.update(cx, |state, cx| {
+        state.insert(chat("s1"), cx);
+    });
+    assert!(
+        t.sessions
+            .read_with(cx, |state, _| state.session_revision("s1"))
+            > before
+    );
+}
+
+#[gpui::test]
+fn leaving_a_saved_session_unchanged_writes_nothing(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    t.tabs(&["s1"]);
+    t.open(cx, vec![chat("s1")]);
+    cx.executor().advance_clock(PERSIST_DEBOUNCE);
+    cx.run_until_parked();
+    let saved = t.count("session_upsert");
+    assert_eq!(saved, 1);
+    // The tab closes, so idle detach saves and caches the session.
+    t.tabs(&[]);
+    t.sessions.update(cx, |state, cx| state.schedule_detach(cx));
+    cx.executor().advance_clock(SESSION_DETACH_DELAY);
+    cx.run_until_parked();
+    assert!(t.get(cx, "s1").is_none());
+    assert_eq!(t.count("session_upsert"), saved);
+}
+
+#[gpui::test]
+fn a_change_undone_while_its_save_runs_is_saved_again(cx: &mut TestAppContext) {
+    let t = setup(cx);
+    t.tabs(&["s1"]);
+    t.open(cx, vec![chat("s1")]);
+    cx.executor().advance_clock(PERSIST_DEBOUNCE);
+    cx.run_until_parked();
+    assert_eq!(t.count("session_upsert"), 1);
+    let original = t.get(cx, "s1").unwrap().model;
+    // The model changes and its save starts, but the store holds it.
+    let gate = t.backend.hold_next("session_upsert");
+    t.sessions.update(cx, |state, cx| {
+        state.update("s1", cx, |session| session.model = "cursor:other".into());
+        state.persist("s1", cx);
+    });
+    cx.run_until_parked();
+    // The user switches back while that write runs, then leaves the chat.
+    t.sessions.update(cx, |state, cx| {
+        state.update("s1", cx, |session| session.model = original.clone());
+        state.persist("s1", cx);
+    });
+    gate.release();
+    cx.run_until_parked();
+    // The second save compares with the row the first one left, not with
+    // the fingerprint from before it, so it writes the original model back.
+    assert_eq!(t.count("session_upsert"), 3);
+    assert_eq!(t.backend.record("s1").unwrap().model, original);
+    // Now the store matches, so leaving again writes nothing.
+    t.sessions.update(cx, |state, cx| state.persist("s1", cx));
+    cx.run_until_parked();
+    assert_eq!(t.count("session_upsert"), 3);
 }
 
 // Idle detach (`detachIdleSessions`).
@@ -1324,7 +1485,7 @@ async fn discards_a_draft_only_record_before_reusing_its_open_session_id(cx: &mu
     let _ = futures::future::join3(draft, discarding, later).await;
     assert_eq!(
         t.backend.commands(),
-        vec!["session_upsert", "session_delete", "session_upsert"]
+        vec!["session_upsert", "session_discard_draft", "session_upsert"]
     );
 }
 
@@ -1558,7 +1719,7 @@ async fn checkpoints_run_in_order_per_session(cx: &mut TestAppContext) {
     let gate = t.backend.hold_next("session_checkpoint_prepare");
     let prepare = checkpoints.prepare("s1", CWD, vec!["a".into()]);
     let capture = checkpoints.capture("s1", CWD, vec!["a".into()]);
-    let other = checkpoints.ensure("s2", CWD);
+    let other = checkpoints.ensure("s2", CWD, false);
     cx.run_until_parked();
     // Different sessions run concurrently; s1's capture waits for its prepare.
     let mut started = t.backend.commands();

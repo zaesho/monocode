@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachment::Attachment;
 use crate::block::{
-    AgentStepKind, ApprovalDecided, InterjectionSeverity, ModelSettings, TaskListItem, ToolPreview,
-    TurnIntent, TurnMetrics,
+    AgentStepKind, ApprovalDecided, InterjectionSeverity, InterjectionStatus, ModelSettings,
+    TaskListItem, ToolPreview, TurnIntent, TurnMetrics,
 };
 use crate::harness::RuntimeMode;
 use crate::user_question::UserQuestion;
@@ -31,7 +31,19 @@ pub enum HarnessEvent {
     #[serde(rename = "session.providerBound", rename_all = "camelCase")]
     SessionProviderBound { provider_session_id: String },
     #[serde(rename = "turn.started", rename_all = "camelCase")]
-    TurnStarted { provider_turn_id: String },
+    TurnStarted {
+        provider_turn_id: String,
+        /// The provider started this turn on its own, for example a
+        /// scheduled wakeup, with no user prompt behind it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<bool>,
+    },
+    /// A turn the provider started on its own (`native`) has ended.
+    #[serde(rename = "turn.finished")]
+    TurnFinished {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native: Option<bool>,
+    },
     #[serde(rename = "session.configChanged", rename_all = "camelCase")]
     SessionConfigChanged {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,20 +65,50 @@ pub enum HarnessEvent {
     BackgroundUpdated { tasks: Vec<String> },
     #[serde(rename = "interjection", rename_all = "camelCase")]
     Interjection {
+        /// Stable identity. A repeat with the same id updates the existing
+        /// block in place instead of appending another one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         text: String,
         custom_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         severity: Option<InterjectionSeverity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<InterjectionStatus>,
     },
     #[serde(rename = "message.delta")]
-    MessageDelta { text: String },
+    MessageDelta {
+        text: String,
+        /// `Some(true)`: plain incremental text to append as is. Without it
+        /// the reducer folds the text in, which tolerates providers that
+        /// resend snapshots but can drop a chunk that repeats earlier text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        append: Option<bool>,
+    },
+    /// The full current text of one provider message part. A repeat with
+    /// the same `part_id` replaces the text in place, so a provider can
+    /// correct text it already streamed.
+    #[serde(rename = "message.part", rename_all = "camelCase")]
+    MessagePart {
+        part_id: String,
+        text: String,
+        reasoning: bool,
+        streaming: bool,
+    },
     #[serde(rename = "message.completed")]
     MessageCompleted,
     /// `image.generated` has two shapes: inline base64 data, or a file on disk.
     #[serde(rename = "image.generated")]
     ImageGenerated(GeneratedImage),
     #[serde(rename = "reasoning.delta")]
-    ReasoningDelta { text: String },
+    ReasoningDelta {
+        text: String,
+        /// As on [`HarnessEvent::MessageDelta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        append: Option<bool>,
+    },
     #[serde(rename = "reasoning.completed")]
     ReasoningCompleted,
     #[serde(rename = "tool.started", rename_all = "camelCase")]
@@ -382,6 +424,10 @@ mod tests {
         round_trip(
             json!({ "type": "interjection", "text": "note", "customType": "advisor", "severity": "concern" }),
         );
+        round_trip(json!({
+            "type": "interjection", "id": "advisor-srvtoolu_1", "text": "note",
+            "customType": "advisor", "model": "claude-fable-5-1", "status": "running"
+        }));
         let metrics = round_trip(
             json!({ "type": "turn.metrics", "inputTokens": 5, "cacheHitPercent": 40.5 }),
         );
@@ -400,11 +446,15 @@ mod tests {
             json!({ "type": "session.error", "message": "boom" }),
             json!({ "type": "session.providerBound", "providerSessionId": "p" }),
             json!({ "type": "turn.started", "providerTurnId": "t" }),
+            json!({ "type": "turn.started", "providerTurnId": "t", "native": true }),
+            json!({ "type": "turn.finished", "native": true }),
             json!({ "type": "session.configChanged", "model": "m", "modelSettings": { "effort": "high" } }),
             json!({ "type": "status", "text": "Working" }),
             json!({ "type": "usage.limited", "resetsAt": 1000 }),
             json!({ "type": "background.updated", "tasks": ["build"] }),
             json!({ "type": "message.delta", "text": "hi" }),
+            json!({ "type": "message.delta", "text": "hi", "append": true }),
+            json!({ "type": "reasoning.delta", "text": "hm", "append": true }),
             json!({ "type": "message.completed" }),
             json!({ "type": "reasoning.delta", "text": "hm" }),
             json!({ "type": "reasoning.completed" }),

@@ -4,9 +4,9 @@
 //!
 //! The host owns the session. This entity polls its snapshot (and reloads at
 //! once on pushed changes), dispatches commands with an outbox that survives
-//! restarts, shows unconfirmed turns optimistically, applies model and
-//! permission changes when the session is idle, and resumes after a usage
-//! limit. Views read `session()` and the other accessors and call the action
+//! restarts, shows unconfirmed turns optimistically, applies model,
+//! provider, and permission changes when the session is idle, and resumes
+//! after a usage limit. Views read `session()` and the other accessors and call the action
 //! methods; `RemoteSessions` merges each new snapshot into `Sessions`.
 //!
 //! React effects become `reconcile`, which runs after every state change in
@@ -28,7 +28,8 @@ use monocode_core::{
 use monocode_remote::host::protocol::{
     ApprovalDecision, CommandReceipt, HostCommand, HostDescriptor, HostModelCatalog, HostSession,
     HostSessionStatus, HostWorktree, REMOTE_PROVIDERS, RemoteAttachment, RemoteMachine,
-    RemoteProvider, SendIntent, provider_name, require_host_descriptor,
+    RemoteProvider, SendIntent, host_supports_provider_inspection, host_supports_provider_switch,
+    provider_name, require_host_descriptor,
 };
 use serde_json::{Value, json};
 
@@ -57,10 +58,10 @@ pub struct Configuration {
     pub mode: RuntimeMode,
 }
 
-/// `same` in the configure effect: the harness is fixed once a session
-/// exists, so it is not compared.
+/// `same` in the configure effect.
 fn same_configuration(a: &Configuration, b: &Configuration) -> bool {
-    a.model == b.model
+    a.harness == b.harness
+        && a.model == b.model
         && a.mode == b.mode
         && same_model_settings(Some(&a.settings), Some(&b.settings))
 }
@@ -117,6 +118,9 @@ pub enum NoticeAction {
     Dismiss,
     /// "Retry": load the host's models again.
     RetryCatalog,
+    /// "Confirm inspection": the user checked the work of a provider
+    /// request that may already have run.
+    ConfirmInspection,
 }
 
 impl NoticeAction {
@@ -125,6 +129,7 @@ impl NoticeAction {
             Self::RetryPending | Self::RetryCatalog => "Retry",
             Self::TryAgain => "Try again",
             Self::Dismiss => "Dismiss",
+            Self::ConfirmInspection => "Confirm inspection",
         }
     }
 }
@@ -156,6 +161,9 @@ pub struct RemoteSessionStatus {
     pub error: String,
     /// `catalog.errors[harness] ?? catalogError`.
     pub catalog_problem: String,
+    /// A provider request may already have run and waits for the user to
+    /// inspect it. `Some(true)` when this host can record the confirmation.
+    pub inspection: Option<bool>,
 }
 
 /// Composer menu actions the host advertises.
@@ -211,6 +219,9 @@ pub struct RemoteSession {
     removing_draft: Option<String>,
     applying: bool,
     applied: Option<Configuration>,
+    /// A change the host refused, with the session revision it was sent
+    /// for. It is not sent again until the session changes.
+    rejected_configuration: Option<(Configuration, i64)>,
     /// The branch the projects package reports for the execution checkout
     /// (`useProjectBranchesState`), fed in by the view.
     current_branch: Option<String>,
@@ -336,6 +347,8 @@ fn with_session_id(command: &HostCommand, id: &str) -> HostCommand {
     match &mut command {
         HostCommand::Create { .. } => {}
         HostCommand::Configure { session_id, .. }
+        | HostCommand::SwitchProvider { session_id, .. }
+        | HostCommand::ConfirmProviderInspection { session_id, .. }
         | HostCommand::Compact { session_id, .. }
         | HostCommand::Send { session_id, .. }
         | HostCommand::Draft { session_id, .. }
@@ -351,6 +364,8 @@ fn command_session_id(command: &HostCommand) -> Option<&str> {
     match command {
         HostCommand::Create { .. } => None,
         HostCommand::Configure { session_id, .. }
+        | HostCommand::SwitchProvider { session_id, .. }
+        | HostCommand::ConfirmProviderInspection { session_id, .. }
         | HostCommand::Compact { session_id, .. }
         | HostCommand::Send { session_id, .. }
         | HostCommand::Draft { session_id, .. }
@@ -444,6 +459,7 @@ impl RemoteSession {
             removing_draft: None,
             applying: false,
             applied: None,
+            rejected_configuration: None,
             current_branch: None,
             poll: None,
             poll_epoch: 0,
@@ -582,6 +598,21 @@ impl RemoteSession {
             || self.pending_send_active()
     }
 
+    /// `needsInspection`: a provider request may already have run, so new
+    /// turns wait until the user confirms they inspected its work.
+    pub fn needs_inspection(&self) -> bool {
+        self.host_session()
+            .and_then(|host| host.provider_context.as_ref())
+            .and_then(|context| context.delivery.as_ref())
+            .is_some_and(|delivery| delivery.needs_inspection())
+    }
+
+    /// `canSwitchProvider`: a started session may move to another of the
+    /// host's providers.
+    pub fn can_switch_provider(&self) -> bool {
+        host_supports_provider_switch(self.descriptor.as_ref()) && !self.needs_inspection()
+    }
+
     fn saved(&self) -> Option<Configuration> {
         self.host_session().map(|host| Configuration {
             harness: host.harness,
@@ -627,7 +658,9 @@ impl RemoteSession {
 
     /// `allowedModelHarnesses`.
     pub fn allowed_model_harnesses(&self) -> Vec<HarnessId> {
-        if let Some(host) = self.host_session() {
+        if let Some(host) = self.host_session()
+            && !self.can_switch_provider()
+        {
             return vec![host.harness];
         }
         let providers = self.providers();
@@ -809,6 +842,26 @@ impl RemoteSession {
             alert,
             enabled: self.online || action == NoticeAction::Dismiss,
         };
+        if self.needs_inspection()
+            && !matches!(
+                self.pending,
+                Some(HostCommand::ConfirmProviderInspection { .. })
+            )
+        {
+            let text =
+                "The provider request may already have run. Inspect its work before continuing.";
+            return Some(
+                if host_supports_provider_inspection(self.descriptor.as_ref()) {
+                    notice(text.into(), detail, NoticeAction::ConfirmInspection)
+                } else {
+                    notice(
+                        text.into(),
+                        Some("Update this host to confirm inspection.".into()),
+                        NoticeAction::Dismiss,
+                    )
+                },
+            );
+        }
         if self.pending.is_some() && !self.sending {
             return Some(notice(
                 "Waiting for the host to confirm your request.".into(),
@@ -867,6 +920,9 @@ impl RemoteSession {
                 .map(|starting| starting.turn.draft),
             error: self.error.clone(),
             catalog_problem: self.catalog_problem(),
+            inspection: self
+                .needs_inspection()
+                .then(|| host_supports_provider_inspection(self.descriptor.as_ref())),
         }
     }
 
@@ -944,12 +1000,13 @@ impl RemoteSession {
     }
 
     /// `available`: the host runs this provider, and a started session keeps
-    /// its own.
+    /// its own unless the host can switch it.
     pub fn model_available(&self, harness: HarnessId) -> bool {
         self.providers().contains(&harness)
-            && self
-                .host_session()
-                .is_none_or(|host| host.harness == harness)
+            && (self.can_switch_provider()
+                || self
+                    .host_session()
+                    .is_none_or(|host| host.harness == harness))
     }
 
     /// `probed`.
@@ -1101,27 +1158,57 @@ impl RemoteSession {
         {
             return;
         }
-        if self.busy() || !self.online || self.pending.is_some() || self.applying {
+        let Some(revision) = self.snapshot.as_ref().map(|snapshot| snapshot.revision) else {
+            return;
+        };
+        if self
+            .rejected_configuration
+            .as_ref()
+            .is_some_and(|(rejected, at)| *at == revision && same_configuration(&changes, rejected))
+        {
+            return;
+        }
+        if self.busy()
+            || self.needs_inspection()
+            || !self.online
+            || self.pending.is_some()
+            || self.applying
+        {
+            return;
+        }
+        // A provider choice waits in memory for a host that can switch.
+        let switching = changes.harness != saved.harness;
+        if switching && !self.can_switch_provider() {
             return;
         }
         self.applying = true;
-        let run = self.run(
+        let command = if switching {
+            HostCommand::SwitchProvider {
+                command_id: new_id(),
+                session_id: host_id,
+                expected_revision: revision,
+                harness: changes.harness,
+                model: changes.model.clone(),
+                model_settings: changes.settings.clone(),
+                runtime_mode: changes.mode,
+            }
+        } else {
             HostCommand::Configure {
                 command_id: new_id(),
                 session_id: host_id,
                 model: changes.model.clone(),
                 model_settings: changes.settings.clone(),
                 runtime_mode: changes.mode,
-            },
-            None,
-            None,
-            cx,
-        );
+            }
+        };
+        let run = self.run(command, None, None, cx);
         cx.spawn(async move |this, cx| {
             let receipt = run.await;
             this.update(cx, |this, cx| {
                 if receipt.is_some() {
                     this.applied = Some(changes);
+                } else {
+                    this.rejected_configuration = Some((changes, revision));
                 }
                 this.applying = false;
                 this.changed(cx);
@@ -1185,6 +1272,7 @@ impl RemoteSession {
             self.unseen_send = None;
             self.changes = None;
             self.applied = None;
+            self.rejected_configuration = None;
             self.error.clear();
             self.removing_draft = None;
             self.preparing = false;
@@ -1304,8 +1392,11 @@ impl RemoteSession {
                 if outcome.is_ok()
                     && let Some(session_id) = &session_id
                 {
-                    outcome = client
-                        .load_remote_session(&machine.id, session_id, known)
+                    // Decoding and applying the sync run off the UI thread.
+                    let load = client.load_remote_session(&machine.id, session_id, known);
+                    outcome = cx
+                        .background_executor()
+                        .spawn(load)
                         .await
                         .and_then(|next| {
                             if next.project_id == project_id {
@@ -1320,8 +1411,18 @@ impl RemoteSession {
                         return None;
                     }
                     let mut active = false;
+                    // The host answered with the snapshot this tab already
+                    // shows, and the tab was already online: nothing a view
+                    // reads changed. React bailed out of the same `setState`.
+                    let mut unchanged = false;
                     match outcome {
                         Ok(next) => {
+                            unchanged = this.online
+                                && failed == 0
+                                && matches!(
+                                    (&this.snapshot, &next),
+                                    (Some(shown), Some(next)) if Arc::ptr_eq(shown, next)
+                                );
                             this.online = true;
                             let machine_id = this.machine.id.clone();
                             this.connections
@@ -1355,7 +1456,11 @@ impl RemoteSession {
                         }
                     }
                     this.in_flight = false;
-                    this.changed(cx);
+                    // A busy tab polls every 750 ms. Redraw only when the poll
+                    // changed something.
+                    if !unchanged {
+                        this.changed(cx);
+                    }
                     let again = std::mem::take(&mut this.again);
                     let live = this.connections.read(cx).remote_changes_live(&this.machine.id);
                     Some((again, live, active))
@@ -1493,6 +1598,18 @@ impl RemoteSession {
         cx: &mut Context<Self>,
     ) -> Task<Option<CommandReceipt>> {
         if self.sending {
+            return Task::ready(None);
+        }
+        if self.needs_inspection()
+            && matches!(
+                command,
+                HostCommand::Send { .. }
+                    | HostCommand::Compact { .. }
+                    | HostCommand::SwitchProvider { .. }
+            )
+        {
+            self.error = "Inspect the interrupted provider request before continuing.".into();
+            cx.notify();
             return Task::ready(None);
         }
         let version = self.binding_version;
@@ -2059,6 +2176,7 @@ impl RemoteSession {
             || self.preparing
             || self.pending.is_some()
             || self.busy()
+            || self.needs_inspection()
             || (text.trim().is_empty() && attachments.is_empty())
         {
             return false;
@@ -2184,7 +2302,33 @@ impl RemoteSession {
                 self.changed(cx);
             }
             NoticeAction::RetryCatalog => self.refresh_catalog(cx),
+            NoticeAction::ConfirmInspection => self.confirm_inspection(cx),
         }
+    }
+
+    /// `confirmInspection`: record that the user inspected the interrupted
+    /// provider request. The host checks the revision, so a confirmation
+    /// never applies to a session that changed since the user looked.
+    pub fn confirm_inspection(&mut self, cx: &mut Context<Self>) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let Some(host) = self.host_session() else {
+            return;
+        };
+        if host.is_busy()
+            || self.sending
+            || !self.online
+            || !host_supports_provider_inspection(self.descriptor.as_ref())
+        {
+            return;
+        }
+        let command = HostCommand::ConfirmProviderInspection {
+            command_id: new_id(),
+            session_id: host.id.clone(),
+            expected_revision: snapshot.revision,
+        };
+        self.run(command, None, None, cx).detach();
     }
 
     /// `selectWorktree`: use another host checkout for a session that has
@@ -2343,7 +2487,12 @@ impl RemoteSession {
         let Some(host_id) = self.host_session().map(|host| host.id.clone()) else {
             return false;
         };
-        if self.busy() || self.pending.is_some() || self.changes.is_some() || !self.online {
+        if self.busy()
+            || self.needs_inspection()
+            || self.pending.is_some()
+            || self.changes.is_some()
+            || !self.online
+        {
             return false;
         }
         let command = message(
@@ -2415,6 +2564,13 @@ impl RemoteSession {
 
     /// `onModelChange`: keep the settings the new model supports.
     pub fn set_model(&mut self, harness: HarnessId, model: &str, cx: &mut Context<Self>) {
+        if self
+            .host_session()
+            .is_some_and(|host| host.harness != harness)
+            && !self.can_switch_provider()
+        {
+            return;
+        }
         let settings: Vec<ModelSetting> = self
             .resolve_model(harness, model)
             .settings

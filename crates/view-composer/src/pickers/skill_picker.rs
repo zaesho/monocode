@@ -512,12 +512,20 @@ impl CreateSkillForm {
         self
     }
 
+    /// The composer calls this and `set_busy` on every frame, so an equal
+    /// value changes nothing.
     pub fn set_error(&mut self, error: Option<SharedString>, cx: &mut Context<Self>) {
+        if error == self.error {
+            return;
+        }
         self.error = error;
         cx.notify();
     }
 
     pub fn set_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        if busy == self.busy {
+            return;
+        }
         self.busy = busy;
         self.input
             .update(cx, |input, cx| input.set_disabled(busy, cx));

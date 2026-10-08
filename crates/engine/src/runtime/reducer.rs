@@ -111,6 +111,7 @@ mod tests {
                 to: HarnessId::Claude,
                 status: HandoffStatus::Preparing,
                 pending: None,
+                transfer: None,
                 extra: Extra::new(),
             }),
             ..Block::new("h", BlockRole::Handoff, "")
@@ -140,7 +141,10 @@ mod tests {
         assert!(!apply_harness_events(&mut s, &[]));
         assert!(apply_harness_events(
             &mut s,
-            &[HarnessEvent::MessageDelta { text: "hi".into() }]
+            &[HarnessEvent::MessageDelta {
+                text: "hi".into(),
+                append: None
+            }]
         ));
         assert_eq!(s.blocks.last().map(|b| b.text.as_str()), Some("hi"));
     }

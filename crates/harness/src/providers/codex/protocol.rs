@@ -506,14 +506,20 @@ pub fn map_codex_notification(method: &str, params: &Value) -> MappedCodexNotifi
             if delta.is_empty() {
                 return MappedCodexNotification::none();
             }
-            MappedCodexNotification::events(vec![HarnessEvent::MessageDelta { text: delta }])
+            MappedCodexNotification::events(vec![HarnessEvent::MessageDelta {
+                text: delta,
+                append: None,
+            }])
         }
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
             let delta = delta_text(rec.get("delta"));
             if delta.is_empty() {
                 return MappedCodexNotification::none();
             }
-            MappedCodexNotification::events(vec![HarnessEvent::ReasoningDelta { text: delta }])
+            MappedCodexNotification::events(vec![HarnessEvent::ReasoningDelta {
+                text: delta,
+                append: None,
+            }])
         }
         "item/plan/delta" => {
             let delta = delta_text(rec.get("delta"));
@@ -751,6 +757,7 @@ fn map_item_lifecycle(method: &str, rec: &Record) -> MappedCodexNotification {
             Some(review) => MappedCodexNotification::events(vec![
                 HarnessEvent::MessageDelta {
                     text: review.to_string(),
+                    append: None,
                 },
                 HarnessEvent::MessageCompleted,
             ]),
@@ -767,7 +774,7 @@ fn map_item_lifecycle(method: &str, rec: &Record) -> MappedCodexNotification {
             let text = delta_text(item.get("text"));
             let mut events = Vec::new();
             if !text.is_empty() {
-                events.push(HarnessEvent::MessageDelta { text });
+                events.push(HarnessEvent::MessageDelta { text, append: None });
                 events.push(HarnessEvent::MessageCompleted);
             }
             return MappedCodexNotification::events(events);
@@ -812,7 +819,7 @@ fn map_item_lifecycle(method: &str, rec: &Record) -> MappedCodexNotification {
                     .join("\n");
                 if !text.is_empty() {
                     return MappedCodexNotification::events(vec![
-                        HarnessEvent::ReasoningDelta { text },
+                        HarnessEvent::ReasoningDelta { text, append: None },
                         HarnessEvent::ReasoningCompleted,
                     ]);
                 }
@@ -1455,7 +1462,7 @@ pub fn map_codex_subagent_steps(call_id: &str, method: &str, params: &Value) -> 
                     call_id, step_id, title, kind, status, detail, preview,
                 ))
             }
-            HarnessEvent::MessageDelta { text } => Some(HarnessEvent::AgentStep {
+            HarnessEvent::MessageDelta { text, .. } => Some(HarnessEvent::AgentStep {
                 call_id: call_id.to_string(),
                 step_id: format!("{item_id}:text"),
                 kind: AgentStepKind::Message,
@@ -1467,7 +1474,7 @@ pub fn map_codex_subagent_steps(call_id: &str, method: &str, params: &Value) -> 
                 agent_name: None,
                 agent_type: None,
             }),
-            HarnessEvent::ReasoningDelta { text } => Some(HarnessEvent::AgentStep {
+            HarnessEvent::ReasoningDelta { text, .. } => Some(HarnessEvent::AgentStep {
                 call_id: call_id.to_string(),
                 step_id: format!("{item_id}:reasoning"),
                 kind: AgentStepKind::Reasoning,

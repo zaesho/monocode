@@ -375,17 +375,19 @@ pub fn help(content: impl IntoElement, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// `Loader` with `animate-spin`: one turn per second.
-pub fn spinning_loader(id: impl Into<ElementId>, size: f32, color: Hsla) -> AnyElement {
-    use gpui::{Animation, AnimationExt as _, Transformation, percentage};
+/// `Loader` with `animate-spin`: one turn per second, redrawn at
+/// [`monocode_ui::ticker::SMOOTH_FPS`] instead of every display refresh. It
+/// keeps turning with reduced motion, as `animate-spin` did.
+pub fn spinning_loader(_id: impl Into<ElementId>, size: f32, color: Hsla) -> AnyElement {
+    use gpui::{Transformation, percentage};
+    use monocode_ui::{SteppedAnimationExt as _, smooth_steps};
+    let period = std::time::Duration::from_secs(1);
     icon(IconName::Loader)
         .size(u(size))
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_secs(1)).repeat(),
-            |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-        )
+        .with_loading_animation(period, smooth_steps(period), |svg, t| {
+            svg.with_transformation(Transformation::rotate(percentage(t)))
+        })
         .into_any_element()
 }
 

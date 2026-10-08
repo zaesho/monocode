@@ -165,8 +165,52 @@ pub struct HandoffMeta {
     /// Inject this brief into prompts to `to` until that harness accepts a turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending: Option<bool>,
+    /// The shared-history transfer this divider reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<HandoffTransfer>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+/// How far a provider switch delivered its shared history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferStatus {
+    Preparing,
+    Imported,
+    Accepted,
+    Uncertain,
+}
+
+/// How the shared history reached the next provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferMode {
+    Pending,
+    Native,
+    Inline,
+}
+
+/// `HandoffMeta["transfer"]`: what the handoff row shows about a switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffTransfer {
+    pub switch_id: String,
+    pub status: TransferStatus,
+    pub mode: TransferMode,
+    pub included: u64,
+    pub omitted: u64,
+    pub historical_attachments: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_submitted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_before_submission: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_inspection: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection_confirmed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -267,13 +311,30 @@ pub enum InterjectionSeverity {
     Blocker,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Where a live interjection stands, such as a Claude Code advisor consult
+/// that has not answered yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InterjectionStatus {
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InterjectionMeta {
     pub custom_type: String,
     /// Highest severity among this interjection's retained notes, when any is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub severity: Option<InterjectionSeverity>,
+    /// Model that wrote the interjection, such as `claude-fable-5-1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<InterjectionStatus>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -514,6 +575,10 @@ pub enum BlockNotice {
 #[serde(rename_all = "camelCase")]
 pub struct Block {
     pub id: String,
+    /// The provider part this assistant or reasoning block shows. Later
+    /// snapshots of that part replace the text, even after a reload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_part_id: Option<String>,
     pub role: BlockRole,
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]

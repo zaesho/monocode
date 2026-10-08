@@ -13,6 +13,7 @@
 //! from sessions/model/inFlight.ts, which needs the transcript reducer and
 //! so comes in as a closure.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use monocode_core::block::ModelSettings;
@@ -205,8 +206,10 @@ pub fn collect_workspace_snapshot_keeping(
     last_dock_side: Option<DockSide>,
     keep_tab: &dyn Fn(&WorkspaceTab) -> bool,
 ) -> WorkspaceSnapshot {
-    let (kept, left_out): (Vec<WorkspaceTab>, Vec<WorkspaceTab>) =
-        tabs.iter().cloned().partition(|tab| keep_tab(tab));
+    // The engine collects a snapshot on every session change. Borrow the
+    // tabs instead of cloning them, since each kept tab is serialized below.
+    let (kept, left_out): (Vec<&WorkspaceTab>, Vec<&WorkspaceTab>) =
+        tabs.iter().partition(|tab| keep_tab(tab));
     let kept_ids: HashSet<String> = kept.iter().flat_map(|tab| leaf_ids(&tab.layout)).collect();
     let dropped_ids: HashSet<String> = left_out
         .iter()
@@ -217,7 +220,7 @@ pub fn collect_workspace_snapshot_keeping(
     let draft = without_inbox_sessions(Draft {
         tabs: without_agent_tabs(&kept)
             .iter()
-            .filter_map(|tab| sanitize_tab(&to_value(tab)))
+            .filter_map(|tab| sanitize_tab(&to_value(tab.as_ref())))
             .collect(),
         sessions: sessions
             .iter()
@@ -314,15 +317,15 @@ pub fn parse_project_return_targets(raw: Option<&Value>) -> ProjectReturnMemory 
 /// outlive the window that started it. Dropping them in `sanitize_file`
 /// would strand an empty pane and cost the whole workspace tab on restore,
 /// so the pane is closed here instead.
-fn without_agent_tabs(tabs: &[WorkspaceTab]) -> Vec<WorkspaceTab> {
+fn without_agent_tabs<'a>(tabs: &[&'a WorkspaceTab]) -> Vec<Cow<'a, WorkspaceTab>> {
     tabs.iter()
-        .filter_map(|tab| {
+        .filter_map(|&tab| {
             if !tab
                 .editor_panes
                 .iter()
                 .any(|pane| pane.files.iter().any(is_agent_tab))
             {
-                return Some(tab.clone());
+                return Some(Cow::Borrowed(tab));
             }
             let mut remaining = Some(tab.clone());
             let mut panes = Vec::new();
@@ -351,9 +354,11 @@ fn without_agent_tabs(tabs: &[WorkspaceTab]) -> Vec<WorkspaceTab> {
                     });
                 }
             }
-            remaining.map(|remaining| WorkspaceTab {
-                editor_panes: panes,
-                ..remaining
+            remaining.map(|remaining| {
+                Cow::Owned(WorkspaceTab {
+                    editor_panes: panes,
+                    ..remaining
+                })
             })
         })
         .collect()

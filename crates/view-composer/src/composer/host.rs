@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{App, Task, Window};
 use monocode_core::session::{ComposerTurnOptions, EditedResendRejection};
@@ -16,7 +17,7 @@ use monocode_core::{Attachment, HarnessId, ModelPrefs, ProjectProviders};
 
 use super::model::clipboard::ClipboardFile;
 use super::model::mcp::{McpConnection, McpTag};
-use super::model::mentions::{ProjectFile, RankedFile};
+use super::model::mentions::{MentionIndex, ProjectFile, RankedFile, build_mention_index};
 use super::model::skills::Skill;
 use crate::pickers::ModelSource;
 
@@ -198,9 +199,32 @@ pub trait ComposerHost: 'static {
     /// `note:` paths) when notes are on. Feeds the highlight's label index.
     fn mention_files(&self, cwd: &str, cx: &mut App) -> Vec<ProjectFile>;
 
+    /// The `@` label index for `cwd`. The default builds it from
+    /// [`Self::mention_files`] on every call. A host with a large project
+    /// should cache it per listing and build it off the UI thread.
+    fn mention_index(&self, cwd: &str, cx: &mut App) -> Arc<MentionIndex> {
+        Arc::new(build_mention_index(&self.mention_files(cwd, cx)))
+    }
+
     /// `rankedFiles`: picker rows for `query`, notes first, then files
     /// (recents first without a query).
     fn rank_mentions(&self, cwd: &str, query: &str, cx: &mut App) -> Vec<RankedFile>;
+
+    /// `rank_mentions` off the UI thread, for a project with many files.
+    /// The task must yield the same rows `rank_mentions` returns for the
+    /// same arguments, notes first, because Enter, Tab, and the arrows fall
+    /// back to `rank_mentions` when a task has not landed. The composer
+    /// starts one when the `@` query or folder changes, drops a stale one,
+    /// and keeps the previous rows on screen meanwhile. `None`, the
+    /// default, ranks inline every time.
+    fn rank_mentions_task(
+        &self,
+        _cwd: &str,
+        _query: &str,
+        _cx: &mut App,
+    ) -> Option<Task<Vec<RankedFile>>> {
+        None
+    }
 
     /// The project file index is still loading.
     fn mentions_loading(&self, _cwd: &str, _cx: &mut App) -> bool {

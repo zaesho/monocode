@@ -392,10 +392,14 @@ impl ConnectionsSettings {
                     });
                     for (machine, request) in machines.iter().zip(requests) {
                         let next = machine_status(machine, request.await, version.as_deref());
+                        // The check repeats every 10 seconds; an unchanged
+                        // status does not redraw the page.
                         let alive = this
                             .update(cx, |this, cx| {
-                                this.status.insert(machine.id.clone(), next);
-                                cx.notify();
+                                if this.status.get(&machine.id) != Some(&next) {
+                                    this.status.insert(machine.id.clone(), next);
+                                    cx.notify();
+                                }
                             })
                             .is_ok();
                         if !alive {

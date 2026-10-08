@@ -109,13 +109,13 @@ fn preserves_turn_acceptance_native_control_identity_and_stop_cleanup() {
         let text: String = events
             .iter()
             .filter_map(|event| match event {
-                HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+                HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
         assert_eq!(text, "hello");
         assert!(events.iter().any(|event| matches!(event, HarnessEvent::SessionProviderBound { provider_session_id } if provider_session_id == PROVIDER)));
-        assert!(events.iter().any(|event| matches!(event, HarnessEvent::TurnStarted { provider_turn_id } if provider_turn_id.starts_with("msg_"))));
+        assert!(events.iter().any(|event| matches!(event, HarnessEvent::TurnStarted { provider_turn_id, .. } if provider_turn_id.starts_with("msg_"))));
         let spawned = host.spawns();
         assert_eq!(spawned[0].session_id, THREAD);
         assert!(spawned[0].args.contains(&"--stdio".into()));
@@ -403,10 +403,9 @@ fn reconnect_recovers_lost_full_text_and_the_terminal_event_from_the_durable_log
             json!({"sessionID":PROVIDER,"assistantMessageID":"msg_answer","ordinal":0,"delta":"hel"}),
         );
         wait_for("initial text", || {
-            events
-                .lock()
-                .iter()
-                .any(|event| matches!(event, HarnessEvent::MessageDelta { text } if text == "hel"))
+            events.lock().iter().any(
+                |event| matches!(event, HarnessEvent::MessageDelta { text, .. } if text == "hel"),
+            )
         })
         .await;
         host.next_log(vec![json!({"id":"evt_full","type":"session.text.ended","durable":{"seq":7},"data":{"sessionID":PROVIDER,"assistantMessageID":"msg_answer","ordinal":0,"text":"hello"}}), json!({"id":"evt_done","type":"session.execution.succeeded","durable":{"seq":8},"data":{"sessionID":PROVIDER}})]);
@@ -416,7 +415,7 @@ fn reconnect_recovers_lost_full_text_and_the_terminal_event_from_the_durable_log
             .lock()
             .iter()
             .filter_map(|event| match event {
-                HarnessEvent::MessageDelta { text } => Some(text.clone()),
+                HarnessEvent::MessageDelta { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect();

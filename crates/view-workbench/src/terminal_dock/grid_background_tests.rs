@@ -146,3 +146,24 @@ fn holds_a_still_frame_under_reduced_motion(cx: &mut TestAppContext) {
     let (_, after) = frame(cx);
     assert_eq!(before, after);
 }
+
+#[gpui::test]
+fn stops_the_frame_timer_while_the_window_is_in_the_background(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx);
+    cx.update(|window, _| window.activate_window());
+    run_for(cx, 100);
+    assert!(view.read_with(cx, |view, _| view.ticking()));
+
+    cx.deactivate_window();
+    draw(cx);
+    assert!(!view.read_with(cx, |view, _| view.ticking()));
+    // No timer, so nothing slides while the window waits in the background.
+    run_for(cx, SLIDE_HOLD_MS + 1000);
+    assert_eq!(view.read_with(cx, |view, _| view.slide_index()), 0);
+
+    cx.update(|window, _| window.activate_window());
+    draw(cx);
+    assert!(view.read_with(cx, |view, _| view.ticking()));
+    run_for(cx, SLIDE_HOLD_MS + 1000);
+    assert_eq!(view.read_with(cx, |view, _| view.slide_index()), 1);
+}

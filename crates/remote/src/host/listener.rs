@@ -29,6 +29,19 @@ const TLS_HANDSHAKE: u8 = 0x16;
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ACCEPT_POLL: Duration = Duration::from_millis(25);
+/// How long the Unix accept thread sleeps in `poll` when nothing arrives.
+/// A new connection or `close` wakes it at once. This bound only matters
+/// when the `HttpServer` closes while its listener stays open.
+#[cfg(unix)]
+const IDLE_POLL_MS: libc::c_int = 250;
+/// How long `listen_host` retries an address that is in use. A process
+/// spawned from any thread gets a copy of every open socket and keeps it until
+/// it execs, so a listener closed during a spawn holds its address for up to a
+/// few milliseconds after `close` returns. Nothing signals when that copy
+/// goes away, and the host spawns agents and git all the time, so binding the
+/// port it just released needs this retry.
+const IN_USE_RETRY: Duration = Duration::from_millis(250);
+const IN_USE_STEP: Duration = Duration::from_millis(2);
 
 pub type LoopbackCheck = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
 
@@ -49,6 +62,13 @@ pub struct HostListener {
     address: SocketAddr,
     closed: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The write end, and the read end the accept thread polls. Holding the
+    /// read end here too keeps a late `close` write from hitting a closed peer.
+    #[cfg(unix)]
+    wake: Option<(
+        std::os::unix::net::UnixStream,
+        Arc<std::os::unix::net::UnixStream>,
+    )>,
 }
 
 impl HostListener {
@@ -59,6 +79,12 @@ impl HostListener {
     /// Stops accepting and releases the port before returning.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        #[cfg(unix)]
+        if let Some((wake, _)) = &self.wake {
+            use std::io::Write as _;
+            let mut wake: &std::os::unix::net::UnixStream = wake;
+            let _ = wake.write(&[1]);
+        }
         let thread = self
             .thread
             .lock()
@@ -136,7 +162,7 @@ pub fn listen_host(
         .clone()
         .unwrap_or_else(|| Arc::new(is_loopback_ip));
     let tls = options.identity.as_ref().map(server_config).transpose()?;
-    let listener = TcpListener::bind((options.bind.as_str(), options.port))
+    let listener = bind(&options.bind, options.port)
         .map_err(|error| format!("listen {}:{}: {error}", options.bind, options.port))?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     listener
@@ -144,6 +170,17 @@ pub fn listen_host(
         .map_err(|error| error.to_string())?;
     let closed = Arc::new(AtomicBool::new(false));
     let stop = closed.clone();
+    // Unix waits in `poll` on the listener and a wake socket that `close`
+    // writes to, instead of retrying `accept` 40 times a second while idle.
+    #[cfg(unix)]
+    let wake = std::os::unix::net::UnixStream::pair()
+        .ok()
+        .filter(|(wake, woken)| {
+            wake.set_nonblocking(true).is_ok() && woken.set_nonblocking(true).is_ok()
+        })
+        .map(|(wake, woken)| (wake, Arc::new(woken)));
+    #[cfg(unix)]
+    let woken = wake.as_ref().map(|(_, woken)| woken.clone());
     let thread = std::thread::Builder::new()
         .name("monocode-host-listener".into())
         .spawn(move || {
@@ -157,6 +194,14 @@ pub fn listen_host(
                             .name("monocode-host-connection".into())
                             .spawn(move || connection(server, tls, loopback, socket, peer));
                     }
+                    #[cfg(unix)]
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock && woken.is_some() =>
+                    {
+                        if let Some(woken) = &woken {
+                            wait_for_accept(&listener, woken);
+                        }
+                    }
                     Err(_) => std::thread::sleep(ACCEPT_POLL),
                 }
             }
@@ -166,7 +211,49 @@ pub fn listen_host(
         address,
         closed,
         thread: Mutex::new(Some(thread)),
+        #[cfg(unix)]
+        wake,
     })
+}
+
+/// Binds `address:port`, retrying for [`IN_USE_RETRY`] while it is in use.
+fn bind(address: &str, port: u16) -> std::io::Result<TcpListener> {
+    let deadline = Instant::now() + IN_USE_RETRY;
+    loop {
+        match TcpListener::bind((address, port)) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+            {
+                std::thread::sleep(IN_USE_STEP);
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Blocks until the listener has a connection, `close` writes to `woken`,
+/// or `IDLE_POLL_MS` passes. The caller then checks its stop flags.
+#[cfg(unix)]
+fn wait_for_accept(listener: &TcpListener, woken: &std::os::unix::net::UnixStream) {
+    use std::os::fd::AsRawFd as _;
+    let mut fds = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: woken.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // SAFETY: `fds` is a live array of two pollfd values for open sockets.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, IDLE_POLL_MS) };
+    if ready < 0 {
+        // EINTR or a poll failure. Fall back to the old pause.
+        std::thread::sleep(ACCEPT_POLL);
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +336,30 @@ mod tests {
         assert!(send(port, Some(&"A".repeat(43)), b"{}").is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn an_idle_listener_sleeps_in_poll_and_close_wakes_it_at_once() {
+        let identity =
+            create_host_certificate("MonoCode Host", std::time::SystemTime::now()).unwrap();
+        let listener = start(&identity, None);
+        let port = listener.local_addr().port();
+        // Let the accept thread settle into its idle wait first.
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        assert_eq!(send(port, None, b"x").unwrap()["size"], 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(50));
+        let closing = Instant::now();
+        listener.close();
+        // Without the wake, close would wait out the idle poll.
+        assert!(
+            closing.elapsed() < Duration::from_millis(IDLE_POLL_MS as u64 / 2),
+            "{:?}",
+            closing.elapsed()
+        );
+        listener.close();
+    }
+
     #[test]
     fn refuses_plain_http_from_another_computer() {
         let identity =
@@ -279,17 +390,26 @@ mod tests {
     }
 
     #[test]
-    fn closing_releases_the_port_for_a_new_listener() {
+    fn closing_releases_the_port_for_a_new_listener_while_processes_spawn() {
         let identity =
             create_host_certificate("MonoCode Host", std::time::SystemTime::now()).unwrap();
-        let listener = start(&identity, None);
-        let port = listener.local_addr().port();
-        listener.close();
-        // Another test's outgoing connection may hold this ephemeral port for
-        // a moment, so retry as the host does when it rebinds.
-        let mut attempts = 0;
-        let again = loop {
-            match listen_host(
+        // The host spawns agents and git from other threads. Each spawn copies
+        // the open listener into the child until it execs, so binding the
+        // port again right after `close` sometimes finds it still in use.
+        let spawning = Arc::new(AtomicBool::new(true));
+        let spawner = {
+            let spawning = spawning.clone();
+            std::thread::spawn(move || {
+                while spawning.load(Ordering::SeqCst) {
+                    let _ = std::process::Command::new("/nonexistent/monocode-spawn-probe").spawn();
+                }
+            })
+        };
+        for _ in 0..50 {
+            let listener = start(&identity, None);
+            let port = listener.local_addr().port();
+            listener.close();
+            let again = listen_host(
                 HttpServer::new(Arc::new(Digester)),
                 HostListenerOptions {
                     port,
@@ -297,17 +417,12 @@ mod tests {
                     identity: None,
                     loopback: None,
                 },
-            ) {
-                Ok(again) => break again,
-                Err(error) if attempts >= 20 => panic!("{error}"),
-                Err(_) => {
-                    attempts += 1;
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        };
-        assert_eq!(again.local_addr().port(), port);
-        assert_eq!(send(port, None, b"x").unwrap()["size"], 1);
-        drop(again);
+            )
+            .unwrap();
+            assert_eq!(again.local_addr().port(), port);
+            assert_eq!(send(port, None, b"x").unwrap()["size"], 1);
+        }
+        spawning.store(false, Ordering::SeqCst);
+        spawner.join().unwrap();
     }
 }

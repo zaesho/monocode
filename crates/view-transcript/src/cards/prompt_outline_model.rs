@@ -103,6 +103,14 @@ pub fn chat_context_label(item: &ChatContextItem) -> String {
             };
             format!("{location} {}", context_excerpt(comment))
         }
+        ChatContextItem::Session { title, .. } => {
+            let title = context_excerpt(title);
+            if title.is_empty() {
+                "Session".to_string()
+            } else {
+                title
+            }
+        }
     }
 }
 

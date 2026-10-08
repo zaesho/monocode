@@ -9,23 +9,25 @@
 //! right click selects a word on macOS, Cmd+A selects all on macOS).
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render, ScrollWheelEvent,
-    SharedString, Styled, Subscription, Task, UTF16Selection, Window, actions, div,
+    App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, Font, FontFallbacks,
+    FontFeatures, FontStyle, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Styled, Subscription,
+    Task, UTF16Selection, Window, actions, div,
 };
 
-use crate::element::{CellHit, LayoutInfo, TerminalElement};
+use crate::element::{CellHit, GridCache, LayoutInfo, TerminalElement};
 use crate::emulator::{Emulator, GridSize, Link, SelectionType, Side};
 use crate::keys::{
     KeyMode, MouseAction, ReportButton, focus_report, is_mac_clear_shortcut, is_text_input,
     keystroke_bytes, mac_shortcut_bytes, mouse_report, paste_bytes,
 };
 use crate::pty::{Pty, PtyEvent, PtySize};
-use crate::theme::{TerminalTheme, resolve_font_family};
+use crate::theme::{TerminalTheme, platform_family_name, resolve_font_family};
 
 actions!(
     terminal,
@@ -90,10 +92,16 @@ pub struct TerminalView {
     pty: Box<dyn Pty>,
     focus_handle: FocusHandle,
     font_family: Option<SharedString>,
+    /// The grid font built from `font_family` and the theme's fallbacks.
+    font: Option<Font>,
+    /// The last frame and shaped rows, reused while nothing changed.
+    grid_cache: GridCache,
     layout: Option<LayoutInfo>,
     blink_visible: bool,
     blink_epoch: usize,
     blink_task: Option<Task<()>>,
+    /// The blink pauses while the window is in the background.
+    window_active: bool,
     marked_text: Option<String>,
     drag: Option<SelectionDrag>,
     selection_scroll_task: Option<Task<()>>,
@@ -132,6 +140,9 @@ impl TerminalView {
             cx.on_blur(&focus_handle, window, |this, _window, cx| {
                 this.focus_changed(false, cx)
             }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                this.window_activation_changed(window.is_window_active(), window, cx)
+            }),
         ];
         let pump = pty.take_events().map(|events| {
             cx.spawn(async move |this, cx| {
@@ -158,10 +169,13 @@ impl TerminalView {
             pty: Box::new(pty),
             focus_handle,
             font_family: None,
+            font: None,
+            grid_cache: GridCache::default(),
             layout: None,
             blink_visible: true,
             blink_epoch: 0,
             blink_task: None,
+            window_active: window.is_window_active(),
             marked_text: None,
             drag: None,
             selection_scroll_task: None,
@@ -188,12 +202,17 @@ impl TerminalView {
         self.emulator.theme()
     }
 
-    /// Change colors or font, for example on a light and dark switch.
+    /// Change colors or font, for example on a light and dark switch. The
+    /// same theme again changes nothing and does not redraw.
     pub fn set_theme(&mut self, theme: TerminalTheme, cx: &mut Context<Self>) {
+        if theme == *self.theme() {
+            return;
+        }
         if theme.font_family != self.theme().font_family
             || theme.font_fallbacks != self.theme().font_fallbacks
         {
             self.font_family = None;
+            self.font = None;
         }
         self.emulator.set_theme(theme);
         cx.notify();
@@ -309,6 +328,47 @@ impl TerminalView {
         family
     }
 
+    /// The grid font: the resolved family, the theme's other families as
+    /// fallbacks, and ligatures off. Cached until the theme's font changes.
+    pub(crate) fn font(&mut self, window: &Window) -> Font {
+        if let Some(font) = &self.font {
+            return font.clone();
+        }
+        let family = self.font_family(window);
+        let fallbacks: Vec<String> = self
+            .theme()
+            .font_families()
+            .filter_map(|f| platform_family_name(f))
+            .filter(|f| *f != family.as_ref())
+            .map(str::to_string)
+            .collect();
+        let font = Font {
+            family,
+            // A terminal is a fixed grid. Ligatures would draw several cells
+            // as fewer glyphs and shift the rest of the row.
+            features: FontFeatures(Arc::new(vec![
+                ("liga".into(), 0),
+                ("calt".into(), 0),
+                ("dlig".into(), 0),
+            ])),
+            fallbacks: (!fallbacks.is_empty()).then(|| FontFallbacks::from_fonts(fallbacks)),
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+        };
+        self.font = Some(font.clone());
+        font
+    }
+
+    /// The emulator to paint and the cache of what was painted last.
+    pub(crate) fn paint_parts(&mut self) -> (&Emulator, &mut GridCache) {
+        (&self.emulator, &mut self.grid_cache)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grid_cache(&self) -> &GridCache {
+        &self.grid_cache
+    }
+
     /// The element measured the grid. Resize the emulator and the PTY when
     /// the cell count changed.
     pub(crate) fn apply_layout(&mut self, layout: LayoutInfo, cx: &mut Context<Self>) {
@@ -366,9 +426,7 @@ impl TerminalView {
         if focused {
             self.restart_blink(cx);
         } else {
-            self.blink_epoch += 1;
-            self.blink_task = None;
-            self.blink_visible = true;
+            self.stop_blink();
             self.hovered_link = None;
         }
         cx.notify();
@@ -381,9 +439,32 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn restart_blink(&mut self, cx: &mut Context<Self>) {
-        self.blink_visible = true;
+    /// The window went to the background or came back. A background window
+    /// shows a steady cursor, so the blink stops redrawing it.
+    fn window_activation_changed(&mut self, active: bool, window: &Window, cx: &mut Context<Self>) {
+        if self.window_active == active {
+            return;
+        }
+        self.window_active = active;
+        if active && self.focus_handle.is_focused(window) {
+            self.restart_blink(cx);
+        } else {
+            self.stop_blink();
+        }
+        cx.notify();
+    }
+
+    fn stop_blink(&mut self) {
         self.blink_epoch += 1;
+        self.blink_task = None;
+        self.blink_visible = true;
+    }
+
+    fn restart_blink(&mut self, cx: &mut Context<Self>) {
+        self.stop_blink();
+        if !self.window_active {
+            return;
+        }
         let epoch = self.blink_epoch;
         self.blink_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -392,8 +473,16 @@ impl TerminalView {
                     if view.blink_epoch != epoch {
                         return false;
                     }
-                    view.blink_visible = !view.blink_visible;
-                    cx.notify();
+                    if view.emulator.cursor_blinks() {
+                        view.blink_visible = !view.blink_visible;
+                        cx.notify();
+                    } else if !view.blink_visible {
+                        // A hidden or steady cursor shows solid once it is
+                        // back. Until then a tick changes nothing on screen,
+                        // so it does not redraw.
+                        view.blink_visible = true;
+                        cx.notify();
+                    }
                     true
                 });
                 if !matches!(keep_going, Ok(true)) {

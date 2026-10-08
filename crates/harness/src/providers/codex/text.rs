@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use monocode_core::block::ModelSettings;
 use monocode_core::harness::{HarnessId, RuntimeMode};
 use monocode_core::js;
-use monocode_core::reducer::{join_stream_text, stream_text_delta};
+use monocode_core::reducer::{join_stream_text_into, stream_text_delta};
 
 use crate::core::catalog::SharedCatalog;
 use crate::core::child::{ChildAccount, ChildEvent, Children};
@@ -639,7 +639,7 @@ fn handle_notification(session: Option<&LiveText>, method: &str, params: &Value)
         let delta = stream_text_delta(as_record(Some(params)).and_then(|rec| rec.get("delta")));
         if !delta.is_empty() {
             let mut state = session.state.lock();
-            state.output = join_stream_text(&state.output, delta);
+            join_stream_text_into(&mut state.output, delta);
         }
         return;
     }

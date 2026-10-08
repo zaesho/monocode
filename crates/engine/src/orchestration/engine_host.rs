@@ -22,7 +22,7 @@ use super::host::{
 };
 use super::peers::OrchestrationPeers;
 use super::state::{
-    OrchestrationRun, OrchestrationTask, WorkspaceKind, WorkspacePolicy,
+    DispatchStage, OrchestrationRun, OrchestrationTask, WorkspaceKind, WorkspacePolicy,
     orchestration_checkout_cwd, orchestration_project_cwd, workspace_identity,
 };
 use crate::history::History;
@@ -176,6 +176,31 @@ async fn create_worker(
         workspace_identity(&project_cwd, &tree.path, tree.branch.as_deref())
     };
     let checkout = workspace.checkout_cwd.clone();
+    // Record the worker's starting state before its first turn so
+    // `integrate_worker` can apply exactly what it changed. A retained
+    // worktree already has worker edits and keeps its existing checkpoint.
+    let checkpoints = cx.update(|cx| Engine::checkpoints(cx));
+    if task.workspace_policy == Some(WorkspacePolicy::Shared) {
+        checkpoints
+            .ensure(&task.session_id, &checkout, false)
+            .await?;
+    } else if task.workspace.is_none()
+        && let Err(error) = checkpoints.ensure(&task.session_id, &checkout, true).await
+    {
+        // Nothing records this worktree yet, so no later cleanup would find
+        // it. Remove it before reporting the failure.
+        let removed = cx
+            .update(|cx| remove_orchestration_worktree(&lead_checkout, &checkout, cx))
+            .await;
+        if removed.is_ok()
+            && let Some(branch) = &workspace.branch
+        {
+            let _ = cx
+                .update(|cx| remove_orchestration_branch(&lead_checkout, branch, cx))
+                .await;
+        }
+        return Err(error);
+    }
     let scratch_dir = match &host.control {
         Some(control) => {
             let (control, owner, lead_id, session_id) = (
@@ -317,11 +342,18 @@ async fn integrate_worker(
         return Err("The worker or lead branch moved while this task was running. The worker worktree was kept for manual review.".into());
     }
     let applied = checkpoints
-        .apply(&task.session_id, &from_cwd, &lead_checkout)
+        .apply(
+            &task.session_id,
+            &from_cwd,
+            &lead_checkout,
+            task.write_scopes.as_deref(),
+        )
         .await?;
     Ok(WorkerIntegration {
         files: applied.files,
         already_applied: applied.already_applied as i64,
+        skipped: applied.skipped,
+        ignored: applied.ignored,
     })
 }
 
@@ -330,6 +362,7 @@ async fn cleanup_worker(
     run: OrchestrationRun,
     task: OrchestrationTask,
     only_if_unchanged: bool,
+    discard_outside: bool,
     cx: &mut AsyncApp,
 ) -> Result<bool, String> {
     let Some(workspace) = task
@@ -371,11 +404,40 @@ async fn cleanup_worker(
             return Ok(false);
         }
     } else if exists {
-        // Re-verify immediately before destructive cleanup. The operation is
-        // idempotent, so this also finishes a partially applied integration.
-        checkpoints
-            .apply(&task.session_id, &path, &lead_checkout)
-            .await?;
+        let dispatch = run
+            .dispatch_list()
+            .iter()
+            .find(|entry| Some(&entry.id) == task.accepted_dispatch_id.as_ref());
+        let mut outside: Vec<String> = dispatch
+            .map(|dispatch| {
+                let outside = dispatch.outside_assignment.iter().flatten();
+                outside
+                    .chain(dispatch.ignored_created.iter().flatten())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Once integrated, never apply again: the lead may have changed or
+        // reverted those files since, and a second apply would undo that.
+        if dispatch.map(|dispatch| dispatch.stage) != Some(DispatchStage::Integrated) {
+            // The operation is idempotent, so this also finishes a partially
+            // applied integration.
+            let applied = checkpoints
+                .apply(
+                    &task.session_id,
+                    &path,
+                    &lead_checkout,
+                    task.write_scopes.as_deref(),
+                )
+                .await?;
+            outside = applied.skipped;
+            outside.extend(applied.ignored);
+        }
+        // Out-of-scope and ignored files exist only in this worktree. Keep it
+        // until the lead has copied what it needs and discards the rest.
+        if !outside.is_empty() && !discard_outside {
+            return Ok(false);
+        }
     }
     let sessions = cx.update(|cx| Engine::sessions(cx));
     if exists {
@@ -461,6 +523,21 @@ impl OrchestrationHost for Rc<EngineHost> {
         Engine::sessions(cx).read(cx).all().to_vec()
     }
 
+    fn read_session(&self, id: &str, cx: &App, read: &mut dyn FnMut(&Session)) {
+        if let Some(session) = Engine::sessions(cx).read(cx).get(id) {
+            read(session);
+        }
+    }
+
+    fn find_session(&self, cx: &App, matches: &mut dyn FnMut(&Session) -> bool) -> Option<Session> {
+        Engine::sessions(cx)
+            .read(cx)
+            .all()
+            .iter()
+            .find(|session| matches(session))
+            .cloned()
+    }
+
     fn choices(&self, cx: &App) -> Vec<HarnessChoice> {
         let Some(config) = submit_config(cx) else {
             return Vec::new();
@@ -508,10 +585,13 @@ impl OrchestrationHost for Rc<EngineHost> {
         run: &OrchestrationRun,
         task: &OrchestrationTask,
         only_if_unchanged: bool,
+        discard_outside: bool,
         cx: &mut App,
     ) -> Task<Result<bool, String>> {
         let (host, run, task) = (self.clone(), run.clone(), task.clone());
-        cx.spawn(async move |cx| cleanup_worker(host, run, task, only_if_unchanged, cx).await)
+        cx.spawn(async move |cx| {
+            cleanup_worker(host, run, task, only_if_unchanged, discard_outside, cx).await
+        })
     }
 
     fn submit(&self, id: &str, text: &str, done: Done, cx: &mut App) {

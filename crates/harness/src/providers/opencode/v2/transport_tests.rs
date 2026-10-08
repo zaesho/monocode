@@ -248,10 +248,9 @@ fn version_two_runs_through_real_process_authenticated_http_and_sse() {
         options.environment["XDG_DATA_HOME"]
     );
     assert!(
-        events
-            .lock()
-            .iter()
-            .any(|event| matches!(event, HarnessEvent::MessageDelta { text } if text == "pong"))
+        events.lock().iter().any(
+            |event| matches!(event, HarnessEvent::MessageDelta { text, .. } if text == "pong")
+        )
     );
     assert!(events.lock().iter().any(|event| matches!(event, HarnessEvent::SessionProviderBound { provider_session_id } if provider_session_id == "ses_transport")));
     assert!(
@@ -348,7 +347,7 @@ fn isolated_live_free_model_turn() {
     let text: String = events
         .iter()
         .filter_map(|event| match event {
-            HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+            HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect();

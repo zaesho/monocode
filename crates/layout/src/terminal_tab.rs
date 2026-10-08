@@ -1,5 +1,6 @@
 //! Port of src/features/terminal/model/terminalTab.ts.
 
+use monocode_core::Session;
 use monocode_core::js;
 use monocode_core::paths::basename;
 
@@ -183,6 +184,33 @@ pub fn scan_osc_cwd(chunk: &str, buffer: &str) -> OscCwdScan {
     OscCwdScan { cwd, rest }
 }
 
+/// `newTerminalCwd`: the working directory for a terminal opened by the
+/// general New Terminal commands.
+///
+/// A session working in a worktree opens terminals in that worktree, even when
+/// the focused pane is a file or terminal from another checkout. Without a
+/// worktree, the focused pane's directory wins, then the session's, then
+/// `fallback`.
+pub fn new_terminal_cwd(
+    active_file: Option<&FilePaneTab>,
+    session: Option<&Session>,
+    fallback: &str,
+) -> String {
+    if let Some(session) = session
+        && session.worktree_removed != Some(true)
+        && let Some(worktree) = session
+            .worktree_cwd
+            .as_deref()
+            .filter(|cwd| !cwd.is_empty())
+    {
+        return worktree.to_string();
+    }
+    active_file
+        .map(|file| file.cwd.clone())
+        .or_else(|| session.map(|session| session.cwd.clone()))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,5 +332,59 @@ mod tests {
         let partial = scan_osc_cwd("\x1b]7;file://h/a", "");
         assert_eq!(partial.cwd, None);
         assert_eq!(partial.rest, "\x1b]7;file://h/a");
+    }
+
+    fn pane(cwd: &str) -> FilePaneTab {
+        new_terminal_file(cwd, None, None)
+    }
+
+    fn worktree_session() -> Session {
+        let mut session = Session::blank("s", monocode_core::HarnessId::Claude, "m", "/repo");
+        session.worktree_cwd = Some("/repo/.worktrees/feature".into());
+        session
+    }
+
+    #[test]
+    fn new_terminal_cwd_opens_in_the_worktree_over_a_focused_main_checkout_pane() {
+        assert_eq!(
+            new_terminal_cwd(Some(&pane("/repo")), Some(&worktree_session()), "/repo"),
+            "/repo/.worktrees/feature"
+        );
+    }
+
+    #[test]
+    fn new_terminal_cwd_keeps_the_focused_pane_for_a_session_without_a_worktree() {
+        let session = Session::blank("s", monocode_core::HarnessId::Claude, "m", "/repo");
+        assert_eq!(
+            new_terminal_cwd(
+                Some(&pane("/repo/packages/app")),
+                Some(&session),
+                "/elsewhere"
+            ),
+            "/repo/packages/app"
+        );
+    }
+
+    #[test]
+    fn new_terminal_cwd_skips_a_removed_worktree() {
+        let mut session = worktree_session();
+        session.worktree_removed = Some(true);
+        assert_eq!(
+            new_terminal_cwd(Some(&pane("/repo/docs")), Some(&session), "/repo"),
+            "/repo/docs"
+        );
+        assert_eq!(
+            new_terminal_cwd(None, Some(&session), "/elsewhere"),
+            "/repo"
+        );
+    }
+
+    #[test]
+    fn new_terminal_cwd_uses_the_fallback_with_no_session_or_focused_pane() {
+        assert_eq!(new_terminal_cwd(None, None, "/repo"), "/repo");
+        assert_eq!(
+            new_terminal_cwd(Some(&pane("/notes")), None, "/repo"),
+            "/notes"
+        );
     }
 }

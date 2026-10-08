@@ -298,8 +298,10 @@ impl<H: UpdaterHost> UpdaterFlow<H> {
 
         let mut downloaded: u64 = 0;
         let mut content_length: u64 = 0;
+        let mut reported: Option<i64> = Some(0);
         let installed = {
             let mut on_event = |event: DownloadEvent| {
+                let chunk = matches!(event, DownloadEvent::Progress { .. });
                 match event {
                     DownloadEvent::Started {
                         content_length: length,
@@ -316,6 +318,13 @@ impl<H: UpdaterHost> UpdaterFlow<H> {
                     let percent = (downloaded as f64 / content_length as f64 * 100.0).round();
                     (percent as i64).min(100)
                 });
+                // Chunks arrive every 64 KB, over a thousand a second on a
+                // fast link. A chunk that leaves the known percent where it
+                // was has nothing new for the UI.
+                if chunk && progress.is_some() && progress == reported {
+                    return;
+                }
+                reported = progress;
                 on_progress(&downloading(progress));
             };
             self.host.download_and_install(&update, &mut on_event).await
@@ -695,6 +704,30 @@ mod tests {
         block_on(flow.install_pending_update(|snapshot| progress.push(snapshot.progress)));
 
         assert_eq!(progress, [Some(0), None, None]);
+    }
+
+    #[test]
+    fn chunks_that_leave_the_percent_unchanged_report_nothing() {
+        let mut host = MockHost::new("0.1.22").checking(Ok(Some(Update::for_test("0.1.23", None))));
+        host.install_events = std::iter::once(DownloadEvent::Started {
+            content_length: Some(1_000),
+        })
+        .chain((0..1_000).map(|_| DownloadEvent::Progress { chunk_length: 1 }))
+        .chain(std::iter::once(DownloadEvent::Finished))
+        .collect();
+        let flow = UpdaterFlow::new(host);
+        block_on(flow.probe_for_update()).unwrap();
+        let mut progress = Vec::new();
+
+        block_on(flow.install_pending_update(|snapshot| progress.push(snapshot.progress)));
+
+        // The first report, Started, one per percent, then Finished.
+        let expected: Vec<_> = [Some(0), Some(0)]
+            .into_iter()
+            .chain((1..=100).map(Some))
+            .chain([Some(100)])
+            .collect();
+        assert_eq!(progress, expected);
     }
 
     #[test]

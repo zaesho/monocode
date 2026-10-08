@@ -208,3 +208,45 @@ fn mouse_drag_selects_and_reporting_sends_sgr(cx: &mut TestAppContext) {
     cx.simulate_mouse_up(at(3, 1), MouseButton::Left, Modifiers::default());
     assert_eq!(pty.take_written(), b"\x1b[<0;4;2M\x1b[<0;4;2m".to_vec());
 }
+
+#[gpui::test]
+fn the_cursor_stops_blinking_when_hidden_or_in_a_background_window(cx: &mut TestAppContext) {
+    use monocode_terminal_view::view::CURSOR_BLINK_INTERVAL;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let (host, pty, cx) = setup(cx);
+    let terminal = terminal(&host, cx);
+    let redraws = Rc::new(Cell::new(0));
+    let count = redraws.clone();
+    cx.update(|_, cx| {
+        cx.observe(&terminal, move |_, _| count.set(count.get() + 1))
+            .detach()
+    });
+    let wait = |intervals: u32, cx: &mut VisualTestContext| {
+        cx.executor()
+            .advance_clock(CURSOR_BLINK_INTERVAL * intervals);
+        cx.run_until_parked();
+    };
+    // Test windows start in the background.
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+
+    // Focused in the active window, the cursor blinks.
+    wait(3, cx);
+    assert!(redraws.get() >= 3);
+
+    // A hidden cursor blinks without anything to show, so it does not redraw.
+    output(&pty, b"\x1b[?25l", cx);
+    wait(1, cx);
+    redraws.set(0);
+    wait(5, cx);
+    assert_eq!(redraws.get(), 0);
+
+    // Shown again, but the window is in the background: no blink either.
+    output(&pty, b"\x1b[?25h", cx);
+    cx.deactivate_window();
+    redraws.set(0);
+    wait(5, cx);
+    assert_eq!(redraws.get(), 0);
+}

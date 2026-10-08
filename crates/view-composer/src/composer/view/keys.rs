@@ -117,6 +117,7 @@ impl Composer {
             return KeyOutcome::Handled;
         }
         if self.mention_open() {
+            self.flush_ranked_files(cx);
             if let Some(file) = self.ranked_files.get(self.mention_active).cloned() {
                 self.pick_mention(&file.file, window, cx);
                 return KeyOutcome::Handled;
@@ -153,6 +154,7 @@ impl Composer {
             return KeyOutcome::Default;
         }
         if self.mention_open() {
+            self.flush_ranked_files(cx);
             let len = self.ranked_files.len();
             if len > 0 {
                 self.mention_active = step(self.mention_active, len, up);
@@ -186,6 +188,7 @@ impl Composer {
             return KeyOutcome::Default;
         }
         if self.mention_open() {
+            self.flush_ranked_files(cx);
             if let Some(file) = self.ranked_files.get(self.mention_active).cloned() {
                 self.pick_mention(&file.file, window, cx);
             }

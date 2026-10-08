@@ -20,7 +20,7 @@ use monocode_ui::{IconName, Theme, file_type_icon, folder_type_icon, icon, u};
 
 use super::super::model::chat_context::{
     ChatContextItem, DiffLineChange, chat_context_key, context_excerpt, context_file_name,
-    line_range,
+    line_range, session_label,
 };
 use super::Composer;
 use crate::pickers::anchor::{Side, anchored_popover};
@@ -38,8 +38,54 @@ pub(crate) struct AttachmentPreview {
 
 pub(crate) struct AttachmentImage {
     file: Attachment,
+    /// Where the composer's copy of the last matching attachment keeps its
+    /// `data` and `preview_url` bytes. While they stay put, the attachment
+    /// has not changed and the megabyte comparison is skipped.
+    seen: (TextIdentity, TextIdentity),
     source: Option<gpui::ImageSource>,
     _load: gpui::Task<()>,
+}
+
+/// Where a string's bytes live and how many there are.
+type TextIdentity = Option<(usize, usize)>;
+
+fn text_identity(text: &Option<String>) -> TextIdentity {
+    text.as_ref()
+        .map(|text| (text.as_ptr() as usize, text.len()))
+}
+
+impl AttachmentImage {
+    fn new(file: &Attachment, source: Option<gpui::ImageSource>, load: gpui::Task<()>) -> Self {
+        Self {
+            file: file.clone(),
+            seen: (text_identity(&file.data), text_identity(&file.preview_url)),
+            source,
+            _load: load,
+        }
+    }
+
+    /// The source was built from an attachment equal to `file`.
+    fn matches(&mut self, file: &Attachment) -> bool {
+        let seen = (text_identity(&file.data), text_identity(&file.preview_url));
+        if seen == self.seen
+            && self.file.id == file.id
+            && self.file.kind == file.kind
+            && self.file.mime_type == file.mime_type
+            && self.file.path == file.path
+        {
+            return true;
+        }
+        if self.file != *file {
+            return false;
+        }
+        self.seen = seen;
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> Option<&gpui::ImageSource> {
+        self.source.as_ref()
+    }
 }
 
 /// The chip whose preview is showing, and the timer that will change it.
@@ -85,6 +131,10 @@ fn chip_label(item: &ChatContextItem) -> ChipLabel {
                 context_excerpt(comment)
             ),
         },
+        ChatContextItem::Session { id, title } => ChipLabel {
+            action: "Session context",
+            full: format!("{} ({id})", session_label(title)),
+        },
     }
 }
 
@@ -116,6 +166,10 @@ fn chip_icon(item: &ChatContextItem, theme: &Theme) -> AnyElement {
             .text_color(theme.content(0.45))
             .into_any_element(),
         ChatContextItem::Comment { .. } => icon(IconName::MessageSquare)
+            .size(u(14.))
+            .text_color(theme.content(0.45))
+            .into_any_element(),
+        ChatContextItem::Session { .. } => icon(IconName::Chatting)
             .size(u(14.))
             .text_color(theme.content(0.45))
             .into_any_element(),
@@ -170,6 +224,9 @@ fn chip_body(item: &ChatContextItem, theme: &Theme) -> Vec<AnyElement> {
                     .into_any_element(),
             );
             out
+        }
+        ChatContextItem::Session { title, .. } => {
+            vec![truncated(session_label(title), 224.).into_any_element()]
         }
     }
 }
@@ -292,6 +349,25 @@ fn chat_context_preview(item: &ChatContextItem, openable: bool, theme: &Theme) -
                 )
                 .into_any_element()
         }
+        ChatContextItem::Session { id, title } => div()
+            .child(header(session_label(title)))
+            .child(
+                div()
+                    .mt(u(6.))
+                    .text_px(12.)
+                    .line_height(u(20.))
+                    .text_color(theme.content(0.70))
+                    .child("A recap of this session's user and assistant messages goes with your message."),
+            )
+            .child(
+                div()
+                    .mt(u(6.))
+                    .font_family(theme.fonts.mono.clone())
+                    .text_px(11.)
+                    .text_color(theme.content(0.40))
+                    .child(id.clone()),
+            )
+            .into_any_element(),
     }
 }
 
@@ -576,17 +652,24 @@ impl Composer {
         file: &Attachment,
         cx: &mut Context<Self>,
     ) -> Option<gpui::ImageSource> {
+        // Inline images are megabytes of base64; decoding them every frame
+        // cost more than drawing the composer, so each source is built once.
+        if let Some(preview) = self.attachment_images.get_mut(&file.id)
+            && preview.matches(file)
+        {
+            return preview.source.clone();
+        }
         let preview_url = file.preview_url.as_deref().filter(|url| !url.is_empty());
         let avif = file.kind == AttachmentKind::Image
             && (preview_url.is_some_and(|url| url.starts_with("data:image/avif;base64,"))
                 || (file.mime_type == "image/avif" && preview_url.is_none()));
         if !avif {
-            return attachment_image(file);
-        }
-        if let Some(preview) = self.attachment_images.get(&file.id)
-            && preview.file == *file
-        {
-            return preview.source.clone();
+            let source = attachment_image(file);
+            self.attachment_images.insert(
+                file.id.clone(),
+                AttachmentImage::new(file, source.clone(), gpui::Task::ready(())),
+            );
+            return source;
         }
         let loading = file.clone();
         let id = file.id.clone();
@@ -603,14 +686,8 @@ impl Composer {
             })
             .ok();
         });
-        self.attachment_images.insert(
-            file.id.clone(),
-            AttachmentImage {
-                file: file.clone(),
-                source: None,
-                _load: task,
-            },
-        );
+        self.attachment_images
+            .insert(file.id.clone(), AttachmentImage::new(file, None, task));
         None
     }
 

@@ -6,10 +6,11 @@
 //! and extensions map to the first icon that lists them, which is what the
 //! package's `Array.find` returns.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div, img};
+use gpui::{App, IntoElement, ParentElement, RenderOnce, SharedString, Styled, Window, div};
 use serde::Deserialize;
 
 use crate::u;
@@ -68,15 +69,20 @@ pub fn file_icon_name(file_name: &str) -> &'static str {
 
 /// The prefix and suffix variants `findFolderIcon` also accepts.
 fn folder_variant_matches(name: &str, folder_name: &str) -> bool {
-    name == folder_name
-        || name == format!(".{folder_name}")
-        || name == format!("_{folder_name}")
-        || name == format!("-{folder_name}")
-        || name == format!("__{folder_name}__")
-        || folder_name == format!(".{name}")
-        || folder_name == format!("_{name}")
-        || folder_name == format!("-{name}")
-        || folder_name == format!("__{name}__")
+    name == folder_name || is_decorated(name, folder_name) || is_decorated(folder_name, name)
+}
+
+/// `decorated` is `.{base}`, `_{base}`, `-{base}`, or `__{base}__`. Compares
+/// slices instead of formatting each variant: a folder that matches no rule
+/// checks all 960 folder names.
+fn is_decorated(decorated: &str, base: &str) -> bool {
+    [".", "_", "-"]
+        .iter()
+        .any(|prefix| decorated.strip_prefix(prefix) == Some(base))
+        || decorated
+            .strip_prefix("__")
+            .and_then(|rest| rest.strip_suffix("__"))
+            == Some(base)
 }
 
 fn find_folder_icon(folder_name: &str, is_root: bool) -> Option<&'static FolderRule> {
@@ -177,16 +183,52 @@ impl FileTypeIcon {
     }
 }
 
-impl RenderOnce for FileTypeIcon {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+/// Resolved asset paths by name and kind. File trees render the same names
+/// every frame, so this skips the lowercase copy, the suffix list, and the
+/// folder rule scan after the first time.
+const RESOLVED_LIMIT: usize = 4096;
+
+thread_local! {
+    static RESOLVED: RefCell<HashMap<(SharedString, u8), Option<SharedString>>> =
+        RefCell::new(HashMap::new());
+}
+
+impl FileTypeIcon {
+    fn kind(&self) -> u8 {
+        u8::from(self.is_dir) | u8::from(self.is_open) << 1 | u8::from(self.is_root) << 2
+    }
+
+    fn resolve(&self) -> Option<SharedString> {
         let icon_name = if self.is_dir {
             folder_icon_name(&self.name, self.is_open, self.is_root)
         } else {
             file_icon_name(&self.name).to_string()
         };
+        file_icon_path(&icon_name)
+    }
+
+    /// [`Self::resolve`] through the [`RESOLVED`] cache.
+    fn asset_path(&self) -> Option<SharedString> {
+        let key = (self.name.clone(), self.kind());
+        if let Some(path) = RESOLVED.with_borrow(|cache| cache.get(&key).cloned()) {
+            return path;
+        }
+        let path = self.resolve();
+        RESOLVED.with_borrow_mut(|cache| {
+            if cache.len() >= RESOLVED_LIMIT {
+                cache.clear();
+            }
+            cache.insert(key, path.clone());
+        });
+        path
+    }
+}
+
+impl RenderOnce for FileTypeIcon {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let frame = div().flex_none().size(u(self.size));
-        match file_icon_path(&icon_name) {
-            Some(path) => frame.child(img(path).size_full()),
+        match self.asset_path() {
+            Some(path) => frame.child(crate::assets::shared_img(path, window, cx).size_full()),
             None => frame,
         }
     }
@@ -240,6 +282,50 @@ mod tests {
         ] {
             assert_eq!(folder_icon_name(name, open, root), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn decorated_folder_names_match_without_formatting() {
+        for (decorated, base, expected) in [
+            (".github", "github", true),
+            ("_tests", "tests", true),
+            ("-tests", "tests", true),
+            ("__tests__", "tests", true),
+            ("__tests", "tests", false),
+            ("tests__", "tests", false),
+            ("____", "", true),
+            ("___", "", false),
+            ("tests", "tests", false),
+            ("..github", "github", false),
+        ] {
+            assert_eq!(
+                is_decorated(decorated, base),
+                expected,
+                "{decorated} {base}"
+            );
+        }
+        assert!(folder_variant_matches("tests", "__tests__"));
+        assert!(folder_variant_matches("__tests__", "tests"));
+        assert!(!folder_variant_matches("tests", "test"));
+    }
+
+    #[test]
+    fn cached_paths_match_a_fresh_resolve() {
+        for icon in [
+            file_type_icon("main.rs"),
+            file_type_icon("noext"),
+            folder_type_icon("src", true, false),
+            folder_type_icon("src", false, true),
+            folder_type_icon("randomdir", false, false),
+        ] {
+            let fresh = icon.resolve();
+            assert_eq!(icon.asset_path(), fresh);
+            assert_eq!(icon.asset_path(), fresh);
+        }
+        assert_ne!(
+            folder_type_icon("src", true, false).asset_path(),
+            folder_type_icon("src", false, false).asset_path()
+        );
     }
 
     #[test]

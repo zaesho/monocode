@@ -30,7 +30,7 @@ use futures::FutureExt;
 use futures::future::Shared;
 use gpui::{App, AppContext, Context, Entity, Task};
 use monocode_core::js;
-use monocode_core::paths::slash;
+use monocode_core::paths::{path_key, slash};
 use monocode_git::fs::{GitBranches, GitDiffIndex, GitDiffStats};
 
 use super::Clock;
@@ -39,6 +39,11 @@ use crate::runtime::engine::Engine;
 
 /// `GIT_POLL_MS`: the changes panel's poll.
 pub const GIT_POLL: Duration = Duration::from_millis(2000);
+/// While the app has windows but none has focus, the poll reads git on
+/// every this many ticks (every 10 s) instead of every tick. One read runs
+/// about a dozen git processes. Focus coming back reloads at once
+/// (`GitStatus::resume`), and `notify_git_changed` still reloads at once.
+pub const GIT_POLL_UNFOCUSED_TICKS: u32 = 5;
 /// `RESUME_TTL_MS`: diff stats younger than this skip a focus reload.
 pub const DIFF_STATS_RESUME_TTL_MS: i64 = 30_000;
 
@@ -188,6 +193,154 @@ pub fn changed_file_paths(prev: &GitDiffIndex, next: &GitDiffIndex) -> Vec<Strin
     paths
 }
 
+/// Whether two indexes agree on everything a ref decides: the branch, the
+/// commit, the remote and upstream, and the counts against them.
+fn same_refs(prev: &GitDiffIndex, next: &GitDiffIndex) -> bool {
+    prev.branch == next.branch
+        && prev.head == next.head
+        && prev.remote == next.remote
+        && prev.upstream == next.upstream
+        && prev.default_branch == next.default_branch
+        && prev.ahead == next.ahead
+        && prev.behind == next.behind
+        && prev.ahead_of_default == next.ahead_of_default
+        && prev.head_pushed == next.head_pushed
+}
+
+/// A folder's poll read a new diff index in which no ref moved: only
+/// working-tree files changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesChange {
+    /// The folder whose index changed, spelled as its `GitStatus` is keyed.
+    pub source: String,
+    /// The same folder with symlinks resolved, when that is known.
+    pub source_real: Option<String>,
+    /// The folder went from no changes to some, or back. Only then can the
+    /// clean or dirty flag of the working copy holding it change: a folder
+    /// with changes before and after sits in a dirty working copy both times.
+    pub emptiness_changed: bool,
+}
+
+/// A folder path for comparing: `~` expanded, no trailing slash, and on
+/// macOS and Windows, whose default file systems ignore case, lowercased.
+/// Lowercasing can only make two different folders look related, which
+/// costs a reload, never a missed one.
+fn comparable(path: &str) -> String {
+    let key = path_key(&monocode_git::fs::expand_home(path).to_string_lossy());
+    if cfg!(any(target_os = "macos", windows)) {
+        key.to_lowercase()
+    } else {
+        key
+    }
+}
+
+/// `path` is `root` or inside it. Both are `comparable` already.
+fn within(path: &str, root: &str) -> bool {
+    path == root
+        || root == "/"
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/') || root.ends_with('/'))
+}
+
+/// The spellings of a folder to compare: as given, and with symlinks
+/// resolved when known.
+fn spellings(raw: &str, real: Option<&str>) -> Vec<String> {
+    let mut out = vec![comparable(raw)];
+    if let Some(real) = real.map(comparable)
+        && !out.contains(&real)
+    {
+        out.push(real);
+    }
+    out
+}
+
+/// A value that moves whenever a ref, `HEAD`, or a working copy of the
+/// repository holding `cwd` changes, from file stamps alone. Git writes a ref
+/// through a lock file it renames into place, so every ref write changes
+/// the stamp of the directory holding it; this hashes the stamps of
+/// `packed-refs`, `HEAD`, every directory under `refs/`, `reftable/`, and
+/// the per-working-copy directories under `worktrees/`. `None` when the
+/// repository cannot be found or is too large to stamp cheaply.
+pub fn refs_fingerprint_on_disk(cwd: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    use std::path::{Path, PathBuf};
+
+    const MAX_ENTRIES: usize = 4_000;
+
+    fn stamp(path: &Path, hasher: &mut impl Hasher) {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                meta.len().hash(hasher);
+                meta.modified().ok().hash(hasher);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.ino().hash(hasher);
+                }
+            }
+            Err(_) => 0u8.hash(hasher),
+        }
+    }
+
+    /// Stamp `dir` and every directory below it. `false` past the limit.
+    fn stamp_tree(dir: &Path, hasher: &mut impl Hasher, budget: &mut usize) -> bool {
+        stamp(dir, hasher);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return true;
+        };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            if *budget == 0 {
+                return false;
+            }
+            *budget -= 1;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+        dirs.iter().all(|dir| stamp_tree(dir, hasher, budget))
+    }
+
+    /// The working copy's git directory and the repository's common one.
+    fn git_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+        let mut dir = Some(root);
+        while let Some(current) = dir {
+            let dot_git = current.join(".git");
+            if dot_git.is_dir() {
+                return Some((dot_git.clone(), dot_git));
+            }
+            if dot_git.is_file() {
+                let text = std::fs::read_to_string(&dot_git).ok()?;
+                let target = text.trim().strip_prefix("gitdir:")?.trim();
+                let git_dir = current.join(target);
+                let common = std::fs::read_to_string(git_dir.join("commondir"))
+                    .ok()
+                    .map(|common| git_dir.join(common.trim()))
+                    .unwrap_or_else(|| git_dir.clone());
+                return Some((git_dir, common));
+            }
+            dir = current.parent();
+        }
+        None
+    }
+
+    let root = monocode_git::fs::expand_home(cwd);
+    let (git_dir, common) = git_dirs(&root)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut budget = MAX_ENTRIES;
+    stamp(&git_dir.join("HEAD"), &mut hasher);
+    stamp(&common.join("HEAD"), &mut hasher);
+    stamp(&common.join("packed-refs"), &mut hasher);
+    for tree in ["refs", "reftable", "worktrees"] {
+        if !stamp_tree(&common.join(tree), &mut hasher, &mut budget) {
+            return None;
+        }
+    }
+    Some(hasher.finish())
+}
+
 /// `ProjectBranchesState`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectBranchesState {
@@ -262,6 +415,13 @@ pub struct GitStatus {
     index_reloads: u64,
     index_task: Option<Task<()>>,
     poll: Option<Task<()>>,
+    /// This folder announced a git change from an index it just read, so the
+    /// `git_changed` that comes back skips reading the index again.
+    index_announced: bool,
+    /// `refs_fingerprint_on_disk` as of the last index read.
+    refs_fingerprint: Option<u64>,
+    /// The folder with symlinks resolved, once `GitStatuses` looked it up.
+    real_cwd: Option<String>,
 
     branches: ProjectBranchesState,
     branches_in_flight: bool,
@@ -294,6 +454,9 @@ impl GitStatus {
             index_reloads: 0,
             index_task: None,
             poll: None,
+            index_announced: false,
+            refs_fingerprint: None,
+            real_cwd: None,
             branches: ProjectBranchesState::default(),
             branches_in_flight: false,
             branches_task: None,
@@ -399,6 +562,7 @@ impl GitStatus {
             return;
         }
         self.poll = Some(cx.spawn(async move |this, cx| {
+            let mut unfocused_ticks = 0;
             loop {
                 let timer = cx.background_executor().timer(GIT_POLL);
                 timer.await;
@@ -406,14 +570,25 @@ impl GitStatus {
                     break;
                 };
                 let keep = cx.update(|cx| {
+                    // No windows at all is the headless host, which polls
+                    // as before.
+                    let unfocused = cx.active_window().is_none() && !cx.windows().is_empty();
                     this.update(cx, |this, cx| {
                         if !this.watched(WatchKind::Index) {
                             this.poll = None;
                             return false;
                         }
-                        if !this.hidden {
-                            this.load_index(false, cx);
+                        if this.hidden {
+                            return true;
                         }
+                        if unfocused {
+                            unfocused_ticks += 1;
+                            if unfocused_ticks < GIT_POLL_UNFOCUSED_TICKS {
+                                return true;
+                            }
+                        }
+                        unfocused_ticks = 0;
+                        this.load_index(false, cx);
                         true
                     })
                 });
@@ -449,11 +624,17 @@ impl GitStatus {
 
     /// `notifyGitChanged` reached this folder.
     pub fn git_changed(&mut self, cx: &mut Context<Self>) {
+        let announced = std::mem::take(&mut self.index_announced);
         if !self.hidden {
-            if self.watched(WatchKind::FileStatuses) {
-                self.load_index(true, cx);
-            } else if self.watched(WatchKind::Index) {
-                self.load_index(false, cx);
+            // When this folder's own new index caused the change, reading the
+            // index again finds nothing new and costs another dozen git
+            // processes.
+            if !announced {
+                if self.watched(WatchKind::FileStatuses) {
+                    self.load_index(true, cx);
+                } else if self.watched(WatchKind::Index) {
+                    self.load_index(false, cx);
+                }
             }
             if self.watched(WatchKind::Branches) {
                 self.load_branches(true, cx);
@@ -466,6 +647,68 @@ impl GitStatus {
         if self.watched(WatchKind::DiffStats) {
             self.load_stats(true, cx);
         }
+    }
+
+    /// Another folder's poll (or this one's) saw edited files and no moved
+    /// ref. This reloads what those files can change here and nothing else:
+    /// the index and diff stats when this folder contains that folder or
+    /// sits inside it, and the working copy list when a working copy may
+    /// have turned clean or dirty. Branches stay as they are, because no ref
+    /// moved. Relatedness goes by folder rather than by changed file: a
+    /// rename lists only its new path, and the old one can sit in another
+    /// watched folder.
+    pub fn files_changed(&mut self, change: &FilesChange, cx: &mut Context<Self>) {
+        // Only the entity that read the index already shows it. Another
+        // spelling of the same folder is its own entity and reloads.
+        let source = self.cwd == change.source;
+        let related = source || self.related_to(change);
+        if !self.hidden {
+            if related && !source {
+                if self.watched(WatchKind::FileStatuses) {
+                    self.load_index(true, cx);
+                } else if self.watched(WatchKind::Index) {
+                    self.load_index(false, cx);
+                }
+            }
+            if self.watched(WatchKind::Worktrees)
+                && change.emptiness_changed
+                && self.may_list_working_copy_of(change)
+            {
+                drop(self.load_worktrees(true, cx));
+            }
+        }
+        // Diff stats reload on a git change even while hidden.
+        if related && self.watched(WatchKind::DiffStats) {
+            self.load_stats(true, cx);
+        }
+    }
+
+    /// This folder holds the changed folder or sits inside it, under any
+    /// spelling of either.
+    fn related_to(&self, change: &FilesChange) -> bool {
+        let mine = spellings(&self.cwd, self.real_cwd.as_deref());
+        let theirs = spellings(&change.source, change.source_real.as_deref());
+        mine.iter().any(|mine| {
+            theirs
+                .iter()
+                .any(|theirs| within(mine, theirs) || within(theirs, mine))
+        })
+    }
+
+    /// Whether this folder's working copy list can show the working copy
+    /// holding the changed folder. An unloaded list counts as yes.
+    fn may_list_working_copy_of(&self, change: &FilesChange) -> bool {
+        let Some(data) = &self.worktrees.data else {
+            return true;
+        };
+        if self.related_to(change) {
+            return true;
+        }
+        let theirs = spellings(&change.source, change.source_real.as_deref());
+        data.worktrees.iter().any(|tree| {
+            let tree = comparable(&tree.path);
+            theirs.iter().any(|theirs| within(theirs, &tree))
+        })
     }
 
     /// `notifyDirsChanged` reached this folder.
@@ -505,7 +748,18 @@ impl GitStatus {
         self.index_in_flight = true;
         let backend = self.backend.clone();
         let cwd = self.cwd.clone();
-        let read = cx.background_spawn(async move { backend.git_diff_index(&cwd) });
+        // The poll runs every `GIT_POLL` while the changes panel shows, so
+        // the status maps are built with the read, off the UI thread.
+        let read = cx.background_spawn(async move {
+            let index = backend.git_diff_index(&cwd).map(|index| {
+                let statuses = build_status_maps(&index, &cwd);
+                (index, statuses)
+            });
+            // After the index: a ref that moves while git runs then shows
+            // on this read or the next one.
+            let refs = backend.git_refs_fingerprint(&cwd);
+            index.map(|(index, statuses)| (index, statuses, refs))
+        });
         self.index_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             let Some(this) = this.upgrade() else {
@@ -517,11 +771,20 @@ impl GitStatus {
         }));
     }
 
-    fn index_loaded(&mut self, result: Result<GitDiffIndex, String>, cx: &mut Context<Self>) {
+    fn index_loaded(
+        &mut self,
+        result: Result<(GitDiffIndex, GitStatusMap, Option<u64>), String>,
+        cx: &mut Context<Self>,
+    ) {
         let mut changed = false;
         match result {
-            Ok(next) => {
-                let statuses = build_status_maps(&next, &self.cwd);
+            Ok((next, statuses, refs)) => {
+                let prev_refs = std::mem::replace(&mut self.refs_fingerprint, refs);
+                // The index carries no branch list or working copy list, so
+                // a ref or working copy added without moving HEAD shows only
+                // in the ref stamps. When they are missing or moved, every
+                // folder reloads as before.
+                let refs_held = prev_refs.is_some() && prev_refs == refs;
                 if statuses != self.statuses {
                     self.statuses = statuses;
                     changed = true;
@@ -539,11 +802,26 @@ impl GitStatus {
                     );
                     if let Some(prev) = prev {
                         let paths = changed_file_paths(&prev, &next);
+                        // A moved ref (commit, checkout, push, fetch) can
+                        // change every folder of the repository, so it reloads
+                        // everything. Edited files only reach the folders
+                        // holding them, so only those reload.
+                        let files = (refs_held && same_refs(&prev, &next)).then(|| FilesChange {
+                            source: self.cwd.clone(),
+                            source_real: self.real_cwd.clone(),
+                            emptiness_changed: prev.files.is_empty() != next.files.is_empty(),
+                        });
+                        if files.is_none() {
+                            self.index_announced = true;
+                        }
                         cx.defer(move |cx| {
                             Engine::hooks(cx)
                                 .workspace
                                 .invalidate_watched_files(Some(&paths), cx);
-                            super::notify_git_changed(cx);
+                            match files {
+                                Some(change) => super::notify_files_changed(&change, cx),
+                                None => super::notify_git_changed(cx),
+                            }
                         });
                     }
                 }
@@ -754,8 +1032,21 @@ impl GitStatuses {
             return entry.clone();
         }
         let (backend, clock, hidden) = (self.backend.clone(), self.clock.clone(), self.hidden);
-        let entry = cx.new(|_| GitStatus::new(cwd, backend, clock, hidden));
+        let entry = cx.new(|_| GitStatus::new(cwd, backend.clone(), clock, hidden));
         self.entries.insert(cwd.to_string(), entry.clone());
+        // Resolve symlinks once, off the UI thread, so a change seen under
+        // one spelling of a folder reaches its other spellings.
+        let (folder, path) = (entry.downgrade(), cwd.to_string());
+        let real = cx.background_spawn(async move { backend.real_path(&path) });
+        cx.spawn(async move |_, cx| {
+            let real = real.await;
+            cx.update(|cx| {
+                if let Some(folder) = folder.upgrade() {
+                    folder.update(cx, |status, _| status.real_cwd = real);
+                }
+            });
+        })
+        .detach();
         entry
     }
 
@@ -795,6 +1086,12 @@ impl GitStatuses {
     /// `notifyDirsChanged`.
     pub fn dirs_changed(&mut self, cx: &mut Context<Self>) {
         self.each(cx, |status, cx| status.dirs_changed(cx));
+    }
+
+    /// Edited files with no moved ref: each folder reloads only what those
+    /// files can change there (`GitStatus::files_changed`).
+    pub fn files_changed(&mut self, change: &FilesChange, cx: &mut Context<Self>) {
+        self.each(cx, |status, cx| status.files_changed(change, cx));
     }
 
     /// A window took focus.
@@ -844,6 +1141,51 @@ pub fn git_status_enabled(cwd: &str) -> bool {
 mod tests {
     use super::*;
     use monocode_git::fs::GitChangedFile;
+
+    #[test]
+    fn the_refs_stamp_moves_with_new_branches_and_working_copies() {
+        let root = std::env::temp_dir().join(format!("monocode-refs-{}", uuid::Uuid::new_v4()));
+        let git = root.join("main/.git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(git.join("refs/heads/main"), "abc\n").unwrap();
+        std::fs::create_dir_all(root.join("main/src")).unwrap();
+        let cwd = root.join("main/src").to_string_lossy().into_owned();
+        let first = refs_fingerprint_on_disk(&cwd);
+        assert!(first.is_some());
+        assert_eq!(refs_fingerprint_on_disk(&cwd), first);
+        // `git branch feature/x`.
+        std::fs::create_dir_all(git.join("refs/heads/feature")).unwrap();
+        std::fs::write(git.join("refs/heads/feature/x"), "abc\n").unwrap();
+        let branched = refs_fingerprint_on_disk(&cwd);
+        assert_ne!(branched, first);
+        // `git worktree add`, seen from the linked working copy too.
+        let linked = git.join("worktrees/linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(linked.join("HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        std::fs::write(linked.join("commondir"), "../..\n").unwrap();
+        std::fs::create_dir_all(root.join("linked")).unwrap();
+        std::fs::write(
+            root.join("linked/.git"),
+            format!("gitdir: {}\n", linked.display()),
+        )
+        .unwrap();
+        let added = refs_fingerprint_on_disk(&cwd);
+        assert_ne!(added, branched);
+        let from_linked = refs_fingerprint_on_disk(&root.join("linked").to_string_lossy());
+        assert!(from_linked.is_some());
+        // Outside any repository there is nothing to stamp.
+        assert_eq!(refs_fingerprint_on_disk(&root.to_string_lossy()), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn folders_compare_without_trailing_slashes() {
+        assert!(within(&comparable("/repo/sub/"), &comparable("/repo/")));
+        assert!(within(&comparable("/repo"), &comparable("/repo/")));
+        assert!(!within(&comparable("/repository"), &comparable("/repo")));
+        assert!(within(&comparable("/anything"), &comparable("/")));
+    }
 
     fn changed(path: &str, relative: &str, status: &str) -> GitChangedFile {
         GitChangedFile {

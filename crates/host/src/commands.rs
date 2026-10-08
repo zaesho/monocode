@@ -61,6 +61,13 @@ fn runtime_mode(value: Option<&Value>) -> Option<RuntimeMode> {
     value.and_then(Value::as_str).and_then(RuntimeMode::parse)
 }
 
+/// A non-negative `Number.isSafeInteger`.
+fn expected_revision(value: Option<&Value>) -> Result<i64, String> {
+    js::safe_integer(value)
+        .filter(|revision| *revision >= 0)
+        .ok_or_else(|| "Invalid expected session revision".to_string())
+}
+
 /// `parseCommand`.
 pub fn parse_command(input: &Value) -> Result<HostCommand, String> {
     let v = input.as_object().ok_or("Invalid command")?;
@@ -121,6 +128,31 @@ pub fn parse_fields(v: &Map<String, Value>) -> Result<HostCommand, String> {
             model: text(get("model"), "model", 200)?,
             model_settings: model_settings(get("modelSettings"))?,
             runtime_mode,
+        });
+    }
+    if kind == Some("switchProvider") {
+        let harness = get("harness")
+            .and_then(Value::as_str)
+            .and_then(parse_provider);
+        let (Some(harness), Some(runtime_mode)) = (harness, runtime_mode(get("runtimeMode")))
+        else {
+            return Err("Invalid provider or permission mode".into());
+        };
+        return Ok(HostCommand::SwitchProvider {
+            command_id,
+            session_id,
+            expected_revision: expected_revision(get("expectedRevision"))?,
+            harness,
+            model: text(get("model"), "model", 200)?,
+            model_settings: model_settings(get("modelSettings"))?,
+            runtime_mode,
+        });
+    }
+    if kind == Some("confirmProviderInspection") {
+        return Ok(HostCommand::ConfirmProviderInspection {
+            command_id,
+            session_id,
+            expected_revision: expected_revision(get("expectedRevision"))?,
         });
     }
     if kind == Some("compact") {
@@ -320,6 +352,39 @@ mod tests {
             }))
             .is_err()
         );
+        for expected_revision in [json!(-1), json!(1.5), json!("1"), Value::Null] {
+            let mut switch = json!({
+                "type": "switchProvider", "commandId": "switch", "sessionId": "session",
+                "harness": "claude", "model": "claude:test",
+                "modelSettings": {}, "runtimeMode": "supervised",
+            });
+            let mut inspect = json!({
+                "type": "confirmProviderInspection", "commandId": "inspect", "sessionId": "session",
+            });
+            if !expected_revision.is_null() {
+                switch["expectedRevision"] = expected_revision.clone();
+                inspect["expectedRevision"] = expected_revision;
+            }
+            assert_eq!(
+                parse_command(&switch).unwrap_err(),
+                "Invalid expected session revision"
+            );
+            assert_eq!(
+                parse_command(&inspect).unwrap_err(),
+                "Invalid expected session revision"
+            );
+        }
+        assert!(matches!(
+            parse_command(&json!({
+                "type": "switchProvider", "commandId": "switch", "sessionId": "session",
+                "expectedRevision": 0, "harness": "claude", "model": "claude:test",
+                "runtimeMode": "supervised",
+            })),
+            Ok(HostCommand::SwitchProvider {
+                expected_revision: 0,
+                ..
+            })
+        ));
     }
 
     #[test]

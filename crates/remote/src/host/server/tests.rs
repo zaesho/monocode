@@ -399,6 +399,18 @@ fn retries_model_discovery_after_a_provider_becomes_available() {
 #[test]
 fn advertises_newer_providers_only_to_desktops_that_request_them() {
     let s = setup(&[HarnessId::Codex, HarnessId::Cursor]);
+    let capabilities =
+        s.call("environment.describe", json!({})).1["result"]["capabilities"].clone();
+    for capability in ["sessionProviderSwitchV1", "sessionProviderInspectionV1"] {
+        assert!(
+            capabilities
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry == capability),
+            "{capability}"
+        );
+    }
     assert_eq!(
         s.call("environment.describe", json!({})).1["result"]["providers"],
         json!(["codex"])
@@ -921,5 +933,66 @@ fn parses_github_work_item_urls() {
     assert_eq!(
         parse_github_work_item_url("https://github.com/a/b/issues/12x"),
         None
+    );
+}
+
+/// A directory whose entries cannot be removed until the guard drops.
+#[cfg(unix)]
+struct ReadOnly(std::path::PathBuf);
+
+#[cfg(unix)]
+impl ReadOnly {
+    fn new(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o500)).unwrap();
+        Self(path.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn reports_a_committed_session_deletion_as_successful_when_context_cleanup_fails() {
+    let s = setup(&[HarnessId::Codex]);
+    let session_id = s.create("cleanup-session");
+    let root = s.directory.path().join("context-history");
+    let history = root.join(&session_id);
+    std::fs::create_dir_all(&history).unwrap();
+    std::fs::write(history.join("history.md"), "Retained context").unwrap();
+    let locked = ReadOnly::new(&root);
+    let deleted = s.call(
+        "sessions.delete",
+        json!({ "projectId": s.project.id, "sessionId": session_id }),
+    );
+    assert_eq!(deleted, (200, json!({ "result": { "deleted": true } })));
+    assert!(s.store.summaries(&s.project.id).unwrap().is_empty());
+    assert_eq!(
+        s.store.session(&session_id).unwrap_err(),
+        "Session not found on this machine"
+    );
+    assert!(history.exists());
+    assert_eq!(s.store.context_cleanup_pending(&session_id), Some(true));
+    drop(locked);
+    let repeated = s.call(
+        "sessions.delete",
+        json!({ "projectId": s.project.id, "sessionId": session_id }),
+    );
+    assert_eq!(repeated, (200, json!({ "result": { "deleted": true } })));
+    assert!(!history.exists());
+    assert_eq!(s.store.context_cleanup_pending(&session_id), Some(false));
+    assert_ne!(
+        s.call(
+            "sessions.delete",
+            json!({ "projectId": "wrong-project", "sessionId": session_id })
+        )
+        .0,
+        200
     );
 }

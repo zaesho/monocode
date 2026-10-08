@@ -98,12 +98,7 @@ impl TranscriptView {
                         .min_w_0()
                         .font_family(theme.fonts.sans.clone())
                         .text_sm_ui()
-                        .child(shimmer(
-                            eid(&row.key, "clock"),
-                            text,
-                            Duration::from_millis(1000),
-                            &theme,
-                        ))
+                        .child(shimmer(text, Duration::from_millis(1000), &theme))
                         .into_any_element(),
                     (!background.is_empty()).then(|| background.join("\n")),
                 )

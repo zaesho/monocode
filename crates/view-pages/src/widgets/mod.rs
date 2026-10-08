@@ -252,15 +252,17 @@ pub fn vertical_rule(theme: &Theme) -> gpui::Div {
         .bg(theme.content(0.15))
 }
 
-/// The `LoaderCircle animate-spin` glyph.
-pub fn spinner_icon(id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
-    use gpui::{Animation, AnimationExt as _, Transformation, percentage};
+/// The `LoaderCircle animate-spin` glyph, redrawn at
+/// [`monocode_ui::ticker::SMOOTH_FPS`] instead of every display refresh. It
+/// keeps turning with reduced motion, as `animate-spin` did.
+pub fn spinner_icon(_id: impl Into<ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+    use gpui::{Transformation, percentage};
+    use monocode_ui::{SteppedAnimationExt as _, smooth_steps};
+    let period = std::time::Duration::from_secs(1);
     icon(IconName::LoaderCircle)
         .size(u(size))
         .text_color(color)
-        .with_animation(
-            id,
-            Animation::new(std::time::Duration::from_secs(1)).repeat(),
-            |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
-        )
+        .with_loading_animation(period, smooth_steps(period), |svg, delta| {
+            svg.with_transformation(Transformation::rotate(percentage(delta)))
+        })
 }

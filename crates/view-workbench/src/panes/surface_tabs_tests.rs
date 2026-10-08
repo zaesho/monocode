@@ -686,3 +686,27 @@ fn expands_a_new_tab_from_zero_width(cx: &mut TestAppContext) {
     draw(h.cx);
     assert_eq!(h.shown()[2], ("third".into(), false, false));
 }
+
+#[gpui::test]
+fn the_same_props_again_do_not_redraw(cx: &mut TestAppContext) {
+    let h = mount(files(Kind::File, &["first", "second"]), "first", false, cx);
+    let notified = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    h.cx.update(|_, cx| {
+        cx.observe(&h.tabs, move |_, _| count.set(count.get() + 1))
+            .detach();
+    });
+    h.tabs.update(h.cx, |tabs, cx| {
+        let props = tabs.props().clone();
+        tabs.set_props(props, cx);
+    });
+    h.cx.run_until_parked();
+    assert_eq!(notified.get(), 0);
+    h.tabs.update(h.cx, |tabs, cx| {
+        let mut props = tabs.props().clone();
+        props.active_file_id = "second".into();
+        tabs.set_props(props, cx);
+    });
+    h.cx.run_until_parked();
+    assert_eq!(notified.get(), 1);
+}

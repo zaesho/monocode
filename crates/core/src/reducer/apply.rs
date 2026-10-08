@@ -35,7 +35,7 @@ use crate::reducer::preview::{
     ToolTitleInput, compose_tool_title, is_file_tool, is_weak_tool_title, merge_tool_preview,
     stub_file_preview,
 };
-use crate::reducer::stream_text::{join_stream_text, join_stream_text_into};
+use crate::reducer::stream_text::join_stream_text_into;
 use crate::session::{Session, UsageLimit};
 use crate::task_list::task_list_text;
 use crate::user_question::UserQuestionPrompt;
@@ -94,14 +94,18 @@ pub fn apply_harness_events_mut(
             continue;
         };
         let start = index;
-        while index + 1 < events.len() && delta_role(&events[index + 1]) == Some(role) {
+        let append = delta_appends(&events[index]);
+        while index + 1 < events.len()
+            && delta_role(&events[index + 1]) == Some(role)
+            && delta_appends(&events[index + 1]) == append
+        {
             index += 1;
         }
         let texts: Vec<&str> = events[start..=index]
             .iter()
             .filter_map(delta_text)
             .collect();
-        changed |= patch_streaming(env, session, role, &texts, true);
+        changed |= patch_streaming(env, session, role, &texts, true, append);
         index += 1;
     }
     changed
@@ -115,9 +119,25 @@ fn delta_role(event: &HarnessEvent) -> Option<BlockRole> {
     }
 }
 
+/// The delta carries plain incremental text (`append: true`).
+fn delta_appends(event: &HarnessEvent) -> bool {
+    matches!(
+        event,
+        HarnessEvent::MessageDelta {
+            append: Some(true),
+            ..
+        } | HarnessEvent::ReasoningDelta {
+            append: Some(true),
+            ..
+        }
+    )
+}
+
 fn delta_text(event: &HarnessEvent) -> Option<&str> {
     match event {
-        HarnessEvent::MessageDelta { text } | HarnessEvent::ReasoningDelta { text } => Some(text),
+        HarnessEvent::MessageDelta { text, .. } | HarnessEvent::ReasoningDelta { text, .. } => {
+            Some(text)
+        }
         _ => None,
     }
 }
@@ -136,8 +156,52 @@ pub fn apply_harness_event_mut(
     event: &HarnessEvent,
 ) -> bool {
     match event {
-        HarnessEvent::MessageDelta { text } => {
-            patch_streaming(env, session, BlockRole::Assistant, &[text.as_str()], true)
+        HarnessEvent::MessageDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Assistant,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
+        HarnessEvent::MessagePart {
+            part_id,
+            text,
+            reasoning,
+            streaming,
+        } => {
+            let role = if *reasoning {
+                BlockRole::Reasoning
+            } else {
+                BlockRole::Assistant
+            };
+            let existing = session.blocks.iter_mut().find(|block| {
+                block.provider_part_id.as_deref() == Some(part_id.as_str()) && block.role == role
+            });
+            match existing {
+                Some(block) => {
+                    if block.text == *text && block.streaming == Some(*streaming) {
+                        return false;
+                    }
+                    // Reuse the block's buffer: snapshots arrive once per token.
+                    block.text.clone_from(text);
+                    block.streaming = Some(*streaming);
+                }
+                None => {
+                    if text.is_empty() {
+                        return false;
+                    }
+                    append_block(
+                        session,
+                        Block {
+                            provider_part_id: Some(part_id.clone()),
+                            streaming: Some(*streaming),
+                            ..Block::new(env.new_id(), role, text.clone())
+                        },
+                    );
+                }
+            }
+            true
         }
         HarnessEvent::MessageCompleted => {
             finish_role(session, BlockRole::Assistant);
@@ -168,9 +232,14 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::ImageGenerated(GeneratedImage::Inline { .. }) => false,
-        HarnessEvent::ReasoningDelta { text } => {
-            patch_streaming(env, session, BlockRole::Reasoning, &[text.as_str()], true)
-        }
+        HarnessEvent::ReasoningDelta { text, append } => patch_streaming(
+            env,
+            session,
+            BlockRole::Reasoning,
+            &[text.as_str()],
+            true,
+            *append == Some(true),
+        ),
         HarnessEvent::ReasoningCompleted => {
             finish_role(session, BlockRole::Reasoning);
             true
@@ -312,7 +381,27 @@ pub fn apply_harness_event_mut(
             session.provider_session_id = Some(provider_session_id.clone());
             true
         }
-        HarnessEvent::TurnStarted { provider_turn_id } => {
+        // A turn the provider started on its own has no user block to stamp;
+        // it only shows the session working until it finishes.
+        HarnessEvent::TurnStarted {
+            native: Some(true), ..
+        } => {
+            let changed = session.busy != Some(true);
+            session.busy = Some(true);
+            changed
+        }
+        HarnessEvent::TurnFinished { native } => {
+            if *native != Some(true) {
+                return false;
+            }
+            finish_role(session, BlockRole::Assistant);
+            finish_role(session, BlockRole::Reasoning);
+            session.busy = Some(false);
+            true
+        }
+        HarnessEvent::TurnStarted {
+            provider_turn_id, ..
+        } => {
             let Some(index) = last_user_index(&session.blocks) else {
                 return false;
             };
@@ -344,21 +433,47 @@ pub fn apply_harness_event_mut(
             true
         }
         HarnessEvent::Interjection {
+            id,
             text,
             custom_type,
             severity,
+            model,
+            status,
         } => {
+            let meta = InterjectionMeta {
+                custom_type: custom_type.clone(),
+                severity: *severity,
+                model: model.clone(),
+                status: *status,
+                extra: Extra::new(),
+            };
+            // A provider that reports progress on one interjection repeats its
+            // id. Update that block where it sits so the transcript keeps one
+            // row per consult.
+            if let Some(id) = nonempty(id.as_deref())
+                && let Some(block) = session
+                    .blocks
+                    .iter_mut()
+                    .find(|block| block.id == id && block.interjection.is_some())
+            {
+                if block.text == *text && block.interjection.as_ref() == Some(&meta) {
+                    return false;
+                }
+                block.text = text.clone();
+                block.interjection = Some(meta);
+                return true;
+            }
             // A visible boundary the user must not miss, so unlike status it
             // never deduplicates and never reads as turn lifecycle.
+            let block_id = match nonempty(id.as_deref()) {
+                Some(id) => id.to_string(),
+                None => env.new_id(),
+            };
             append_block(
                 session,
                 Block {
-                    interjection: Some(InterjectionMeta {
-                        custom_type: custom_type.clone(),
-                        severity: *severity,
-                        extra: Extra::new(),
-                    }),
-                    ..Block::new(env.new_id(), BlockRole::System, text.as_str())
+                    interjection: Some(meta),
+                    ..Block::new(block_id, BlockRole::System, text.as_str())
                 },
             );
             true
@@ -981,6 +1096,7 @@ fn patch_streaming(
     role: BlockRole,
     texts: &[&str],
     streaming: bool,
+    append: bool,
 ) -> bool {
     if role == BlockRole::Reasoning && texts.iter().all(|text| text.is_empty()) {
         return false;
@@ -996,9 +1112,16 @@ fn patch_streaming(
             // tokens and full snapshots, so concatenating the incoming chunks
             // would duplicate text. The text only ever grows, so it changed
             // exactly when a join did something.
+            // An appending provider sends plain increments, so they are
+            // concatenated as is.
             let mut changed = false;
             for text in texts {
-                changed |= join_stream_text_into(&mut last.text, text);
+                if append {
+                    changed |= !text.is_empty();
+                    last.text.push_str(text);
+                } else {
+                    changed |= join_stream_text_into(&mut last.text, text);
+                }
             }
             if !changed && last.streaming == Some(streaming) {
                 return false;
@@ -1008,9 +1131,16 @@ fn patch_streaming(
         }
     }
     seal_last_stream(&mut session.blocks);
-    let text = texts
-        .iter()
-        .fold(String::new(), |acc, text| join_stream_text(&acc, text));
+    let text = if append {
+        texts.concat()
+    } else {
+        // Join in place so a batch of k deltas does not copy the text k times.
+        let mut text = String::new();
+        for chunk in texts {
+            join_stream_text_into(&mut text, chunk);
+        }
+        text
+    };
     session.blocks.push(Block {
         streaming: Some(streaming),
         ..Block::new(env.new_id(), role, text)
@@ -1289,7 +1419,7 @@ fn cap_tool_detail(value: Option<&str>) -> Option<String> {
     if text.is_empty() {
         return None;
     }
-    if js::len(text) <= MAX_TOOL_DETAIL_CHARS {
+    if js::len_at_most(text, MAX_TOOL_DETAIL_CHARS) {
         return Some(text.to_string());
     }
     Some(format!(
@@ -1401,9 +1531,37 @@ fn record_agent_step(session: &mut Session, event: &HarnessEvent) -> bool {
         extra: Extra::new(),
     };
 
-    let at = run.and_then(|run| run.steps.iter().position(|entry| entry.id == *step_id));
-    let steps = match (run, at) {
-        (Some(run), Some(at)) => {
+    let name = nonempty(agent_name.as_deref())
+        .or_else(|| run.and_then(|run| nonempty(Some(&run.name))))
+        .or_else(|| nonempty(prev.tool.as_ref().and_then(|tool| tool.title.as_deref())))
+        .or_else(|| nonempty(Some(&prev.text)))
+        .unwrap_or("Subagent")
+        .to_string();
+    let agent_type = agent_type
+        .clone()
+        .or_else(|| run.and_then(|run| run.agent_type.clone()))
+        .filter(|agent_type| !agent_type.is_empty());
+    let model = run
+        .and_then(|run| run.model.clone())
+        .filter(|model| !model.is_empty());
+
+    // The TypeScript built a new run with every step copied and compared it
+    // with the old one. A run keeps up to 300 steps with their previews and
+    // streamed subagent text repeats this per token, so change the run in
+    // place: only the merged step and the header can differ.
+    let Some(run) = session.blocks[index].agent_run.as_mut() else {
+        session.blocks[index].agent_run = Some(AgentRunMeta {
+            name,
+            agent_type,
+            model,
+            steps: vec![step],
+            extra: Extra::new(),
+        });
+        return true;
+    };
+    let same_header = run.name == name && run.agent_type == agent_type && run.model == model;
+    match run.steps.iter().position(|entry| entry.id == *step_id) {
+        Some(at) => {
             let existing = &run.steps[at];
             let mut merged = existing.clone();
             merged.id = step.id;
@@ -1424,54 +1582,27 @@ fn record_agent_step(session: &mut Session, event: &HarnessEvent) -> bool {
                 merged.detail = step.detail;
             }
             merged.preview = merge_tool_preview(preview.as_ref(), existing.preview.as_ref());
-            let mut steps = run.steps.clone();
-            steps[at] = merged;
-            steps
-        }
-        _ => {
-            let mut steps = run.map(|run| run.steps.clone()).unwrap_or_default();
-            steps.push(step);
-            if steps.len() > MAX_AGENT_STEPS {
-                steps.drain(..steps.len() - MAX_AGENT_STEPS);
+            if same_header && same_agent_step(existing, &merged) {
+                return false;
             }
-            steps
+            run.steps[at] = merged;
         }
-    };
-
-    let name = nonempty(agent_name.as_deref())
-        .or_else(|| run.and_then(|run| nonempty(Some(&run.name))))
-        .or_else(|| nonempty(prev.tool.as_ref().and_then(|tool| tool.title.as_deref())))
-        .or_else(|| nonempty(Some(&prev.text)))
-        .unwrap_or("Subagent")
-        .to_string();
-    let next = AgentRunMeta {
-        name,
-        agent_type: agent_type
-            .clone()
-            .or_else(|| run.and_then(|run| run.agent_type.clone()))
-            .filter(|agent_type| !agent_type.is_empty()),
-        model: run
-            .and_then(|run| run.model.clone())
-            .filter(|model| !model.is_empty()),
-        steps,
-        extra: Extra::new(),
-    };
-    if run.is_some_and(|run| same_agent_run(run, &next)) {
-        return false;
+        // A new step id never matches the step it would sit beside, so the
+        // run always changes.
+        None => {
+            run.steps.push(step);
+            if run.steps.len() > MAX_AGENT_STEPS {
+                let excess = run.steps.len() - MAX_AGENT_STEPS;
+                run.steps.drain(..excess);
+            }
+        }
     }
-    session.blocks[index].agent_run = Some(next);
+    run.name = name;
+    run.agent_type = agent_type;
+    run.model = model;
+    // The replaced run started with no unknown fields.
+    run.extra = Extra::new();
     true
-}
-
-fn same_agent_run(a: &AgentRunMeta, b: &AgentRunMeta) -> bool {
-    a.name == b.name
-        && a.agent_type == b.agent_type
-        && a.model == b.model
-        && a.steps.len() == b.steps.len()
-        && a.steps
-            .iter()
-            .zip(&b.steps)
-            .all(|(a, b)| same_agent_step(a, b))
 }
 
 fn same_agent_step(a: &AgentStep, b: &AgentStep) -> bool {
@@ -1486,7 +1617,7 @@ fn same_agent_step(a: &AgentStep, b: &AgentStep) -> bool {
 
 fn cap_agent_step_text(value: &str) -> String {
     let text = js::trim(value);
-    if js::len(text) <= MAX_AGENT_STEP_CHARS {
+    if js::len_at_most(text, MAX_AGENT_STEP_CHARS) {
         return text.to_string();
     }
     format!("{}\u{2026}", js::slice_prefix(text, MAX_AGENT_STEP_CHARS))
@@ -1574,7 +1705,7 @@ fn prefer_label(parts: &[Option<&str>]) -> String {
         .filter(|part| !is_call_id(part))
         .collect();
     // `compactLabel(part) === part`: one line of at most 240 characters.
-    let compact = |part: &&str| !part.contains('\n') && js::len(part) <= 240;
+    let compact = |part: &&str| !part.contains('\n') && js::len_at_most(part, 240);
     let strong: Vec<&str> = filled
         .iter()
         .copied()

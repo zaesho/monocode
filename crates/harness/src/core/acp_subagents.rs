@@ -240,10 +240,10 @@ impl AcpSubagents {
                         preview,
                     });
                 }
-                HarnessEvent::MessageDelta { text: delta } => {
+                HarnessEvent::MessageDelta { text: delta, .. } => {
                     output.push(self.prose_step(params, &parent, ProseKind::Message, &delta));
                 }
-                HarnessEvent::ReasoningDelta { text: delta } => {
+                HarnessEvent::ReasoningDelta { text: delta, .. } => {
                     output.push(self.prose_step(params, &parent, ProseKind::Reasoning, &delta));
                 }
                 // Child plans, context meters, and lifecycle notifications
@@ -439,7 +439,10 @@ mod tests {
     use serde_json::json;
 
     fn delta(text: &str) -> HarnessEvent {
-        HarnessEvent::MessageDelta { text: text.into() }
+        HarnessEvent::MessageDelta {
+            text: text.into(),
+            append: None,
+        }
     }
 
     fn tool_started(call_id: &str, title: &str, kind: Option<&str>) -> HarnessEvent {

@@ -182,9 +182,10 @@ impl Decoder {
                     });
                 } else if reasoning {
                     if !delta.is_empty() {
-                        result
-                            .events
-                            .push(HarnessEvent::ReasoningDelta { text: delta });
+                        result.events.push(HarnessEvent::ReasoningDelta {
+                            text: delta,
+                            append: None,
+                        });
                     }
                     if ended {
                         result.events.push(HarnessEvent::ReasoningCompleted);
@@ -198,9 +199,10 @@ impl Decoder {
                     });
                 } else {
                     if !delta.is_empty() {
-                        result
-                            .events
-                            .push(HarnessEvent::MessageDelta { text: delta });
+                        result.events.push(HarnessEvent::MessageDelta {
+                            text: delta,
+                            append: None,
+                        });
                     }
                     if ended {
                         result.events.push(HarnessEvent::MessageCompleted);
@@ -495,13 +497,19 @@ mod tests {
         let first = decoder.decode(&json!({"id":"evt_delta","type":"session.text.delta","data":{"sessionID":"ses_owned","assistantMessageID":"msg_owned","ordinal":0,"delta":"hel"}}));
         assert_eq!(
             first.events,
-            vec![HarnessEvent::MessageDelta { text: "hel".into() }]
+            vec![HarnessEvent::MessageDelta {
+                text: "hel".into(),
+                append: None
+            }]
         );
         let full = json!({"id":"evt_full","type":"session.text.ended","durable":{"seq":4},"data":{"sessionID":"ses_owned","assistantMessageID":"msg_owned","ordinal":0,"text":"hello"}});
         assert_eq!(
             decoder.decode(&full).events,
             vec![
-                HarnessEvent::MessageDelta { text: "lo".into() },
+                HarnessEvent::MessageDelta {
+                    text: "lo".into(),
+                    append: None
+                },
                 HarnessEvent::MessageCompleted
             ]
         );

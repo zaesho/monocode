@@ -66,7 +66,7 @@ fn has_readable_bin(text: &str) -> bool {
 /// command should stay as typed (git, npm, scripts, mixed opaque work).
 pub fn infer_shell_intent(command: &str) -> Option<ShellIntent> {
     let text = unwrap_shell_command(command);
-    if text.is_empty() || js::len(&text) > MAX_COMMAND_CHARS {
+    if text.is_empty() || !js::len_at_most(&text, MAX_COMMAND_CHARS) {
         return None;
     }
     if starts_with_word_then_text(&text, &["Read", "Find", "List", "Edit", "Write"], false) {

@@ -13,10 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ElementId, Hsla, Image, ImageFormat,
-    InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Transformation, div, img,
-    percentage, prelude::FluentBuilder as _,
+    AnyElement, App, ElementId, Hsla, Image, ImageFormat, InteractiveElement as _, IntoElement,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Transformation, div, img, percentage, prelude::FluentBuilder as _,
 };
 use monocode_markdown::{MarkdownStyle, SyntaxColors};
 use monocode_ui::color::{hex, with_alpha};
@@ -187,16 +186,37 @@ pub fn provider_mark(provider: InboxProvider, size: f32, ink: Hsla) -> AnyElemen
 
 // Spinners.
 
-/// An icon that turns once a second (`animate-spin`).
-pub fn spin_icon(id: impl Into<ElementId>, name: IconName, size: f32, ink: Hsla) -> AnyElement {
+/// An icon that turns once a second (`animate-spin`), redrawn at
+/// [`monocode_ui::ticker::SMOOTH_FPS`] instead of every display refresh. It
+/// keeps turning with reduced motion, as `animate-spin` did.
+pub fn spin_icon(_id: impl Into<ElementId>, name: IconName, size: f32, ink: Hsla) -> AnyElement {
+    use monocode_ui::{SteppedAnimationExt as _, smooth_steps};
+    let period = Duration::from_secs(1);
     icon(name)
         .size(u(size))
         .text_color(ink)
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(1)).repeat(),
-            |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
-        )
+        .with_loading_animation(period, smooth_steps(period), |svg, delta| {
+            svg.with_transformation(Transformation::rotate(percentage(delta)))
+        })
+        .into_any_element()
+}
+
+/// [`spin_icon`] for `animate-spin motion-reduce:animate-none`: it holds
+/// still with reduced motion.
+pub fn motion_safe_spin_icon(
+    _id: impl Into<ElementId>,
+    name: IconName,
+    size: f32,
+    ink: Hsla,
+) -> AnyElement {
+    use monocode_ui::{SteppedAnimationExt as _, smooth_steps};
+    let period = Duration::from_secs(1);
+    icon(name)
+        .size(u(size))
+        .text_color(ink)
+        .with_stepped_animation(period, smooth_steps(period), |svg, delta| {
+            svg.with_transformation(Transformation::rotate(percentage(delta)))
+        })
         .into_any_element()
 }
 

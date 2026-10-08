@@ -36,7 +36,7 @@ impl DateTimeStyle {
 }
 
 /// Format epoch milliseconds for display, or return an empty label for an
-/// invalid timestamp. The formatter reads current OS preferences per call.
+/// invalid timestamp. Each call reads the current OS locale and time zone.
 pub fn format_local(epoch_ms: i64, style: DateTimeStyle) -> String {
     format_with(epoch_ms, style, None, false).unwrap_or_default()
 }
@@ -56,11 +56,29 @@ fn format_with(
 
 #[cfg(target_os = "macos")]
 mod native {
+    use std::cell::RefCell;
+
     use objc2::AnyThread as _;
-    use objc2::rc::autoreleasepool;
+    use objc2::rc::{Retained, autoreleasepool};
     use objc2_foundation::{NSDate, NSDateFormatter, NSLocale, NSString, NSTimeZone};
 
     use super::DateTimeStyle;
+
+    /// A formatter built for the OS locale and time zone objects it holds.
+    /// Building one and applying a template costs about 50 microseconds, and
+    /// views format clock times on every frame, so each thread keeps one per
+    /// style. Foundation hands out new locale and time zone objects when the
+    /// user changes preferences, and the pointer check then rebuilds.
+    struct Cached {
+        style: DateTimeStyle,
+        locale: Retained<NSLocale>,
+        zone: Retained<NSTimeZone>,
+        formatter: Retained<NSDateFormatter>,
+    }
+
+    thread_local! {
+        static FORMATTERS: RefCell<Vec<Cached>> = const { RefCell::new(Vec::new()) };
+    }
 
     pub fn format(
         ms: i64,
@@ -68,7 +86,59 @@ mod native {
         locale: Option<&str>,
         utc: bool,
     ) -> Option<String> {
-        autoreleasepool(|_| format_in_pool(ms, style, locale, utc))
+        autoreleasepool(|_| {
+            if locale.is_none() && !utc {
+                format_current(ms, style)
+            } else {
+                format_in_pool(ms, style, locale, utc)
+            }
+        })
+    }
+
+    fn format_current(ms: i64, style: DateTimeStyle) -> Option<String> {
+        let locale = NSLocale::currentLocale();
+        let zone = NSTimeZone::defaultTimeZone();
+        let date = NSDate::dateWithTimeIntervalSince1970(ms as f64 / 1000.);
+        FORMATTERS.with(|formatters| {
+            let mut formatters = formatters.borrow_mut();
+            let index = match formatters.iter().position(|cached| cached.style == style) {
+                Some(index)
+                    if Retained::as_ptr(&formatters[index].locale) == Retained::as_ptr(&locale)
+                        && Retained::as_ptr(&formatters[index].zone) == Retained::as_ptr(&zone) =>
+                {
+                    index
+                }
+                found => {
+                    let formatter = NSDateFormatter::new();
+                    formatter.setLocale(Some(&locale));
+                    formatter.setTimeZone(Some(&zone));
+                    formatter
+                        .setLocalizedDateFormatFromTemplate(&NSString::from_str(style.skeleton()));
+                    let cached = Cached {
+                        style,
+                        locale,
+                        zone,
+                        formatter,
+                    };
+                    match found {
+                        Some(index) => {
+                            formatters[index] = cached;
+                            index
+                        }
+                        None => {
+                            formatters.push(cached);
+                            formatters.len() - 1
+                        }
+                    }
+                }
+            };
+            Some(
+                formatters[index]
+                    .formatter
+                    .stringFromDate(&date)
+                    .to_string(),
+            )
+        })
     }
 
     fn format_in_pool(
@@ -88,6 +158,22 @@ mod native {
         formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(style.skeleton()));
         let date = NSDate::dateWithTimeIntervalSince1970(ms as f64 / 1000.);
         Some(formatter.stringFromDate(&date).to_string())
+    }
+
+    #[cfg(test)]
+    pub(super) fn uncached(ms: i64, style: DateTimeStyle) -> Option<String> {
+        autoreleasepool(|_| format_in_pool(ms, style, None, false))
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_formatter(style: DateTimeStyle) -> Option<*const NSDateFormatter> {
+        FORMATTERS.with(|formatters| {
+            formatters
+                .borrow()
+                .iter()
+                .find(|cached| cached.style == style)
+                .map(|cached| Retained::as_ptr(&cached.formatter))
+        })
     }
 }
 
@@ -533,6 +619,30 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn repeated_labels_reuse_one_formatter_and_match_a_fresh_one() {
+        for style in [
+            DateTimeStyle::MonthDay,
+            DateTimeStyle::Time,
+            DateTimeStyle::DateTime,
+            DateTimeStyle::Reminder,
+            DateTimeStyle::TimeZone,
+        ] {
+            let first = format_local(OCTOBER_2, style);
+            let formatter = native::cached_formatter(style).expect("cached formatter");
+            for offset in 0..50 {
+                let at = OCTOBER_2 + offset * 3_600_000;
+                assert_eq!(
+                    format_local(at, style),
+                    native::uncached(at, style).unwrap()
+                );
+            }
+            assert_eq!(format_local(OCTOBER_2, style), first);
+            assert_eq!(native::cached_formatter(style), Some(formatter));
+        }
     }
 
     #[test]

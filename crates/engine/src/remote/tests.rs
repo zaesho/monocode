@@ -585,13 +585,21 @@ fn setup_with(cx: &mut TestAppContext, transport: FakeTransport) -> Setup {
 
 const PROJECT: &str = "remote://env/home/me/repo";
 
-fn descriptor() -> Value {
+/// The descriptor of a host that also advertises `extra` capabilities.
+fn descriptor_with(extra: &[&str]) -> Value {
+    let mut capabilities = vec![
+        "changes.wait",
+        "attachments.upload",
+        "sessions.plan",
+        "sessions.draft",
+    ];
+    capabilities.extend_from_slice(extra);
     json!({
         "protocolVersion": 1,
         "environmentId": "env",
         "name": "mini",
         "providers": ["codex", "claude"],
-        "capabilities": ["changes.wait", "attachments.upload", "sessions.plan", "sessions.draft"],
+        "capabilities": capabilities,
         "hostVersion": "0.6.0"
     })
 }
@@ -624,6 +632,29 @@ fn host_session(id: &str, revision: i64, busy: bool, blocks: Value) -> Value {
     })
 }
 
+#[test]
+fn an_unchanged_sync_hands_back_the_known_snapshot_itself() {
+    let transport = FakeTransport::new();
+    let client = client_with(&transport);
+    transport.respond(
+        "sessions.sync",
+        json!({
+            "kind": "snapshot",
+            "value": host_session("host-1", 3, false, json!([user_block("turn", "Fix it")])),
+        }),
+    );
+    let first = block_on(client.load_remote_session("machine", "host-1", None)).unwrap();
+    transport.respond(
+        "sessions.sync",
+        json!({ "kind": "unchanged", "revision": 3 }),
+    );
+    let again =
+        block_on(client.load_remote_session("machine", "host-1", Some(first.clone()))).unwrap();
+    // No copy of the transcript: the poll gets the same allocation back.
+    assert!(Arc::ptr_eq(&again, &first));
+    assert_eq!(transport.calls_for("sessions.sync").len(), 2);
+}
+
 /// A scripted host: one session per id, commands recorded, `changes.wait`
 /// held until the test releases it.
 #[derive(Default)]
@@ -632,6 +663,8 @@ struct Host {
     next_session: String,
     dispatch_error: Option<String>,
     on_send: Option<fn(&mut Host, &Value)>,
+    /// Capabilities beyond the base set, such as provider switching.
+    capabilities: Vec<&'static str>,
 }
 
 fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
@@ -643,7 +676,7 @@ fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
     transport.set_handler(move |_, method, params| {
         let mut host = state.lock();
         let reply = match method {
-            "environment.describe" => Reply::Value(descriptor()),
+            "environment.describe" => Reply::Value(descriptor_with(&host.capabilities)),
             "models.list" => Reply::Value(catalog()),
             "changes.wait" => Reply::Hold,
             "sessions.list" => Reply::Value(json!([])),
@@ -677,6 +710,27 @@ fn host(transport: &FakeTransport) -> Arc<Mutex<Host>> {
                     && let Some(on_send) = host.on_send
                 {
                     on_send(&mut host, params);
+                }
+                // The host side of RemoteSession.test.ts `dispatch`.
+                if let Some(value) = host.sessions.get_mut(&session_id) {
+                    let revision = value["revision"].as_i64().unwrap_or_default();
+                    match params["type"].as_str() {
+                        Some("switchProvider") => {
+                            value["revision"] = json!(revision + 1);
+                            for key in ["harness", "model", "modelSettings", "runtimeMode"] {
+                                value["session"][key] = params[key].clone();
+                            }
+                        }
+                        Some("confirmProviderInspection") => {
+                            value["revision"] = json!(revision + 1);
+                            if let Some(context) =
+                                value["session"]["providerContext"].as_object_mut()
+                            {
+                                context.remove("delivery");
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Reply::Value(json!({
                     "commandId": params["commandId"],
@@ -1058,6 +1112,7 @@ fn a_rejected_command_leaves_the_outbox_and_shows_the_error(cx: &mut TestAppCont
                 failed_draft: Some(false),
                 error: "Host rejected request: Session is busy".into(),
                 catalog_problem: String::new(),
+                inspection: None,
             }
         );
         assert!(tab.session(cx).blocks.is_empty());
@@ -1179,6 +1234,40 @@ fn older_hosts_without_pushed_changes_keep_polling(cx: &mut TestAppContext) {
     s.advance(cx, 3_000);
     assert_eq!(s.transport.calls_for("sessions.sync").len(), syncs + 2);
     assert_eq!(s.transport.calls_for("changes.wait").len(), 1);
+}
+
+#[gpui::test]
+fn an_unchanged_poll_does_not_redraw_the_tab(cx: &mut TestAppContext) {
+    let (s, host) = remote_setup(cx, Some("host-1"));
+    host.lock()
+        .sessions
+        .insert("host-1".into(), host_session("host-1", 3, false, json!([])));
+    s.transport.queue(
+        "changes.wait",
+        Reply::Error("Host rejected request: Unsupported host method".into()),
+    );
+    let tab = s.open(cx, "tab-1");
+    let notified = Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    let _observe = cx.update(|cx| cx.observe(&tab, move |_, _| count.set(count.get() + 1)));
+    let syncs = s.transport.calls_for("sessions.sync").len();
+    s.advance(cx, 3_000);
+    s.advance(cx, 3_000);
+    assert_eq!(s.transport.calls_for("sessions.sync").len(), syncs + 2);
+    assert_eq!(notified.get(), 0);
+    // A new revision still redraws.
+    host.lock().sessions.insert(
+        "host-1".into(),
+        host_session("host-1", 4, false, json!([user_block("turn", "Fix it")])),
+    );
+    s.advance(cx, 3_000);
+    assert!(notified.get() > 0);
+    assert_eq!(
+        tab.read_with(cx, |tab, _| tab
+            .snapshot()
+            .map(|snapshot| snapshot.revision)),
+        Some(4)
+    );
 }
 
 #[gpui::test]
@@ -1529,3 +1618,5 @@ fn real_host_answers_in_the_shapes_the_client_reads() {
     request("devices.revokeSelf", json!({})).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+mod provider_switch;

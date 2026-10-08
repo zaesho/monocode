@@ -40,6 +40,10 @@ pub struct WorkerPreparation {
 pub struct WorkerIntegration {
     pub files: Vec<String>,
     pub already_applied: i64,
+    /// Changed files outside the write scopes, left in the worker worktree.
+    pub skipped: Vec<String>,
+    /// Gitignored files the worker created that the lead lacks, not applied.
+    pub ignored: Vec<String>,
 }
 
 /// The terminal callback of a managed turn.
@@ -50,6 +54,21 @@ pub type Done = Box<dyn FnOnce(ControlOutcome, &mut App)>;
 pub trait OrchestrationHost {
     fn session(&self, id: &str, cx: &App) -> Option<Session>;
     fn sessions(&self, cx: &App) -> Vec<Session>;
+    /// Hand one session to `read` without copying it. The orchestrator reads
+    /// workers on every `Sessions` change, and a copy is the whole
+    /// transcript. The default copies it through `session`.
+    fn read_session(&self, id: &str, cx: &App, read: &mut dyn FnMut(&Session)) {
+        if let Some(session) = self.session(id, cx) {
+            read(&session);
+        }
+    }
+    /// The first session `matches` accepts, copying only that one. The
+    /// default copies every session through `sessions`.
+    fn find_session(&self, cx: &App, matches: &mut dyn FnMut(&Session) -> bool) -> Option<Session> {
+        self.sessions(cx)
+            .into_iter()
+            .find(|session| matches(session))
+    }
     /// Installed harnesses and their models.
     fn choices(&self, cx: &App) -> Vec<HarnessChoice>;
     fn create_worker(
@@ -65,11 +84,13 @@ pub trait OrchestrationHost {
         cx: &mut App,
     ) -> Task<Result<WorkerIntegration, String>>;
     /// `Ok(false)` when unreviewed changes require the worktree to be kept.
+    /// `discard_outside` removes it even while out-of-scope files remain.
     fn cleanup_worker(
         &self,
         run: &OrchestrationRun,
         task: &OrchestrationTask,
         only_if_unchanged: bool,
+        discard_outside: bool,
         cx: &mut App,
     ) -> Task<Result<bool, String>>;
     /// Start a managed turn. `done` runs exactly once when it ends or is

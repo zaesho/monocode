@@ -7,6 +7,7 @@
 //! engine and provider tests can use it too.
 
 pub mod chat_context;
+pub mod handoff;
 pub mod link;
 pub mod plan;
 pub mod pool;
@@ -19,5 +20,5 @@ pub use monocode_core::transcript::{
 };
 pub use plan::{
     BlockStore, FoldLine, FoldTitle, ItemView, Placement, PlanCache, PlanOptions, PlanState, Row,
-    RowKind, TurnFooter, build_plan, visible_blocks,
+    RowKind, RowRef, TurnFooter, build_plan, visible_blocks,
 };

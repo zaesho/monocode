@@ -73,6 +73,8 @@ pub struct ClaudeControlRequest {
     pub tool_name: Option<String>,
     pub input: Record,
     pub tool_use_id: Option<String>,
+    /// The nested `request` object, which an elicitation reads its form from.
+    pub request: Option<Record>,
 }
 
 /// `ClaudeCliSettings`: the JSON passed to `--settings`.
@@ -236,11 +238,13 @@ pub fn parse_json_line(line: &str) -> Option<Record> {
 }
 
 /// `buildClaudeUserMessage`. Fails like `attachmentPathText` when an
-/// attachment has no local path.
+/// attachment has no local path. `uuid` names the request, so Claude's replay
+/// of it can confirm acceptance.
 pub fn build_claude_user_message(
     text: &str,
     attachments: &[Attachment],
     effort: Option<&str>,
+    uuid: Option<&str>,
 ) -> Result<Value, String> {
     let text = apply_claude_prompt_effort_prefix(&prompt_text(text, attachments), effort);
     let mut content = Vec::new();
@@ -255,12 +259,16 @@ pub fn build_claude_user_message(
             }
         }
     }
-    Ok(json!({
+    let mut message = json!({
         "type": "user",
         "session_id": "",
         "parent_tool_use_id": null,
         "message": { "role": "user", "content": content },
-    }))
+    });
+    if let Some(uuid) = uuid {
+        message["uuid"] = Value::String(uuid.to_string());
+    }
+    Ok(message)
 }
 
 /// `(message.message as { content: unknown[] }).content`.
@@ -310,6 +318,9 @@ pub struct ClaudeSpawnOptions {
     pub include_partial_messages: Option<bool>,
     pub max_turns: Option<i64>,
     pub isolated: bool,
+    /// `--tools`: the only built-in tools Claude may use. An empty list
+    /// turns them all off.
+    pub tools: Option<Vec<String>>,
 }
 
 fn non_empty(value: &Option<String>) -> Option<&str> {
@@ -328,6 +339,10 @@ pub fn build_claude_spawn_args(input: &ClaudeSpawnOptions) -> Vec<String> {
     .map(String::from)
     .to_vec();
     if !input.isolated {
+        // Foreground subagents only report their prose with this flag.
+        args.push("--forward-subagent-text".into());
+        // Claude echoes each user message back, which confirms acceptance.
+        args.push("--replay-user-messages".into());
         args.extend(["--permission-prompt-tool".into(), "stdio".into()]);
     }
     if input.include_partial_messages != Some(false) {
@@ -352,6 +367,9 @@ pub fn build_claude_spawn_args(input: &ClaudeSpawnOptions) -> Vec<String> {
         args.push(format!("--setting-sources={CLAUDE_SETTING_SOURCES}"));
         args.push("--settings".into());
         args.push(settings);
+    }
+    if let Some(tools) = &input.tools {
+        args.extend(["--tools".into(), tools.join(",")]);
     }
     if let Some(model) = non_empty(&input.model) {
         args.extend(["--model".into(), model.to_string()]);
@@ -509,6 +527,7 @@ pub fn parse_control_request(rec: &Record) -> Option<ClaudeControlRequest> {
             .or_else(|| string_field(nested, "toolUseID"))
             .or_else(|| string_field(Some(rec), "tool_use_id"))
             .map(str::to_string),
+        request: nested.cloned(),
     })
 }
 
@@ -573,7 +592,7 @@ pub fn status_text_from_system(rec: &Record) -> Option<String> {
     }
     let subtype = subtype_of(rec).unwrap_or("");
     let compact = subtype.starts_with("compact");
-    if subtype != "status" && !compact {
+    if subtype != "status" && subtype != "notification" && !compact {
         return None;
     }
     // Prose lives in `message`; `status` carries the bare lifecycle token.
@@ -615,15 +634,25 @@ fn string_items(rec: &Record, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `isMissingConversationResult`: the result Claude prints and exits with
+/// when `--resume` names a session it has no transcript for.
+pub fn is_missing_conversation_result(rec: &Record) -> bool {
+    if string_field(Some(rec), "type") != Some("result")
+        || rec.get("is_error").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    string_items(rec, "errors")
+        .iter()
+        .any(|item| item.starts_with("No conversation found with session ID"))
+}
+
 /// `turnStatusFromResult`.
 pub fn turn_status_from_result(rec: &Record) -> ClaudeTurnResult {
     let done = |status| ClaudeTurnResult {
         status,
         error: None,
     };
-    if subtype_of(rec) == Some("success") {
-        return done(ClaudeTurnStatus::Completed);
-    }
     let errors = string_items(rec, "errors");
     let joined = errors.join(" ").to_lowercase();
     let terminal = string_field(Some(rec), "terminal_reason").unwrap_or("");
@@ -636,9 +665,18 @@ pub fn turn_status_from_result(rec: &Record) -> ClaudeTurnResult {
     if joined.contains("cancel") {
         return done(ClaudeTurnStatus::Cancelled);
     }
+    // A success subtype can still carry an API error in `is_error` or a
+    // failed `terminal_reason`.
+    if subtype_of(rec) == Some("success")
+        && rec.get("is_error").and_then(Value::as_bool) != Some(true)
+        && matches!(terminal, "" | "success" | "end_turn")
+    {
+        return done(ClaudeTurnStatus::Completed);
+    }
     let error = errors
         .into_iter()
-        .find(|item| !item.starts_with("[ede_diagnostic]"));
+        .find(|item| !item.starts_with("[ede_diagnostic]"))
+        .or_else(|| string_field(Some(rec), "result").map(str::to_string));
     ClaudeTurnResult {
         status: ClaudeTurnStatus::Failed,
         error: Some(error.unwrap_or_else(|| "Claude turn failed.".into())),
@@ -1079,12 +1117,22 @@ pub fn assistant_message_id(rec: &Record) -> Option<String> {
     owned(string_field(record_field(Some(rec), "message"), "id"))
 }
 
-/// One `tool_use` block of an assistant message.
+/// One `tool_use` or `server_tool_use` block of an assistant message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeToolUse {
     pub id: String,
     pub name: String,
     pub input: Record,
+    /// The API ran this call itself (`server_tool_use`), such as `advisor`.
+    pub server: bool,
+}
+
+impl ClaudeToolUse {
+    /// A call to the advisor server tool, which MonoCode shows as an
+    /// interjection rather than a tool row.
+    pub fn is_advisor(&self) -> bool {
+        self.server && self.name == ADVISOR_TOOL_NAME
+    }
 }
 
 /// `assistantToolUses`.
@@ -1093,18 +1141,147 @@ pub fn assistant_tool_uses(rec: &Record) -> Vec<ClaudeToolUse> {
         .iter()
         .filter_map(|block| {
             let row = as_record(block)?;
-            if type_of(row) != Some("tool_use") {
-                return None;
-            }
+            let server = match type_of(row) {
+                Some("tool_use") => false,
+                Some("server_tool_use") => true,
+                _ => return None,
+            };
             Some(ClaudeToolUse {
                 id: string_field(Some(row), "id")?.to_string(),
                 name: string_field(Some(row), "name")?.to_string(),
                 input: record_field(Some(row), "input")
                     .cloned()
                     .unwrap_or_default(),
+                server,
             })
         })
         .collect()
+}
+
+/// Name of Claude Code's advisor server tool.
+pub const ADVISOR_TOOL_NAME: &str = "advisor";
+
+fn is_advisor_call(row: &Record) -> bool {
+    type_of(row) == Some("server_tool_use")
+        && string_field(Some(row), "name") == Some(ADVISOR_TOOL_NAME)
+}
+
+/// Id of an advisor call the stream opened with `content_block_start`.
+pub fn advisor_call_from_event(rec: &Record) -> Option<String> {
+    let event = record_field(Some(rec), "event")?;
+    if type_of(event) != Some("content_block_start") {
+        return None;
+    }
+    let block = record_field(Some(event), "content_block")?;
+    if !is_advisor_call(block) {
+        return None;
+    }
+    owned(string_field(Some(block), "id"))
+}
+
+/// Provider id of the message a `message_start` stream event opens.
+pub fn message_id_from_stream_start(rec: &Record) -> Option<String> {
+    let event = record_field(Some(rec), "event")?;
+    if type_of(event) != Some("message_start") {
+        return None;
+    }
+    owned(string_field(record_field(Some(event), "message"), "id"))
+}
+
+/// What one advisor consult returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeAdvisorOutcome {
+    /// Plaintext advice (`advisor_result`).
+    Advice(String),
+    /// Advice the provider encrypted (`advisor_redacted_result`).
+    Redacted,
+    /// The consult failed (`advisor_tool_result_error`) with this code.
+    Error(String),
+    /// A result type this version does not know, or empty advice.
+    Unknown,
+}
+
+/// One `advisor_tool_result` block of an assistant message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeAdvisorResult {
+    pub tool_use_id: String,
+    pub outcome: ClaudeAdvisorOutcome,
+}
+
+/// Advisor results an assistant message carries. Claude Code puts them in
+/// the assistant content, not in a user `tool_result`.
+pub fn assistant_advisor_results(rec: &Record) -> Vec<ClaudeAdvisorResult> {
+    message_content(rec)
+        .iter()
+        .filter_map(|block| {
+            let row = as_record(block)?;
+            if type_of(row) != Some("advisor_tool_result") {
+                return None;
+            }
+            let content = record_field(Some(row), "content");
+            let outcome = match content.and_then(type_of) {
+                Some("advisor_result") => match string_field(content, "text") {
+                    Some(text) if !text.trim().is_empty() => {
+                        ClaudeAdvisorOutcome::Advice(text.to_string())
+                    }
+                    _ => ClaudeAdvisorOutcome::Unknown,
+                },
+                Some("advisor_redacted_result") => ClaudeAdvisorOutcome::Redacted,
+                Some("advisor_tool_result_error") => ClaudeAdvisorOutcome::Error(
+                    string_field(content, "error_code")
+                        .unwrap_or("unknown")
+                        .to_string(),
+                ),
+                _ => ClaudeAdvisorOutcome::Unknown,
+            };
+            Some(ClaudeAdvisorResult {
+                tool_use_id: string_field(Some(row), "tool_use_id")?.to_string(),
+                outcome,
+            })
+        })
+        .collect()
+}
+
+/// One `advisor_message` entry of `usage.iterations`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeAdvisorUsage {
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+fn is_advisor_iteration(entry: &Record) -> bool {
+    type_of(entry) == Some("advisor_message")
+}
+
+/// The `advisor_message` entries of a `usage` record, in order.
+pub fn advisor_usages(usage: Option<&Record>) -> Vec<ClaudeAdvisorUsage> {
+    usage
+        .and_then(|usage| usage.get("iterations"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(as_record)
+        .filter(|entry| is_advisor_iteration(entry))
+        .map(|entry| ClaudeAdvisorUsage {
+            model: owned(string_field(Some(entry), "model")),
+            input_tokens: number_field(Some(entry), "input_tokens") as i64,
+            output_tokens: number_field(Some(entry), "output_tokens") as i64,
+        })
+        .collect()
+}
+
+/// Advisor usage from a `message_delta` stream event. The stream's assistant
+/// records name no advisor model, so this is the first place it shows up.
+pub fn advisor_usages_from_message_delta(rec: &Record) -> Vec<ClaudeAdvisorUsage> {
+    let Some(event) = record_field(Some(rec), "event") else {
+        return Vec::new();
+    };
+    if type_of(event) != Some("message_delta") {
+        return Vec::new();
+    }
+    advisor_usages(record_field(Some(event), "usage"))
 }
 
 /// One `tool_result` block of a user message.
@@ -1420,10 +1597,6 @@ fn context_used_from_usage(usage: Option<&Record>) -> f64 {
         + number_field(usage, "output_tokens")
 }
 
-fn tokens(value: f64) -> Option<i64> {
-    (value != 0.0).then_some(value as i64)
-}
-
 /// `turnMetricsFromResult`: aggregate token accounting for the completed turn.
 pub fn turn_metrics_from_result(rec: &Record) -> Option<TurnMetrics> {
     let usage = record_field(Some(rec), "usage")?;
@@ -1437,11 +1610,12 @@ pub fn turn_metrics_from_result(rec: &Record) -> Option<TurnMetrics> {
     if input_tokens == 0.0 && output_tokens == 0.0 && cacheable_input == 0.0 {
         return None;
     }
+    // Zero counts stay, so totals summed across results keep every field.
     Some(TurnMetrics {
-        input_tokens: tokens(input_tokens),
-        output_tokens: tokens(output_tokens),
-        cache_read_tokens: tokens(cache_read_tokens),
-        cache_write_tokens: tokens(cache_write_tokens),
+        input_tokens: Some(input_tokens as i64),
+        output_tokens: Some(output_tokens as i64),
+        cache_read_tokens: Some(cache_read_tokens as i64),
+        cache_write_tokens: Some(cache_write_tokens as i64),
         cache_hit_percent: (cache_reported && cacheable_input != 0.0)
             .then(|| (cache_read_tokens / cacheable_input) * 100.0),
         extra: Default::default(),
@@ -1457,6 +1631,12 @@ pub fn context_used_from_assistant(rec: &Record) -> Option<i64> {
     (used > 0.0).then_some(used as i64)
 }
 
+/// `id` without a trailing `[1m]`, compared case-insensitively.
+fn strip_1m_suffix(id: &str) -> String {
+    let lower = id.to_lowercase();
+    lower.strip_suffix("[1m]").unwrap_or(&lower).to_string()
+}
+
 /// Context level and window from a turn `result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ClaudeContextReading {
@@ -1469,25 +1649,40 @@ pub struct ClaudeContextReading {
 /// `usage` at the top level sums every iteration of the turn, so the last entry
 /// of `usage.iterations` is what actually sits in the window. `modelUsage`
 /// carries the window itself, which is why we let the CLI tell us rather than
-/// keeping a model table in sync.
-pub fn context_from_result(rec: &Record) -> Option<ClaudeContextReading> {
+/// keeping a model table in sync. It lists every model the turn used,
+/// subagents and helpers included, so only the main `model`'s entry counts.
+/// Without a model, only a lone entry is unambiguous.
+pub fn context_from_result(rec: &Record, model: Option<&str>) -> Option<ClaudeContextReading> {
     let usage = record_field(Some(rec), "usage");
+    // An advisor consult runs in its own window, so it says nothing about
+    // this one.
     let last = usage
         .and_then(|usage| usage.get("iterations"))
         .and_then(Value::as_array)
-        .and_then(|iterations| iterations.last())
-        .and_then(as_record);
-    let used = context_used_from_usage(last.or(usage));
+        .and_then(|iterations| {
+            iterations
+                .iter()
+                .filter_map(as_record)
+                .rfind(|entry| !is_advisor_iteration(entry))
+        });
+    // Without iterations, top-level usage sums the whole turn and overstates
+    // what the window holds, so it gives no reading.
+    let used = context_used_from_usage(last);
 
-    let mut window: Option<f64> = None;
-    if let Some(model_usage) = record_field(Some(rec), "modelUsage") {
-        for entry in model_usage.values() {
-            let context_window = number_field(as_record(entry), "contextWindow");
-            if context_window > 0.0 {
-                window = Some(window.unwrap_or(0.0).max(context_window));
-            }
-        }
-    }
+    let model_usage = record_field(Some(rec), "modelUsage");
+    let entry = match (model_usage, model) {
+        (Some(model_usage), Some(model)) => model_usage.get(model).or_else(|| {
+            let wanted = strip_1m_suffix(model);
+            model_usage
+                .iter()
+                .find(|(id, _)| strip_1m_suffix(id) == wanted)
+                .map(|(_, entry)| entry)
+        }),
+        (Some(model_usage), None) if model_usage.len() == 1 => model_usage.values().next(),
+        _ => None,
+    };
+    let context_window = number_field(entry.and_then(as_record), "contextWindow");
+    let window = (context_window > 0.0).then_some(context_window);
 
     if used == 0.0 && window.is_none() {
         return None;

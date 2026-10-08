@@ -208,7 +208,7 @@ pub const FIELDS: [(&str, &[&str]); 12] = [
     ("retry", &["taskId", "text", "files"]),
     ("cancel", &["taskId"]),
     ("wait", &["timeoutSeconds"]),
-    ("review", &["taskId"]),
+    ("review", &["taskId", "discardOutside"]),
     ("finish", &[]),
     ("steer", &["taskId", "text"]),
     ("respond", &["taskId", "requestId", "decision"]),

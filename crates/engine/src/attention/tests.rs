@@ -94,6 +94,8 @@ fn limits(provider: RateLimitProvider, session: Option<RateLimitWindow>) -> Prov
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: NOW,
         error: None,
         status: RateLimitStatus::Ok,
@@ -667,8 +669,12 @@ fn keeps_concurrent_questions_approvals_and_sessions_with_the_same_request_id_di
     assert_eq!(bodies(&test).len(), 2);
     session.blocks = Vec::new();
     upsert(cx, session);
+    // Each banner goes out on its own background task, so the two banners
+    // of the first pass can arrive in either order.
+    let mut delivered = bodies(&test);
+    delivered[..2].sort();
     assert_eq!(
-        bodies(&test),
+        delivered,
         [
             pair("first", "Approve: Read source"),
             pair("other", "Choose a branch"),

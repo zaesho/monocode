@@ -15,6 +15,9 @@ use crate::shell::{Shell, ShellLayout, SidebarTab, drag_region};
 /// The compact rail of one window.
 pub struct CompactRail {
     shell: WeakEntity<Shell>,
+    /// The shell draws the rail cached; this redraws it on the shell's, the
+    /// sessions', and the project's git changes.
+    region: crate::shell::CachedRegion,
 }
 
 impl CompactRail {
@@ -22,7 +25,10 @@ impl CompactRail {
         if let Some(inbox) = Inbox::try_global(cx) {
             cx.observe(&inbox, |_, _, cx| cx.notify()).detach();
         }
-        Self { shell }
+        Self {
+            shell,
+            region: Default::default(),
+        }
     }
 
     fn with_shell(&self, cx: &mut App, f: impl FnOnce(&mut Shell, &mut Context<Shell>)) {
@@ -39,6 +45,7 @@ impl Render for CompactRail {
             let shell = shell.read(cx);
             (shell.layout.clone(), shell.sidebar_cwd(cx))
         };
+        self.region.sync(&self.shell, Some(&cwd), cx);
         let (projects, active) = rail_projects(&cwd, cx);
         self.render_compact_rail(&layout, &projects, active, cx)
             .into_any_element()

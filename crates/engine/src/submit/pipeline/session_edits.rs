@@ -6,6 +6,7 @@ use monocode_core::block::{Block, BlockRole, PlanBlockMeta, PlanBuildTarget, Pla
 use monocode_core::context_usage::drop_context_window;
 use monocode_core::handoff::ComposerSwitchPlan;
 use monocode_core::models::ModelCatalog;
+use monocode_core::provider_context::remember_leaving_binding;
 use monocode_core::reducer::UserTurnExtra;
 use monocode_core::session::{format_session_title, session_display_title};
 use monocode_core::{Extra, HarnessId, ModelSettings, Session, js};
@@ -50,6 +51,8 @@ pub fn with_harness_choice(
     model: &str,
     model_settings: ModelSettings,
 ) {
+    // The provider the session leaves keeps its native conversation.
+    remember_leaving_binding(session);
     session.title = if session.blocks.is_empty() {
         harness.label().to_string()
     } else {
@@ -58,7 +61,10 @@ pub fn with_harness_choice(
             &session_display_title(&session.title, session.harness),
         )
     };
-    if session.model != model {
+    if session.harness != harness {
+        // The meter belongs to the provider; its binding keeps the reading.
+        session.context = None;
+    } else if session.model != model {
         session.context = drop_context_window(session.context.as_ref());
     }
     if session.harness != harness {

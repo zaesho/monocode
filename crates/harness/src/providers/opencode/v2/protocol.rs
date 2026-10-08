@@ -41,5 +41,5 @@ pub fn model_ref(model: &str, variant: Option<&str>) -> Result<Value> {
 }
 
 pub fn permission_rules(mode: RuntimeMode) -> Value {
-    Value::Array(build_open_code_permission_rules(mode).into_iter().map(|rule| json!({"action":rule.permission,"resource":rule.pattern,"effect":rule.action})).collect())
+    Value::Array(build_open_code_permission_rules(mode, false, None).into_iter().map(|rule| json!({"action":rule.permission,"resource":rule.pattern,"effect":rule.action})).collect())
 }

@@ -149,11 +149,17 @@ pub struct InboxView {
     list_limit: usize,
     resize: PaneResize,
     revision: u64,
+    /// The listed items as of the last [`Self::sync`]. Building them maps
+    /// every item (related sessions, project marks, conversion), so render
+    /// reads this copy instead of asking the list again each frame.
+    visible: Rc<Vec<ListedItem>>,
     detail: Option<(String, Entity<InboxDetailView>, Subscription)>,
     discussion: Option<(String, Entity<InboxDiscussionPanel>, Subscription)>,
     discussion_open: bool,
     list_scroll: ScrollHandle,
     animate: bool,
+    /// The cards show "2m ago".
+    minute_tick: crate::pr::linked_notice::MinuteTick,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -203,11 +209,13 @@ impl InboxView {
             list_limit: LIST_PAGE_SIZE,
             resize: PaneResize::new(width, DEFAULT_WIDTH, MIN_WIDTH, ResizeEdge::Right),
             revision: 0,
+            visible: Rc::default(),
             detail: None,
             discussion: None,
             discussion_open: false,
             list_scroll: ScrollHandle::new(),
             animate: true,
+            minute_tick: Default::default(),
             _subscriptions: vec![search_events, list_sub],
         };
         view.sync(window, cx);
@@ -299,6 +307,7 @@ impl InboxView {
                 }
             }
         }
+        self.visible = Rc::new(visible);
         self.sync_detail(selected, window, cx);
         cx.notify();
     }
@@ -802,7 +811,7 @@ impl InboxView {
                 .child("Add a connection to start using the Inbox.")
                 .into_any_element();
         }
-        let visible = self.visible_items(cx);
+        let visible = self.visible.clone();
         if let Some(error) = self.state.source_error.clone()
             && visible.is_empty()
         {
@@ -827,7 +836,7 @@ impl InboxView {
         let has_more = shown < visible.len();
         let selected = self.selected_key.clone();
         let mut list = div().flex().flex_col().gap(u(2.)).p(u(6.));
-        for listed in visible.into_iter().take(shown) {
+        for listed in visible.iter().take(shown).cloned() {
             let active = selected.as_deref() == Some(listed.key.as_str());
             let id = ElementId::Name(format!("inbox-card:{}", listed.key).into());
             let entity = cx.entity().downgrade();
@@ -940,6 +949,7 @@ impl InboxView {
 
 impl Render for InboxView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.minute_tick.drawn(cx);
         let theme = Theme::of(cx).clone();
         let scale = theme.ui_scale();
         let viewport = f32::from(window.viewport_size().width) / scale;

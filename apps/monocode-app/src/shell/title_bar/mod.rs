@@ -23,6 +23,20 @@ pub use model::{HarnessState, TabLead, TitleTabView, title_tab_view};
 const TAB_WIDTH: f32 = 224.0;
 const TAB_MIN_WIDTH: f32 = 112.0;
 
+/// What the tabs were built from. `Workspace::title_tabs` copies every open
+/// session with its transcript, and the window renders the title bar on
+/// every frame, so the tabs are rebuilt only when one of these changed.
+#[derive(PartialEq)]
+struct TabsKey {
+    revision: u64,
+    observed: u64,
+    workspace: Option<gpui::EntityId>,
+    unseen: HashSet<String>,
+}
+
+/// The window's title tabs and the active tab id.
+type TitleTabs = (Vec<TitleTabView>, String);
+
 /// The title bar of one window.
 pub struct TitleBar {
     shell: WeakEntity<Shell>,
@@ -31,6 +45,15 @@ pub struct TitleBar {
     scrolled_tab: Option<String>,
     title_drop: Option<monocode_layout::pane_drop::TitleTabDrop>,
     menu: Option<(String, Point<Pixels>)>,
+    /// Counts changes of the window's workspace and the remote session
+    /// entities, for the tab cache.
+    observed: u64,
+    workspace_observation: Option<(gpui::EntityId, gpui::Subscription)>,
+    tabs_cache: Option<(TabsKey, std::rc::Rc<TitleTabs>)>,
+    /// The shell draws the bar cached; this redraws it on the shell's and
+    /// the sessions' changes.
+    region: super::CachedRegion,
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl TitleBar {
@@ -38,14 +61,68 @@ impl TitleBar {
         self.menu.is_some()
     }
 
-    pub fn new(shell: WeakEntity<Shell>, _: &mut Window, _: &mut Context<Self>) -> Self {
+    pub fn new(shell: WeakEntity<Shell>, _: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Remote tabs take their titles and blank state from these.
+        let mut subscriptions = Vec::new();
+        if let Some(remote) = monocode_engine::remote::RemoteGlobal::try_global(cx) {
+            let (connections, sessions) = (remote.connections.clone(), remote.sessions.clone());
+            subscriptions.push(cx.observe(&connections, Self::observed_changed));
+            subscriptions.push(cx.observe(&sessions, Self::observed_changed));
+        }
         Self {
             shell,
             scroll: ScrollHandle::new(),
             scrolled_tab: None,
             title_drop: None,
             menu: None,
+            observed: 0,
+            workspace_observation: None,
+            tabs_cache: None,
+            region: Default::default(),
+            _subscriptions: subscriptions,
         }
+    }
+
+    fn observed_changed<T>(&mut self, _: gpui::Entity<T>, cx: &mut Context<Self>) {
+        self.observed += 1;
+        cx.notify();
+    }
+
+    /// The tabs for this frame: the last ones when nothing they show changed.
+    fn cached_tabs(&mut self, cx: &mut Context<Self>) -> std::rc::Rc<TitleTabs> {
+        let workspace = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).workspace.clone());
+        if let Some(workspace) = &workspace
+            && self
+                .workspace_observation
+                .as_ref()
+                .is_none_or(|(id, _)| *id != workspace.entity_id())
+        {
+            self.workspace_observation = Some((
+                workspace.entity_id(),
+                cx.observe(workspace, Self::observed_changed),
+            ));
+            self.observed += 1;
+        }
+        let unseen: HashSet<String> = Attention::try_global(cx)
+            .map(|attention| attention.notifier.read(cx).unseen_finished_ids().clone())
+            .unwrap_or_default();
+        let key = TabsKey {
+            revision: crate::revisions::revision(cx),
+            observed: self.observed,
+            workspace: workspace.as_ref().map(|workspace| workspace.entity_id()),
+            unseen,
+        };
+        if let Some((built, tabs)) = &self.tabs_cache
+            && *built == key
+        {
+            return tabs.clone();
+        }
+        let tabs = std::rc::Rc::new(self.tabs(cx));
+        self.tabs_cache = Some((key, tabs.clone()));
+        tabs
     }
 
     /// The window's title tabs and the active tab id.
@@ -78,8 +155,10 @@ impl Render for TitleBar {
         let Some(shell) = self.shell.upgrade() else {
             return div().into_any_element();
         };
+        self.region.sync(&self.shell, None, cx);
         let layout = shell.read(cx).layout.clone();
-        let (tabs, active_tab_id) = self.tabs(cx);
+        let cached = self.cached_tabs(cx);
+        let (tabs, active_tab_id) = (&cached.0, cached.1.clone());
         let ids = tabs
             .iter()
             .map(|tab| tab.id.clone())
@@ -106,7 +185,7 @@ impl Render for TitleBar {
             self.scroll.scroll_to_item(index);
             self.scrolled_tab = Some(active_tab_id.clone());
         }
-        self.render_title_bar(&layout, &tabs, &active_tab_id, cx)
+        self.render_title_bar(&layout, tabs, &active_tab_id, cx)
             .into_any_element()
     }
 }
@@ -124,10 +203,12 @@ impl TitleBar {
         let compact_title_bar = layout.compact_title_bar();
         let rail_closed = !layout.project_rail_open;
 
+        // The shell draws the bar cached at full width; the root fills it.
         let mut bar = div()
             .id("title-bar")
             .flex()
             .flex_none()
+            .w_full()
             .h(u(theme.metrics.title_bar_height))
             .items_stretch()
             .border_b_1()

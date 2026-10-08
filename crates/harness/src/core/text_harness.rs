@@ -58,10 +58,16 @@ pub async fn generate_commit_message(
     cwd: &str,
     preferred: Option<HarnessId>,
     signal: Option<AbortSignal>,
+    provider_account_id: Option<&str>,
     is_available: impl Fn(HarnessId) -> bool,
 ) -> Result<String> {
     registry
-        .generate_harness_commit_message(pick_text_harness(preferred, is_available), cwd, signal)
+        .generate_harness_commit_message(
+            pick_text_harness(preferred, is_available),
+            cwd,
+            signal,
+            provider_account_id,
+        )
         .await
 }
 
@@ -70,10 +76,15 @@ pub async fn generate_pr_content(
     registry: &HarnessRegistry,
     cwd: &str,
     preferred: Option<HarnessId>,
+    provider_account_id: Option<&str>,
     is_available: impl Fn(HarnessId) -> bool,
 ) -> Result<Option<GeneratedPrContent>> {
     registry
-        .generate_harness_pr_content(pick_text_harness(preferred, is_available), cwd)
+        .generate_harness_pr_content(
+            pick_text_harness(preferred, is_available),
+            cwd,
+            provider_account_id,
+        )
         .await
 }
 

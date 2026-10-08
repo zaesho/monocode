@@ -24,6 +24,10 @@ pub struct SessionNavigation {
     find_enabled: bool,
     find_side: FindSide,
     return_focus: Option<FocusHandle>,
+    /// The "Editor: Find" shortcut override and the
+    /// [`crate::revisions::revision`] it was read at. Every key press in the
+    /// pane asks for it, and reading it parses every stored setting.
+    find_override: Option<(u64, Option<KeybindingOverride>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -69,6 +73,7 @@ impl SessionNavigation {
             find_enabled: true,
             find_side: FindSide::Right,
             return_focus: None,
+            find_override: None,
             _subscriptions: vec![find_event, outline_event, transcript_changed],
         }
     }
@@ -135,16 +140,25 @@ impl SessionNavigation {
         if !self.visible || !self.focused || !self.find_enabled {
             return false;
         }
-        let override_ = monocode_app::boot::AppServices::try_global(cx).and_then(|services| {
-            monocode_settings::load_app_settings(
-                &services.kv,
-                monocode_core::platform::Platform::current(),
-            )
-            .settings
-            .keybinding_overrides
-            .get("Editor: Find")
-            .cloned()
-        });
+        let revision = crate::revisions::revision(cx);
+        let override_ = match &self.find_override {
+            Some((read, override_)) if *read == revision => override_.clone(),
+            _ => {
+                let override_ =
+                    monocode_app::boot::AppServices::try_global(cx).and_then(|services| {
+                        monocode_settings::load_app_settings(
+                            &services.kv,
+                            monocode_core::platform::Platform::current(),
+                        )
+                        .settings
+                        .keybinding_overrides
+                        .get("Editor: Find")
+                        .cloned()
+                    });
+                self.find_override = Some((revision, override_.clone()));
+                override_
+            }
+        };
         self.handle_find_key(keystroke, override_.as_ref(), window, cx)
     }
 

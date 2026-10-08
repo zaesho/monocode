@@ -127,10 +127,38 @@ pub struct WorkspaceArea {
     linked_panels: HashMap<String, Entity<LinkedWorkItemPanel>>,
     active_linked_panel: Option<String>,
     composer_target: Option<String>,
+    /// [`Self::sessions_key`] at the last sync.
+    sessions_key: Option<u64>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl WorkspaceArea {
+    /// A hash of what `sync` reads from `Sessions`: which sessions are open
+    /// and remote, and the active tab's pane titles. Streamed text leaves it
+    /// alone, so a busy session does not re-sync every pane each frame.
+    fn sessions_key(&self, cx: &gpui::App) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let sessions = Engine::sessions(cx).read(cx);
+        for session in sessions.all() {
+            session.id.hash(&mut hasher);
+            monocode_layout::paths::is_remote_project_path(&session.cwd).hash(&mut hasher);
+        }
+        if let Some(tab) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.read(cx).active_tab())
+        {
+            for id in leaf_ids(&tab.layout) {
+                sessions
+                    .get(&id)
+                    .map(|session| (&session.title, session.harness))
+                    .hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    }
+
     fn focused_session_view(&self, cx: &gpui::App) -> Option<&SessionView> {
         let tab = self.workspace.as_ref()?.read(cx).active_tab()?;
         self.sessions.get(&tab.focused_id)
@@ -146,6 +174,36 @@ impl WorkspaceArea {
             .is_some_and(|pane| pane.session_shortcuts_blocked(cx))
     }
 
+    /// Hide the split hint while the composer holds a session drag. The
+    /// next move outside the composer draws it again.
+    pub fn hide_external_drop(&mut self, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| tree.set_external_drop(None, cx));
+        }
+    }
+
+    /// The composer took a drop, so the tree's outside drag is over.
+    pub fn end_external_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| tree.external_drag_end(position, false, cx));
+        }
+    }
+
+    /// A drop the composer passed on: handle it as a drop on the pane area.
+    pub fn drop_external(
+        &mut self,
+        source: PaneDragSource,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tree) = &self.tree {
+            tree.update(cx, |tree, cx| {
+                tree.external_drag_move(source, position, cx);
+                tree.external_drag_end(position, true, cx);
+            });
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             workspace: None,
@@ -157,6 +215,7 @@ impl WorkspaceArea {
             linked_panels: HashMap::new(),
             active_linked_panel: None,
             composer_target: None,
+            sessions_key: None,
             _subscriptions: Vec::new(),
         }
     }
@@ -174,7 +233,9 @@ impl WorkspaceArea {
         let sessions = Engine::sessions(cx);
         self._subscriptions
             .push(cx.observe_in(&sessions, window, |this, _, window, cx| {
-                this.sync(window, cx)
+                if this.sessions_key != Some(this.sessions_key(cx)) {
+                    this.sync(window, cx)
+                }
             }));
         if let Some(inbox) = monocode_engine::inbox::inbox::Inbox::try_global(cx) {
             self._subscriptions
@@ -344,6 +405,7 @@ impl WorkspaceArea {
         let Some(workspace) = self.workspace.clone() else {
             return;
         };
+        self.sessions_key = Some(self.sessions_key(cx));
         let Some(tab) = workspace.read(cx).active_tab().cloned() else {
             return;
         };

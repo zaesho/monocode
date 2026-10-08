@@ -19,15 +19,18 @@ mod pages;
 mod panes;
 mod quick;
 mod remote_pane;
+mod revisions;
 #[cfg(feature = "screenshot")]
 mod screenshot;
 mod session_cards;
 mod session_empty;
+mod session_links;
 mod session_navigation;
 mod session_pane;
 mod session_threads;
 mod session_toolbar;
 mod shell;
+mod skill_manager;
 mod slots;
 mod views;
 
@@ -87,7 +90,7 @@ fn main() {
         eprintln!("--screenshot needs a build with `--features screenshot`");
         std::process::exit(2);
     }
-    let data_dir = if entry.engine {
+    let data_dir = if entry.engine || entry.name == "skills-manager" {
         match data_dir::resolve(args.data_dir.as_deref()) {
             Ok(dir) => {
                 eprintln!("data dir: {}", dir.path.display());
@@ -116,8 +119,20 @@ fn main() {
     }
     application.run(move |cx: &mut App| {
         gpui_component::init(cx);
-        if let Some(dir) = data_dir.clone()
-            && let Err(err) = boot::boot(BootOptions::app(dir), cx)
+        if let Some(dir) = &data_dir {
+            cx.set_global(skill_manager::StartupOptions {
+                isolated: args.skills_home.is_some(),
+                data_dir: dir.path.clone(),
+                skills_home: args
+                    .skills_home
+                    .clone()
+                    .or_else(|| monocode_platform::dirs_home().map(std::path::PathBuf::from)),
+            });
+        }
+        if entry.engine
+            && let Some(dir) = data_dir.clone()
+            && let Err(err) =
+                boot::boot_with_skill_home(BootOptions::app(dir), args.skills_home.clone(), cx)
         {
             eprintln!("could not start: {err:#}");
             std::process::exit(1);
@@ -200,9 +215,13 @@ fn main() {
         .detach();
         #[cfg(feature = "screenshot")]
         if let Some(out) = args.screenshot.clone() {
-            let settle = args
-                .settle_ms
-                .unwrap_or(if entry.engine { 2500 } else { 900 });
+            let settle =
+                args.settle_ms
+                    .unwrap_or(if entry.engine || entry.name == "skills-manager" {
+                        2500
+                    } else {
+                        900
+                    });
             screenshot::capture_and_quit(
                 window.into(),
                 out,

@@ -27,6 +27,8 @@ impl AttentionSubmit for SubmitForAttention {
             note_card: explicit.then_some(request.note_card),
             handoff_card: explicit.then_some(request.handoff_card),
             intent: request.intent,
+            app_request_id: request.app_request_id,
+            build_target: request.build_target,
             ..SubmitOptions::default()
         };
         submit.update(cx, |submit, cx| {

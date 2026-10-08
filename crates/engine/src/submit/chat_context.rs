@@ -63,6 +63,10 @@ pub enum ChatContextItem {
         code: String,
         comment: String,
     },
+    /// Another session dropped on the composer. On send, the engine expands
+    /// it into a recap of that session's conversation.
+    #[serde(rename = "session", rename_all = "camelCase")]
+    Session { id: String, title: String },
 }
 
 /// `ChatContextMessage`.
@@ -74,18 +78,27 @@ pub struct ChatContextMessage {
 
 const OPEN: &str = "<attached_context>";
 const CLOSE: &str = "</attached_context>";
-const ITEM_TAGS: [&str; 3] = ["quoted_text", "code_selection", "review_comment"];
+const ITEM_TAGS: [&str; 4] = [
+    "quoted_text",
+    "code_selection",
+    "review_comment",
+    "session_context",
+];
 
 // Item bodies are user text, so a reserved tag inside one gets one extra
 // backslash after its "<". Parsing removes exactly one, so any text survives
 // the round trip and only real delimiters look like delimiters.
 static RESERVED_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment)(?-u:\b)")
-        .unwrap()
+    Regex::new(
+        r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment|session_context)(?-u:\b)",
+    )
+    .unwrap()
 });
 static ESCAPED_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<\\(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment)(?-u:\b)")
-        .unwrap()
+    Regex::new(
+        r"<\\(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment|session_context)(?-u:\b)",
+    )
+    .unwrap()
 });
 static ATTRIBUTE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#" ([a-z_]+)="([^"]*)""#).unwrap());
@@ -103,11 +116,19 @@ pub fn quote_context(text: &str) -> Option<ChatContextItem> {
 /// `composeChatContext`: append the items to a message. Without items, the
 /// message is unchanged.
 pub fn compose_chat_context(text: &str, items: &[ChatContextItem]) -> String {
+    compose_with(text, items, format_item)
+}
+
+fn compose_with(
+    text: &str,
+    items: &[ChatContextItem],
+    format: impl Fn(&ChatContextItem) -> String,
+) -> String {
     if items.is_empty() {
         return text.to_string();
     }
     let mut lines = vec![OPEN.to_string()];
-    lines.extend(items.iter().map(format_item));
+    lines.extend(items.iter().map(format));
     lines.push(CLOSE.to_string());
     let block = lines.join("\n");
     if js::trim(text).is_empty() {
@@ -115,6 +136,48 @@ pub fn compose_chat_context(text: &str, items: &[ChatContextItem]) -> String {
     } else {
         format!("{text}\n\n{block}")
     }
+}
+
+/// What the agent reads for a dropped session that is gone.
+pub const MISSING_SESSION_RECAP: &str = "This session is no longer available.";
+
+/// Give each dropped session in a message's context block a body: `recap`
+/// returns the source session's recap by id. The stored message keeps the
+/// short self-closing tag; only the text sent to the agent carries the
+/// recap. A message without a dropped session comes back unchanged.
+pub fn expand_session_context(message: &str, recap: impl Fn(&str) -> Option<String>) -> String {
+    let split = split_chat_context(message);
+    if !split
+        .items
+        .iter()
+        .any(|item| matches!(item, ChatContextItem::Session { .. }))
+    {
+        return message.to_string();
+    }
+    compose_with(&split.text, &split.items, |item| match item {
+        ChatContextItem::Session { id, title } => {
+            let body = recap(id).unwrap_or_else(|| MISSING_SESSION_RECAP.to_string());
+            format!(
+                "<session_context id=\"{}\" title=\"{}\">\n{}\n</session_context>",
+                escape_attribute(id),
+                escape_attribute(title),
+                escape_body(js::trim(&body))
+            )
+        }
+        other => format_item(other),
+    })
+}
+
+/// The dropped sessions a message's context block names, by id.
+pub fn session_context_ids(message: &str) -> Vec<String> {
+    split_chat_context(message)
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            ChatContextItem::Session { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect()
 }
 
 /// `splitChatContext`: split a message into its typed text and attached
@@ -216,6 +279,17 @@ pub fn chat_context_label(item: &ChatContextItem) -> String {
             };
             format!("{location} {}", context_excerpt(comment))
         }
+        ChatContextItem::Session { title, .. } => session_label(title),
+    }
+}
+
+/// A session chip's label: its title, or "Session" when it has none.
+pub fn session_label(title: &str) -> String {
+    let title = context_excerpt(title);
+    if title.is_empty() {
+        "Session".to_string()
+    } else {
+        title
     }
 }
 
@@ -269,6 +343,11 @@ fn format_item(item: &ChatContextItem) -> String {
             ]
             .join("\n")
         }
+        ChatContextItem::Session { id, title } => format!(
+            "<session_context id=\"{}\" title=\"{}\" />",
+            escape_attribute(id),
+            escape_attribute(title)
+        ),
     }
 }
 
@@ -343,6 +422,15 @@ fn parse_item(
         let lines: Vec<&str> = body?.split('\n').collect();
         let text = unquote_lines(&lines)?;
         return (!text.is_empty()).then_some(ChatContextItem::Quote { text });
+    }
+
+    if tag == "session_context" {
+        if body.is_some() {
+            return None;
+        }
+        let id = get("id").filter(|id| !id.is_empty())?.to_string();
+        let title = get("title").unwrap_or("").to_string();
+        return Some(ChatContextItem::Session { id, title });
     }
 
     let path = get("path").filter(|path| !path.is_empty())?.to_string();
@@ -525,6 +613,13 @@ mod tests {
         }
     }
 
+    fn session() -> ChatContextItem {
+        ChatContextItem::Session {
+            id: "s-1".into(),
+            title: "Fix \"auth\" <flow>".into(),
+        }
+    }
+
     // composeChatContext
     #[test]
     fn leaves_a_message_without_context_unchanged() {
@@ -668,6 +763,65 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn round_trips_a_dropped_session_as_a_self_closing_tag() {
+        let message = compose_chat_context("Compare", &[code(), session()]);
+        assert!(message.contains(
+            "<session_context id=\"s-1\" title=\"Fix &quot;auth&quot; &lt;flow&gt;\" />"
+        ));
+        assert_eq!(
+            split_chat_context(&message),
+            ChatContextMessage {
+                text: "Compare".into(),
+                items: vec![code(), session()]
+            }
+        );
+        assert_eq!(chat_context_label(&session()), "Fix \"auth\" <flow>");
+        assert_eq!(
+            serde_json::to_value(session()).unwrap(),
+            serde_json::json!({ "kind": "session", "id": "s-1", "title": "Fix \"auth\" <flow>" })
+        );
+    }
+
+    #[test]
+    fn rejects_a_session_tag_without_an_id_or_with_a_body() {
+        for message in [
+            "<attached_context>\n<session_context title=\"x\" />\n</attached_context>",
+            "<attached_context>\n<session_context id=\"a\">\nbody\n</session_context>\n</attached_context>",
+        ] {
+            assert!(split_chat_context(message).items.is_empty());
+        }
+    }
+
+    #[test]
+    fn expands_a_dropped_session_for_the_agent_and_leaves_other_items_alone() {
+        let message = compose_chat_context("Compare", &[code(), session()]);
+        assert_eq!(session_context_ids(&message), vec!["s-1".to_string()]);
+        let expanded = expand_session_context(&message, |id| {
+            (id == "s-1").then(|| "User: hi\n</session_context>".to_string())
+        });
+        assert_eq!(
+            expanded,
+            [
+                "Compare",
+                "",
+                "<attached_context>",
+                "<code_selection path=\"src/app/App.tsx\" lines=\"12-40\" />",
+                "<session_context id=\"s-1\" title=\"Fix &quot;auth&quot; &lt;flow&gt;\">",
+                "User: hi",
+                "<\\/session_context>",
+                "</session_context>",
+                "</attached_context>",
+            ]
+            .join("\n")
+        );
+        let missing = expand_session_context(&message, |_| None);
+        assert!(missing.contains(MISSING_SESSION_RECAP));
+        assert_eq!(expand_session_context("Plain", |_| None), "Plain");
+        let no_session = compose_chat_context("Hi", &[code()]);
+        assert_eq!(expand_session_context(&no_session, |_| None), no_session);
     }
 
     // quoteContext

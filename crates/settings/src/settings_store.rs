@@ -76,14 +76,59 @@ pub const APP_SETTINGS_KEYS: [&str; 53] = [
     project_providers::PROJECT_PROVIDER_SETTINGS_KEY,
 ];
 
+/// A value parsed from the store, valid while the store's generation holds.
+struct ParsedCache<T> {
+    kv: u64,
+    generation: u64,
+    platform: Platform,
+    value: T,
+}
+
+static APP_SETTINGS_CACHE: Mutex<Option<ParsedCache<AppSettings>>> = Mutex::new(None);
+static SETTINGS_CACHE: Mutex<Option<ParsedCache<Settings>>> = Mutex::new(None);
+
+/// Parse with `parse`, or return the copy parsed at the store's current
+/// generation. Views read settings while they draw, and a full parse reads
+/// and decodes every key.
+fn cached_parse<T: Clone>(
+    cache: &Mutex<Option<ParsedCache<T>>>,
+    kv: &Kv,
+    platform: Platform,
+    parse: impl FnOnce() -> T,
+) -> T {
+    let generation = kv.generation();
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(cached) = cache.as_ref()
+        && cached.kv == kv.id()
+        && cached.generation == generation
+        && cached.platform == platform
+    {
+        return cached.value.clone();
+    }
+    let value = parse();
+    // A change while parsing moves the generation past this entry, so a
+    // value that mixes old and new items is never served.
+    *cache = Some(ParsedCache {
+        kv: kv.id(),
+        generation,
+        platform,
+        value: value.clone(),
+    });
+    value
+}
+
 /// Every stored preference, read the way each `load*` function did.
 pub fn load_app_settings(kv: &Kv, platform: Platform) -> AppSettings {
-    AppSettings::from_local_storage(|key| kv.get_item(key), platform)
+    cached_parse(&APP_SETTINGS_CACHE, kv, platform, || {
+        AppSettings::from_local_storage(|key| kv.get_item(key), platform)
+    })
 }
 
 /// The app behavior settings from settings.ts.
 pub fn load_settings(kv: &Kv, platform: Platform) -> Settings {
-    Settings::from_local_storage(|key| kv.get_item(key), platform)
+    cached_parse(&SETTINGS_CACHE, kv, platform, || {
+        Settings::from_local_storage(|key| kv.get_item(key), platform)
+    })
 }
 
 fn on_change(
@@ -260,6 +305,34 @@ pub fn subscribe_live_agents_enabled(
     on_store_change: impl Fn() + Send + Sync + 'static,
 ) -> Subscription {
     on_change(kv, LIVE_AGENTS_ENABLED_KEY, on_store_change)
+}
+
+/// Agents in any thread may list project sessions and open new ones,
+/// without `/operator`. Lives here rather than in `monocode_core` because the
+/// Tauri app has no such setting.
+pub const AGENT_SESSIONS_ENABLED_KEY: &str = "monocode.agentSessionsEnabled";
+pub const AGENT_SESSIONS_ENABLED_DEFAULT: bool = true;
+/// Sessions an agent opens without `/operator` start as unsent drafts the
+/// user reviews.
+pub const AGENT_SESSIONS_REVIEW_KEY: &str = "monocode.agentSessionsReview";
+pub const AGENT_SESSIONS_REVIEW_DEFAULT: bool = false;
+
+/// Whether agents may open sessions without `/operator`.
+pub fn load_agent_sessions_enabled(kv: &Kv) -> bool {
+    read_flag(kv, AGENT_SESSIONS_ENABLED_KEY).unwrap_or(AGENT_SESSIONS_ENABLED_DEFAULT)
+}
+
+pub fn save_agent_sessions_enabled(kv: &Kv, value: bool) {
+    write_flag(kv, AGENT_SESSIONS_ENABLED_KEY, value);
+}
+
+/// Whether sessions agents open without `/operator` wait as drafts.
+pub fn load_agent_sessions_review(kv: &Kv) -> bool {
+    read_flag(kv, AGENT_SESSIONS_REVIEW_KEY).unwrap_or(AGENT_SESSIONS_REVIEW_DEFAULT)
+}
+
+pub fn save_agent_sessions_review(kv: &Kv, value: bool) {
+    write_flag(kv, AGENT_SESSIONS_REVIEW_KEY, value);
 }
 
 /// `loadCloseToTray`: Close to tray is Windows-only, so other platforms read
@@ -485,6 +558,37 @@ pub fn current_keybindings(kv: &Kv, platform: Platform) -> Vec<KeybindingRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parsed_settings_follow_every_store_change() {
+        let kv = Kv::in_memory();
+        let other = Kv::in_memory();
+        assert!(load_app_settings(&kv, MAC).settings.notes_enabled);
+        save_notes_enabled(&kv, false);
+        assert!(!load_app_settings(&kv, MAC).settings.notes_enabled);
+        assert!(!load_settings(&kv, MAC).notes_enabled);
+        // Another store never sees this store's cached copy.
+        assert!(load_app_settings(&other, MAC).settings.notes_enabled);
+        save_notes_enabled(&kv, true);
+        assert!(load_app_settings(&kv, MAC).settings.notes_enabled);
+        assert!(load_settings(&kv, MAC).notes_enabled);
+        kv.remove_item(NOTES_ENABLED_KEY);
+        assert_eq!(
+            load_app_settings(&kv, MAC),
+            AppSettings::from_local_storage(|key| kv.get_item(key), MAC)
+        );
+    }
+
+    #[test]
+    fn agents_open_sessions_by_default_without_review() {
+        let kv = Kv::in_memory();
+        assert!(load_agent_sessions_enabled(&kv));
+        assert!(!load_agent_sessions_review(&kv));
+        save_agent_sessions_enabled(&kv, false);
+        save_agent_sessions_review(&kv, true);
+        assert!(!load_agent_sessions_enabled(&kv));
+        assert!(load_agent_sessions_review(&kv));
+    }
     use monocode_core::shortcut::Modifiers;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

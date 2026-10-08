@@ -420,6 +420,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(again.local_addr().port(), port);
+            assert_eq!(send(port, None, b"x").unwrap()["size"], 1);
         }
         spawning.store(false, Ordering::SeqCst);
         spawner.join().unwrap();

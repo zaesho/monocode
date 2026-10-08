@@ -21,7 +21,7 @@ pub use diff_stat::{DiffStat, diff_stat};
 pub use input::{TextField, text_field};
 pub use kbd::{Kbd, kbd};
 pub use menu::{MENU_WIDTH, Menu, MenuEntry, MenuItem, context_menu, menu};
-pub use modal::{Modal, ModalSize, modal};
+pub use modal::{Modal, ModalSize, modal, window_layer};
 pub use popover::{
     POPOVER_GAP, POPOVER_PADDING, PopoverFrame, PopoverSide, popover_at, popover_frame,
 };

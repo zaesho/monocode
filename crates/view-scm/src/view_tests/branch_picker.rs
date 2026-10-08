@@ -4,7 +4,10 @@
 //! typeface read CSS classes; GPUI sets the font on the element, so it has
 //! no counterpart here.
 
-use gpui::{Entity, Focusable as _, TestAppContext, VisualTestContext};
+use gpui::{
+    AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Render,
+    Styled as _, TestAppContext, VisualTestContext, Window, div, px,
+};
 
 use super::support::{Recorded, setup};
 use crate::git::{GitBranchEntry, GitBranches};
@@ -43,6 +46,37 @@ fn render_picker<'a>(
         BranchPicker::new(scm, cwd, Some("main".into()), window, cx)
     });
     cx.run_until_parked();
+    (picker, cx, setup)
+}
+
+/// The picker inside a box the size of a toolbar trigger, as the session
+/// toolbar shows it.
+struct Toolbar(Entity<BranchPicker>);
+
+impl Render for Toolbar {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(120.)).h(px(24.)).child(self.0.clone())
+    }
+}
+
+fn render_in_toolbar<'a>(
+    cx: &'a mut TestAppContext,
+    cwd: &str,
+    list: GitBranches,
+) -> (
+    Entity<BranchPicker>,
+    &'a mut VisualTestContext,
+    super::support::Setup,
+) {
+    let setup = setup(cx, Recorded::default().hooks());
+    setup.backend.set_branches(cwd, Ok(list));
+    let scm = setup.scm.clone();
+    let cwd = cwd.to_string();
+    let (toolbar, cx) = cx.add_window_view(move |window, cx| {
+        Toolbar(cx.new(|cx| BranchPicker::new(scm, cwd, Some("main".into()), window, cx)))
+    });
+    cx.run_until_parked();
+    let picker = toolbar.read_with(cx, |toolbar, _| toolbar.0.clone());
     (picker, cx, setup)
 }
 
@@ -148,7 +182,7 @@ fn checks_out_the_highlighted_matching_branch_when_enter_is_pressed(cx: &mut Tes
 
 #[gpui::test]
 fn opens_the_stash_dialog_when_git_refuses_over_local_changes(cx: &mut TestAppContext) {
-    let (picker, cx, setup) = render_picker(cx, "/repo", branches(&["main", "other"]));
+    let (picker, cx, setup) = render_in_toolbar(cx, "/repo", branches(&["main", "other"]));
     setup.git.fail(
         "git_checkout",
         Some("error: Your local changes to the following files would be overwritten by checkout"),
@@ -161,6 +195,10 @@ fn opens_the_stash_dialog_when_git_refuses_over_local_changes(cx: &mut TestAppCo
         .read_with(cx, |picker, _| picker.blocked_dialog().cloned())
         .unwrap();
     assert!(!picker.read_with(cx, |picker, _| picker.is_open()));
+    // The dialog covers the window, not just the trigger-sized box the
+    // picker renders in.
+    let panel = cx.debug_bounds("switch-branch-dialog").unwrap();
+    assert_eq!(panel.size.width, px(420.));
 
     setup.git.fail("git_checkout", None);
     dialog.update(cx, |dialog, cx| dialog.stash(cx));

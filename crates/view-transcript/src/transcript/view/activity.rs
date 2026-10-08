@@ -2,7 +2,7 @@
 //! `ActivityPhaseGroup`, `ActivityRow`, and the one-line thinking, note,
 //! status, and interjection rows from AgentTranscript.tsx.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -24,6 +24,7 @@ use monocode_ui::{Theme, u};
 use crate::transcript::model::plan::{ItemView, Placement, Row};
 use crate::transcript::model::turn::{headline_has_more, interjection_chrome};
 
+use super::entrance::{StepStage, entering_step, next_frame, settled_step, spine_run};
 use super::parts::{
     chevron, monocode_mark, phase_icon, phase_step, pulse, rail_branch, rail_spine,
 };
@@ -166,6 +167,16 @@ impl TranscriptView {
         let inert = phase.steps.is_empty() && !headline_has_more(phase.headline.as_deref());
         let theme = Theme::of(cx).clone();
         let part = |name: &str| eid(key, &format!("{name}:{}", phase.id));
+        // Only a step that lands while the group is open and live enters;
+        // the rest are history (`settled` in ActivityPhaseGroup).
+        let phase_key = format!("{key}/{}", phase.id);
+        let now = Instant::now();
+        self.entrances.sync(
+            &phase_key,
+            phase.steps.iter().map(|step| step.id.as_str()),
+            active && open && !cx.reduce_motion(),
+            now,
+        );
 
         // A lone call the agent never introduced is not a group.
         if phase.headline.is_none() && phase.steps.len() == 1 {
@@ -287,8 +298,19 @@ impl TranscriptView {
                 0
             };
             let mut steps = div().flex().flex_col().min_w_0();
-            let count = phase.steps.len() + usize::from(headline.is_some());
+            let stages: Vec<StepStage> = phase.steps[skip..]
+                .iter()
+                .map(|step| self.entrances.stage(&phase_key, &step.id, now))
+                .collect();
+            // A step queued behind another stays out of the layout, and
+            // the step above it keeps the short spine of a last step.
+            let waiting = stages
+                .iter()
+                .filter(|stage| **stage == StepStage::Waiting)
+                .count();
+            let count = phase.steps.len() - waiting + usize::from(headline.is_some());
             let mut at = skip;
+            let mut animating = waiting > 0;
             if let Some(headline) = headline {
                 at += 1;
                 if skip == 0 {
@@ -310,10 +332,53 @@ impl TranscriptView {
                     ));
                 }
             }
-            for step in &phase.steps[skip..] {
-                at += 1;
-                let row = self.render_activity_row(key, step, active, cx);
-                steps = steps.child(phase_step(at == count, &theme, row));
+            let shown = &phase.steps[skip..];
+            for (index, (step, stage)) in shown.iter().zip(&stages).enumerate() {
+                let step_key = format!("{phase_key}/{}", step.id);
+                match *stage {
+                    StepStage::Waiting => continue,
+                    StepStage::Entering { progress, .. } => {
+                        at += 1;
+                        animating = true;
+                        let row = self.render_activity_row(key, step, active, cx);
+                        steps = steps.child(entering_step(
+                            step_key,
+                            progress,
+                            &self.step_heights,
+                            &theme,
+                            row,
+                        ));
+                    }
+                    StepStage::Settled => {
+                        at += 1;
+                        // The spine runs on past this step once the one
+                        // under it starts to arrive.
+                        let spine = match stages.get(index + 1) {
+                            Some(StepStage::Entering { .. }) => self
+                                .entrances
+                                .started(&phase_key, &shown[index + 1].id)
+                                .and_then(|started| {
+                                    spine_run(
+                                        self.entrances.pace(&phase_key, &step.id),
+                                        started,
+                                        now,
+                                    )
+                                }),
+                            _ => None,
+                        };
+                        let row = self.render_activity_row(key, step, active, cx);
+                        steps = steps.child(settled_step(
+                            at == count,
+                            spine,
+                            active.then(|| (step_key, self.step_heights.clone())),
+                            &theme,
+                            row,
+                        ));
+                    }
+                }
+            }
+            if animating {
+                steps = steps.child(next_frame());
             }
             if active {
                 let handle = self.scroll_handle(&scroll_key);

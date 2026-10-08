@@ -2,6 +2,7 @@
 //! rail). The compact 48px rail lives with the sidebar, as
 //! `CompactProjectRail` did in Sidebar.tsx.
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, Context, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
@@ -13,7 +14,7 @@ use monocode_engine::runtime::Engine;
 use monocode_engine::runtime::util::project_path::same_project_path;
 use monocode_layout::paths::{project_key, project_name};
 use monocode_layout::tab_groups::{JsRecord, resolve_tab_group_color};
-use monocode_ui::color::hex;
+use monocode_ui::color::{hex, mix};
 use monocode_ui::widgets::{diff_stat, dot, icon_button, spinner, tooltip};
 use monocode_ui::{IconName, Theme, UiStyled as _, icon, u};
 
@@ -459,6 +460,10 @@ impl ProjectRail {
             self.shell.clone(),
         );
 
+        // GPUI paints a box shadow under the whole box, not only outside it
+        // as CSS does, so the button takes the rail's fill to cover it. A
+        // see-through rail would show the shadow anyway, so it gets none.
+        let opaque_rail = c.sidebar_glass.a >= 1.0;
         let search = div()
             .id("rail-search")
             .relative()
@@ -471,10 +476,11 @@ impl ProjectRail {
             .rounded(u(theme.radius.md))
             .border_1()
             .border_color(theme.content(0.08))
-            .shadow_sm()
+            .bg(c.sidebar_glass)
+            .when(opaque_rail, |el| el.shadow_sm())
             .text_color(theme.content(0.50))
             .hover({
-                let fill = theme.content(0.10);
+                let fill = mix(c.content, c.sidebar_glass, 0.10);
                 let ink = c.content;
                 move |s| s.bg(fill).text_color(ink)
             })

@@ -9,8 +9,8 @@ use std::rc::Rc;
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ElementId, InteractiveElement as _, IntoElement,
-    MouseButton, ParentElement, RenderOnce, SharedString, Styled as _, Window, deferred, div,
-    relative,
+    MouseButton, ParentElement, RenderOnce, SharedString, Styled as _, Window, anchored, deferred,
+    div, point, px, relative,
 };
 
 use crate::styled::{UiStyled as _, glass_backdrop};
@@ -91,7 +91,7 @@ impl ParentElement for Modal {
 }
 
 impl RenderOnce for Modal {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let theme = Theme::of(cx);
         let c = theme.colors;
         let motion = theme.motion;
@@ -198,29 +198,33 @@ impl RenderOnce for Modal {
             backdrop.into_any_element()
         };
 
-        deferred(
-            div()
-                .id("modal-layer")
-                .occlude()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .child(backdrop)
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .px(u(12.))
-                        .child(div().flex_none().h(relative(top)))
-                        .child(panel),
-                ),
-        )
+        deferred(window_layer(
+            div().id("modal-layer").occlude().child(backdrop).child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .px(u(12.))
+                    .child(div().flex_none().h(relative(top)))
+                    .child(panel),
+            ),
+            window,
+        ))
         .with_priority(theme.layer.dialog)
     }
+}
+
+/// Places `layer` over the whole window, like the React portal's
+/// `fixed inset-0`. A modal renders from the view that owns its open state,
+/// which can be a small control such as the branch trigger, and an absolute
+/// layer with `size_full` would only cover that parent.
+pub fn window_layer(layer: gpui::Stateful<gpui::Div>, window: &Window) -> impl IntoElement {
+    let size = window.viewport_size();
+    anchored()
+        .position(point(px(0.), px(0.)))
+        .child(layer.w(size.width).h(size.height))
 }

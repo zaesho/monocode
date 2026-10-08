@@ -198,6 +198,8 @@ pub struct FakeList {
     pub listeners: Listeners,
     /// `mark_source_read` fails while set, like a full storage.
     pub fail_writes: Rc<RefCell<bool>>,
+    /// How many times a view asked for the visible items.
+    pub visible_reads: Rc<std::cell::Cell<usize>>,
 }
 
 impl FakeList {
@@ -208,6 +210,7 @@ impl FakeList {
             calls: Rc::default(),
             listeners: Listeners::default(),
             fail_writes: Rc::default(),
+            visible_reads: Rc::default(),
         }
     }
 
@@ -235,6 +238,7 @@ impl InboxListData for FakeList {
     }
 
     fn visible_items(&self, search: &str, _: &App) -> Vec<ListedItem> {
+        self.visible_reads.set(self.visible_reads.get() + 1);
         let source = self.state.borrow().source;
         let needle = search.trim().to_lowercase();
         self.items

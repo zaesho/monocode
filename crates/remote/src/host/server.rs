@@ -21,7 +21,8 @@ use super::http::{BodyError, HttpHandler, HttpServer, Request, Response};
 use super::js;
 use super::listener::is_loopback_ip;
 use super::protocol::{
-    HOST_PROTOCOL_VERSION, HostModelCatalog, HostProject, RemoteProvider, provider_name,
+    HOST_PROTOCOL_VERSION, HostModelCatalog, HostProject, RemoteProvider,
+    SESSION_PROVIDER_INSPECTION_CAPABILITY, SESSION_PROVIDER_SWITCH_CAPABILITY, provider_name,
 };
 use super::store::{SessionPatch, now_ms};
 use super::sync_transfer::{SyncLimits, SyncTransfers};
@@ -38,7 +39,7 @@ const MAX_PAIRING_BODY: usize = 4 * 1024;
 const MAX_PAIRING_FAILURES_PER_MINUTE: usize = 30;
 
 /// What `environment.describe` advertises.
-pub const CAPABILITIES: [&str; 27] = [
+pub const CAPABILITIES: [&str; 29] = [
     "changes.wait",
     "sessions",
     "projects.browse",
@@ -66,6 +67,8 @@ pub const CAPABILITIES: [&str; 27] = [
     "attachments.read",
     "sessions.draft",
     "sessions.plan",
+    SESSION_PROVIDER_SWITCH_CAPABILITY,
+    SESSION_PROVIDER_INSPECTION_CAPABILITY,
 ];
 
 /// This host's version, reported as `hostVersion`.
@@ -572,11 +575,22 @@ impl HostServer {
             "sessions.update" => self.sessions_update(params),
             "sessions.delete" => {
                 let session_id = js::string(get("sessionId"));
-                let current = store.session(&session_id)?;
-                if get("projectId").and_then(Value::as_str) != Some(current.project_id.as_str()) {
+                // A repeated delete must still name the session's project.
+                let project_id = match store.deleted_session_project(&session_id)? {
+                    Some(project_id) => project_id,
+                    None => store.session(&session_id)?.project_id.clone(),
+                };
+                if get("projectId").and_then(Value::as_str) != Some(project_id.as_str()) {
                     return Err("Session does not belong to this project".into());
                 }
                 store.delete_session(&session_id)?;
+                // The deletion has committed. Cleanup that fails now retries on
+                // the next start or deletion.
+                if let Err(error) = store.retry_context_cleanup() {
+                    eprintln!(
+                        "Context history cleanup failed after session deletion {session_id}: {error}"
+                    );
+                }
                 to_json(&json!({ "deleted": true }))
             }
             "sessions.sync" => {

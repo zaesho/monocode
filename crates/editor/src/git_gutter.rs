@@ -54,13 +54,19 @@ impl LineMark {
 
 /// The buffer rows that get a `+` in the gutter: every line an inserted
 /// chunk marks.
+#[cfg(test)]
 pub(crate) fn added_rows(git: &GitSnapshot) -> Vec<usize> {
+    added_rows_in(git, 0..usize::MAX).collect()
+}
+
+/// The added rows inside `visible`. Paint calls this every frame, so it
+/// clips each chunk instead of listing every added row in the file.
+fn added_rows_in(git: &GitSnapshot, visible: Range<usize>) -> impl Iterator<Item = usize> + '_ {
     git.marked
         .iter()
         .zip(&git.chunks)
         .filter(|(_, chunk)| chunk.is_insertion())
-        .flat_map(|(marked, _)| marked.clone())
-        .collect()
+        .flat_map(move |(marked, _)| marked.start.max(visible.start)..marked.end.min(visible.end))
 }
 
 /// The removed lines of chunk `index` as `(old line number, text)`, each
@@ -207,7 +213,6 @@ fn paint_overlay(
         weight: gpui::FontWeight::SEMIBOLD,
         ..mono
     };
-    let added_rows = added_rows(git);
 
     let mut markers: Vec<(Bounds<Pixels>, usize)> = Vec::new();
     // `.cm-gutters` border-right.
@@ -282,11 +287,7 @@ fn paint_overlay(
     });
 
     // A `+` left of the bar on every visible added line.
-    for line in added_rows
-        .iter()
-        .filter(|line| visible.contains(*line))
-        .filter_map(|line| row(*line))
-    {
+    for line in added_rows_in(git, visible.clone()).filter_map(&row) {
         let glyph = shape_mark(LineMark::Added, &mark_font, theme.diff_added_number, window);
         let _ = glyph.paint(
             // On the first row of a wrapped line, like the CodeMirror marker.

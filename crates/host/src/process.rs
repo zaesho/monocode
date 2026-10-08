@@ -34,6 +34,7 @@ fn npm_entry(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some("node_modules/@openai/codex/bin/codex.js"),
         "claude" => Some("node_modules/@anthropic-ai/claude-code/cli.js"),
+        "opencode" => Some("node_modules/opencode-ai/bin/opencode"),
         _ => None,
     }
 }
@@ -450,6 +451,25 @@ mod tests {
         assert_eq!(
             provider_launch("C:\\tools\\custom.cmd", &[], "windows").unwrap_err(),
             "Unsupported Windows provider launcher"
+        );
+    }
+
+    #[test]
+    fn runs_the_npm_opencode_wrapper_entry_with_node() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = directory.path().join("opencode.cmd");
+        let entry = directory
+            .path()
+            .join("node_modules/opencode-ai/bin/opencode");
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&wrapper, "@echo off\r\n").unwrap();
+        std::fs::write(&entry, "#!/usr/bin/env node\n").unwrap();
+        assert_eq!(
+            provider_launch(&wrapper.to_string_lossy(), &["serve".into()], "windows").unwrap(),
+            Launch {
+                command: "node".into(),
+                args: vec![entry.to_string_lossy().into_owned(), "serve".into()],
+            }
         );
     }
 }

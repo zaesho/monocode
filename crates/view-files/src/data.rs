@@ -21,7 +21,7 @@ use gpui::{App, AppContext as _, AsyncApp, Subscription, Task};
 use monocode_git::fs::{GitChangedFile, GitDiffIndex, GitFileDiff};
 use serde::{Deserialize, Serialize};
 
-use crate::fuzzy::score_path;
+use crate::fuzzy::{PreparedQuery, score_path_prepared};
 use crate::paths::{looks_like_project, parent_path};
 
 /// A data call that finishes later. Errors are the messages the UI shows.
@@ -292,9 +292,11 @@ pub trait FilesData: 'static {
         cx.background_spawn(async move { monocode_git::fs::reveal_path(path) })
     }
 
-    /// File paths a file manager put on the system clipboard.
-    fn clipboard_file_paths(&self, _cx: &mut App) -> DataTask<Vec<String>> {
-        Task::ready(monocode_platform::pasteboard::clipboard_file_paths())
+    /// File paths a file manager put on the system clipboard. Read on the
+    /// background executor: a pasteboard that serves its data lazily can
+    /// block, and on Linux `wl-paste` can wait up to 2 s.
+    fn clipboard_file_paths(&self, cx: &mut App) -> DataTask<Vec<String>> {
+        cx.background_spawn(async { monocode_platform::pasteboard::clipboard_file_paths() })
     }
 
     fn read_text_file(&self, path: &str, cx: &mut App) -> DataTask<String> {
@@ -390,36 +392,80 @@ pub fn rank_project_files(
         return out;
     }
 
-    let mut scored: Vec<RankedFile> = files
+    if limit == 0 {
+        return Vec::new();
+    }
+    // Score by index and clone only the files that make the cut: a short
+    // query matches most of a 20 000 file index on every keystroke.
+    let prepared = PreparedQuery::new(monocode_core::js::trim(query));
+    let mut scored: Vec<Scored> = files
         .iter()
-        .filter_map(|file| {
-            let hit = score_path(query, &file.relative, &file.name)?;
+        .enumerate()
+        .filter_map(|(index, file)| {
+            let hit = score_path_prepared(&prepared, &file.relative, &file.name)?;
             let recency = recent_rank
                 .get(file.path.as_str())
                 .map_or(0, |recency| (MAX_RECENTS as i64 - *recency as i64) * 8);
-            Some(RankedFile {
-                file: file.clone(),
+            Some(Scored {
+                index,
                 score: hit.score + recency,
+                len: js_len(&file.relative),
                 positions: hit.positions,
             })
         })
         .collect();
-    scored.sort_by(|a, b| {
+    // The order `sort_by` gave, with the file's position as the last key so
+    // a partial selection keeps the stable sort's tie order.
+    let order = |a: &Scored, b: &Scored| {
         b.score
             .cmp(&a.score)
-            .then_with(|| {
-                monocode_core::js::len(&a.file.relative)
-                    .cmp(&monocode_core::js::len(&b.file.relative))
-            })
-            .then_with(|| locale_compare(&a.file.relative, &b.file.relative))
-    });
-    scored.truncate(limit);
+            .then_with(|| a.len.cmp(&b.len))
+            .then_with(|| locale_compare(&files[a.index].relative, &files[b.index].relative))
+            .then_with(|| a.index.cmp(&b.index))
+    };
+    if scored.len() > limit {
+        scored.select_nth_unstable_by(limit - 1, order);
+        scored.truncate(limit);
+    }
+    scored.sort_unstable_by(order);
     scored
+        .into_iter()
+        .map(|hit| RankedFile {
+            file: files[hit.index].clone(),
+            score: hit.score,
+            positions: hit.positions,
+        })
+        .collect()
+}
+
+/// A matched file, by its index in the listing.
+struct Scored {
+    index: usize,
+    score: i64,
+    /// `relative.length` in UTF-16 code units.
+    len: usize,
+    positions: Vec<usize>,
+}
+
+/// `String.prototype.length`, without a scan for ASCII text.
+fn js_len(text: &str) -> usize {
+    if text.is_ascii() {
+        text.len()
+    } else {
+        monocode_core::js::len(text)
+    }
 }
 
 /// `String.prototype.localeCompare` for paths, close to ICU's root order.
 fn locale_compare(a: &str, b: &str) -> std::cmp::Ordering {
-    let folded = a.to_lowercase().cmp(&b.to_lowercase());
+    // ASCII lowercases byte by byte, so compare without allocating.
+    let folded = if a.is_ascii() && b.is_ascii() {
+        a.bytes()
+            .map(|byte| byte.to_ascii_lowercase())
+            .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
+    } else {
+        a.to_lowercase().cmp(&b.to_lowercase())
+    };
     if folded != std::cmp::Ordering::Equal {
         return folded;
     }
@@ -956,6 +1002,90 @@ mod tests {
         assert_eq!(map.dirs["/p/src"], "modified");
         assert_eq!(map.dirs["/p/src/a"], "untracked");
         assert!(!map.dirs.contains_key("/p"));
+    }
+
+    /// The ranking before it scored by index: clone every hit, stable sort
+    /// everything, then truncate.
+    fn reference_rank(
+        files: &[ProjectFile],
+        query: &str,
+        recents: &[String],
+        limit: usize,
+    ) -> Vec<RankedFile> {
+        let recent_rank: HashMap<&str, usize> = recents
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.as_str(), index))
+            .collect();
+        let mut scored: Vec<RankedFile> = files
+            .iter()
+            .filter_map(|file| {
+                let hit = crate::fuzzy::score_path(query, &file.relative, &file.name)?;
+                let recency = recent_rank
+                    .get(file.path.as_str())
+                    .map_or(0, |recency| (MAX_RECENTS as i64 - *recency as i64) * 8);
+                Some(RankedFile {
+                    file: file.clone(),
+                    score: hit.score + recency,
+                    positions: hit.positions,
+                })
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| {
+                    monocode_core::js::len(&a.file.relative)
+                        .cmp(&monocode_core::js::len(&b.file.relative))
+                })
+                .then_with(|| {
+                    let folded = a
+                        .file
+                        .relative
+                        .to_lowercase()
+                        .cmp(&b.file.relative.to_lowercase());
+                    if folded != std::cmp::Ordering::Equal {
+                        return folded;
+                    }
+                    b.file.relative.cmp(&a.file.relative)
+                })
+        });
+        scored.truncate(limit);
+        scored
+    }
+
+    #[test]
+    fn partial_ranking_matches_a_full_stable_sort() {
+        let mut files = Vec::new();
+        for dir in ["src", "Src", "lib/ui", "tests", "docs/Ünïcode", "a"] {
+            for name in [
+                "app.ts",
+                "App.tsx",
+                "apple.rs",
+                "map.md",
+                "zap.ts",
+                "paper.ts",
+                "a.ts",
+                "README.md",
+                "äpp.ts",
+                "Σapp.ts",
+            ] {
+                let relative = format!("{dir}/{name}");
+                files.push(ProjectFile::new(name, format!("/r/{relative}"), relative));
+            }
+        }
+        // Duplicate paths tie on every key but their position.
+        files.push(ProjectFile::new("app.ts", "/r/src/app.ts", "src/app.ts"));
+        let recents = vec!["/r/lib/ui/map.md".to_string(), "/r/a/a.ts".to_string()];
+        for query in ["a", "ap", "app", "A P", "ts", "src app", "zz", "ä", " p "] {
+            for limit in [0, 1, 7, 80, 1000] {
+                assert_eq!(
+                    rank_project_files(&files, query, &recents, limit),
+                    reference_rank(&files, query, &recents, limit),
+                    "query {query:?} limit {limit}"
+                );
+            }
+        }
     }
 
     #[test]

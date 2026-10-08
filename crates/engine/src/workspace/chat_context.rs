@@ -51,14 +51,19 @@ pub enum ChatContextItem {
         code: String,
         comment: String,
     },
+    /// Another session dropped on the composer.
+    #[serde(rename = "session", rename_all = "camelCase")]
+    Session { id: String, title: String },
 }
 
 const OPEN: &str = "<attached_context>";
 const CLOSE: &str = "</attached_context>";
 
 static RESERVED_TAG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment)\b")
-        .expect("reserved tag pattern")
+    Regex::new(
+        r"<(\\*)(/?)(attached_context|quoted_text|code_selection|review_comment|session_context)\b",
+    )
+    .expect("reserved tag pattern")
 });
 
 static BLOCKQUOTE_PREFIX: LazyLock<Regex> =
@@ -150,6 +155,11 @@ fn format_item(item: &ChatContextItem) -> String {
             ]
             .join("\n")
         }
+        ChatContextItem::Session { id, title } => format!(
+            "<session_context id=\"{}\" title=\"{}\" />",
+            escape_attribute(id),
+            escape_attribute(title)
+        ),
     }
 }
 
@@ -198,6 +208,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&item).unwrap(),
             serde_json::json!({ "kind": "code", "path": "src/value.ts", "startLine": 3, "endLine": 5 })
+        );
+    }
+
+    #[test]
+    fn seeds_a_dropped_session_as_a_self_closing_tag() {
+        let item = ChatContextItem::Session {
+            id: "s-1".into(),
+            title: "Auth".into(),
+        };
+        assert_eq!(
+            composer_seed_for_add_to_chat(&item),
+            "<attached_context>\n<session_context id=\"s-1\" title=\"Auth\" />\n</attached_context>"
         );
     }
 

@@ -89,23 +89,9 @@ pub struct PaneLeaf {
     pub view: AnyView,
 }
 
-/// What a drag that started outside the tree carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaneDragSource {
-    /// A workspace tab from the title bar.
-    WorkspaceTab(String),
-    /// A session card from the sidebar.
-    Session(String),
-}
-
-impl PaneDragSource {
-    /// The id the hint compares with leaf ids, like `PaneDrop.fromId`.
-    pub fn id(&self) -> &str {
-        match self {
-            PaneDragSource::WorkspaceTab(id) | PaneDragSource::Session(id) => id,
-        }
-    }
-}
+/// What a drag that started outside the tree carries. The composer accepts
+/// session drags too, so the type lives in `monocode_ui`.
+pub use monocode_ui::drag::PaneDragSource;
 
 /// What the user did in the tree.
 #[derive(Debug, Clone, PartialEq)]
@@ -255,6 +241,8 @@ impl PaneTree {
     }
 
     /// A new layout drops any sash preview, as the `[layout]` effect did.
+    /// The host calls this on every workspace and session change, so the
+    /// same layout and focus again do not redraw.
     pub fn set_layout(
         &mut self,
         layout: LayoutNode,
@@ -262,14 +250,21 @@ impl PaneTree {
         cx: &mut Context<Self>,
     ) {
         let focused_id = focused_id.into();
+        let mut changed = false;
         if self.layout != layout {
             self.layout = layout;
             self.draft = None;
             self.sash = None;
             self.track_entering_panes(cx);
+            changed = true;
         }
-        self.focused_id = focused_id;
-        cx.notify();
+        if self.focused_id != focused_id {
+            self.focused_id = focused_id;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Start the slide for leaves a split added. The app reuses one tree
@@ -315,23 +310,35 @@ impl PaneTree {
         self.entering.get(pane_id).map(|(from, _)| *from)
     }
 
-    /// The leaves' content. Leaves without an entry draw empty.
+    /// The leaves' content. Leaves without an entry draw empty. The same
+    /// leaves again (same ids, kinds, and views) do not redraw.
     pub fn set_leaves(
         &mut self,
         leaves: impl IntoIterator<Item = PaneLeaf>,
         cx: &mut Context<Self>,
     ) {
-        self.leaves = leaves
+        let leaves: HashMap<String, PaneLeaf> = leaves
             .into_iter()
             .map(|leaf| (leaf.id.clone(), leaf))
             .collect();
-        cx.notify();
+        let same = leaves.len() == self.leaves.len()
+            && leaves.iter().all(|(id, leaf)| {
+                self.leaves.get(id).is_some_and(|old| {
+                    old.kind == leaf.kind && old.view.entity_id() == leaf.view.entity_id()
+                })
+            });
+        self.leaves = leaves;
+        if !same {
+            cx.notify();
+        }
     }
 
     /// Hidden trees take no external drops (`useExternalPaneDrop(visible)`).
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
-        self.visible = visible;
-        cx.notify();
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
     }
 
     pub fn set_title_tab_hit_test(&mut self, hit_test: Option<TitleTabHitTest>) {

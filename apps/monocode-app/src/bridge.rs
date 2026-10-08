@@ -18,7 +18,7 @@ use monocode_core::session::session_work_cwd;
 use monocode_core::user_question::UserQuestionReply;
 use monocode_core::{HarnessId, ModelSettings, Session};
 use monocode_engine::attention::ApprovalRouter;
-use monocode_engine::runtime::{HarnessHooks, RecoveredSession};
+use monocode_engine::runtime::{CatalogScope, HarnessHooks, RecoveredSession};
 use monocode_engine::workspace::Workspace;
 use monocode_harness::core::catalog::SharedCatalog;
 use monocode_harness::providers::cursor;
@@ -133,19 +133,43 @@ impl HarnessHooks for AppHarnessHooks {
         cx.background_spawn(probe).detach();
     }
 
-    fn refresh_catalogs(&self, harnesses: Vec<HarnessId>, cx: &mut App) -> Task<()> {
+    fn refresh_catalogs(
+        &self,
+        harnesses: Vec<HarnessId>,
+        scope: CatalogScope,
+        cx: &mut App,
+    ) -> Task<()> {
         let registry = self.registry.clone();
         let catalog = self.catalog.clone();
+        let scope = monocode_harness::core::registry::CatalogScope {
+            cwd: scope.cwd,
+            provider_account_id: scope.provider_account_id,
+            force: false,
+        };
         cx.background_spawn(async move {
             registry
-                .refresh_harness_catalogs(harnesses, false, |id| catalog.has_live_catalog(id))
+                .refresh_harness_catalogs_in(harnesses, scope, |id| catalog.has_live_catalog(id))
                 .await;
+        })
+    }
+
+    fn refresh_project_catalogs(&self, directories: Vec<String>, cx: &mut App) -> Task<()> {
+        let registry = self.registry.clone();
+        cx.background_spawn(async move {
+            let refreshes = directories.iter().map(|directory| {
+                registry.refresh_project_harness_catalog(HarnessId::Opencode, directory)
+            });
+            futures::future::join_all(refreshes).await;
         })
     }
 
     fn resolve_model(&self, session: &Session, _cx: &App) -> Option<(String, ModelSettings)> {
         let catalog = self.catalog.read();
-        let resolved = catalog.resolve_model(session.harness, Some(&session.model));
+        let resolved = catalog.resolve_model_in(
+            session.harness,
+            Some(&session.model),
+            Some(monocode_core::session::session_work_cwd(session)),
+        );
         let settings = catalog.merge_model_settings(&resolved, Some(&session.model_settings));
         Some((resolved.id, settings))
     }

@@ -2,6 +2,7 @@
 //! ACP mapping for Grok Build. Droid and Hermes reuse the event, permission,
 //! and option helpers here.
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -67,6 +68,9 @@ pub struct GrokPermissionRequest {
     pub call_id: Option<String>,
     pub preview: Option<ToolPreview>,
     pub option_ids: Vec<String>,
+    /// The ACP `kind` (`allow_once`, `reject_always`, ...) of each option
+    /// that supplied one, keyed by option id.
+    pub option_kinds: HashMap<String, String>,
 }
 
 /// `askQuestionsFromAcp`.
@@ -238,65 +242,55 @@ pub fn grok_auth_error(detail: &str) -> anyhow::Error {
     anyhow::anyhow!("Grok Build did not start. {detail}")
 }
 
-/// `pickAutoOption`.
+/// `pickAutoOption`. Edit-only mode approves reads, searches and edits on
+/// its own. Delete, move, switch_mode and unresolved kinds go to the user.
 pub fn pick_auto_option(
     runtime_mode: RuntimeMode,
     kind: Option<&str>,
     option_ids: &[String],
+    option_kinds: &HashMap<String, String>,
 ) -> Option<String> {
-    if option_ids.is_empty() {
-        return None;
-    }
-    let tool = kind.unwrap_or("").to_lowercase();
     if runtime_mode == RuntimeMode::Supervised {
         return None;
     }
     if runtime_mode == RuntimeMode::AutoAcceptEdits
-        && (tool == "execute" || tool == "other" || tool == "fetch")
+        && !matches!(kind, Some("read" | "search" | "edit"))
     {
         return None;
     }
-    if runtime_mode == RuntimeMode::FullAccess {
-        return pick_option(
-            option_ids,
-            &[
-                "allow-always",
-                "allow_always",
-                "allow-once",
-                "allow_once",
-                "allow",
-            ],
-        );
+    permission_option_id(ApprovalDecision::Allow, option_ids, option_kinds)
+}
+
+/// `permissionOptionId`. Options that declare a kind are matched by kind
+/// only. The well-known ids are a fallback for options without a kind, and
+/// no match returns `None` rather than an id the agent never offered.
+pub fn permission_option_id(
+    decision: ApprovalDecision,
+    option_ids: &[String],
+    option_kinds: &HashMap<String, String>,
+) -> Option<String> {
+    let kinds: &[&str] = if decision == ApprovalDecision::Allow {
+        &["allow_once", "allow_always"]
+    } else {
+        &["reject_once", "reject_always"]
+    };
+    for kind in kinds {
+        if let Some(id) = option_ids
+            .iter()
+            .find(|id| option_kinds.get(*id).is_some_and(|value| value == kind))
+        {
+            return Some(id.clone());
+        }
     }
-    pick_option(
-        option_ids,
+    let preferred: &[&str] = if decision == ApprovalDecision::Allow {
         &[
             "allow-once",
             "allow_once",
             "allow-always",
             "allow_always",
             "allow",
-        ],
-    )
-}
-
-/// `permissionOptionId`.
-pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -> String {
-    if decision == ApprovalDecision::Allow {
-        return pick_option(
-            option_ids,
-            &[
-                "allow-once",
-                "allow_once",
-                "allow-always",
-                "allow_always",
-                "allow",
-            ],
-        )
-        .unwrap_or_else(|| "allow-once".into());
-    }
-    pick_option(
-        option_ids,
+        ]
+    } else {
         &[
             "reject-once",
             "reject_once",
@@ -304,9 +298,14 @@ pub fn permission_option_id(decision: ApprovalDecision, option_ids: &[String]) -
             "reject_always",
             "reject",
             "deny",
-        ],
-    )
-    .unwrap_or_else(|| "reject-once".into())
+        ]
+    };
+    let unkinded: Vec<String> = option_ids
+        .iter()
+        .filter(|id| !option_kinds.contains_key(*id))
+        .cloned()
+        .collect();
+    pick_option(&unkinded, preferred)
 }
 
 /// `permissionRequestFromAcp`.
@@ -358,22 +357,31 @@ pub fn permission_request_from_acp(params: &Value) -> GrokPermissionRequest {
         .or_else(|| grok.title.clone())
         .or(label)
         .unwrap_or_else(|| "Permission".into());
-    let option_ids = rec
+    let options = rec
         .and_then(|rec| rec.get("options"))
         .and_then(Value::as_array)
-        .map(|options| {
-            options
-                .iter()
-                .filter_map(|item| {
-                    let item = item.as_object()?;
-                    match field(item, "optionId").or_else(|| field(item, "option_id")) {
-                        Some(Value::String(id)) => Some(id.clone()),
-                        _ => None,
-                    }
-                })
-                .collect()
-        })
+        .map(Vec::as_slice)
         .unwrap_or_default();
+    fn option_id(item: &Value) -> Option<(&Rec, String)> {
+        let item = item.as_object()?;
+        match field(item, "optionId").or_else(|| field(item, "option_id")) {
+            Some(Value::String(id)) => Some((item, id.clone())),
+            _ => None,
+        }
+    }
+    let option_ids = options
+        .iter()
+        .filter_map(option_id)
+        .map(|(_, id)| id)
+        .collect();
+    let option_kinds = options
+        .iter()
+        .filter_map(option_id)
+        .filter_map(|(item, id)| match item.get("kind") {
+            Some(Value::String(kind)) => Some((id, kind.clone())),
+            _ => None,
+        })
+        .collect();
     let call_id = grok
         .call_id
         .clone()
@@ -391,6 +399,7 @@ pub fn permission_request_from_acp(params: &Value) -> GrokPermissionRequest {
         kind,
         call_id,
         option_ids,
+        option_kinds,
     }
 }
 
@@ -433,7 +442,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::MessageDelta { text }]
+            vec![HarnessEvent::MessageDelta { text, append: None }]
         };
     }
 
@@ -445,7 +454,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::ReasoningDelta { text }]
+            vec![HarnessEvent::ReasoningDelta { text, append: None }]
         };
     }
 

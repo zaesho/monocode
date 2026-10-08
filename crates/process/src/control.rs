@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::harness::HarnessHost;
 use monocode_platform::expand_home;
 
-const APP_TURN_INACTIVE: &str = "MonoCode app access is inactive. Use /operator once in this thread to enable it, then call the CLI during an active agent turn. Retrying this request now will not enable access.";
+const APP_TURN_INACTIVE: &str = "MonoCode app access is inactive. Use /operator once in this thread, turn on Let agents open sessions in Settings, or link this session to another one, then call the CLI during an active agent turn. Retrying this request now will not enable access.";
 
 #[derive(Clone)]
 struct Grant {

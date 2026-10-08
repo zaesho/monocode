@@ -26,6 +26,38 @@ use crate::model::{
 };
 use crate::style::{loader, merged_ink, open_ink};
 
+/// Redraws a view once a minute while it is drawn, so the "2m ago" labels
+/// it builds from the clock move. It stops after a minute without a draw
+/// (the view is hidden or gone) and starts again on the next draw.
+#[derive(Default)]
+pub(crate) struct MinuteTick {
+    drawn: Rc<std::cell::Cell<bool>>,
+    running: Rc<std::cell::Cell<bool>>,
+    _task: Option<Task<()>>,
+}
+
+impl MinuteTick {
+    /// Call from the view's render.
+    pub(crate) fn drawn<V: 'static>(&mut self, cx: &mut Context<V>) {
+        self.drawn.set(true);
+        if self.running.replace(true) {
+            return;
+        }
+        let (drawn, running) = (self.drawn.clone(), self.running.clone());
+        self._task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                if !drawn.replace(false) || this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+            running.set(false);
+        }));
+    }
+}
+
 /// `entryKindLabel`.
 pub fn entry_kind_label(entry: &LinkedWorkItemActivityEntry) -> String {
     match entry.kind {
@@ -136,6 +168,8 @@ pub struct LinkedWorkItemUpdateNotice {
     cleanup: Option<CleanupAction>,
     animate: bool,
     _cleanup_task: Option<Task<()>>,
+    /// The activity rows show "2m ago".
+    minute_tick: MinuteTick,
 }
 
 impl EventEmitter<NoticeDone> for LinkedWorkItemUpdateNotice {}
@@ -156,6 +190,7 @@ impl LinkedWorkItemUpdateNotice {
             cleanup: None,
             animate: true,
             _cleanup_task: None,
+            minute_tick: MinuteTick::default(),
         };
         notice.set_card(session_id, card, cx);
         notice
@@ -362,6 +397,7 @@ impl Render for LinkedWorkItemUpdateNotice {
         let Some(card) = self.card.clone().filter(|_| self.shown()) else {
             return div().into_any_element();
         };
+        self.minute_tick.drawn(cx);
         let theme = Theme::of(cx).clone();
         let text = NoticeText::new(&card);
         let kind_icon = if card.kind == WorkItemKind::Pr {

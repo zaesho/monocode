@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result, bail};
 
 pub const USAGE: &str = "\
 usage: monocode-app [--data-dir <dir>] [--open-session <id>] [--view <name>]
+                    [--skills-home <dir>]
                     [--theme dark|light|system] [--size WxH] [--ui-scale <0.5..2>]
                     [--screenshot <out.png>] [--settle-ms <ms>]
                     [--backdrop <#rrggbb|none>]
@@ -16,6 +17,8 @@ usage: monocode-app [--data-dir <dir>] [--open-session <id>] [--view <name>]
                          else the Tauri app's (~/Library/Application Support/
                          com.monocode.desktop on macOS).
   --open-session <id>    Opens this stored session once the workspace restores.
+  --skills-home <dir>    An absolute home directory for skill discovery and
+                         managed exports. Use an isolated directory for previews.
 
   --view <name>          Which view fills the window. Default: shell.
                          Run with --list-views to print the names.
@@ -25,7 +28,8 @@ usage: monocode-app [--data-dir <dir>] [--open-session <id>] [--view <name>]
   --screenshot <path>    Writes the first settled frame as a PNG and exits.
                          Needs a build with --features screenshot.
   --settle-ms <ms>       Screenshot only: how long to redraw before the
-                         capture. Default: 900, or 2500 for engine views.
+                         capture. Default: 900, or 2500 for engine views and
+                         the skill manager.
   --backdrop <color>     Screenshot only: the color the transparent window is
                          composited over, standing in for the blurred desktop.
                          Default: #5f5560. `none` keeps the alpha channel.
@@ -43,6 +47,7 @@ pub struct Args {
     pub backdrop: Option<[u8; 3]>,
     pub list_views: bool,
     pub data_dir: Option<PathBuf>,
+    pub skills_home: Option<PathBuf>,
     pub open_session: Option<String>,
     pub settle_ms: Option<u64>,
     pub urls: Vec<String>,
@@ -60,6 +65,7 @@ impl Default for Args {
             backdrop: Some([0x5f, 0x55, 0x60]),
             list_views: false,
             data_dir: None,
+            skills_home: None,
             open_session: None,
             settle_ms: None,
             urls: Vec::new(),
@@ -120,6 +126,13 @@ impl Args {
                 "--backdrop" => out.backdrop = parse_color(&value("--backdrop")?)?,
                 "--list-views" => out.list_views = true,
                 "--data-dir" => out.data_dir = Some(PathBuf::from(value("--data-dir")?)),
+                "--skills-home" => {
+                    let path = PathBuf::from(value("--skills-home")?);
+                    if !path.is_absolute() {
+                        bail!("--skills-home needs an absolute directory path");
+                    }
+                    out.skills_home = Some(path);
+                }
                 "--open-session" => out.open_session = Some(value("--open-session")?),
                 "--settle-ms" => {
                     let ms: u64 = value("--settle-ms")?
@@ -153,6 +166,7 @@ mod tests {
         assert_eq!(args.view, "shell");
         assert_eq!(args.size, (1280.0, 800.0));
         assert!(args.screenshot.is_none());
+        assert!(args.skills_home.is_none());
     }
 
     #[test]
@@ -192,5 +206,27 @@ mod tests {
         assert!(parse(&["--theme", "sepia"]).is_err());
         assert!(parse(&["--backdrop", "#12"]).is_err());
         assert!(parse(&["--nope"]).is_err());
+        assert!(parse(&["--skills-home", "relative/home"]).is_err());
+        assert!(parse(&["--skills-home"]).is_err());
+    }
+
+    #[test]
+    fn isolated_preview_flags_preserve_native_window_and_url_options() {
+        let home = std::env::temp_dir().join("skill preview home");
+        let home = home.to_string_lossy();
+        let args = parse(&[
+            "--skills-home",
+            &home,
+            "--size",
+            "900x600",
+            "monocode://pair?fixture",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.skills_home.as_deref(),
+            Some(std::path::Path::new(home.as_ref()))
+        );
+        assert!(args.size_override);
+        assert_eq!(args.urls, vec!["monocode://pair?fixture"]);
     }
 }

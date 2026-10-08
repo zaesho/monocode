@@ -4,17 +4,24 @@
 //!
 //! The TypeScript kept one module-level cache. Here it is the `FileIndex`
 //! entity, one per app, and observers replace `subscribeProjectFiles`
-//! (`cx.observe(&index, ..)`). Like the TypeScript, it caches the listing of
-//! one project at a time: the project the user last loaded.
+//! (`cx.observe(&index, ..)`). Views that only care about one project
+//! subscribe to [`ProjectFilesChanged`] instead.
+//!
+//! The TypeScript cached the listing of one project at a time. Every open
+//! session pane reads the listing of its own project, so with one slot two
+//! panes in different projects evicted each other's listing and re-listed
+//! forever. The index keeps one listing per project, up to
+//! [`MAX_CACHED_PROJECTS`].
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use futures::future::Shared;
-use gpui::{Context, Task};
+use gpui::{Context, EventEmitter, Task};
 
 use super::backend::{FsBackend, ProjectFile};
 use crate::runtime::util::fuzzy::score_path;
@@ -22,8 +29,15 @@ use crate::workspace::paths::{looks_like_project, normalize_editor_path, resolve
 
 const MAX_RECENTS: usize = 30;
 const MAX_RESULTS: usize = 80;
+/// The most project listings the index keeps. The least recently used one
+/// goes first.
+pub const MAX_CACHED_PROJECTS: usize = 8;
 /// `REFRESH_MS`: the debounce before a directory change re-lists the project.
 pub const REFRESH_DELAY: Duration = Duration::from_millis(150);
+/// How long a failed scan answers for its project. Views reload when a scan
+/// ends, so without this a project that cannot be listed (a removed
+/// worktree, a folder without permission) is re-listed in a loop.
+pub const FAILED_SCAN_RETRY: Duration = Duration::from_secs(10);
 
 /// A finished listing. Errors are the backend's message.
 pub type FilesResult = Result<Arc<Vec<ProjectFile>>, String>;
@@ -31,13 +45,35 @@ pub type FilesResult = Result<Arc<Vec<ProjectFile>>, String>;
 /// A listing in progress that any number of callers can await.
 pub type FilesLoad = Shared<Task<FilesResult>>;
 
+/// The listing of `cwd` changed. A scan that finds the same files does not
+/// emit it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectFilesChanged {
+    pub cwd: String,
+}
+
+/// How far a cached listing can be trusted. `peek_project_files` returns
+/// it in every state, so views do not flash empty while it re-lists, and
+/// `load_project_files` scans again in every state but `Fresh`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freshness {
+    Fresh,
+    /// Files may have changed outside the app while its windows were away.
+    /// The next read re-lists it ([`FileIndex::revalidate`]).
+    Unknown,
+    /// An edit or a directory change in the app outdated it. The next
+    /// refresh re-lists it.
+    Invalidated,
+}
+
 struct Cache {
-    cwd: String,
     files: Arc<Vec<ProjectFile>>,
+    freshness: Freshness,
+    /// The index clock when the listing was last read, for eviction.
+    used: Cell<u64>,
 }
 
 struct Inflight {
-    cwd: String,
     id: u64,
     load: FilesLoad,
 }
@@ -56,10 +92,13 @@ fn norm_cwd(cwd: &str) -> String {
 /// The project file index.
 pub struct FileIndex {
     backend: Arc<dyn FsBackend>,
-    cache: Option<Cache>,
-    inflight: Option<Inflight>,
+    caches: HashMap<String, Cache>,
+    inflight: HashMap<String, Inflight>,
+    /// The last failed scan of each project, and when it failed.
+    failed: HashMap<String, (Instant, String)>,
     last_cwd: Option<String>,
     epoch: u64,
+    clock: Cell<u64>,
     refresh_timer: Option<Task<()>>,
     refreshing: bool,
     refresh_again: bool,
@@ -68,14 +107,18 @@ pub struct FileIndex {
     hidden: bool,
 }
 
+impl EventEmitter<ProjectFilesChanged> for FileIndex {}
+
 impl FileIndex {
     pub fn new(backend: Arc<dyn FsBackend>) -> Self {
         Self {
             backend,
-            cache: None,
-            inflight: None,
+            caches: HashMap::new(),
+            inflight: HashMap::new(),
+            failed: HashMap::new(),
             last_cwd: None,
             epoch: 0,
+            clock: Cell::new(0),
             refresh_timer: None,
             refreshing: false,
             refresh_again: false,
@@ -84,43 +127,81 @@ impl FileIndex {
         }
     }
 
-    /// `peekProjectFiles`: the cached listing for `cwd`, if it is the one
-    /// in the cache.
+    fn touch(&self, cache: &Cache) {
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        cache.used.set(now);
+    }
+
+    /// `peekProjectFiles`: the cached listing for `cwd`, if there is one.
+    /// An outdated listing is returned until the new scan lands.
     pub fn peek_project_files(&self, cwd: &str) -> Option<Arc<Vec<ProjectFile>>> {
-        self.cache
-            .as_ref()
-            .filter(|cache| cache.cwd == cwd)
-            .map(|cache| cache.files.clone())
+        let cache = self.caches.get(cwd)?;
+        self.touch(cache);
+        Some(cache.files.clone())
     }
 
-    /// `invalidateProjectFiles`: drop the listing for `cwd`, or every
-    /// listing when `None`.
+    /// `invalidateProjectFiles`: the listing for `cwd` is out of date, and
+    /// the next refresh re-lists it. `None` marks every listing as possibly
+    /// outdated, so each re-lists when it is next read. The old listing
+    /// stays readable until the re-list lands, and a re-list that finds the
+    /// same files notifies nobody.
     pub fn invalidate_project_files(&mut self, cwd: Option<&str>, cx: &mut Context<Self>) {
-        let cache_cwd = self.cache.as_ref().map(|cache| cache.cwd.as_str());
-        let inflight_cwd = self.inflight.as_ref().map(|inflight| inflight.cwd.as_str());
-        if let Some(cwd) = cwd
-            && cache_cwd != Some(cwd)
-            && inflight_cwd != Some(cwd)
-        {
-            return;
+        match cwd {
+            Some(cwd) => {
+                self.failed.remove(cwd);
+                let cached = self.caches.get_mut(cwd);
+                let running = self.inflight.remove(cwd).is_some();
+                if cached.is_none() && !running {
+                    return;
+                }
+                if let Some(cache) = cached {
+                    cache.freshness = Freshness::Invalidated;
+                }
+            }
+            None => {
+                self.inflight.clear();
+                self.failed.clear();
+                self.mark_unknown();
+            }
         }
-        if cwd.is_none() || cache_cwd == cwd {
-            self.cache = None;
-        }
-        if cwd.is_none() || inflight_cwd == cwd {
-            self.inflight = None;
-            self.epoch += 1;
-        }
-        if cwd.is_none() {
-            self.last_cwd = None;
-            self.refresh_timer = None;
-        }
-        cx.notify();
+        self.schedule_index_refresh(cx);
     }
 
-    /// `scheduleIndexRefresh`: re-list the last project after the debounce.
+    /// Every fresh listing may be out of date.
+    fn mark_unknown(&mut self) {
+        for cache in self.caches.values_mut() {
+            if cache.freshness == Freshness::Fresh {
+                cache.freshness = Freshness::Unknown;
+            }
+        }
+    }
+
+    fn has_refresh_targets(&self) -> bool {
+        self.last_cwd.is_some()
+            || self
+                .caches
+                .values()
+                .any(|cache| cache.freshness == Freshness::Invalidated)
+    }
+
+    /// Re-list `cwd` in the background if its listing may be out of date
+    /// and no scan is running. Views call this when they read the listing;
+    /// a changed listing arrives as [`ProjectFilesChanged`].
+    pub fn revalidate(&mut self, cwd: &str, cx: &mut Context<Self>) {
+        let outdated = self
+            .caches
+            .get(cwd)
+            .is_some_and(|cache| cache.freshness != Freshness::Fresh);
+        if outdated && !self.hidden && !self.inflight.contains_key(cwd) {
+            drop(self.start_scan(cwd, cx));
+        }
+    }
+
+    /// `scheduleIndexRefresh`: re-list the last project, and every
+    /// invalidated listing, after the debounce.
     pub fn schedule_index_refresh(&mut self, cx: &mut Context<Self>) {
-        if self.last_cwd.is_none() || self.hidden || self.refresh_timer.is_some() {
+        if !self.has_refresh_targets() || self.hidden || self.refresh_timer.is_some() {
             return;
         }
         let timer = cx.background_executor().timer(REFRESH_DELAY);
@@ -140,14 +221,20 @@ impl FileIndex {
             self.refresh_again = true;
             return;
         }
-        let Some(cwd) = self.last_cwd.clone() else {
+        let mut targets: Vec<String> = self.last_cwd.iter().cloned().collect();
+        for (cwd, cache) in &self.caches {
+            if cache.freshness == Freshness::Invalidated && !targets.contains(cwd) {
+                targets.push(cwd.clone());
+            }
+        }
+        if targets.is_empty() {
             return;
-        };
+        }
         self.refreshing = true;
-        let load = self.load_project_files(&cwd, true, cx);
+        let loads: Vec<FilesLoad> = targets.iter().map(|cwd| self.start_scan(cwd, cx)).collect();
         cx.spawn(async move |this, cx| {
             // The next focus or directory change retries a failed scan.
-            let _ = load.await;
+            futures::future::join_all(loads).await;
             this.update(cx, |this, cx| {
                 this.refreshing = false;
                 if this.refresh_again {
@@ -161,9 +248,12 @@ impl FileIndex {
     }
 
     /// A window became visible or took focus: the TypeScript `focus` and
-    /// `visibilitychange` listeners.
+    /// `visibilitychange` listeners. Files may have changed outside the app.
+    /// The last project re-lists now, as in the TypeScript; the others
+    /// re-list when they are next read.
     pub fn window_shown(&mut self, cx: &mut Context<Self>) {
         if !self.hidden {
+            self.mark_unknown();
             self.schedule_index_refresh(cx);
         }
     }
@@ -172,6 +262,7 @@ impl FileIndex {
     pub fn set_hidden(&mut self, hidden: bool, cx: &mut Context<Self>) {
         self.hidden = hidden;
         if !hidden {
+            self.mark_unknown();
             self.schedule_index_refresh(cx);
         }
     }
@@ -205,7 +296,8 @@ impl FileIndex {
     }
 
     /// `loadProjectFiles`: the cached listing, the scan already running, or
-    /// a new scan. `refresh` always starts a new scan.
+    /// a new scan. `refresh` always starts a new scan, and so does a
+    /// listing that is not fresh.
     pub fn load_project_files(
         &mut self,
         cwd: &str,
@@ -216,55 +308,131 @@ impl FileIndex {
             return Task::ready(Ok(Arc::new(Vec::new()))).shared();
         }
         self.last_cwd = Some(cwd.to_string());
-        if !refresh && let Some(cache) = self.cache.as_ref().filter(|cache| cache.cwd == cwd) {
+        if !refresh
+            && let Some(cache) = self
+                .caches
+                .get(cwd)
+                .filter(|cache| cache.freshness == Freshness::Fresh)
+        {
+            self.touch(cache);
             return Task::ready(Ok(cache.files.clone())).shared();
         }
-        if !refresh
-            && let Some(inflight) = self
-                .inflight
-                .as_ref()
-                .filter(|inflight| inflight.cwd == cwd)
-        {
+        if !refresh && let Some(inflight) = self.inflight.get(cwd) {
             return inflight.load.clone();
         }
+        if !refresh
+            && let Some((at, error)) = self.failed.get(cwd)
+            && cx.background_executor().now().duration_since(*at) < FAILED_SCAN_RETRY
+        {
+            return Task::ready(Err(error.clone())).shared();
+        }
+        self.start_scan(cwd, cx)
+    }
 
+    /// List `cwd` on the background executor. The result replaces the
+    /// cached listing unless a newer scan or an invalidation came after it.
+    fn start_scan(&mut self, cwd: &str, cx: &mut Context<Self>) -> FilesLoad {
         self.epoch += 1;
         let id = self.epoch;
-        let scan = cx
-            .background_executor()
-            .spawn(self.backend.list_project_files(cwd.to_string()));
+        let previous = self.caches.get(cwd).map(|cache| cache.files.clone());
+        let listing = self.backend.list_project_files(cwd.to_string());
+        let scan = cx.background_executor().spawn(async move {
+            let files = listing.await?;
+            // The same files keep the old `Arc`, so readers can tell nothing
+            // changed with a pointer compare.
+            Ok(match previous {
+                Some(previous) if *previous == files => previous,
+                _ => Arc::new(files),
+            })
+        });
         let cwd_owned = cwd.to_string();
         let load = cx
             .spawn(async move |this, cx| {
-                let result = scan.await.map(Arc::new);
+                let result: FilesResult = scan.await;
                 this.update(cx, |this, cx| {
-                    if let Ok(files) = &result
-                        && id == this.epoch
-                    {
-                        this.cache = Some(Cache {
-                            cwd: cwd_owned,
-                            files: files.clone(),
-                        });
-                        cx.notify();
-                    }
-                    if this
+                    if !this
                         .inflight
-                        .as_ref()
+                        .get(&cwd_owned)
                         .is_some_and(|inflight| inflight.id == id)
                     {
-                        this.inflight = None;
+                        return;
+                    }
+                    this.inflight.remove(&cwd_owned);
+                    match &result {
+                        Ok(files) => {
+                            this.failed.remove(&cwd_owned);
+                            this.store(cwd_owned, files.clone(), cx);
+                        }
+                        Err(error) => {
+                            let now = cx.background_executor().now();
+                            this.failed.insert(cwd_owned.clone(), (now, error.clone()));
+                            // A listing that could not be re-listed may name
+                            // files that are gone, such as a removed worktree.
+                            if this
+                                .caches
+                                .get(&cwd_owned)
+                                .is_some_and(|cache| cache.freshness != Freshness::Fresh)
+                            {
+                                this.caches.remove(&cwd_owned);
+                                cx.emit(ProjectFilesChanged { cwd: cwd_owned });
+                                cx.notify();
+                            }
+                        }
                     }
                 })
                 .ok();
                 result
             })
             .shared();
-        self.inflight = Some(Inflight {
-            cwd: cwd.to_string(),
-            id,
-            load: load.clone(),
-        });
+        self.inflight.insert(
+            cwd.to_string(),
+            Inflight {
+                id,
+                load: load.clone(),
+            },
+        );
         load
+    }
+
+    fn store(&mut self, cwd: String, files: Arc<Vec<ProjectFile>>, cx: &mut Context<Self>) {
+        let changed = match self.caches.get_mut(&cwd) {
+            Some(cache) => {
+                let changed = !Arc::ptr_eq(&cache.files, &files);
+                cache.files = files;
+                cache.freshness = Freshness::Fresh;
+                changed
+            }
+            None => {
+                self.caches.insert(
+                    cwd.clone(),
+                    Cache {
+                        files,
+                        freshness: Freshness::Fresh,
+                        used: Cell::new(0),
+                    },
+                );
+                true
+            }
+        };
+        if let Some(cache) = self.caches.get(&cwd) {
+            self.touch(cache);
+        }
+        while self.caches.len() > MAX_CACHED_PROJECTS {
+            let Some(oldest) = self
+                .caches
+                .iter()
+                .filter(|(key, _)| **key != cwd)
+                .min_by_key(|(_, cache)| cache.used.get())
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.caches.remove(&oldest);
+        }
+        if changed {
+            cx.emit(ProjectFilesChanged { cwd });
+            cx.notify();
+        }
     }
 
     /// `resolveOpenablePath`: resolve a transcript or markdown file link to
@@ -514,31 +682,46 @@ pub fn rank_project_files_limit(
         return out;
     }
 
-    let mut scored: Vec<RankedFile> = files
+    // Score by listing position and clone only the rows that make the cut.
+    // A short query matches most of a large project, and this runs on every
+    // keystroke.
+    let mut scored: Vec<(usize, i64, Vec<usize>)> = files
         .iter()
-        .filter_map(|file| {
+        .enumerate()
+        .filter_map(|(at, file)| {
             let hit = score_path(query, &file.relative, &file.name)?;
             let recency = recent_rank
                 .get(file.path.as_str())
                 .map_or(0, |recency| (MAX_RECENTS as i64 - *recency as i64) * 8);
-            Some(RankedFile {
-                file: file.clone(),
-                score: hit.score + recency,
-                positions: hit.positions,
-            })
+            Some((at, hit.score + recency, hit.positions))
         })
         .collect();
-    scored.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+    let order = |a: &(usize, i64, Vec<usize>), b: &(usize, i64, Vec<usize>)| {
+        let (left, right) = (&files[a.0], &files[b.0]);
+        b.1.cmp(&a.1)
             .then_with(|| {
-                monocode_core::js::len(&a.file.relative)
-                    .cmp(&monocode_core::js::len(&b.file.relative))
+                monocode_core::js::len(&left.relative).cmp(&monocode_core::js::len(&right.relative))
             })
-            .then_with(|| locale_compare(&a.file.relative, &b.file.relative))
-    });
-    scored.truncate(limit);
+            .then_with(|| locale_compare(&left.relative, &right.relative))
+            // The TypeScript sort was stable, so equal rows keep listing order.
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    if limit == 0 {
+        return Vec::new();
+    }
+    if scored.len() > limit {
+        scored.select_nth_unstable_by(limit - 1, order);
+        scored.truncate(limit);
+    }
+    scored.sort_by(order);
     scored
+        .into_iter()
+        .map(|(at, score, positions)| RankedFile {
+            file: files[at].clone(),
+            score,
+            positions,
+        })
+        .collect()
 }
 
 /// `String.prototype.localeCompare` for paths with the OS default locale.
@@ -649,6 +832,16 @@ mod tests {
             .expect("loaded")
             .map(|files| files.to_vec())
             .unwrap_or_default()
+    }
+
+    fn settle_result(load: FilesLoad, cx: &mut TestAppContext) -> FilesResult {
+        cx.run_until_parked();
+        load.now_or_never().expect("loaded")
+    }
+
+    fn settle_arc(load: FilesLoad, cx: &mut TestAppContext) -> Arc<Vec<ProjectFile>> {
+        cx.run_until_parked();
+        load.now_or_never().expect("loaded").expect("listed")
     }
 
     #[gpui::test]
@@ -829,6 +1022,248 @@ mod tests {
                 .map(|files| files.to_vec()),
             Some(more)
         );
+    }
+
+    #[gpui::test]
+    fn keeps_one_listing_per_project(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        let other = "/Users/me/other";
+        settle(load(&index, false, cx), cx);
+        settle(
+            index.update(cx, |index, cx| index.load_project_files(other, false, cx)),
+            cx,
+        );
+        assert_eq!(fs.list_calls().len(), 2);
+        // Both projects stay listed, so alternating readers do not re-list.
+        settle(load(&index, false, cx), cx);
+        settle(
+            index.update(cx, |index, cx| index.load_project_files(other, false, cx)),
+            cx,
+        );
+        assert_eq!(fs.list_calls().len(), 2);
+        index.read_with(cx, |index, _| {
+            assert!(index.peek_project_files(CWD).is_some());
+            assert!(index.peek_project_files(other).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn evicts_the_least_recently_used_listing(cx: &mut TestAppContext) {
+        let (_, index) = setup(cx);
+        let projects: Vec<String> = (0..=MAX_CACHED_PROJECTS)
+            .map(|n| format!("/Users/me/project{n}"))
+            .collect();
+        for project in &projects {
+            settle(
+                index.update(cx, |index, cx| index.load_project_files(project, false, cx)),
+                cx,
+            );
+            // Reading the first project keeps it recent.
+            index.read_with(cx, |index, _| index.peek_project_files(&projects[0]));
+        }
+        index.read_with(cx, |index, _| {
+            assert!(index.peek_project_files(&projects[0]).is_some());
+            assert!(index.peek_project_files(&projects[1]).is_none());
+            assert!(
+                index
+                    .peek_project_files(&projects[MAX_CACHED_PROJECTS])
+                    .is_some()
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn an_unchanged_rescan_keeps_the_listing_and_notifies_nobody(cx: &mut TestAppContext) {
+        let (_, index) = setup(cx);
+        let first = settle_arc(load(&index, false, cx), cx);
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let _observe = cx.update(|cx| cx.observe(&index, move |_, _| seen.set(seen.get() + 1)));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = events.clone();
+        let _subscribe = cx.update(|cx| {
+            cx.subscribe(&index, move |_, event: &ProjectFilesChanged, _| {
+                log.borrow_mut().push(event.cwd.clone())
+            })
+        });
+        let again = settle_arc(load(&index, true, cx), cx);
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(count.get(), 0);
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn names_the_project_whose_listing_changed(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        settle(load(&index, false, cx), cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = events.clone();
+        let _subscribe = cx.update(|cx| {
+            cx.subscribe(&index, move |_, event: &ProjectFilesChanged, _| {
+                log.borrow_mut().push(event.cwd.clone())
+            })
+        });
+        let mut more = files();
+        more.push(extra());
+        fs.set_files(more);
+        settle(load(&index, true, cx), cx);
+        assert_eq!(*events.borrow(), vec![CWD.to_string()]);
+    }
+
+    #[gpui::test]
+    fn an_invalidated_listing_stays_readable_until_the_relist_lands(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        settle(load(&index, false, cx), cx);
+        let mut more = files();
+        more.push(extra());
+        fs.set_files(more.clone());
+        index.update(cx, |index, cx| {
+            index.invalidate_project_files(Some(CWD), cx)
+        });
+        assert_eq!(
+            index
+                .read_with(cx, |index, _| index.peek_project_files(CWD))
+                .map(|files| files.to_vec()),
+            Some(files())
+        );
+        // A load after the invalidation waits for a fresh scan.
+        assert_eq!(settle(load(&index, false, cx), cx), more);
+        assert_eq!(fs.list_calls().len(), 2);
+    }
+
+    #[gpui::test]
+    fn an_invalidated_listing_is_relisted_after_the_debounce(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        let other = "/Users/me/other";
+        settle(
+            index.update(cx, |index, cx| index.load_project_files(other, false, cx)),
+            cx,
+        );
+        settle(load(&index, false, cx), cx);
+        let mut more = files();
+        more.push(extra());
+        fs.set_files(more.clone());
+        index.update(cx, |index, cx| {
+            index.invalidate_project_files(Some(other), cx)
+        });
+        cx.executor().advance_clock(REFRESH_DELAY);
+        cx.run_until_parked();
+        assert_eq!(
+            index
+                .read_with(cx, |index, _| index.peek_project_files(other))
+                .map(|files| files.to_vec()),
+            Some(more)
+        );
+    }
+
+    #[gpui::test]
+    fn a_failed_scan_answers_until_the_retry_delay(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        fs.fail_files("Project scan unavailable");
+        assert!(settle_result(load(&index, false, cx), cx).is_err());
+        assert_eq!(fs.list_calls().len(), 1);
+        // The failure answers at once instead of starting another scan.
+        let again = load(&index, false, cx);
+        assert!(again.clone().now_or_never().expect("ready").is_err());
+        assert_eq!(fs.list_calls().len(), 1);
+        cx.executor().advance_clock(FAILED_SCAN_RETRY);
+        fs.set_files(files());
+        assert_eq!(settle(load(&index, false, cx), cx), files());
+        assert_eq!(fs.list_calls().len(), 2);
+    }
+
+    #[gpui::test]
+    fn a_folder_that_is_not_a_project_answers_at_once(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        let home = index.update(cx, |index, cx| index.load_project_files("/", false, cx));
+        assert!(home.now_or_never().is_some());
+        assert!(fs.list_calls().is_empty());
+    }
+
+    #[gpui::test]
+    fn a_focus_relists_the_last_project_and_the_others_when_read(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        let other = "/Users/me/other";
+        settle(
+            index.update(cx, |index, cx| index.load_project_files(other, false, cx)),
+            cx,
+        );
+        settle(load(&index, false, cx), cx);
+        let mut more = files();
+        more.push(extra());
+        fs.set_files(more.clone());
+        index.update(cx, |index, cx| index.window_shown(cx));
+        cx.executor().advance_clock(REFRESH_DELAY);
+        cx.run_until_parked();
+        // Only the last project re-listed on focus.
+        assert_eq!(fs.list_calls().len(), 3);
+        let peek = |index: &Entity<FileIndex>, cwd: &str, cx: &mut TestAppContext| {
+            index
+                .read_with(cx, |index, _| index.peek_project_files(cwd))
+                .map(|files| files.to_vec())
+        };
+        assert_eq!(peek(&index, CWD, cx), Some(more.clone()));
+        assert_eq!(peek(&index, other, cx), Some(files()));
+        // Reading the other project re-lists it once.
+        index.update(cx, |index, cx| index.revalidate(other, cx));
+        index.update(cx, |index, cx| index.revalidate(other, cx));
+        cx.run_until_parked();
+        assert_eq!(fs.list_calls().len(), 4);
+        assert_eq!(peek(&index, other, cx), Some(more));
+        index.update(cx, |index, cx| index.revalidate(other, cx));
+        cx.run_until_parked();
+        assert_eq!(fs.list_calls().len(), 4);
+    }
+
+    #[gpui::test]
+    fn a_failed_relist_drops_the_outdated_listing(cx: &mut TestAppContext) {
+        let (fs, index) = setup(cx);
+        settle(load(&index, false, cx), cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = events.clone();
+        let _subscribe = cx.update(|cx| {
+            cx.subscribe(&index, move |_, event: &ProjectFilesChanged, _| {
+                log.borrow_mut().push(event.cwd.clone())
+            })
+        });
+        fs.fail_files("worktree removed");
+        index.update(cx, |index, cx| {
+            index.invalidate_project_files(Some(CWD), cx)
+        });
+        cx.executor().advance_clock(REFRESH_DELAY);
+        cx.run_until_parked();
+        assert_eq!(
+            index.read_with(cx, |index, _| index.peek_project_files(CWD)),
+            None
+        );
+        assert_eq!(*events.borrow(), vec![CWD.to_string()]);
+    }
+
+    #[test]
+    fn ranking_keeps_the_full_sort_order_when_it_cuts_early() {
+        let names = [
+            "b.rs", "a.rs", "ab.rs", "ba.rs", "src/a.rs", "src/b.rs", "x/a.rs", "a.rs",
+        ];
+        let files: Vec<ProjectFile> = names
+            .iter()
+            .enumerate()
+            .map(|(n, relative)| {
+                let name = relative.rsplit('/').next().unwrap();
+                ProjectFile::new(name, format!("{CWD}/{n}/{relative}"), *relative)
+            })
+            .collect();
+        let all = rank_project_files_limit(&files, "a", &[], usize::MAX);
+        for limit in 0..=files.len() {
+            let cut = rank_project_files_limit(&files, "a", &[], limit);
+            assert_eq!(cut, all[..limit.min(all.len())].to_vec(), "limit {limit}");
+        }
+        // Equal rows keep listing order, as a stable sort did.
+        let twins: Vec<&RankedFile> = all
+            .iter()
+            .filter(|hit| hit.file.relative == "a.rs")
+            .collect();
+        assert_eq!(twins.len(), 2);
+        assert!(twins[0].file.path < twins[1].file.path);
     }
 
     #[test]

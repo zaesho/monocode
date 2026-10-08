@@ -58,8 +58,14 @@ fn forwards_grok_text_deltas_without_duplicating_snapshots() {
         assert_eq!(
             events.all(),
             vec![
-                HarnessEvent::MessageDelta { text: "Hel".into() },
-                HarnessEvent::MessageDelta { text: "lo".into() },
+                HarnessEvent::MessageDelta {
+                    text: "Hel".into(),
+                    append: None
+                },
+                HarnessEvent::MessageDelta {
+                    text: "lo".into(),
+                    append: None
+                },
             ]
         );
         text.stop(None).await;

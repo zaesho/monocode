@@ -803,9 +803,11 @@ impl RemoteConnections {
         if self.cached_snapshot(machine_id, session_id).is_some() {
             return Task::ready(Ok(()));
         }
-        let load = self
-            .client
-            .load_remote_session(machine_id, session_id, None);
+        // Decoding and applying the snapshot run off the UI thread.
+        let load = cx.background_executor().spawn(
+            self.client
+                .load_remote_session(machine_id, session_id, None),
+        );
         let (machine_id, session_id) = (machine_id.to_string(), session_id.to_string());
         cx.spawn(async move |this, cx| {
             let snapshot = load.await?;

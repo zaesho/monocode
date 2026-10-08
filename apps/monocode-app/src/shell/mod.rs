@@ -16,6 +16,7 @@ mod footer;
 mod github_star;
 mod glass_backdrop;
 mod hosts;
+mod import_cli_sessions;
 mod launch_host;
 mod live_agents;
 mod main_pane;
@@ -278,6 +279,9 @@ pub struct Shell {
     file_panes: HashMap<String, Entity<FilePane>>,
     open_session: Option<String>,
     start: WorkspaceStart,
+    /// The open sessions' [`crate::revisions::current_sessions_digest`]. The shell
+    /// redraws when it moves, not on every streamed token.
+    sessions_digest: Option<u64>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -285,6 +289,9 @@ pub struct Shell {
 impl Shell {
     pub fn new(options: ShellOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
         packages::ensure(cx);
+        // Start the render caches' change counter before any region
+        // subscribes, so it sees each change first.
+        crate::revisions::revision(cx);
         let rail_width = AppServices::try_global(cx)
             .map(|services| {
                 monocode_settings::load_app_settings(
@@ -349,6 +356,7 @@ impl Shell {
                     .and_then(|startup| startup.0.clone())
             }),
             start: options.start,
+            sessions_digest: None,
             _subscriptions: Vec::new(),
             _tasks: Vec::new(),
         };
@@ -544,8 +552,17 @@ impl Shell {
         self._subscriptions
             .push(cx.observe(&history, |_, _, cx| cx.notify()));
         let sessions = Engine::sessions(cx);
+        self.sessions_digest = Some(crate::revisions::current_sessions_digest(cx));
         self._subscriptions
-            .push(cx.observe(&sessions, |_, _, cx| cx.notify()));
+            .push(cx.observe(&sessions, |this, _, cx| {
+                // The shell draws session titles and the footer's model;
+                // streamed text changes neither.
+                let digest = crate::revisions::current_sessions_digest(cx);
+                if this.sessions_digest != Some(digest) {
+                    this.sessions_digest = Some(digest);
+                    cx.notify();
+                }
+            }));
         if let Some(attention) = Attention::try_global(cx) {
             let approvals = attention.approvals.clone();
             let notifier = attention.notifier.clone();
@@ -577,7 +594,9 @@ impl Shell {
             let workspace = workspace.read(cx);
             (
                 workspace.sidebar_cwd(cx),
-                workspace.active_session(cx).map(|session| session.id),
+                workspace
+                    .active_session_ref(cx)
+                    .map(|session| session.id.clone()),
                 workspace.tabs().to_vec(),
             )
         };
@@ -1188,6 +1207,10 @@ impl Shell {
                 .flex_1()
                 .min_h_0()
                 .min_w_0()
+                // Not cached: a cached view that redraws makes every cached
+                // view inside it redraw too, and the composer's caret redraws
+                // this area twice a second. The panes cache the transcript
+                // and file views inside it instead.
                 .child(factory(window, cx))
                 .into_any_element();
         }
@@ -1208,20 +1231,61 @@ impl Render for Shell {
             )
         });
         let compact_title_bar = layout.compact_title_bar();
+        // The regions are cached views: each redraws only after it, or a
+        // view inside it, was notified, instead of on every change in the
+        // window (a streamed token, the composer's caret). Each style
+        // matches the size the region's root gives itself. Keep cached
+        // views out of other cached views that redraw often: an outer
+        // redraw redraws everything cached inside it.
         let rail: Option<AnyElement> = if layout.project_rail_open {
             Some(if layout.page == Some(Page::Settings) {
                 settings_rail::view(cx.weak_entity(), layout.rail_width, window, cx)
                     .into_any_element()
             } else {
-                self.rail.clone().into_any_element()
+                self.rail
+                    .clone()
+                    .cached(
+                        gpui::StyleRefinement::default()
+                            .w(u(layout.rail_width))
+                            .h_full()
+                            .flex_none(),
+                    )
+                    .into_any_element()
             })
         } else if layout.compact_rail_visible() {
-            Some(self.compact_rail.clone().into_any_element())
+            Some(
+                self.compact_rail
+                    .clone()
+                    .cached(
+                        gpui::StyleRefinement::default()
+                            .w(u(theme.metrics.compact_rail_width))
+                            .h_full()
+                            .flex_none(),
+                    )
+                    .into_any_element(),
+            )
         } else {
             None
         };
-        let sidebar = (layout.session_sidebar_open && layout.page != Some(Page::Settings))
-            .then(|| self.sidebar.clone().into_any_element());
+        let sidebar =
+            (layout.session_sidebar_open && layout.page != Some(Page::Settings)).then(|| {
+                self.sidebar
+                    .clone()
+                    .cached(
+                        gpui::StyleRefinement::default()
+                            .w(u(layout.sidebar_width))
+                            .h_full()
+                            .min_h_0()
+                            .flex_none(),
+                    )
+                    .into_any_element()
+            });
+        let title_bar = self.title_bar.clone().cached(
+            gpui::StyleRefinement::default()
+                .w_full()
+                .h(u(theme.metrics.title_bar_height))
+                .flex_none(),
+        );
         let mut main = div()
             .flex()
             .flex_col()
@@ -1229,8 +1293,9 @@ impl Render for Shell {
             .min_w_0()
             .min_h_0()
             .bg(c.body_glass);
+        let mut title_bar = Some(title_bar);
         if !compact_title_bar {
-            main = main.child(self.title_bar.clone());
+            main = main.children(title_bar.take());
         }
         let body = self.render_main_body(window, cx);
         let main = main.child(body).child(self.render_footer(cx));
@@ -1260,7 +1325,7 @@ impl Render for Shell {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up));
         root = self.register_actions(root, cx);
         if compact_title_bar {
-            root = root.child(self.title_bar.clone());
+            root = root.children(title_bar.take());
         }
         root = root
             .child(row)
@@ -1274,6 +1339,49 @@ impl Render for Shell {
             root = root.cursor_col_resize();
         }
         root
+    }
+}
+
+/// What a shell region drawn through `Entity::cached` listens to. GPUI
+/// reuses a cached view's last frame until that view, or a view inside it,
+/// is notified. The rails, the sidebar, and the title bar read the shell's
+/// layout, the open sessions, the settings, and git status in their render,
+/// so each holds one of these and redraws when any of them changes.
+#[derive(Default)]
+pub(crate) struct CachedRegion {
+    shell: Option<Subscription>,
+    git: Option<(String, Subscription)>,
+    revision: Option<Subscription>,
+}
+
+impl CachedRegion {
+    /// Observe the shell once it exists (regions are built inside
+    /// `Shell::new`, before it does), the revision counter, and the git
+    /// status of `git_cwd` once something created it. Call from render.
+    pub(crate) fn sync<V: 'static>(
+        &mut self,
+        shell: &WeakEntity<Shell>,
+        git_cwd: Option<&str>,
+        cx: &mut Context<V>,
+    ) {
+        if self.revision.is_none() {
+            self.revision = Some(crate::revisions::observe(cx, |_, cx| cx.notify()));
+        }
+        if self.shell.is_none()
+            && let Some(shell) = shell.upgrade()
+        {
+            self.shell = Some(cx.observe(&shell, |_, _, cx| cx.notify()));
+        }
+        let Some(cwd) = git_cwd else {
+            return;
+        };
+        if self.git.as_ref().is_some_and(|(path, _)| path == cwd) {
+            return;
+        }
+        let status = monocode_engine::projects::ProjectsGlobal::try_global(cx)
+            .and_then(|projects| projects.git.read(cx).get(cwd));
+        self.git =
+            status.map(|status| (cwd.to_string(), cx.observe(&status, |_, _, cx| cx.notify())));
     }
 }
 
@@ -1403,6 +1511,10 @@ fn workspace_chat_context(
             },
             code: code.clone(),
             comment: comment.clone(),
+        },
+        Source::Session { id, title } => Target::Session {
+            id: id.clone(),
+            title: title.clone(),
         },
     }
 }

@@ -191,7 +191,7 @@ pub trait ChildBackend: Send + Sync {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()>;
+    ) -> ChildFuture<String>;
     /// `homeDir()` on the machine running the child.
     fn home_dir(&self) -> ChildFuture<String>;
     /// `hasHeadlessChildBackend`: true for a headless host's backend.
@@ -252,13 +252,55 @@ struct RouterState {
     owned_children: HashSet<String>,
     owned_sse: HashSet<String>,
     live_pid: HashMap<String, u32>,
+    /// Children that were replaced, killed, or exited, by session id, oldest
+    /// first. A respawn reuses the session id, so their late output must not
+    /// reach the new child's watcher.
+    retired_pids: HashMap<String, VecDeque<u32>>,
+    /// A child that exited on its own. The exit can arrive before its last
+    /// output lines, so it is only retired once the session spawns or kills
+    /// another child.
+    exited_pid: HashMap<String, u32>,
     pending_exit: HashMap<String, Vec<(Option<i32>, u32)>>,
+}
+
+/// Retired pids kept per session.
+const MAX_RETIRED: usize = 8;
+
+/// The children [`ChildRouter::retire_child`] retired, so a spawn that fails
+/// can put them back.
+#[derive(Debug, Clone, Copy, Default)]
+struct RetiredChild {
+    live: Option<u32>,
+    exited: Option<u32>,
 }
 
 impl RouterState {
     fn clear(&mut self) {
         // Dropping the senders closes every watcher's channel.
         *self = RouterState::default();
+    }
+
+    /// True when the line came from a child this session no longer runs.
+    /// Lines without a pid always pass.
+    fn is_retired_line(&self, session_id: &str, pid: Option<u32>) -> bool {
+        pid.is_some_and(|pid| {
+            self.retired_pids
+                .get(session_id)
+                .is_some_and(|retired| retired.contains(&pid))
+        })
+    }
+
+    fn unretire(&mut self, session_id: &str, pids: &[u32]) {
+        if let Some(retired) = self.retired_pids.get_mut(session_id) {
+            retired.retain(|pid| !pids.contains(pid));
+        }
+    }
+
+    /// `noteChildExited`: the current child exited. Its output still flows
+    /// until the session starts or kills another child.
+    fn note_child_exited(&mut self, session_id: &str, pid: u32) {
+        self.live_pid.remove(session_id);
+        self.exited_pid.insert(session_id.to_string(), pid);
     }
 }
 
@@ -293,9 +335,23 @@ impl ChildRouter {
         Self::default()
     }
 
-    /// `harness-stdout`.
+    /// `harness-stdout` for a line with no pid. It reaches the session's
+    /// current watcher whichever child wrote it.
     pub fn on_stdout(&self, session_id: &str, line: String) {
+        self.route_stdout(session_id, line, None);
+    }
+
+    /// `harness-stdout` for a line from child `pid`. Dropped when that child
+    /// was replaced, killed, or exited before the session's latest spawn.
+    pub fn on_child_stdout(&self, session_id: &str, line: String, pid: u32) {
+        self.route_stdout(session_id, line, Some(pid));
+    }
+
+    fn route_stdout(&self, session_id: &str, line: String, pid: Option<u32>) {
         let mut state = self.state.lock();
+        if state.is_retired_line(session_id, pid) {
+            return;
+        }
         if let Some(watcher) = state.watchers.get(session_id) {
             let _ = watcher.try_send(ChildEvent::Stdout(line));
             return;
@@ -305,9 +361,24 @@ impl ChildRouter {
         }
     }
 
-    /// `harness-stderr`. Dropped when nobody watches the session.
+    /// `harness-stderr` for a line with no pid. Dropped when nobody watches
+    /// the session.
     pub fn on_stderr(&self, session_id: &str, line: String) {
-        if let Some(watcher) = self.state.lock().watchers.get(session_id) {
+        self.route_stderr(session_id, line, None);
+    }
+
+    /// `harness-stderr` for a line from child `pid`, filtered like
+    /// [`Self::on_child_stdout`].
+    pub fn on_child_stderr(&self, session_id: &str, line: String, pid: u32) {
+        self.route_stderr(session_id, line, Some(pid));
+    }
+
+    fn route_stderr(&self, session_id: &str, line: String, pid: Option<u32>) {
+        let state = self.state.lock();
+        if state.is_retired_line(session_id, pid) {
+            return;
+        }
+        if let Some(watcher) = state.watchers.get(session_id) {
             let _ = watcher.try_send(ChildEvent::Stderr(line));
         }
     }
@@ -320,7 +391,7 @@ impl ChildRouter {
         }
         let current = state.live_pid.get(session_id).copied();
         if is_current_child_exit(current.map(i64::from), Some(i64::from(pid))) {
-            state.live_pid.remove(session_id);
+            state.note_child_exited(session_id, pid);
             if let Some(watcher) = state.watchers.get(session_id) {
                 let _ = watcher.try_send(ChildEvent::Exit(code));
             }
@@ -411,22 +482,60 @@ impl ChildRouter {
         self.state.lock().owned_sse.insert(session_id.to_string());
     }
 
-    fn clear_pid(&self, session_id: &str) {
+    /// `retireChild`: stop routing the session's current and exited child,
+    /// before a spawn or kill. Returns them for [`Self::restore_child`].
+    fn retire_child(&self, session_id: &str) -> RetiredChild {
         let mut state = self.state.lock();
-        state.live_pid.remove(session_id);
         state.pending_exit.remove(session_id);
+        let previous = RetiredChild {
+            live: state.live_pid.remove(session_id),
+            exited: state.exited_pid.remove(session_id),
+        };
+        let pids: Vec<u32> = previous.live.into_iter().chain(previous.exited).collect();
+        if pids.is_empty() {
+            return previous;
+        }
+        let retired = state
+            .retired_pids
+            .entry(session_id.to_string())
+            .or_default();
+        retired.extend(pids);
+        while retired.len() > MAX_RETIRED {
+            retired.pop_front();
+        }
+        previous
+    }
+
+    /// A spawn failed, and the backend may have left the previous child
+    /// running, so keep its output flowing. A newer spawn's pid wins.
+    fn restore_child(&self, session_id: &str, previous: RetiredChild) {
+        let mut state = self.state.lock();
+        let pids: Vec<u32> = previous.live.into_iter().chain(previous.exited).collect();
+        state.unretire(session_id, &pids);
+        if let Some(pid) = previous.live
+            && !state.live_pid.contains_key(session_id)
+        {
+            state.live_pid.insert(session_id.to_string(), pid);
+        }
+        if let Some(pid) = previous.exited
+            && !state.exited_pid.contains_key(session_id)
+        {
+            state.exited_pid.insert(session_id.to_string(), pid);
+        }
     }
 
     /// Record the spawned pid and deliver an exit that beat it here.
     fn spawned(&self, session_id: &str, pid: u32) {
         let mut state = self.state.lock();
+        // The OS can hand a retired child's pid to the new one.
+        state.unretire(session_id, &[pid]);
         state.live_pid.insert(session_id.to_string(), pid);
         let exits = state.pending_exit.remove(session_id);
         let Some((code, _)) = exits.and_then(|exits| exits.into_iter().find(|(_, p)| *p == pid))
         else {
             return;
         };
-        state.live_pid.remove(session_id);
+        state.note_child_exited(session_id, pid);
         if let Some(watcher) = state.watchers.get(session_id) {
             let _ = watcher.try_send(ChildEvent::Exit(code));
         }
@@ -438,12 +547,12 @@ impl ChildRouter {
 }
 
 impl HarnessEvents for ChildRouter {
-    fn stdout(&self, session_id: &str, line: String) {
-        self.on_stdout(session_id, line);
+    fn stdout(&self, session_id: &str, line: String, pid: u32) {
+        self.on_child_stdout(session_id, line, pid);
     }
 
-    fn stderr(&self, session_id: &str, line: String) {
-        self.on_stderr(session_id, line);
+    fn stderr(&self, session_id: &str, line: String, pid: u32) {
+        self.on_child_stderr(session_id, line, pid);
     }
 
     fn exit(&self, session_id: &str, code: Option<i32>, pid: u32) {
@@ -663,7 +772,7 @@ impl Children {
     }
 
     pub async fn spawn_request(&self, mut request: SpawnRequest) -> Result<()> {
-        self.inner.router.clear_pid(&request.session_id);
+        let previous = self.inner.router.retire_child(&request.session_id);
         self.inner.router.own_child(&request.session_id);
         if request.binary_path.is_none() {
             request.binary_path = request
@@ -671,7 +780,15 @@ impl Children {
                 .and_then(|provider| self.binary_path_for(provider, &BinaryPathChoice::Runtime));
         }
         let session_id = request.session_id.clone();
-        let pid = self.inner.backend.spawn(request).await.map_err(err)?;
+        let pid = match self.inner.backend.spawn(request).await {
+            Ok(pid) => pid,
+            Err(error) => {
+                // A rejected spawn, such as one with a missing working
+                // directory, can leave the previous child running.
+                self.inner.router.restore_child(&session_id, previous);
+                return Err(err(error));
+            }
+        };
         if pid == 0 {
             return Ok(());
         }
@@ -690,7 +807,7 @@ impl Children {
 
     /// `killChild`. Stops routing the session at once, then kills it.
     pub async fn kill_child(&self, session_id: &str) -> Result<()> {
-        self.inner.router.clear_pid(session_id);
+        self.inner.router.retire_child(session_id);
         self.unwatch_child(session_id);
         self.inner
             .backend
@@ -871,9 +988,16 @@ impl Children {
         })
     }
 
+    /// The executable the user configured for `provider`, if any.
+    pub fn runtime_binary_path(&self, provider: HarnessId) -> Option<String> {
+        self.inner.backend.runtime_binary_path(provider)
+    }
+
     /// `updateHarnessCli`: run the CLI's own self-update against the binary
     /// MonoCode uses.
-    pub async fn update_harness_cli(&self, provider: HarnessId) -> Result<()> {
+    /// `updateHarnessCli`: the updater's output, which may say how to update
+    /// when the CLI cannot update itself.
+    pub async fn update_harness_cli(&self, provider: HarnessId) -> Result<String> {
         let resolved = self.resolve_binary(provider).await?;
         let binary_path = self.inner.backend.runtime_binary_path(provider);
         self.inner
@@ -922,7 +1046,7 @@ static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").
 
 /// Runs a harness CLI's self-update (`monocode_integrations::harness_updates::harness_update`).
 pub type CliUpdater =
-    Arc<dyn Fn(String, String, Option<String>) -> Result<(), String> + Send + Sync>;
+    Arc<dyn Fn(String, String, Option<String>) -> Result<String, String> + Send + Sync>;
 
 /// Settings for [`HostChildBackend`].
 #[derive(Clone, Default)]
@@ -1150,7 +1274,7 @@ impl ChildBackend for HostChildBackend {
         command: String,
         provider: HarnessId,
         binary_path: Option<String>,
-    ) -> ChildFuture<()> {
+    ) -> ChildFuture<String> {
         let updater = self.options.updater.clone();
         blocking(move || match updater {
             Some(update) => update(command, provider.as_str().to_string(), binary_path),

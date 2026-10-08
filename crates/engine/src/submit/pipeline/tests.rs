@@ -55,17 +55,23 @@ struct Script {
     result: Result<(), String>,
     /// Wait for `cancel_turn` before resolving.
     hold: bool,
+    /// Report acceptance before the events.
+    accept: bool,
 }
 
 impl Script {
     fn reply(text: &str) -> Self {
         Self {
             events: vec![
-                HarnessEvent::MessageDelta { text: text.into() },
+                HarnessEvent::MessageDelta {
+                    text: text.into(),
+                    append: None,
+                },
                 HarnessEvent::MessageCompleted,
             ],
             result: Ok(()),
             hold: false,
+            accept: true,
         }
     }
 }
@@ -152,7 +158,7 @@ impl HarnessAdapter for FakeAdapter {
             .unwrap_or_else(|| Script::reply("done"));
         let release = self.release.1.clone();
         async move {
-            if let Some(accepted) = on_accepted {
+            if let Some(accepted) = on_accepted.filter(|_| script.accept) {
                 accepted();
             }
             for event in script.events {
@@ -282,6 +288,10 @@ struct Fixture {
 }
 
 fn setup(cx: &mut TestAppContext) -> Fixture {
+    setup_with_skill_sources(cx, Arc::new(NoSkills))
+}
+
+fn setup_with_skill_sources(cx: &mut TestAppContext, skills: Arc<dyn SkillSources>) -> Fixture {
     let backend = init_test_engine(cx);
     let executor = cx.executor();
     let spawner: SharedSpawner =
@@ -291,6 +301,7 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
         RegistryOptions {
             turn_control: None,
             idle_park: Duration::from_secs(86_400),
+            ambient_events: None,
         },
     );
     let codex = FakeAdapter::new(HarnessId::Codex);
@@ -302,8 +313,11 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
     registry.register_harness(codex.clone());
     registry.register_harness(fx.clone());
     let kv = Kv::in_memory();
+    // Most tests compare the exact text a turn sends. The tests for agent
+    // session access turn the setting back on.
+    monocode_settings::settings_store::save_agent_sessions_enabled(&kv, false);
     let mut config = SubmitConfig::new(registry, SharedCatalog::new(), kv.clone(), spawner);
-    config.skill_sources = Arc::new(NoSkills);
+    config.skill_sources = skills;
     config.app_cli_path =
         Arc::new(|| Ok("/Applications/MonoCode.app/Contents/MacOS/monocode".into()));
     let submit = cx.update(|cx| Submit::init(config, cx));
@@ -363,6 +377,283 @@ fn recorder() -> (Rc<RefCell<Vec<ControlOutcome>>>, OnSettled) {
         outcomes,
         Rc::new(move |outcome: ControlOutcome, _: &mut App| sink.borrow_mut().push(outcome)),
     )
+}
+
+struct RawSkillCommands;
+
+impl NativeCommandProvider for RawSkillCommands {
+    fn discover(
+        &self,
+        _context: monocode_harness::core::native_commands::CommandContext,
+    ) -> BoxFuture<'_, Result<Vec<monocode_harness::core::native_commands::NativeCommand>>> {
+        async { Ok(Vec::new()) }.boxed()
+    }
+
+    fn raw_slash_commands(&self) -> bool {
+        true
+    }
+}
+
+struct ColdFileSkills {
+    initial_scan: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
+}
+
+impl SkillSources for ColdFileSkills {
+    fn command_provider(&self, harness: HarnessId) -> Option<Arc<dyn NativeCommandProvider>> {
+        (harness == HarnessId::Omp)
+            .then(|| Arc::new(RawSkillCommands) as Arc<dyn NativeCommandProvider>)
+    }
+
+    fn list_skills(
+        &self,
+        _cwd: String,
+        _disabled: Vec<String>,
+    ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
+        let pending = self.initial_scan.lock().take();
+        async move {
+            if let Some(pending) = pending {
+                let _ = pending.await;
+            }
+            Ok(vec![DiscoveredSkill {
+                name: "review".into(),
+                description: "Review shared files".into(),
+                path: "/shared/review/SKILL.md".into(),
+                scope: "user".into(),
+                source: "agents".into(),
+            }])
+        }
+        .boxed()
+    }
+
+    fn read_text_file(&self, _path: String) -> BoxFuture<'static, Result<String, String>> {
+        async { Ok("Shared review instructions".into()) }.boxed()
+    }
+
+    fn home_dir(&self) -> BoxFuture<'static, Result<String, String>> {
+        NoSkills.home_dir()
+    }
+    fn create_path(
+        &self,
+        parent: String,
+        name: String,
+        is_dir: bool,
+    ) -> BoxFuture<'static, Result<String, String>> {
+        NoSkills.create_path(parent, name, is_dir)
+    }
+    fn write_text_file(
+        &self,
+        path: String,
+        content: String,
+    ) -> BoxFuture<'static, Result<(), String>> {
+        NoSkills.write_text_file(path, content)
+    }
+}
+
+fn setup_cold_file_scan(
+    cx: &mut TestAppContext,
+) -> (
+    Fixture,
+    Arc<FakeAdapter>,
+    futures::channel::oneshot::Sender<()>,
+) {
+    let (release_scan, scan) = futures::channel::oneshot::channel();
+    let fixture = setup_with_skill_sources(
+        cx,
+        Arc::new(ColdFileSkills {
+            initial_scan: Mutex::new(Some(scan)),
+        }),
+    );
+    let omp = FakeAdapter::new(HarnessId::Omp);
+    cx.update(|cx| {
+        fixture.submit.update(cx, |submit, _| {
+            submit.config.registry.register_harness(omp.clone());
+        })
+    });
+    (fixture, omp, release_scan)
+}
+
+#[gpui::test]
+async fn cold_file_skill_classifies_before_consuming_note_cards(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.note_card = Some(monocode_core::notes::NoteComposerCard {
+        id: "note".into(),
+        slug: "policy".into(),
+        title: "Review policy".into(),
+        source_cwd: None,
+        body: "Note instructions".into(),
+    });
+    insert(started, cx);
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review inspect this",
+                Vec::new(),
+                SubmitOptions::default(),
+                cx,
+            )
+        })
+    });
+    assert!(matches!(
+        acceptance,
+        crate::submit::SubmissionAcceptance::Deferred(_)
+    ));
+    cx.run_until_parked();
+    let pending = session("s", cx);
+    assert!(pending.blocks.is_empty());
+    assert!(pending.note_card.is_some());
+    assert!(omp.calls.lock().sends.is_empty());
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(true));
+    assert!(session("s", cx).note_card.is_none());
+    let sent = &omp.calls.lock().sends[0].text;
+    assert!(sent.contains("Shared review instructions"));
+    assert!(sent.contains("Resource directory: /shared/review"));
+    assert!(sent.contains("Note instructions"));
+}
+
+#[gpui::test]
+async fn cold_file_skill_stays_cancelled_after_stop(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.note_card = Some(monocode_core::notes::NoteComposerCard {
+        id: "note".into(),
+        slug: "policy".into(),
+        title: "Review policy".into(),
+        source_cwd: None,
+        body: "Note instructions".into(),
+    });
+    insert(started, cx);
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review inspect this",
+                Vec::new(),
+                SubmitOptions::default(),
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(session("s", cx).blocks.is_empty());
+    cx.update(|cx| {
+        fixture
+            .submit
+            .update(cx, |submit, cx| submit.stop("s", false, cx))
+    });
+    cx.run_until_parked();
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    let stopped = session("s", cx);
+    assert!(stopped.blocks.is_empty());
+    assert_eq!(stopped.note_card.as_ref().unwrap().id, "note");
+    assert!(omp.calls.lock().sends.is_empty());
+    assert!(omp.calls.lock().rewinds.is_empty());
+}
+
+#[gpui::test]
+async fn cold_edited_skill_does_not_replace_a_newer_completed_turn(cx: &mut TestAppContext) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.blocks = vec![
+        Block::new("old-user", BlockRole::User, "Original request"),
+        Block::new("old-answer", BlockRole::Assistant, "Original answer"),
+    ];
+    insert(started, cx);
+    let rejected: Rc<RefCell<Vec<EditedResendRejection>>> = Rc::default();
+    let sink = rejected.clone();
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review edited request",
+                Vec::new(),
+                SubmitOptions {
+                    resend_edited: true,
+                    on_resend_rejected: Some(Rc::new(move |rejection, _| {
+                        sink.borrow_mut().push(rejection)
+                    })),
+                    ..SubmitOptions::default()
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(submit(
+        &fixture,
+        "s",
+        "Newer request",
+        SubmitOptions::default(),
+        cx
+    ));
+    let completed = session("s", cx);
+    assert!(!completed.is_busy());
+    let completed_history = texts(&completed);
+    assert!(completed_history.contains(&(BlockRole::User, "Newer request".into())));
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    assert_eq!(texts(&session("s", cx)), completed_history);
+    assert_eq!(omp.calls.lock().sends.len(), 1);
+    assert!(omp.calls.lock().rewinds.is_empty());
+    assert_eq!(rejected.borrow().len(), 1);
+    assert!(!rejected.borrow()[0].provider_rewound);
+}
+
+#[gpui::test]
+async fn cold_edited_skill_keeps_replaced_history_when_turn_generation_is_unchanged(
+    cx: &mut TestAppContext,
+) {
+    let (fixture, omp, release_scan) = setup_cold_file_scan(cx);
+    let mut started = chat("s", HarnessId::Omp);
+    started.blocks = vec![
+        Block::new("old-user", BlockRole::User, "Original request"),
+        Block::new("old-answer", BlockRole::Assistant, "Original answer"),
+    ];
+    insert(started, cx);
+    let acceptance = cx.update(|cx| {
+        fixture.submit.update(cx, |submit, cx| {
+            submit.submit(
+                "s",
+                "/review edited request",
+                Vec::new(),
+                SubmitOptions {
+                    resend_edited: true,
+                    ..SubmitOptions::default()
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            let generation = sessions.turn_gen("s");
+            sessions.update("s", cx, |session| {
+                session.blocks = vec![
+                    Block::new("replacement-user", BlockRole::User, "Replacement request"),
+                    Block::new(
+                        "replacement-answer",
+                        BlockRole::Assistant,
+                        "Replacement answer",
+                    ),
+                ]
+            });
+            assert_eq!(sessions.turn_gen("s"), generation);
+        })
+    });
+    let replacement_history = texts(&session("s", cx));
+    release_scan.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(acceptance.resolve().await, Ok(false));
+    assert_eq!(texts(&session("s", cx)), replacement_history);
+    assert!(omp.calls.lock().sends.is_empty());
+    assert!(omp.calls.lock().rewinds.is_empty());
 }
 
 #[gpui::test]
@@ -451,6 +742,7 @@ async fn a_failed_turn_reports_the_error_and_parks_the_provider(cx: &mut TestApp
         events: vec![],
         result: Err("boom".into()),
         hold: false,
+        accept: true,
     });
     let (outcomes, on_settled) = recorder();
     submit(
@@ -507,6 +799,46 @@ async fn queues_a_follow_up_while_a_turn_runs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn queues_a_linked_message_for_a_busy_session_with_its_request_id(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    insert(
+        Session {
+            busy: Some(true),
+            ..chat("s", HarnessId::Codex)
+        },
+        cx,
+    );
+    let text = crate::runtime::session_links::link_message_text("p", "Peer", "status?");
+    let accepted = submit(
+        &fixture,
+        "s",
+        &text,
+        SubmitOptions {
+            app_request_id: Some("link-1".into()),
+            follow_up_behavior: Some(FollowUpBehavior::Queue),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert!(accepted);
+    let queued = session("s", cx).queued_messages.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].app_request_id.as_deref(), Some("link-1"));
+
+    // Other app requests to a busy session are still refused.
+    assert!(!submit(
+        &fixture,
+        "s",
+        "plain",
+        SubmitOptions {
+            app_request_id: Some("app-2".into()),
+            ..SubmitOptions::default()
+        },
+        cx,
+    ));
+}
+
+#[gpui::test]
 async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
     let fixture = setup(cx);
     insert(
@@ -537,7 +869,14 @@ async fn steers_a_follow_up_into_the_running_turn(cx: &mut TestAppContext) {
 /// Queue output from the running turn without letting its flush run.
 fn queue_output(id: &str, text: &str, cx: &mut App) {
     Engine::sessions(cx).update(cx, |sessions, cx| {
-        sessions.enqueue_event(id, HarnessEvent::MessageDelta { text: text.into() }, cx);
+        sessions.enqueue_event(
+            id,
+            HarnessEvent::MessageDelta {
+                text: text.into(),
+                append: None,
+            },
+            cx,
+        );
     });
 }
 
@@ -578,6 +917,7 @@ async fn puts_output_that_already_arrived_before_a_submitted_message(cx: &mut Te
     );
 }
 
+#[cfg(feature = "orchestration")]
 #[gpui::test]
 async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut TestAppContext) {
     use crate::orchestration::engine_host::EngineHost;
@@ -607,6 +947,182 @@ async fn puts_output_that_already_arrived_before_orchestrator_guidance(cx: &mut 
         ]
     );
     assert_eq!(fixture.codex.calls.lock().steers.len(), 1);
+}
+
+#[cfg(feature = "orchestration")]
+/// An `EngineHost` over a projects backend that records worktree calls.
+fn worker_host(
+    cx: &mut TestAppContext,
+) -> (
+    Rc<crate::orchestration::engine_host::EngineHost>,
+    Arc<crate::projects::testing::FakeBackend>,
+) {
+    use crate::projects::{ProjectsConfig, ProjectsGlobal};
+    let projects = crate::projects::testing::FakeBackend::new();
+    let backend = projects.clone();
+    cx.update(|cx| {
+        ProjectsGlobal::init(
+            ProjectsConfig {
+                kv: Kv::in_memory(),
+                backend,
+                clock: crate::projects::system_clock(),
+            },
+            cx,
+        )
+    });
+    insert(chat("lead", HarnessId::Codex), cx);
+    let host = Rc::new(crate::orchestration::engine_host::EngineHost {
+        control: None,
+        harness_host: None,
+        owner: String::new(),
+        peers: Rc::new(crate::orchestration::peers::NoPeers),
+    });
+    (host, projects)
+}
+
+#[cfg(feature = "orchestration")]
+#[gpui::test]
+async fn creates_a_worker_checkpoint_before_its_first_turn(cx: &mut TestAppContext) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::tests::{run, task};
+    use crate::orchestration::state::{OrchestrationTask, WorkspacePolicy};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, _projects) = worker_host(cx);
+    let isolated = OrchestrationTask {
+        harness: HarnessId::Codex,
+        model: "codex:default".into(),
+        ..task("a")
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &isolated, cx));
+    cx.run_until_parked();
+    let created = created.now_or_never().unwrap().unwrap();
+    let path = created.workspace.checkout_cwd;
+    assert_eq!(
+        fixture.backend.calls("session_checkpoint_ensure"),
+        [json!({ "sessionId": "a", "cwd": path, "isolated": true })]
+    );
+
+    let shared = OrchestrationTask {
+        id: "b".into(),
+        session_id: "b".into(),
+        workspace_policy: Some(WorkspacePolicy::Shared),
+        ..isolated
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &shared, cx));
+    cx.run_until_parked();
+    assert!(created.now_or_never().unwrap().is_ok());
+    assert_eq!(
+        fixture.backend.calls("session_checkpoint_ensure")[1],
+        json!({ "sessionId": "b", "cwd": CWD })
+    );
+}
+
+#[cfg(feature = "orchestration")]
+#[gpui::test]
+async fn removes_a_new_worktree_when_its_checkpoint_fails(cx: &mut TestAppContext) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::OrchestrationTask;
+    use crate::orchestration::state::tests::{run, task};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, projects) = worker_host(cx);
+    fixture
+        .backend
+        .set_failing("session_checkpoint_ensure", true);
+    let worker = OrchestrationTask {
+        harness: HarnessId::Codex,
+        model: "codex:default".into(),
+        ..task("a")
+    };
+    let created = cx.update(|cx| host.create_worker(&run(vec![]), &worker, cx));
+    cx.run_until_parked();
+    assert!(created.now_or_never().unwrap().is_err());
+    let worktree = &projects.calls("git_orchestration_worktree_create")[0];
+    assert_eq!(
+        projects.calls("git_orchestration_worktree_remove"),
+        [
+            json!({ "cwd": CWD, "path": format!("{CWD}-worktrees/{}", worktree["branch"].as_str().unwrap()) })
+        ]
+    );
+    assert_eq!(
+        projects.calls("git_orchestration_branch_remove"),
+        [json!({ "cwd": CWD, "branch": worktree["branch"] })]
+    );
+    assert!(cx.update(|cx| Engine::sessions(cx).read(cx).get("a").is_none()));
+}
+
+#[cfg(feature = "orchestration")]
+#[gpui::test]
+async fn keeps_an_integrated_worktree_with_outside_files_until_the_lead_discards_them(
+    cx: &mut TestAppContext,
+) {
+    use crate::orchestration::host::OrchestrationHost;
+    use crate::orchestration::state::tests::{run, task};
+    use crate::orchestration::state::{
+        DispatchStage, DispatchState, OrchestrationDispatch, OrchestrationTask, workspace_identity,
+    };
+    use crate::projects::backend::{Worktree, Worktrees};
+    use serde_json::json;
+
+    let fixture = setup(cx);
+    let (host, projects) = worker_host(cx);
+    let path = format!("{CWD}-worktrees/mc-orch-a");
+    let workspace = workspace_identity(CWD, &path, Some("mc/orch-a"));
+    let mut lead = Worktree::new(CWD, Some("main"));
+    lead.is_main = true;
+    projects.set_worktrees(
+        CWD,
+        Ok(Worktrees {
+            worktrees: vec![lead, Worktree::new(path.clone(), Some("mc/orch-a"))],
+            default_root: String::new(),
+        }),
+    );
+    let worker = OrchestrationTask {
+        accepted: true,
+        accepted_dispatch_id: Some("d1".into()),
+        workspace: Some(workspace.clone()),
+        ..task("a")
+    };
+    let mut current = run(vec![worker.clone()]);
+    current.dispatches = Some(vec![OrchestrationDispatch {
+        id: "d1".into(),
+        task_id: "a".into(),
+        session_id: "a".into(),
+        workspace,
+        state: DispatchState::Completed,
+        stage: DispatchStage::Integrated,
+        started_at: 0,
+        updated_at: 0,
+        result: None,
+        error: None,
+        cleanup_error: None,
+        outside_assignment: Some(vec!["coverage/out.json".into()]),
+        ignored_created: None,
+        extra: Extra::new(),
+    }]);
+
+    let kept = cx.update(|cx| host.cleanup_worker(&current, &worker, false, false, cx));
+    cx.run_until_parked();
+    assert_eq!(kept.now_or_never(), Some(Ok(false)));
+    // An integrated dispatch is never applied again.
+    assert!(fixture.backend.calls("session_checkpoint_apply").is_empty());
+    assert!(
+        projects
+            .calls("git_orchestration_worktree_remove")
+            .is_empty()
+    );
+
+    let removed = cx.update(|cx| host.cleanup_worker(&current, &worker, false, true, cx));
+    cx.run_until_parked();
+    assert_eq!(removed.now_or_never(), Some(Ok(true)));
+    assert!(fixture.backend.calls("session_checkpoint_apply").is_empty());
+    assert_eq!(
+        projects.calls("git_orchestration_worktree_remove"),
+        [json!({ "cwd": CWD, "path": path })]
+    );
 }
 
 #[gpui::test]
@@ -685,6 +1201,123 @@ async fn operator_turns_get_app_access_and_cli_instructions(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn ordinary_turns_learn_the_open_session_actions_once(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    monocode_settings::settings_store::save_agent_sessions_enabled(&fixture.kv, true);
+    insert(chat("s", HarnessId::Codex), cx);
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    submit(&fixture, "s", "again", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.starts_with("hello\n\n<monocode_app>"));
+    assert!(sends[0].text.contains("sessions.start"));
+    assert!(sends[0].text.contains("runs its prompt at once"));
+    assert!(
+        sends[0]
+            .text
+            .contains("Run `/Applications/MonoCode.app/Contents/MacOS/monocode app --help`")
+    );
+    assert_eq!(sends[0].session.app_access, Some(true));
+    // The open session actions keep the provider's network policy.
+    assert_eq!(sends[0].session.controls_agents, Some(false));
+    assert_eq!(sends[1].text, "again");
+    assert_eq!(sends[1].session.app_access, Some(true));
+}
+
+#[gpui::test]
+async fn the_review_setting_changes_the_instructions(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    monocode_settings::settings_store::save_agent_sessions_enabled(&fixture.kv, true);
+    monocode_settings::settings_store::save_agent_sessions_review(&fixture.kv, true);
+    insert(chat("s", HarnessId::Codex), cx);
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.contains("waits as an unsent draft"));
+}
+
+#[gpui::test]
+async fn linked_turns_get_link_actions_and_the_loopback_socket(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    let mut peer = chat("t", HarnessId::Codex);
+    peer.title = "API work".into();
+    insert(chat("s", HarnessId::Codex), cx);
+    insert(peer, cx);
+    cx.update(|cx| {
+        Engine::links(cx).update(cx, |links, cx| links.link("s", "t", cx).unwrap());
+    });
+    submit(&fixture, "s", "hello", SubmitOptions::default(), cx);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.contains("Linked sessions: \"API work\" (t)."));
+    assert!(!sends[0].text.contains("sessions.start"));
+    assert_eq!(sends[0].session.app_access, Some(true));
+    assert_eq!(sends[0].session.controls_agents, Some(true));
+}
+
+#[gpui::test]
+async fn a_user_message_resets_the_link_budget_and_an_agent_message_does_not(
+    cx: &mut TestAppContext,
+) {
+    let fixture = setup(cx);
+    insert(chat("s", HarnessId::Codex), cx);
+    insert(chat("t", HarnessId::Codex), cx);
+    let links = cx.update(|cx| Engine::links(cx));
+    links.update(cx, |links, cx| {
+        links.link("s", "t", cx).unwrap();
+        for _ in 0..5 {
+            links.spend("s", "t").unwrap();
+        }
+    });
+    let from_agent = crate::runtime::session_links::link_message_text("s", "S", "ping");
+    submit(&fixture, "t", &from_agent, SubmitOptions::default(), cx);
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 5);
+    submit(
+        &fixture,
+        "t",
+        "from the agent CLI",
+        SubmitOptions {
+            app_request_id: Some("app-s-1".into()),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 5);
+    submit(
+        &fixture,
+        "t",
+        "the user writes",
+        SubmitOptions::default(),
+        cx,
+    );
+    assert_eq!(links.read_with(cx, |links, _| links.sent("s", "t")), 0);
+}
+
+#[gpui::test]
+async fn a_dropped_session_reaches_the_agent_as_portable_history(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    let mut source = chat("src", HarnessId::Codex);
+    source.title = "Auth fix".into();
+    source.blocks = vec![
+        Block::new("u1", BlockRole::User, "Why does login fail?"),
+        Block::new("a1", BlockRole::Assistant, "The cookie is missing."),
+    ];
+    insert(source, cx);
+    insert(chat("s", HarnessId::Codex), cx);
+    let message = crate::submit::chat_context::compose_chat_context(
+        "Continue from this",
+        &[crate::submit::chat_context::ChatContextItem::Session {
+            id: "src".into(),
+            title: "Auth fix".into(),
+        }],
+    );
+    submit(&fixture, "s", &message, SubmitOptions::default(), cx);
+    // The transcript keeps the short tag; the agent gets the history.
+    assert_eq!(session("s", cx).blocks[0].text, message);
+    let sends = &fixture.codex.calls.lock().sends;
+    assert!(sends[0].text.starts_with("Continue from this\n\n<attached_context>\n<session_context id=\"src\" title=\"Auth fix\">\nSource session: \"Auth fix\" (src)."));
+    assert!(sends[0].text.contains("The cookie is missing."));
+    assert!(sends[0].text.contains("/data/context-snapshots/src/a1.md"));
+}
+
+#[gpui::test]
 async fn promotes_a_saved_draft_and_sends_it(cx: &mut TestAppContext) {
     let fixture = setup(cx);
     insert(chat("s", HarnessId::Codex), cx);
@@ -744,7 +1377,15 @@ async fn removes_a_draft_and_discards_a_draft_only_session(cx: &mut TestAppConte
             .backend
             .commands()
             .iter()
-            .any(|command| command.contains("delete"))
+            .any(|command| command == "session_discard_draft")
+    );
+    // A discard is not a delete, so the id stays usable.
+    assert!(
+        !fixture
+            .backend
+            .commands()
+            .iter()
+            .any(|command| command == "session_delete")
     );
     cx.executor()
         .advance_clock(crate::runtime::sessions::PERSIST_DEBOUNCE);
@@ -758,9 +1399,11 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
     fixture.codex.push(Script {
         events: vec![HarnessEvent::MessageDelta {
             text: "working".into(),
+            append: None,
         }],
         result: Ok(()),
         hold: true,
+        accept: true,
     });
     let (outcomes, on_settled) = recorder();
     submit(
@@ -778,6 +1421,8 @@ async fn stop_cancels_the_turn_and_pauses_the_queue(cx: &mut TestAppContext) {
         Engine::sessions(cx).update(cx, |sessions, cx| {
             sessions.update("s", cx, |session| {
                 session.queued_messages = Some(vec![QueuedMessage {
+                    selection: None,
+                    app_request_id: None,
                     id: "q".into(),
                     text: "next".into(),
                     attachments: vec![],
@@ -838,9 +1483,7 @@ async fn compacts_context_or_says_the_provider_cannot(cx: &mut TestAppContext) {
     assert_eq!(fixture.codex.calls.lock().compacts, 1);
 }
 
-#[gpui::test]
-async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut TestAppContext) {
-    let fixture = setup(cx);
+fn switched(fixture: &Fixture, cx: &mut TestAppContext) {
     let mut started = chat("s", HarnessId::Fx);
     started.blocks = vec![
         Block::new("u1", BlockRole::User, "fix the footer"),
@@ -852,6 +1495,28 @@ async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut
             submit.set_model("s", HarnessId::Codex, "codex:default", cx)
         })
     });
+}
+
+fn delivery(session: &Session) -> Option<monocode_core::provider_context::ProviderContextDelivery> {
+    session.provider_context.as_ref()?.delivery.clone()
+}
+
+fn transfer(session: &Session) -> monocode_core::block::HandoffTransfer {
+    session
+        .blocks
+        .iter()
+        .rev()
+        .find_map(|block| block.handoff.as_ref()?.transfer.clone())
+        .unwrap()
+}
+
+#[gpui::test]
+async fn switching_providers_sends_the_shared_history_with_the_next_request(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::block::{TransferMode, TransferStatus};
+    let fixture = setup(cx);
+    switched(&fixture, cx);
     let armed = session("s", cx);
     assert_eq!(armed.harness, HarnessId::Codex);
     assert_eq!(
@@ -874,12 +1539,132 @@ async fn switching_providers_arms_a_handoff_that_the_next_send_delivers(cx: &mut
         .find(|block| block.role == BlockRole::Handoff)
         .unwrap();
     assert_eq!(handoff.handoff.as_ref().unwrap().pending, Some(false));
-    assert!(handoff.text.contains("fix the footer"));
-    assert_eq!(fixture.fx.calls.lock().forgets, ["s"]);
+    assert!(
+        handoff
+            .text
+            .starts_with("Continue with shared history. 2 saved items")
+    );
+    let shown = transfer(&session);
+    assert_eq!(shown.status, TransferStatus::Accepted);
+    assert_eq!(shown.mode, TransferMode::Inline);
+    assert_eq!(shown.included, 2);
+    assert_eq!(delivery(&session).unwrap().status, TransferStatus::Accepted);
+    // The source keeps its conversation; the fresh target starts clean.
+    assert_eq!(fixture.fx.calls.lock().stops, ["s"]);
+    assert!(fixture.fx.calls.lock().forgets.is_empty());
+    assert_eq!(fixture.codex.calls.lock().forgets, ["s"]);
     let sent = &fixture.codex.calls.lock().sends[0].text;
-    assert!(sent.starts_with("You are continuing an existing conversation handed off from fx."));
-    assert!(sent.contains("now the header"));
-    assert!(sent.contains("<handoff>"));
+    assert!(sent.starts_with("Continue this existing MonoCode conversation."));
+    assert!(sent.contains("fix the footer"));
+    assert_eq!(sent.matches("now the header").count(), 1);
+    // The accepted switch reached storage.
+    assert!(
+        fixture
+            .backend
+            .commands()
+            .iter()
+            .any(|command| command == "session_upsert")
+    );
+}
+
+#[gpui::test]
+async fn a_request_during_the_source_turn_waits_with_its_selection(cx: &mut TestAppContext) {
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update("s", cx, |session| session.busy = Some(true))
+        })
+    });
+    let accepted = submit(
+        &fixture,
+        "s",
+        "after the switch",
+        SubmitOptions {
+            follow_up_behavior: Some(FollowUpBehavior::Steer),
+            ..SubmitOptions::default()
+        },
+        cx,
+    );
+    assert!(accepted);
+    let session = session("s", cx);
+    let queued = session.queued_messages.unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0]
+            .selection
+            .as_ref()
+            .map(|selection| selection.harness),
+        Some(HarnessId::Codex)
+    );
+    // The source turn keeps running.
+    assert!(fixture.fx.calls.lock().cancels.is_empty());
+    assert!(fixture.fx.calls.lock().steers.is_empty());
+    assert!(fixture.codex.calls.lock().sends.is_empty());
+}
+
+#[gpui::test]
+async fn an_unacknowledged_switch_waits_for_inspection_without_resending(cx: &mut TestAppContext) {
+    use monocode_core::block::TransferStatus;
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    fixture.codex.push(Script {
+        events: vec![],
+        result: Err("The connection dropped".into()),
+        hold: false,
+        accept: false,
+    });
+    submit(&fixture, "s", "apply it once", SubmitOptions::default(), cx);
+    let recovered = session("s", cx);
+    let saved = delivery(&recovered).unwrap();
+    assert_eq!(saved.status, TransferStatus::Uncertain);
+    assert!(saved.is_submitted() && saved.needs_inspection());
+    assert!(
+        recovered
+            .blocks
+            .iter()
+            .filter(|block| block.role == BlockRole::User)
+            .all(|block| !block.is_draft())
+    );
+    assert_eq!(transfer(&recovered).needs_inspection, Some(true));
+    assert_eq!(fixture.codex.calls.lock().stops, ["s"]);
+
+    let accepted = submit(&fixture, "s", "next request", SubmitOptions::default(), cx);
+    assert!(!accepted);
+    assert_eq!(fixture.codex.calls.lock().sends.len(), 1);
+    let inspected = session("s", cx);
+    assert!(delivery(&inspected).is_none());
+    assert_eq!(transfer(&inspected).inspection_confirmed, Some(true));
+    assert!(
+        inspected
+            .blocks
+            .iter()
+            .any(|block| block.text == crate::submit::provider_switch::INSPECTION_SAVED)
+    );
+}
+
+#[gpui::test]
+async fn a_switch_that_fails_before_dispatch_returns_the_request_as_a_draft(
+    cx: &mut TestAppContext,
+) {
+    use monocode_core::block::TransferStatus;
+    let fixture = setup(cx);
+    switched(&fixture, cx);
+    fixture.backend.set_failing("session_upsert", true);
+    submit(&fixture, "s", "not yet sent", SubmitOptions::default(), cx);
+    let failed = session("s", cx);
+    assert!(fixture.codex.calls.lock().sends.is_empty());
+    let saved = delivery(&failed).unwrap();
+    assert_eq!(saved.status, TransferStatus::Uncertain);
+    assert_eq!(saved.failed_before_submission, Some(true));
+    assert!(
+        failed
+            .blocks
+            .iter()
+            .any(|block| block.role == BlockRole::User && block.is_draft())
+    );
+    // The switch stays armed for a retry.
+    assert!(failed.pending_switch.is_some());
 }
 
 #[gpui::test]
@@ -1257,6 +2042,86 @@ async fn reports_orchestration_refusals_and_managed_unavailability(cx: &mut Test
             "Session is unavailable or already running"
         )]
     );
+}
+
+/// A run led by `lead` with `worker` as one of its agents.
+struct WorkerRun;
+
+impl SubmitOrchestrationHooks for WorkerRun {
+    fn led_run_status(&self, session_id: &str, _cx: &App) -> Option<String> {
+        (session_id == "lead").then(|| "active".to_string())
+    }
+
+    fn run_status_for_session(&self, session_id: &str, _cx: &App) -> Option<String> {
+        matches!(session_id, "lead" | "worker").then(|| "active".to_string())
+    }
+}
+
+fn edit_script() -> Script {
+    let paths = Some(vec!["src/a.rs".to_string()]);
+    Script {
+        events: vec![
+            HarnessEvent::ToolStarted {
+                agent_model: None,
+                call_id: "c".into(),
+                title: "Edit".into(),
+                kind: Some("edit".into()),
+                status: None,
+                background: None,
+                preview: None,
+                paths: paths.clone(),
+            },
+            HarnessEvent::ToolUpdated {
+                agent_model: None,
+                call_id: "c".into(),
+                title: Some("Edit".into()),
+                kind: Some("edit".into()),
+                status: Some("completed".into()),
+                detail: None,
+                preview: None,
+                paths,
+            },
+            HarnessEvent::MessageCompleted,
+        ],
+        result: Ok(()),
+        hold: false,
+        accept: true,
+    }
+}
+
+#[gpui::test]
+async fn records_worker_edits_but_not_the_leads_or_a_worker_turn_checkpoint(
+    cx: &mut TestAppContext,
+) {
+    let fixture = setup(cx);
+    cx.update(|cx| {
+        fixture.submit.update(cx, |submit, _| {
+            submit.set_peers(|peers| peers.orchestration = Rc::new(WorkerRun))
+        })
+    });
+    insert(chat("worker", HarnessId::Codex), cx);
+    insert(chat("lead", HarnessId::Codex), cx);
+    let checkpoint_calls = |fixture: &Fixture| -> Vec<String> {
+        fixture
+            .backend
+            .commands()
+            .into_iter()
+            .filter(|command| command.starts_with("session_checkpoint_"))
+            .collect()
+    };
+
+    fixture.codex.push(edit_script());
+    submit(&fixture, "worker", "edit", SubmitOptions::default(), cx);
+    // The worker got its checkpoint before its first turn, so the turn
+    // creates none. Its edits are still recorded.
+    assert_eq!(
+        checkpoint_calls(&fixture),
+        ["session_checkpoint_prepare", "session_checkpoint_capture"]
+    );
+
+    fixture.codex.push(edit_script());
+    submit(&fixture, "lead", "edit", SubmitOptions::default(), cx);
+    assert_eq!(checkpoint_calls(&fixture).len(), 2);
 }
 
 #[derive(Default)]

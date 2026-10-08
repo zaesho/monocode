@@ -14,6 +14,7 @@
 
 mod approval_ui;
 mod attachments;
+mod context;
 mod fake;
 mod live;
 mod protocol;

@@ -10,11 +10,11 @@ use std::time::Duration;
 #[cfg(not(target_os = "macos"))]
 use gpui::prelude::FluentBuilder as _;
 #[cfg(not(target_os = "macos"))]
-use gpui::{AppContext as _, Entity, Subscription};
+use gpui::{AppContext as _, Entity};
 use gpui::{
     Context, Image, ImageFormat, InteractiveElement as _, IntoElement, ObjectFit,
     ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Task, Window, canvas, div, img,
+    Subscription, Task, Window, canvas, div, img,
 };
 use gpui_component::WindowExt as _;
 #[cfg(not(target_os = "macos"))]
@@ -23,7 +23,6 @@ use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use monocode_ui::widgets::button;
 use monocode_ui::widgets::tooltip;
 use monocode_ui::{Theme, u};
-#[cfg(not(target_os = "macos"))]
 use std::cell::Cell;
 #[cfg(target_os = "linux")]
 use std::cell::RefCell;
@@ -75,8 +74,15 @@ pub struct InboxMediaView {
     alt: String,
     state: LoadState,
     natural_size: Option<(u32, u32)>,
+    /// The video drew since the last visibility tick.
+    painted: Rc<Cell<bool>>,
+    /// A placement check is waiting for the next frame.
+    recheck_pending: Rc<Cell<bool>>,
+    /// The window the video last drew in.
+    window: Option<gpui::AnyWindowHandle>,
     _load: Task<()>,
     _visibility: Task<()>,
+    _keystrokes: Subscription,
     #[cfg(not(target_os = "macos"))]
     seek: Entity<SliderState>,
     #[cfg(not(target_os = "macos"))]
@@ -206,8 +212,12 @@ impl InboxMediaView {
             alt,
             state: LoadState::Loading,
             natural_size: None,
+            painted: Rc::default(),
+            recheck_pending: Rc::default(),
+            window: None,
             _load: load,
             _visibility: visibility,
+            _keystrokes: Self::watch_keystrokes(cx),
             #[cfg(not(target_os = "macos"))]
             seek,
             #[cfg(not(target_os = "macos"))]
@@ -235,7 +245,6 @@ impl InboxMediaView {
                     .update(cx, |this, cx| match &this.state {
                         LoadState::Loading => true,
                         LoadState::Video(video) => {
-                            video.suspend_if_idle(Duration::from_millis(250));
                             let size = video.natural_size();
                             if size != this.natural_size {
                                 this.natural_size = size;
@@ -243,6 +252,21 @@ impl InboxMediaView {
                             }
                             #[cfg(not(target_os = "macos"))]
                             cx.notify();
+                            if this.painted.replace(false) {
+                                if redraws_every_frame(video) {
+                                    // The player's own controls start playback
+                                    // without a GPUI event. A redraw resumes the
+                                    // per-frame placement a playing video needs;
+                                    // while it already runs this changes nothing.
+                                    cx.notify();
+                                } else {
+                                    this.recheck_placement(video.clone(), cx);
+                                }
+                            } else {
+                                // A whole tick without drawing: the page left
+                                // the window, or the window stopped drawing.
+                                video.suspend_if_idle(Duration::from_millis(250));
+                            }
                             true
                         }
                         _ => false,
@@ -251,6 +275,34 @@ impl InboxMediaView {
                 {
                     break;
                 }
+            }
+        })
+    }
+
+    /// The visibility tick's check for a paused video: see [`schedule_recheck`].
+    fn recheck_placement(&self, video: Rc<NativeVideo>, cx: &mut Context<Self>) {
+        let Some(handle) = self.window else {
+            return;
+        };
+        let view = cx.entity_id();
+        let pending = self.recheck_pending.clone();
+        handle
+            .update(cx, |_, window, _| {
+                schedule_recheck(window, video, view, &pending)
+            })
+            .ok();
+    }
+
+    /// A key press can switch pages, so a paused video checks its placement
+    /// in the next frame and hides with the page instead of on the next tick.
+    fn watch_keystrokes(cx: &mut Context<Self>) -> Subscription {
+        cx.observe_keystrokes(|this, _, window, cx| {
+            if let LoadState::Video(video) = &this.state
+                && this.window == Some(window.window_handle())
+                && !redraws_every_frame(video)
+            {
+                let view = cx.entity_id();
+                schedule_recheck(window, video.clone(), view, &this.recheck_pending);
             }
         })
     }
@@ -292,8 +344,12 @@ impl InboxMediaView {
                     alt: self.alt.clone(),
                     state: LoadState::Video(video.clone()),
                     natural_size: video.natural_size(),
+                    painted: Rc::default(),
+                    recheck_pending: Rc::default(),
+                    window: None,
                     _load: Task::ready(()),
                     _visibility: Self::watch_visibility(cx),
+                    _keystrokes: Self::watch_keystrokes(cx),
                     seek: self.seek.clone(),
                     _seek: None,
                     volume: self.volume.clone(),
@@ -438,8 +494,7 @@ impl Render for FullscreenPlayer {
 
 impl Render for InboxMediaView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        #[cfg(target_os = "macos")]
-        let _ = window;
+        self.window = Some(window.window_handle());
         let theme = Theme::of(cx).clone();
         let src = self.src.clone();
         let services = self.services.clone();
@@ -495,6 +550,9 @@ impl Render for InboxMediaView {
                     .natural_size
                     .map_or(16. / 9., |(width, height)| width as f32 / height as f32);
                 let weak = cx.entity().downgrade();
+                let painted = self.painted.clone();
+                let recheck = self.recheck_pending.clone();
+                let view = cx.entity_id();
                 #[cfg(target_os = "linux")]
                 let frame_store = self.video_frame.clone();
                 #[cfg(not(target_os = "macos"))]
@@ -712,11 +770,42 @@ impl Render for InboxMediaView {
                                 );
                             }
                         }
-                        // Hiding before the next paint removes a cached player's
-                        // native view as soon as this page leaves the window.
-                        let video = video.clone();
-                        window.on_next_frame(move |_, _| video.hide());
-                        window.request_animation_frame();
+                        painted.set(true);
+                        if redraws_every_frame(&video) {
+                            // Hiding before the next paint removes a cached
+                            // player's native view as soon as this page
+                            // leaves the window.
+                            let video = video.clone();
+                            window.on_next_frame(move |_, _| video.hide());
+                            window.request_animation_frame();
+                        } else {
+                            // A paused video does not redraw every frame.
+                            // A click anywhere can switch pages, on press or
+                            // on release, so it checks its placement in the
+                            // frame after each; the visibility tick and key
+                            // presses cover the rest.
+                            let (down_video, down_recheck) = (video.clone(), recheck.clone());
+                            window.on_mouse_event(
+                                move |_: &gpui::MouseDownEvent, phase, window, _| {
+                                    if phase == gpui::DispatchPhase::Capture {
+                                        schedule_recheck(
+                                            window,
+                                            down_video.clone(),
+                                            view,
+                                            &down_recheck,
+                                        );
+                                    }
+                                },
+                            );
+                            let video = video.clone();
+                            window.on_mouse_event(
+                                move |_: &gpui::MouseUpEvent, phase, window, _| {
+                                    if phase == gpui::DispatchPhase::Capture {
+                                        schedule_recheck(window, video.clone(), view, &recheck);
+                                    }
+                                },
+                            );
+                        }
                     },
                 )
                 .w_full();
@@ -763,6 +852,32 @@ impl Render for InboxMediaView {
             }
         }
     }
+}
+
+/// Whether the player needs a redraw every frame: while it plays, and
+/// always on Linux, where GPUI paints the decoded frames itself.
+fn redraws_every_frame(video: &NativeVideo) -> bool {
+    cfg!(target_os = "linux") || video.is_playing()
+}
+
+/// Hides the native player and redraws `view` in the next frame, once per
+/// frame. The redraw places the player again in that same frame if the view
+/// still draws; if its page left the window, the player stays hidden.
+fn schedule_recheck(
+    window: &Window,
+    video: Rc<NativeVideo>,
+    view: gpui::EntityId,
+    pending: &Rc<Cell<bool>>,
+) {
+    if pending.replace(true) {
+        return;
+    }
+    let pending = pending.clone();
+    window.on_next_frame(move |_, cx| {
+        pending.set(false);
+        video.hide();
+        cx.notify(view);
+    });
 }
 
 #[cfg(not(target_os = "macos"))]

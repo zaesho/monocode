@@ -4,8 +4,16 @@
 //! The TypeScript defaulted `changelog` to the bundled CHANGELOG.md. Here
 //! callers pass `BUNDLED_CHANGELOG` for that.
 
+use std::sync::LazyLock;
+
 pub use monocode_layout::ReleaseNotesTabSource;
 use regex::Regex;
+
+static NEXT_HEADING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^## ").expect("valid heading pattern"));
+static RELEASE_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$").expect("valid date pattern")
+});
 
 /// The repository's CHANGELOG.md, compiled in as the web build bundled it.
 pub const BUNDLED_CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
@@ -38,8 +46,7 @@ pub fn release_notes_for_version(version: &str, changelog: &str) -> Option<Relea
     .expect("valid heading pattern");
     let found = heading.find(changelog)?;
 
-    let next_heading = Regex::new(r"(?m)^## ").expect("valid heading pattern");
-    let end = next_heading
+    let end = NEXT_HEADING
         .find_at(changelog, found.end())
         .map_or(changelog.len(), |next| next.start());
     let markdown = changelog[found.start()..end].trim_end().to_string();
@@ -97,8 +104,7 @@ const MONTHS: [&str; 12] = [
 /// `formatReleaseDate`: `2026-09-01` becomes `1 Sep 2026`. Anything else comes
 /// back unchanged.
 pub fn format_release_date(iso: &str) -> String {
-    let pattern = Regex::new(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$").expect("valid date pattern");
-    let Some(captures) = pattern.captures(iso) else {
+    let Some(captures) = RELEASE_DATE.captures(iso) else {
         return iso.to_string();
     };
     let month_number: usize = captures[2].parse().unwrap_or(0);

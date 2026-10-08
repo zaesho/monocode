@@ -58,10 +58,38 @@ pub fn format_relative(value: i64, now: i64) -> String {
     if days < 7 {
         return format!("{days}d");
     }
-    monocode_platform::date_time::format_local(
-        value,
-        monocode_platform::date_time::DateTimeStyle::MonthDay,
-    )
+    month_day(value)
+}
+
+/// The month and day label for an epoch-ms time, remembered per time. The
+/// sidebar formats one per older session card, and the native formatter is
+/// slow on some platforms. The labels follow the OS locale and time zone, so
+/// the memo starts over each minute: after the user changes either, the
+/// cards show the new format within a minute (the sidebar's clock redraws
+/// them every 30 seconds).
+fn month_day(value: i64) -> String {
+    thread_local! {
+        static LABELS: std::cell::RefCell<(i64, std::collections::HashMap<i64, String>)> =
+            Default::default();
+    }
+    let minute = now_ms() / 60_000;
+    LABELS.with(|labels| {
+        let mut labels = labels.borrow_mut();
+        let (read_at, labels) = &mut *labels;
+        if *read_at != minute || labels.len() > 4096 {
+            *read_at = minute;
+            labels.clear();
+        }
+        if let Some(label) = labels.get(&value) {
+            return label.clone();
+        }
+        let label = monocode_platform::date_time::format_local(
+            value,
+            monocode_platform::date_time::DateTimeStyle::MonthDay,
+        );
+        labels.insert(value, label.clone());
+        label
+    })
 }
 
 /// `formatGitLabel` from Sidebar.tsx.

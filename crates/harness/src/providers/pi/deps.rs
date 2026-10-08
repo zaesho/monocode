@@ -6,7 +6,9 @@ use serde_json::Value;
 pub use crate::core::native_commands::{
     NativeCommand, NativeSubcommand, native_command_invocation,
 };
-pub use monocode_core::reducer::{extract_tool_preview, join_stream_text, title_from_tool_input};
+pub use monocode_core::reducer::{
+    extract_tool_preview, join_stream_text_into, title_from_tool_input,
+};
 
 /// `Record<string, unknown>`.
 pub type Rec = monocode_core::reducer::Record;

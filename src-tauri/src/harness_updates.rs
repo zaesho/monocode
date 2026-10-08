@@ -25,7 +25,7 @@ pub async fn harness_update(
     binary_path: Option<String>,
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
-        harness_updates::harness_update(command, binary_provider, binary_path)
+        harness_updates::harness_update(command, binary_provider, binary_path).map(|_| ())
     })
     .await
     .map_err(|e| e.to_string())?

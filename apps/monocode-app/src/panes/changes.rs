@@ -15,11 +15,29 @@ pub fn view(window: &mut Window, cx: &mut App) -> Option<AnyView> {
         Some(cx.new(|cx| Changes::new(workspace, window, cx)).into())
     })
 }
+/// What `refresh` reads from `Sessions`: the active session's identity,
+/// project, working copy, and harness.
+type SessionsKey = Option<(String, String, Option<String>, monocode_core::HarnessId)>;
+
+fn sessions_key(workspace: &Workspace, cx: &App) -> SessionsKey {
+    workspace.active_session_ref(cx).map(|session| {
+        (
+            session.id.clone(),
+            session.cwd.clone(),
+            session.worktree_cwd.clone(),
+            session.harness,
+        )
+    })
+}
+
 struct Changes {
     workspace: Entity<Workspace>,
     panel: Entity<GitChangesPanel>,
     cwd: String,
     selection: Option<Selection>,
+    /// [`sessions_key`] at the last session change. Streamed text changes
+    /// none of it, and the tab stays alive after it is hidden.
+    sessions_key: Option<SessionsKey>,
     _events: Subscription,
     _subscriptions: Vec<Subscription>,
     _remote_watch: Option<(monocode_settings::Subscription, Task<()>)>,
@@ -88,7 +106,9 @@ impl Changes {
 
     fn sync(&mut self, cx: &mut Context<Self>) {
         let workspace = self.workspace.read(cx);
-        let harness = workspace.active_session(cx).map(|session| session.harness);
+        let harness = workspace
+            .active_session_ref(cx)
+            .map(|session| session.harness);
         let selection = Selection::from_tab(workspace.active_tab(), &self.cwd);
         let changed = self.selection.as_ref() != Some(&selection);
         self.panel.update(cx, |panel, cx| {
@@ -147,7 +167,11 @@ impl Changes {
                 &engine.sessions.clone(),
                 window,
                 |this, _, window, cx| {
-                    this.refresh(window, cx);
+                    let key = sessions_key(this.workspace.read(cx), cx);
+                    if this.sessions_key.as_ref() != Some(&key) {
+                        this.sessions_key = Some(key);
+                        this.refresh(window, cx);
+                    }
                 },
             ));
         }
@@ -184,6 +208,7 @@ impl Changes {
             panel,
             cwd,
             selection: None,
+            sessions_key: None,
             _events: events,
             _subscriptions: subscriptions,
             _remote_watch: remote_watch,

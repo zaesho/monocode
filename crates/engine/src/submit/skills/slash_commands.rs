@@ -154,10 +154,10 @@ fn is_skill_query(typed: &str) -> bool {
         return true;
     }
     let word = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
-    match typed.split_once(':') {
-        None => typed.chars().all(word),
-        Some((head, tail)) => !head.is_empty() && head.chars().all(word) && tail.chars().all(word),
-    }
+    let segments: Vec<_> = typed.split(':').collect();
+    segments.iter().enumerate().all(|(index, segment)| {
+        segment.chars().all(word) && (!segment.is_empty() || index + 1 == segments.len())
+    })
 }
 
 /// `replaceSlashToken`.

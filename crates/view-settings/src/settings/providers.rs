@@ -1,6 +1,6 @@
 //! Port of `ProvidersPage`, `ProviderRow`, and `ProjectScopeIcon` in
-//! SettingsView.tsx. The accounts card at the top is a slot the accounts
-//! module fills.
+//! SettingsView.tsx. The accounts card at the top and the CLI updates card
+//! after the Agent CLIs are slots the accounts module fills.
 
 use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
@@ -199,6 +199,7 @@ pub struct ProvidersSection {
     model_selects: BTreeMap<HarnessId, Entity<Select>>,
     binaries: BTreeMap<HarnessId, Entity<BinaryControl>>,
     accounts: Option<AnyView>,
+    harness_updates: Option<AnyView>,
     _watch: (Vec<monocode_settings::Subscription>, Task<()>),
     _subscriptions: Vec<Subscription>,
 }
@@ -265,6 +266,11 @@ impl ProvidersSection {
             .accounts
             .clone()
             .map(|build| build(slot, window, cx));
+        let harness_updates = ctx
+            .hosts
+            .harness_updates
+            .clone()
+            .map(|build| build(slot, window, cx));
         let watch = watch_keys(
             &kv,
             &[
@@ -295,6 +301,7 @@ impl ProvidersSection {
             model_selects,
             binaries,
             accounts,
+            harness_updates,
             ctx,
             _watch: watch,
             _subscriptions: Vec::new(),
@@ -643,12 +650,23 @@ impl Render for ProvidersSection {
                     )
                     .into_any_element(),
             });
+        // `HarnessUpdatesGroup` is the `harness-updates` card, which the
+        // accounts module fills. Without it a placeholder keeps the search
+        // target.
+        let harness_updates = match self.harness_updates.clone() {
+            Some(view) => view.into_any_element(),
+            None => group(&reveal, "CLI updates")
+                .id("harness-updates")
+                .description("MonoCode compares each installed CLI with its newest release and updates it with the CLI's own updater.")
+                .into_any_element(),
+        };
         div()
             .flex()
             .flex_col()
             .child(accounts)
             .child(usage_display)
             .child(clis)
+            .child(harness_updates)
             .child(advanced)
     }
 }

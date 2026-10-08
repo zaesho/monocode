@@ -37,7 +37,7 @@ use crate::composer_host::SessionComposerHost;
 use crate::session_threads::SessionOrchestration;
 use crate::session_toolbar::SessionToolbar;
 
-#[derive(Default)]
+#[derive(Default, PartialEq)]
 struct HostModels {
     models: BTreeMap<HarnessId, Vec<AgentModel>>,
     selected: Option<AgentModel>,
@@ -55,10 +55,12 @@ struct HostModelSource {
 }
 
 impl HostModelSource {
-    fn sync(&self, remote: &Entity<RemoteSession>, cx: &App) {
+    /// Read the host's models. Returns whether they changed: the composer's
+    /// model picker reads them while it draws, so the pane redraws it then.
+    fn sync(&self, remote: &Entity<RemoteSession>, cx: &App) -> bool {
         let session = remote.read(cx);
         let selection = session.configuration();
-        *self.models.borrow_mut() = HostModels {
+        let next = HostModels {
             models: monocode_core::HARNESSES
                 .into_iter()
                 .map(|harness| {
@@ -79,6 +81,21 @@ impl HostModelSource {
             machine_name: session.machine().name.clone(),
         };
         *self.session.borrow_mut() = Some(remote.downgrade());
+        let changed = *self.models.borrow() != next;
+        if changed {
+            *self.models.borrow_mut() = next;
+        }
+        changed
+    }
+
+    /// Forget the host's models. Returns whether there were any.
+    fn clear(&self) -> bool {
+        *self.session.borrow_mut() = None;
+        let changed = *self.models.borrow() != HostModels::default();
+        if changed {
+            *self.models.borrow_mut() = HostModels::default();
+        }
+        changed
     }
 }
 
@@ -261,8 +278,12 @@ pub struct RemotePane {
     focused: bool,
     visible: bool,
     opening: bool,
+    /// `Sessions::session_revision` of the local shell session at the last
+    /// sync, to skip other sessions' changes.
+    shell_revision: u64,
+    /// Redraws the usage-limit countdown every 30 seconds while it shows.
+    usage_tick: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
-    _settings_watch: Option<(monocode_settings::Subscription, Task<()>)>,
 }
 
 impl RemotePane {
@@ -320,7 +341,13 @@ impl RemotePane {
         let mut subscriptions = vec![
             cx.subscribe_in(&view, window, Self::on_event),
             cx.subscribe_in(&transcript, window, Self::on_card_event),
-            cx.observe_in(&sessions, window, |this, _, window, cx| {
+            cx.observe_in(&sessions, window, |this, sessions, window, cx| {
+                // Every session's change notifies; this pane reads only its
+                // own shell session from `Sessions`.
+                let revision = sessions.read(cx).session_revision(&this.session_id);
+                if revision != 0 && revision == this.shell_revision {
+                    return;
+                }
                 this.sync(window, cx)
             }),
             cx.observe(&reveals, |this, _, cx| {
@@ -328,12 +355,23 @@ impl RemotePane {
                 this.reveal_search(cx);
             }),
         ];
-        if let Some(remote) = RemoteGlobal::try_global(cx) {
-            subscriptions.push(cx.observe_in(
-                &remote.connections.clone(),
-                window,
-                |this, _, window, cx| this.sync(window, cx),
-            ));
+        if let Some((connections, remote_sessions)) = RemoteGlobal::try_global(cx)
+            .map(|remote| (remote.connections.clone(), remote.sessions.clone()))
+        {
+            subscriptions.push(cx.observe_in(&connections, window, |this, _, window, cx| {
+                this.sync(window, cx)
+            }));
+            subscriptions.push(
+                cx.observe_in(&remote_sessions, window, |this, _, window, cx| {
+                    this.sync(window, cx)
+                }),
+            );
+        }
+        // The composer docks when the tab splits.
+        if let Some(workspace) = workspace.upgrade() {
+            subscriptions.push(cx.observe_in(&workspace, window, |this, _, window, cx| {
+                this.sync(window, cx)
+            }));
         }
         let mut pane = Self {
             session_id,
@@ -354,35 +392,27 @@ impl RemotePane {
             focused: false,
             visible: true,
             opening: false,
+            shell_revision: 0,
+            usage_tick: None,
             _subscriptions: subscriptions,
-            _settings_watch: None,
         };
-        if let Some(services) = AppServices::try_global(cx) {
-            let (tx, rx) = async_channel::bounded(1);
-            let subscription = services.kv.subscribe(move |change| {
-                if change.key.starts_with("monocode.") && !change.key.contains("draft") {
-                    let _ = tx.try_send(());
-                }
-            });
-            let watch = cx.spawn_in(window, async move |this, cx| {
-                while rx.recv().await.is_ok() {
-                    if this
-                        .update_in(cx, |this, window, cx| this.sync(window, cx))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-            pane._settings_watch = Some((subscription, watch));
-        }
+        // Settings (`monocode.` keys and the `monocode:` project records:
+        // chat backgrounds, tab-group labels and colors), project marks, and
+        // the model catalog the transcript names models from. Drafts do not
+        // count.
+        pane._subscriptions.push(crate::revisions::observe_in(
+            window,
+            cx,
+            |this, window, cx| this.sync(window, cx),
+        ));
         pane.sync(window, cx);
         pane
     }
 
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sessions = Engine::sessions(cx);
-        let shell = sessions.read(cx).get(&self.session_id).cloned();
+        let shell = sessions.read(cx).snapshot(&self.session_id);
+        self.shell_revision = sessions.read(cx).session_revision(&self.session_id);
         if shell.is_none() && !self.opening {
             self.opening = true;
             sessions
@@ -422,8 +452,11 @@ impl RemotePane {
             },
             ..RemoteSessionProps::default()
         };
+        let models_changed = match &remote {
+            Some(remote) => self.models.sync(remote, cx),
+            None => self.models.clear(),
+        };
         if let Some(remote) = &remote {
-            self.models.sync(remote, cx);
             let remote = remote.read(cx);
             let status = remote.status();
             let features = remote.features();
@@ -445,25 +478,23 @@ impl RemotePane {
                 failed_turn: status.failed_draft.map(|draft| FailedTurn { draft }),
                 error: status.error,
                 catalog_problem: status.catalog_problem,
+                inspection: status.inspection,
             };
             props.session = Some(Arc::new(remote.session(cx)));
-        } else {
-            *self.models.session.borrow_mut() = None;
-            *self.models.models.borrow_mut() = HostModels::default();
         }
-        if let Some(services) = AppServices::try_global(cx) {
-            let appearance = monocode_settings::load_app_settings(
-                &services.kv,
-                monocode_core::platform::Platform::current(),
-            )
-            .appearance;
+        if AppServices::try_global(cx).is_some() {
+            // The session panes' cached config: the stored layout and anchor
+            // and the catalog, parsed and copied once per settings change.
+            let base = crate::session_pane::transcript_config(cx);
             props.transcript = TranscriptConfig {
-                layout: appearance.transcript_layout,
-                anchor_prompts: appearance.transcript_anchor,
-                catalog: Arc::new(services.catalog.snapshot()),
+                layout: base.layout,
+                anchor_prompts: base.anchor_prompts,
+                catalog: base.catalog,
                 can_add_to_chat: true,
                 ..TranscriptConfig::default()
             };
+        }
+        if let Some(services) = AppServices::try_global(cx) {
             props.model_controls_beside =
                 monocode_settings::settings_store::load_model_controls(&services.kv)
                     == ModelControls::Beside;
@@ -517,6 +548,11 @@ impl RemotePane {
         if self.view.read(cx).props() != &props {
             self.view
                 .update(cx, |view, cx| view.set_props(props, window, cx));
+        } else if models_changed {
+            // The model pill and picker read the host's models through
+            // `HostModelSource`; no prop changed, so redraw the composer.
+            let composer = self.view.read(cx).composer().clone();
+            composer.update(cx, |_, cx| cx.notify());
         }
         self.reveal_search(cx);
     }
@@ -762,6 +798,9 @@ impl RemotePane {
                         NoticeAction::RetryCatalog => {
                             monocode_engine::remote::NoticeAction::RetryCatalog
                         }
+                        NoticeAction::ConfirmInspection => {
+                            monocode_engine::remote::NoticeAction::ConfirmInspection
+                        }
                     };
                     remote.update(cx, |remote, cx| remote.run_notice_action(action, cx));
                 }
@@ -794,8 +833,8 @@ impl RemotePane {
 }
 
 impl Render for RemotePane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync(window, cx);
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // `sync` runs from the observers of everything it reads, not here.
         let composer = self.view.read(cx).composer().clone();
         let band = self.bounds.get().and_then(|pane| {
             composer.read(cx).bounds().map(|composer| {
@@ -815,6 +854,27 @@ impl Render for RemotePane {
             .session
             .as_ref()
             .and_then(|session| session.usage_limit);
+        // "Resets in 4h 42m" counts down: redraw every 30 seconds while a
+        // reset time shows, like the local `UsageLimitNotice`.
+        let counting = usage.is_some_and(|limit| {
+            limit
+                .resets_at
+                .is_some_and(|at| at > monocode_engine::remote::now_ms())
+        });
+        if !counting {
+            self.usage_tick = None;
+        } else if self.usage_tick.is_none() {
+            self.usage_tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(30))
+                        .await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
         let usage_bar = usage.and_then(|limit| {
             let remote = self.remote.clone()?;
             let enabled = remote.read(cx).online() && !remote.read(cx).busy();
@@ -885,6 +945,9 @@ impl Render for RemotePane {
             .min_h_0()
             .min_w_0()
             .child(self.bounds.probe())
+            .child(crate::session_pane::clear_file_drag_on_exit(
+                composer.downgrade(),
+            ))
             .children(self.remote.as_ref().map(|_| self.background.clone()))
             .children(self.remote.as_ref().map(|_| self.toolbar.clone()))
             .children(usage_bar)

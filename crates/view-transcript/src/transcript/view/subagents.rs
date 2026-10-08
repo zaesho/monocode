@@ -2,6 +2,7 @@
 //! AgentTranscript.tsx. A row is a mascot, a name, and how far the agent
 //! got; clicking it opens the agent's own trail underneath.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,28 @@ use super::style::{MarkdownVariant, TextSizes as _};
 use super::{MarkdownSlot, TranscriptView, eid};
 
 impl TranscriptView {
+    /// A run's steps as transcript blocks, made once per version of the run's
+    /// block. Rebuilding them each frame would copy every step's text and
+    /// preview and give the rows new blocks to compare.
+    fn step_blocks(&mut self, block: &BlockRef) -> Rc<[BlockRef]> {
+        if let Some((source, steps)) = self.step_blocks.get(&block.id)
+            && Arc::ptr_eq(source, block)
+        {
+            return steps.clone();
+        }
+        let steps: Rc<[BlockRef]> = block
+            .agent_run
+            .as_ref()
+            .map(|run| run.steps.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .map(|step| Arc::new(agent_step_block(step)))
+            .collect();
+        self.step_blocks
+            .insert(block.id.clone(), (block.clone(), steps.clone()));
+        steps
+    }
+
     /// `SubagentStack`: one row per delegated run.
     pub(super) fn render_subagent_stack(
         &mut self,
@@ -63,12 +86,13 @@ impl TranscriptView {
         let brief = subagent_brief(block);
         let model = subagent_model_name(block, &self.config.catalog);
         let active = live && state == ToolCallState::Pending;
+        // Borrow the trail: this runs every frame while the row is on screen.
         let steps = block
             .agent_run
             .as_ref()
-            .map(|run| run.steps.clone())
+            .map(|run| run.steps.as_slice())
             .unwrap_or_default();
-        let status = subagent_status_line(block, &steps);
+        let status = subagent_status_line(block, steps);
         let report = subagent_report(block);
         let failed = state == ToolCallState::Rejected;
         let theme = Theme::of(cx).clone();
@@ -79,12 +103,7 @@ impl TranscriptView {
                 .min_w_0()
                 .font_family(theme.fonts.sans.clone())
                 .text_sm_ui()
-                .child(shimmer(
-                    eid(key, &format!("agent-name:{}", block.id)),
-                    name.clone(),
-                    Duration::from_millis(1600),
-                    &theme,
-                ))
+                .child(shimmer(name.clone(), Duration::from_millis(1600), &theme))
                 .into_any_element()
         } else {
             let ink = if failed {
@@ -139,12 +158,7 @@ impl TranscriptView {
             ToolCallState::Pending => theme.content(0.7),
             ToolCallState::Accepted => theme.content(0.45),
         };
-        let mascot_el = mascot(
-            eid(key, &format!("mascot:{}", block.id)),
-            &name,
-            mascot_color,
-            active,
-        );
+        let mascot_el = mascot(&name, mascot_color, active);
 
         // A run without a step has nothing to open into. The row keeps its
         // place, so the chevron arriving later moves nothing.
@@ -195,10 +209,7 @@ impl TranscriptView {
         if open {
             // The run's trail as transcript blocks, grouped the way the main
             // trail is. No scroll window of its own: each live phase keeps one.
-            let step_blocks: Vec<BlockRef> = steps
-                .iter()
-                .map(|step| Arc::new(agent_step_block(step)))
-                .collect();
+            let step_blocks = self.step_blocks(block);
             let phases = self.render_activity_phases(
                 &format!("{key}/{}", block.id),
                 &step_blocks,

@@ -20,6 +20,29 @@ pub struct DiscoveredSkill {
     pub source: String,
 }
 
+/// Effective user and provider config directories for one catalog account.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillDiscoveryContext {
+    pub home: Option<PathBuf>,
+    /// Config roots, such as `CLAUDE_CONFIG_DIR` and `CODEX_HOME`.
+    pub provider_homes: HashMap<String, PathBuf>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDiscoveryDiagnostic {
+    pub path: String,
+    pub message: String,
+}
+
+/// Every candidate in root precedence order, including same-name files.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInventory {
+    pub candidates: Vec<DiscoveredSkill>,
+    pub diagnostics: Vec<SkillDiscoveryDiagnostic>,
+}
+
 struct DisabledFilter {
     normalized: HashSet<String>,
     canonical: HashSet<PathBuf>,
@@ -81,15 +104,31 @@ fn normalize_path_for_compare(path: &str) -> String {
 /// harness folders. Same name: earlier roots win.
 /// Excludes disabled paths before deduplication so lower-priority enabled
 /// same-name files can fall through.
+///
+/// Claude's user skills and plugins come from the default account's config
+/// directory, which `CLAUDE_CONFIG_DIR` can move.
 pub fn list_skills(
     cwd: String,
     disabled_paths: Option<Vec<String>>,
 ) -> Result<Vec<DiscoveredSkill>, String> {
-    let project = expand_home(&cwd);
-    let home = dirs_home().map(PathBuf::from);
-    Ok(list_skills_from(
-        &project,
-        home.as_deref(),
+    let mut context = SkillDiscoveryContext {
+        home: dirs_home().map(PathBuf::from),
+        ..Default::default()
+    };
+    if let Some(claude_dir) = crate::harness::configured_claude_dir() {
+        context.provider_homes.insert("claude".into(), claude_dir);
+    }
+    list_skills_with_context(cwd, disabled_paths, context)
+}
+
+pub fn list_skills_with_context(
+    cwd: String,
+    disabled_paths: Option<Vec<String>>,
+    context: SkillDiscoveryContext,
+) -> Result<Vec<DiscoveredSkill>, String> {
+    let inventory = discover_skill_inventory_from(&expand_home(&cwd), &context);
+    Ok(enabled_skills(
+        inventory.candidates,
         disabled_paths.as_deref(),
     ))
 }
@@ -99,36 +138,67 @@ pub fn list_skills_from(
     home: Option<&Path>,
     disabled_paths: Option<&[String]>,
 ) -> Vec<DiscoveredSkill> {
+    let inventory = discover_skill_inventory_from(
+        project,
+        &SkillDiscoveryContext {
+            home: home.map(Path::to_path_buf),
+            ..Default::default()
+        },
+    );
+    enabled_skills(inventory.candidates, disabled_paths)
+}
+
+fn enabled_skills(
+    candidates: Vec<DiscoveredSkill>,
+    disabled_paths: Option<&[String]>,
+) -> Vec<DiscoveredSkill> {
     let disabled_filter = DisabledFilter::new(disabled_paths);
     let mut by_name: HashMap<String, DiscoveredSkill> = HashMap::new();
+    for skill in candidates {
+        if disabled_filter
+            .as_ref()
+            .is_some_and(|filter| filter.is_disabled(&skill.path))
+        {
+            continue;
+        }
+        if by_name.len() >= MAX_SKILLS {
+            break;
+        }
+        by_name.entry(skill.name.clone()).or_insert(skill);
+    }
+    let mut out: Vec<DiscoveredSkill> = by_name.into_values().collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Inventories all configured roots without disabled filtering or name deduplication.
+pub fn discover_skill_inventory_from(
+    project: &Path,
+    context: &SkillDiscoveryContext,
+) -> SkillInventory {
+    let project = absolute_path(project);
+    let home = context.home.as_deref();
+    let mut inventory = SkillInventory::default();
     let mut seen_roots: HashSet<PathBuf> = HashSet::new();
 
-    let mut add_root = |root: PathBuf, scope: &str, source: &str| {
-        if by_name.len() >= MAX_SKILLS {
-            return;
-        }
+    let mut add_root = |root: PathBuf, scope: &str, source: &str, namespace: Option<&str>| {
+        let root = absolute_path(&root);
         let key = std::fs::canonicalize(&root).unwrap_or(root.clone());
         if !seen_roots.insert(key) {
             return;
         }
-        for skill in scan_root(&root, scope, source) {
-            if disabled_filter
-                .as_ref()
-                .is_some_and(|f| f.is_disabled(&skill.path))
-            {
-                continue;
+        for mut skill in scan_root(&root, scope, source, &mut inventory.diagnostics) {
+            if let Some(namespace) = namespace {
+                skill.name = format!("{namespace}:{}", skill.name);
             }
-            if by_name.len() >= MAX_SKILLS {
-                break;
-            }
-            by_name.entry(skill.name.clone()).or_insert(skill);
+            inventory.candidates.push(skill);
         }
     };
 
     // Highest priority first so later roots cannot replace a name.
-    add_root(project.join(".agents/skills"), "project", "agents");
+    add_root(project.join(".agents/skills"), "project", "agents", None);
     if let Some(home) = home {
-        add_root(home.join(".agents/skills"), "user", "agents");
+        add_root(home.join(".agents/skills"), "user", "agents", None);
     }
 
     for (dir, source) in [
@@ -142,64 +212,68 @@ pub fn list_skills_from(
         (".grok/skills", "grok"),
         (".hermes/skills", "hermes"),
     ] {
-        add_root(project.join(dir), "project", source);
-        if let Some(home) = home {
-            add_root(home.join(dir), "user", source);
+        add_root(project.join(dir), "project", source, None);
+        if let Some(config) = context.provider_homes.get(source) {
+            add_root(config.join("skills"), "user", source, None);
+        } else if let Some(home) = home {
+            add_root(home.join(dir), "user", source, None);
         }
     }
-    if let Some(home) = home {
-        add_root(home.join(".pi/agent/skills"), "user", "pi");
-        add_root(home.join(".omp/agent/skills"), "user", "omp");
-        // New-provider roots come after every pre-existing root so an
-        // identically named skill can never shadow an established provider.
-        let root = home.join(".gemini/antigravity/skills");
-        if root.is_dir() {
-            add_root(root, "user", "antigravity");
-        }
-        add_root(project.join(".factory/skills"), "project", "droid");
-        add_root(home.join(".factory/skills"), "user", "droid");
-        for (root, scope, namespace) in claude_plugin_skill_roots(home, project) {
-            add_namespaced_root(
-                &mut by_name,
-                root,
-                scope,
-                "claude",
-                &namespace,
-                disabled_filter.as_ref(),
-            );
+    for source in ["pi", "omp"] {
+        let config = context
+            .provider_homes
+            .get(source)
+            .cloned()
+            .or_else(|| home.map(|home| home.join(format!(".{source}"))));
+        if let Some(config) = config {
+            add_root(config.join("agent/skills"), "user", source, None);
         }
     }
-
-    let mut out: Vec<DiscoveredSkill> = by_name.into_values().collect();
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
+    // Keep new-provider roots after pre-existing roots for name precedence.
+    let antigravity = context
+        .provider_homes
+        .get("antigravity")
+        .cloned()
+        .or_else(|| home.map(|home| home.join(".gemini/antigravity")));
+    if let Some(config) = antigravity {
+        add_root(config.join("skills"), "user", "antigravity", None);
+    }
+    add_root(project.join(".factory/skills"), "project", "droid", None);
+    let factory = context
+        .provider_homes
+        .get("droid")
+        .cloned()
+        .or_else(|| home.map(|home| home.join(".factory")));
+    if let Some(factory) = factory {
+        add_root(factory.join("skills"), "user", "droid", None);
+    }
+    let claude_config = context
+        .provider_homes
+        .get("claude")
+        .cloned()
+        .or_else(|| home.map(|home| home.join(".claude")));
+    if let Some(claude_config) = claude_config {
+        for (root, scope, namespace) in claude_plugin_skill_roots(&claude_config, home, &project) {
+            add_root(root, scope, "claude", Some(&namespace));
+        }
+    }
+    inventory
 }
 
-fn add_namespaced_root(
-    by_name: &mut HashMap<String, DiscoveredSkill>,
-    root: PathBuf,
-    scope: &str,
-    source: &str,
-    namespace: &str,
-    disabled_filter: Option<&DisabledFilter>,
-) {
-    if by_name.len() >= MAX_SKILLS {
-        return;
-    }
-    for mut skill in scan_root(&root, scope, source) {
-        if disabled_filter.is_some_and(|f| f.is_disabled(&skill.path)) {
-            continue;
-        }
-        if by_name.len() >= MAX_SKILLS {
-            break;
-        }
-        skill.name = format!("{namespace}:{}", skill.name);
-        by_name.entry(skill.name.clone()).or_insert(skill);
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(path)
     }
 }
 
-fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'static str, String)> {
-    let registry = home.join(".claude/plugins/installed_plugins.json");
+fn claude_plugin_skill_roots(
+    config: &Path,
+    home: Option<&Path>,
+    project: &Path,
+) -> Vec<(PathBuf, &'static str, String)> {
+    let registry = config.join("plugins/installed_plugins.json");
     let Ok(raw) = std::fs::read_to_string(registry) else {
         return Vec::new();
     };
@@ -212,7 +286,7 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
 
     let mut roots = Vec::new();
     for (plugin_id, installed) in plugins {
-        if !claude_plugin_enabled(home, project, plugin_id) {
+        if !claude_plugin_enabled_from_config(config, project, plugin_id) {
             continue;
         }
         let namespace = plugin_id
@@ -239,7 +313,10 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
                     else {
                         continue;
                     };
-                    if !path_is_within(project, &resolve_home_path(project_path, home)) {
+                    if !path_is_within(
+                        project,
+                        &resolve_home_path(project_path, home.unwrap_or(config)),
+                    ) {
                         continue;
                     }
                     "project"
@@ -248,7 +325,7 @@ fn claude_plugin_skill_roots(home: &Path, project: &Path) -> Vec<(PathBuf, &'sta
                 Some(_) => continue,
             };
             roots.push((
-                resolve_home_path(install_path, home).join("skills"),
+                resolve_home_path(install_path, home.unwrap_or(config)).join("skills"),
                 scope,
                 namespace.to_string(),
             ));
@@ -273,7 +350,12 @@ fn resolve_home_path(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
+#[cfg(test)]
 fn claude_plugin_enabled(home: &Path, project: &Path, plugin_id: &str) -> bool {
+    claude_plugin_enabled_from_config(&home.join(".claude"), project, plugin_id)
+}
+
+fn claude_plugin_enabled_from_config(config: &Path, project: &Path, plugin_id: &str) -> bool {
     if let Some(enabled) = managed_plugin_setting(plugin_id) {
         return enabled;
     }
@@ -281,7 +363,7 @@ fn claude_plugin_enabled(home: &Path, project: &Path, plugin_id: &str) -> bool {
     for settings in [
         project_root.join(".claude/settings.local.json"),
         project_root.join(".claude/settings.json"),
-        home.join(".claude/settings.json"),
+        config.join("settings.json"),
     ] {
         if let Some(enabled) = plugin_setting(&settings, plugin_id) {
             return enabled;
@@ -364,12 +446,39 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-fn scan_root(root: &Path, scope: &str, source: &str) -> Vec<DiscoveredSkill> {
-    let Ok(reader) = std::fs::read_dir(root) else {
-        return Vec::new();
+fn scan_root(
+    root: &Path,
+    scope: &str,
+    source: &str,
+    diagnostics: &mut Vec<SkillDiscoveryDiagnostic>,
+) -> Vec<DiscoveredSkill> {
+    let reader = match std::fs::read_dir(root) {
+        Ok(reader) => reader,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                diagnostics.push(SkillDiscoveryDiagnostic {
+                    path: monocode_platform::path_to_js(root),
+                    message: format!("Could not scan skill directory: {error}"),
+                });
+            }
+            return Vec::new();
+        }
     };
     let mut out = Vec::new();
-    for ent in reader.flatten() {
+    let mut entries = reader
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                diagnostics.push(SkillDiscoveryDiagnostic {
+                    path: monocode_platform::path_to_js(root),
+                    message: format!("Could not read skill directory entry: {error}"),
+                });
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for ent in entries {
         let dir = ent.path();
         if !dir.is_dir() {
             continue;
@@ -382,11 +491,25 @@ fn scan_root(root: &Path, scope: &str, source: &str) -> Vec<DiscoveredSkill> {
         }
         let skill_md = skill_md_path(&dir);
         let Some(skill_md) = skill_md else { continue };
-        let Ok(bytes) = read_prefix(&skill_md, MAX_FRONTMATTER_BYTES) else {
-            continue;
+        let bytes = match read_prefix(&skill_md, MAX_FRONTMATTER_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                diagnostics.push(SkillDiscoveryDiagnostic {
+                    path: monocode_platform::path_to_js(&skill_md),
+                    message: format!("Could not read skill: {error}"),
+                });
+                continue;
+            }
         };
-        let Ok(text) = String::from_utf8(bytes) else {
-            continue;
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                diagnostics.push(SkillDiscoveryDiagnostic {
+                    path: monocode_platform::path_to_js(&skill_md),
+                    message: format!("Skill metadata is not UTF-8: {error}"),
+                });
+                continue;
+            }
         };
         let fallback = slug_name(folder);
         if fallback.is_empty() {
@@ -593,6 +716,52 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), body).unwrap();
     }
 
+    #[test]
+    fn named_claude_profile_uses_its_skills_and_plugin_registry() {
+        let project = tmp("profile-project");
+        let home = tmp("profile-home");
+        let profile = tmp("profile");
+        write_skill(
+            &home.0.join(".claude/skills"),
+            "default-only",
+            "---\nname: default-only\ndescription: Default skill\n---\nDefault",
+        );
+        write_skill(
+            &profile.0.join("skills"),
+            "named-only",
+            "---\nname: named-only\ndescription: Named skill\n---\nNamed",
+        );
+        write_skill(
+            &project.0.join(".claude/skills"),
+            "project-only",
+            "---\nname: project-only\ndescription: Project skill\n---\nProject",
+        );
+        let plugin = profile.0.join("plugins/cache/community/workflow-kit/1.0.0");
+        write_skill(
+            &plugin.join("skills"),
+            "plugin-only",
+            "---\nname: plugin-only\ndescription: Profile plugin\n---\nPlugin",
+        );
+        let registry = serde_json::json!({"version": 2, "plugins": {"workflow-kit@community": [{"scope": "user", "installPath": plugin, "version": "1.0.0"}]}});
+        std::fs::write(
+            profile.0.join("plugins/installed_plugins.json"),
+            serde_json::to_vec(&registry).unwrap(),
+        )
+        .unwrap();
+        let context = SkillDiscoveryContext {
+            home: Some(home.0.clone()),
+            provider_homes: HashMap::from([("claude".to_string(), profile.0.clone())]),
+        };
+        let found =
+            list_skills_with_context(project.0.to_string_lossy().into_owned(), None, context)
+                .unwrap();
+        let names: Vec<_> = found.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["named-only", "project-only", "workflow-kit:plugin-only"]
+        );
+    }
+
     fn write_plugin_setting(root: &Path, file: &str, plugin_id: &str, enabled: bool) {
         let dir = root.join(".claude");
         std::fs::create_dir_all(&dir).unwrap();
@@ -600,6 +769,124 @@ mod tests {
             "enabledPlugins": { plugin_id: enabled }
         });
         std::fs::write(dir.join(file), serde_json::to_vec(&settings).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn raw_inventory_keeps_same_name_candidates_before_disabled_filtering() {
+        let project = tmp("inventory-project");
+        let home = tmp("inventory-home");
+        for (root, description) in [
+            (project.0.join(".agents/skills"), "Project"),
+            (home.0.join(".agents/skills"), "Personal"),
+            (home.0.join(".codex/skills"), "Provider"),
+        ] {
+            write_skill(
+                &root,
+                "review",
+                &format!("---\nname: review\ndescription: {description}\n---\n"),
+            );
+        }
+        let context = SkillDiscoveryContext {
+            home: Some(home.0.clone()),
+            ..Default::default()
+        };
+        let inventory = discover_skill_inventory_from(&project.0, &context);
+        assert_eq!(
+            inventory
+                .candidates
+                .iter()
+                .map(|skill| skill.description.as_str())
+                .collect::<Vec<_>>(),
+            ["Project", "Personal", "Provider"]
+        );
+        let disabled = inventory.candidates[0].path.clone();
+        let visible = list_skills_with_context(
+            project.0.to_string_lossy().into_owned(),
+            Some(vec![disabled]),
+            context,
+        )
+        .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].description, "Personal");
+    }
+
+    #[test]
+    fn effective_provider_roots_select_account_files_and_plugin_settings() {
+        let project = tmp("account-project");
+        let home = tmp("account-home");
+        let account_a = tmp("account-a");
+        let account_b = tmp("account-b");
+        write_skill(&home.0.join(".codex/skills"), "default-only", "Default");
+        write_skill(
+            &account_a.0.join("skills"),
+            "review",
+            "---\nname: review\ndescription: A\n---\n",
+        );
+        write_skill(
+            &account_b.0.join("skills"),
+            "review",
+            "---\nname: review\ndescription: B\n---\n",
+        );
+        write_skill(&account_a.0.join(".agents/skills"), "wrong-root", "Wrong");
+        write_skill(
+            &account_a.0.join("plugins/sample/skills"),
+            "plugin-skill",
+            "Plugin",
+        );
+        std::fs::write(account_a.0.join("plugins/installed_plugins.json"), serde_json::json!({"plugins": {"sample@test": [{"scope":"user", "installPath":account_a.0.join("plugins/sample")}]}}).to_string()).unwrap();
+        std::fs::write(
+            account_a.0.join("settings.json"),
+            r#"{"enabledPlugins":{"sample@test":false}}"#,
+        )
+        .unwrap();
+        let context_a = SkillDiscoveryContext {
+            home: Some(home.0.clone()),
+            provider_homes: HashMap::from([
+                ("codex".into(), account_a.0.clone()),
+                ("claude".into(), account_a.0.clone()),
+            ]),
+        };
+        let context_b = SkillDiscoveryContext {
+            home: Some(home.0.clone()),
+            provider_homes: HashMap::from([("codex".into(), account_b.0.clone())]),
+        };
+        let a = discover_skill_inventory_from(&project.0, &context_a);
+        let b = discover_skill_inventory_from(&project.0, &context_b);
+        assert_eq!(
+            a.candidates
+                .iter()
+                .map(|skill| skill.description.as_str())
+                .collect::<Vec<_>>(),
+            ["A"]
+        );
+        assert_eq!(
+            b.candidates
+                .iter()
+                .map(|skill| skill.description.as_str())
+                .collect::<Vec<_>>(),
+            ["B"]
+        );
+        assert!(a.candidates.iter().all(|skill| skill.name != "wrong-root"
+            && skill.name != "default-only"
+            && skill.name != "sample:plugin-skill"));
+    }
+
+    #[test]
+    fn inventory_reports_bad_metadata_and_keeps_readable_candidates() {
+        let project = tmp("inventory-errors");
+        write_skill(&project.0.join(".agents/skills"), "readable", "Readable");
+        let bad = project.0.join(".agents/skills/bad/SKILL.md");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, [0xff, 0xfe]).unwrap();
+        let inventory =
+            discover_skill_inventory_from(&project.0, &SkillDiscoveryContext::default());
+        assert_eq!(inventory.candidates.len(), 1);
+        assert_eq!(inventory.diagnostics.len(), 1);
+        assert_eq!(
+            inventory.diagnostics[0].path,
+            monocode_platform::path_to_js(&bad)
+        );
+        assert!(inventory.diagnostics[0].message.contains("UTF-8"));
     }
 
     #[test]

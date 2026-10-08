@@ -15,10 +15,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity,
-    InteractiveElement as _, IntoElement, MouseDownEvent, ParentElement as _, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Transformation, WeakEntity,
-    Window, div, percentage,
+    AnyElement, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    MouseDownEvent, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, Transformation, WeakEntity, Window, div, percentage,
 };
 use gpui_base::input::{InputBaseState, InputEditorStyle, InputModeKind};
 use gpui_component::input::{
@@ -39,6 +38,7 @@ use super::actions::{
     OrchestrationActions, OrchestrationRunView, OrchestrationRuns, OrchestrationWorkerDetail,
 };
 use super::parts::{Placement, anchored_popover, eid, flip, harness_icon};
+use crate::motion::smooth_loop;
 
 /// Tasks shown before "Show N more tasks".
 const VISIBLE_TASKS: usize = 3;
@@ -1282,15 +1282,13 @@ impl OrchestrationPreview {
         let proposal = &self.proposal;
         let spinning = self.planning() || proposal.status == OrchestrationProposalStatus::Starting;
         let mark = if spinning {
-            icon(IconName::CircleDashed)
+            let ring = icon(IconName::CircleDashed)
                 .size(u(16.))
-                .text_color(theme.content(0.55))
-                .with_animation(
-                    "orchestration-spin",
-                    Animation::new(Duration::from_secs(1)).repeat(),
-                    |svg, t| svg.with_transformation(Transformation::rotate(percentage(t))),
-                )
-                .into_any_element()
+                .text_color(theme.content(0.55));
+            smooth_loop(Duration::from_secs(1), move |t| {
+                ring.with_transformation(Transformation::rotate(percentage(t)))
+            })
+            .into_any_element()
         } else {
             icon(IconName::MessageMultiple)
                 .size(u(16.))

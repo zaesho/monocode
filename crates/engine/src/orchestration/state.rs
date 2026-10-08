@@ -149,6 +149,12 @@ pub struct OrchestrationDispatch {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_error: Option<String>,
+    /// Changed files outside the write scope, left in the kept worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_assignment: Option<Vec<String>>,
+    /// Gitignored files the worker created, left in the kept worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_created: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: Extra,
 }

@@ -13,6 +13,7 @@ use monocode_engine::attention::{
     Attention, KvLocalStore, NativeRateLimitFetcher, RateLimitFetcher,
 };
 use monocode_harness::core::auth::{HarnessLogin, supports_harness_login};
+use monocode_harness::core::availability::HarnessAvailabilityProbe;
 use monocode_harness::core::child::BinaryPathChoice;
 use monocode_harness::core::provider_accounts as accounts;
 use monocode_layout::tab_groups;
@@ -45,8 +46,12 @@ impl AccountsAdapter {
         let a = change.clone();
         let notifications = cx.observe(&notifier, move |_, cx| a(cx));
         let (send, receive) = async_channel::bounded(1);
-        let kv = AppServices::global(cx).kv.subscribe(move |_| {
-            let _ = send.try_send(());
+        // Composer drafts and the window geometry are not shown here, and
+        // each change redraws every main window's footer.
+        let kv = AppServices::global(cx).kv.subscribe(move |change| {
+            if !change.key.contains("draft") && change.key != "monocode.nativeMainWindowState" {
+                let _ = send.try_send(());
+            }
         });
         let task = cx.spawn(async move |cx| {
             while receive.recv().await.is_ok() {
@@ -62,22 +67,24 @@ impl AccountsAdapter {
     }
 
     fn appearance(&self, key: &str, seed: &str, cx: &App) -> ProjectAppearance {
-        let mut store =
-            monocode_engine::projects::KvAppearanceStore(AppServices::global(cx).kv.clone());
-        let mut appearance = tab_groups::TabGroupAppearance::new();
-        let logos = appearance.load_tab_group_logos(&mut store);
-        let mascots = appearance.load_tab_group_mascots(&mut store);
-        let colors = appearance.load_tab_group_colors(&mut store);
-        let custom = appearance.load_tab_group_custom_colors(&mut store);
+        // The inbox asks once per item and project; parse the four records
+        // once per settings change.
+        let records = crate::revisions::memo(cx, "project-appearance", |cx| {
+            let mut store =
+                monocode_engine::projects::KvAppearanceStore(AppServices::global(cx).kv.clone());
+            let mut appearance = tab_groups::TabGroupAppearance::new();
+            (
+                appearance.load_tab_group_logos(&mut store),
+                appearance.load_tab_group_mascots(&mut store),
+                appearance.load_tab_group_colors(&mut store),
+                appearance.load_tab_group_custom_colors(&mut store),
+            )
+        });
+        let (logos, mascots, colors, custom) = &*records;
         ProjectAppearance {
-            logo: tab_groups::resolve_tab_group_logo(key, Some(&logos)),
-            mascot: tab_groups::resolve_tab_group_mascot(key, Some(&mascots)),
-            color: tab_groups::resolve_tab_group_color(
-                key,
-                Some(&colors),
-                Some(&custom),
-                Some(seed),
-            ),
+            logo: tab_groups::resolve_tab_group_logo(key, Some(logos)),
+            mascot: tab_groups::resolve_tab_group_mascot(key, Some(mascots)),
+            color: tab_groups::resolve_tab_group_color(key, Some(colors), Some(custom), Some(seed)),
         }
     }
 
@@ -212,11 +219,21 @@ impl UsageHost for AccountsAdapter {
         cx.background_executor()
             .spawn(async move { future.await.map_err(|e| e.to_string()) })
     }
+    // The usage footer asks for these per provider on every render, and each
+    // read parses a settings record; keep the answers until a setting changes.
     fn provider_accounts(&self, provider: HarnessId, cx: &App) -> Vec<ProviderAccount> {
-        convert(accounts::provider_accounts(
+        let kept = crate::revisions::memo(cx, "provider-accounts", |_| {
+            std::cell::RefCell::new(HashMap::<HarnessId, Vec<ProviderAccount>>::new())
+        });
+        if let Some(accounts) = kept.borrow().get(&provider) {
+            return accounts.clone();
+        }
+        let read: Vec<ProviderAccount> = convert(accounts::provider_accounts(
             &KvLocalStore(AppServices::global(cx).kv.clone()),
             provider,
-        ))
+        ));
+        kept.borrow_mut().insert(provider, read.clone());
+        read
     }
     fn selected_provider_account_id(
         &self,
@@ -224,11 +241,20 @@ impl UsageHost for AccountsAdapter {
         project: Option<&str>,
         cx: &App,
     ) -> String {
-        accounts::selected_provider_account_id(
+        let kept = crate::revisions::memo(cx, "provider-account-selection", |_| {
+            std::cell::RefCell::new(HashMap::<(HarnessId, Option<String>), String>::new())
+        });
+        let key = (provider, project.map(str::to_string));
+        if let Some(id) = kept.borrow().get(&key) {
+            return id.clone();
+        }
+        let id = accounts::selected_provider_account_id(
             &KvLocalStore(AppServices::global(cx).kv.clone()),
             provider,
             project,
-        )
+        );
+        kept.borrow_mut().insert(key, id.clone());
+        id
     }
     fn select_provider_account(
         &self,
@@ -403,49 +429,63 @@ impl NotificationsHost for AccountsAdapter {
 }
 
 impl HarnessUpdateHost for AccountsAdapter {
-    fn check_for_updates(&self, cx: &mut App) -> Task<Vec<HarnessUpdate>> {
+    fn claim_launch_check(&self, _: &mut App) -> bool {
+        !self.dismissed.get()
+            && monocode_engine::attention::harness_updates::claim_launch_harness_update_check()
+    }
+    fn check_versions(&self, force: bool, cx: &mut App) -> Task<Vec<HarnessVersionCheck>> {
         use monocode_engine::attention::harness_updates::{
-            HarnessUpdateDeps, UPDATABLE_HARNESSES, claim_launch_harness_update_check,
-            fetch_latest_harness_version, find_harness_updates,
+            HarnessUpdateDeps, UPDATABLE_HARNESSES, check_harness_versions,
+            fetch_latest_harness_version,
         };
-        if self.dismissed.get() || !claim_launch_harness_update_check() {
-            return Task::ready(Vec::new());
-        }
         let services = AppServices::global(cx);
-        let settings =
-            monocode_settings::load_app_settings(&services.kv, monocode_core::Platform::current());
+        let probe = HarnessAvailabilityProbe::new(
+            services.registry.clone(),
+            services.children.clone(),
+            services.availability.clone(),
+        );
+        let availability = services.availability.clone();
         let children = services.children.clone();
         let executor = cx.background_executor().clone();
-        let harnesses = UPDATABLE_HARNESSES
-            .into_iter()
-            .filter(|h| !settings.models.hidden_picker_providers.contains(h))
-            .collect();
-        let deps = HarnessUpdateDeps {
-            harnesses,
-            installed_version: Box::new(move |id| {
-                let children = children.clone();
-                async move {
-                    children
-                        .inspect_harness_binary(id, BinaryPathChoice::Runtime)
-                        .await
-                        .map(|v| v.version)
-                        .map_err(|e| e.to_string())
-                }
-                .boxed()
-            }),
-            latest_version: Box::new(move |id| {
-                executor
-                    .spawn(async move { fetch_latest_harness_version(id) })
+        let probed = executor.spawn(probe.probe_harness_availability(force));
+        cx.foreground_executor().spawn(async move {
+            probed.await;
+            let deps = HarnessUpdateDeps {
+                harnesses: UPDATABLE_HARNESSES
+                    .into_iter()
+                    .filter(|id| availability.is_harness_available(*id))
+                    .collect(),
+                installed_version: Box::new(move |id| {
+                    let children = children.clone();
+                    async move {
+                        children
+                            .inspect_harness_binary(id, BinaryPathChoice::Runtime)
+                            .await
+                            .map(|v| v.version)
+                            .map_err(|e| e.to_string())
+                    }
                     .boxed()
-            }),
-        };
-        cx.foreground_executor()
-            .spawn(async move { convert(find_harness_updates(deps).await) })
+                }),
+                latest_version: Box::new(move |id| {
+                    executor
+                        .spawn(async move { fetch_latest_harness_version(id) })
+                        .boxed()
+                }),
+            };
+            convert(check_harness_versions(deps).await)
+        })
+    }
+    fn is_picker_visible(&self, harness: HarnessId, cx: &App) -> bool {
+        let settings = monocode_settings::load_app_settings(
+            &AppServices::global(cx).kv,
+            monocode_core::Platform::current(),
+        );
+        !settings.models.hidden_picker_providers.contains(&harness)
     }
     fn dismiss_updates(&self, _: &mut App) {
         self.dismissed.set(true);
     }
-    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<()> {
+    fn update_cli(&self, harness: HarnessId, cx: &mut App) -> HostTask<String> {
         let children = AppServices::global(cx).children.clone();
         cx.background_executor().spawn(async move {
             children

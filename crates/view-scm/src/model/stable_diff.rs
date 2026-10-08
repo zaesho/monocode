@@ -23,7 +23,10 @@ pub trait HasId {
 /// `reuseIfShallowEqual`: `previous` when `next` has the same fields.
 pub fn reuse_if_shallow_equal<T: ShallowEq>(previous: Option<&Arc<T>>, next: Arc<T>) -> Arc<T> {
     match previous {
-        Some(previous) if previous.shallow_eq(&next) => previous.clone(),
+        // The same allocation needs no field walk.
+        Some(previous) if Arc::ptr_eq(previous, &next) || previous.shallow_eq(&next) => {
+            previous.clone()
+        }
         _ => next,
     }
 }

@@ -17,6 +17,8 @@ use monocode_store::StoreEvents;
 use monocode_store::checkpoint::{
     self, CheckpointApplyResult, CheckpointFileDiff, CheckpointStatus, CheckpointStore,
 };
+use monocode_store::cli_sessions::{CliSession, Entry as CliEntry};
+use monocode_store::context_history::{self, ContextAssetSnapshot, ContextAssetSource};
 use monocode_store::session_store::{
     self, InFlightSession, SessionRecord, SessionSearchOptions, SessionSearchResult, SessionStore,
     SessionSummary as StoredSummary, SessionUpsert,
@@ -44,6 +46,9 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn cancel_search(&self, search_owner: String) -> StoreFuture<()>;
     /// `session_delete`.
     fn delete(&self, session_id: String, image_paths: Vec<String>) -> StoreFuture<()>;
+    /// `session_discard_draft`: drop a transient draft record. The id stays
+    /// usable, and settled history or provider execution is refused.
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()>;
     /// `session_set_archived`.
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()>;
     /// `session_set_pinned`.
@@ -60,6 +65,18 @@ pub trait SessionBackend: Send + Sync + 'static {
     fn set_workspace_snapshot(&self, snapshot: Value) -> StoreFuture<()>;
     /// `workspace_get_snapshot`.
     fn workspace_snapshot(&self) -> StoreFuture<Option<Value>>;
+    /// Every link between two sessions, each pair once.
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>>;
+    /// Add (`linked`) or remove the link between two sessions.
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()>;
+    /// Save a portable transcript snapshot of `session_id` as `name` and
+    /// return its absolute path, for an agent's file tools to read.
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String>;
     /// `claude_shell_commands`: Bash commands by tool-use id, read from
     /// Claude's own transcript.
     fn claude_shell_commands(
@@ -68,11 +85,54 @@ pub trait SessionBackend: Send + Sync + 'static {
         provider_account_id: Option<String>,
         tool_ids: Vec<String>,
     ) -> StoreFuture<HashMap<String, String>>;
+    /// `session_context_snapshot`: save the shared history of one provider
+    /// switch and return its path. The same content returns the same path.
+    fn write_switch_snapshot(
+        &self,
+        _session_id: String,
+        _switch_id: String,
+        _content: String,
+    ) -> StoreFuture<String> {
+        unsupported("Saving shared history")
+    }
+    /// `session_context_assets`: durable copies of historical attachments.
+    fn snapshot_context_assets(
+        &self,
+        _session_id: String,
+        _attachments: Vec<ContextAssetSource>,
+    ) -> StoreFuture<Vec<ContextAssetSnapshot>> {
+        unsupported("Saving historical attachments")
+    }
+    /// `cli_sessions_list`: sessions the provider CLIs recorded for `cwd`
+    /// that have no row yet.
+    fn cli_sessions_list(&self, _cwd: String) -> StoreFuture<Vec<CliSession>> {
+        unsupported("Listing CLI sessions")
+    }
+    /// `cli_session_read`: one CLI transcript as import entries.
+    fn cli_session_read(&self, _harness: String, _path: PathBuf) -> StoreFuture<Vec<CliEntry>> {
+        unsupported("Reading CLI sessions")
+    }
+    /// `session_import`: save an imported session with the CLI's own
+    /// timestamps. `None` when that provider session already has a row.
+    fn import_session(
+        &self,
+        _session: SessionUpsert,
+        _created_at: i64,
+        _updated_at: i64,
+    ) -> StoreFuture<Option<StoredSummary>> {
+        unsupported("Importing CLI sessions")
+    }
+}
+
+fn unsupported<T: Send + 'static>(what: &str) -> StoreFuture<T> {
+    futures::future::ready(Err(format!("{what} is not available here"))).boxed()
 }
 
 /// The `session_checkpoint_*` commands.
 pub trait CheckpointBackend: Send + Sync + 'static {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()>;
+    /// `isolated` marks a worker that owns its checkout, so every later
+    /// change there counts as its own.
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()>;
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()>;
     fn capture(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()>;
     fn status(&self, session_id: String, cwd: String) -> StoreFuture<CheckpointStatus>;
@@ -81,6 +141,7 @@ pub trait CheckpointBackend: Send + Sync + 'static {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult>;
     fn cleanup_safe(&self, session_id: String, cwd: String) -> StoreFuture<bool>;
     fn forget(&self, session_id: String) -> StoreFuture<()>;
@@ -102,6 +163,23 @@ pub trait CheckpointBackend: Send + Sync + 'static {
         cwd: String,
         relative: Option<String>,
     ) -> StoreFuture<CheckpointStatus>;
+}
+
+/// Write `<dir>/<session_id>/<name>.md`. Both parts must be plain ids so
+/// the file stays inside `dir`.
+pub fn write_context_snapshot(
+    dir: &std::path::Path,
+    session_id: &str,
+    name: &str,
+    text: &str,
+) -> Result<String, String> {
+    session_store::validate_id(session_id, "session")?;
+    session_store::validate_id(name, "snapshot")?;
+    let folder = dir.join(session_id);
+    std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+    let path = folder.join(format!("{name}.md"));
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Store change notices with nobody listening.
@@ -191,6 +269,23 @@ impl SessionBackend for StoreBackend {
         self.run(move |store| session_store::session_upsert(store, session))
     }
 
+    fn cli_sessions_list(&self, cwd: String) -> StoreFuture<Vec<CliSession>> {
+        self.run(move |store| session_store::cli_sessions_list(store, &cwd))
+    }
+
+    fn cli_session_read(&self, harness: String, path: PathBuf) -> StoreFuture<Vec<CliEntry>> {
+        self.run(move |_| session_store::cli_session_read(&harness, &path))
+    }
+
+    fn import_session(
+        &self,
+        session: SessionUpsert,
+        created_at: i64,
+        updated_at: i64,
+    ) -> StoreFuture<Option<StoredSummary>> {
+        self.run(move |store| session_store::session_import(store, session, created_at, updated_at))
+    }
+
     fn get(&self, session_id: String) -> StoreFuture<Option<SessionRecord>> {
         self.run(move |store| session_store::session_get(store, session_id))
     }
@@ -230,6 +325,13 @@ impl SessionBackend for StoreBackend {
         })
     }
 
+    fn discard_draft(&self, session_id: String) -> StoreFuture<()> {
+        let events = self.events.clone();
+        self.run(move |store| {
+            session_store::session_discard_draft(store, events.as_ref(), session_id)
+        })
+    }
+
     fn set_archived(&self, session_id: String, archived: bool) -> StoreFuture<()> {
         self.run(move |store| session_store::session_set_archived(store, session_id, archived))
     }
@@ -262,6 +364,55 @@ impl SessionBackend for StoreBackend {
         self.run(session_store::workspace_get_snapshot)
     }
 
+    fn list_session_links(&self) -> StoreFuture<Vec<(String, String)>> {
+        self.run(monocode_store::session_links::session_list_links)
+    }
+
+    fn set_session_link(&self, a: String, b: String, linked: bool) -> StoreFuture<()> {
+        self.run(move |store| monocode_store::session_links::session_set_link(store, a, b, linked))
+    }
+
+    fn write_context_snapshot(
+        &self,
+        session_id: String,
+        name: String,
+        text: String,
+    ) -> StoreFuture<String> {
+        let dir = self.data_dir.join("context-snapshots");
+        self.executor
+            .spawn(async move { write_context_snapshot(&dir, &session_id, &name, &text) })
+            .boxed()
+    }
+
+    fn write_switch_snapshot(
+        &self,
+        session_id: String,
+        switch_id: String,
+        content: String,
+    ) -> StoreFuture<String> {
+        let data_dir = self.data_dir.clone();
+        self.run(move |store| {
+            context_history::session_context_snapshot(
+                store,
+                &data_dir,
+                &session_id,
+                &switch_id,
+                &content,
+            )
+        })
+    }
+
+    fn snapshot_context_assets(
+        &self,
+        session_id: String,
+        attachments: Vec<ContextAssetSource>,
+    ) -> StoreFuture<Vec<ContextAssetSnapshot>> {
+        let data_dir = self.data_dir.clone();
+        self.run(move |store| {
+            context_history::session_context_assets(store, &data_dir, &session_id, attachments)
+        })
+    }
+
     fn claude_shell_commands(
         &self,
         provider_session_id: String,
@@ -283,8 +434,10 @@ impl SessionBackend for StoreBackend {
 }
 
 impl CheckpointBackend for StoreBackend {
-    fn ensure(&self, session_id: String, cwd: String) -> StoreFuture<()> {
-        self.checkpoint(move |store| checkpoint::session_checkpoint_ensure(store, session_id, cwd))
+    fn ensure(&self, session_id: String, cwd: String, isolated: bool) -> StoreFuture<()> {
+        self.checkpoint(move |store| {
+            checkpoint::session_checkpoint_ensure(store, session_id, cwd, isolated)
+        })
     }
 
     fn prepare(&self, session_id: String, cwd: String, paths: Vec<String>) -> StoreFuture<()> {
@@ -308,9 +461,10 @@ impl CheckpointBackend for StoreBackend {
         session_id: String,
         from_cwd: String,
         to_cwd: String,
+        write_scopes: Option<Vec<String>>,
     ) -> StoreFuture<CheckpointApplyResult> {
         self.checkpoint(move |store| {
-            checkpoint::session_checkpoint_apply(store, session_id, from_cwd, to_cwd)
+            checkpoint::session_checkpoint_apply(store, session_id, from_cwd, to_cwd, write_scopes)
         })
     }
 

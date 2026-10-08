@@ -1,12 +1,16 @@
 //! SQLite storage shared by the Tauri app and the GPUI app: sessions,
-//! checkpoints, notes, reminders, automations, and the Cursor session reader.
+//! checkpoints, notes, reminders, automations, the Cursor session reader, and
+//! the reader for sessions the provider CLIs recorded on their own.
 //! Moved from `src-tauri/src`.
 
 pub mod automations;
 pub mod checkpoint;
+pub mod cli_sessions;
+pub mod context_history;
 pub mod cursor_store;
 pub mod notes;
 pub mod reminders;
+pub mod session_links;
 pub mod session_store;
 
 /// Change notices for data that several windows show. The Tauri app emits

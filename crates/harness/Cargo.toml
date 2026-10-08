@@ -41,6 +41,8 @@ thiserror.workspace = true
 url.workspace = true
 sha2.workspace = true
 time.workspace = true
+# Local time for the next fire of a job Claude scheduled.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [dev-dependencies]
 monocode-locale = { workspace = true, features = ["test-support"] }

@@ -6,6 +6,7 @@
 
 pub mod app_search;
 pub mod archive_shortcut;
+pub mod cli_import;
 #[allow(clippy::module_inception)]
 pub mod history;
 pub mod host;

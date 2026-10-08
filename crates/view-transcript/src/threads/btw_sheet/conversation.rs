@@ -57,6 +57,45 @@ pub struct BtwTab {
     pub status: Option<BtwThreadStatus>,
 }
 
+/// What the tab strip shows of a tab.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BtwTabLabel {
+    pub id: String,
+    pub question: Option<String>,
+    pub status: Option<BtwThreadStatus>,
+    /// The tab has a saved thread (not an unsent draft).
+    pub saved: bool,
+}
+
+/// Where a tab comes from, borrowed from the conversation.
+enum TabSource<'a> {
+    Entry(&'a BtwSessionThread),
+    Draft { id: &'a str, turn: &'a [Block] },
+}
+
+impl<'a> TabSource<'a> {
+    fn id(&self) -> &'a str {
+        match self {
+            TabSource::Entry(entry) => &entry.thread.id,
+            TabSource::Draft { id, .. } => id,
+        }
+    }
+
+    fn turn(&self) -> &'a [Block] {
+        match self {
+            TabSource::Entry(entry) => &entry.turn,
+            TabSource::Draft { turn, .. } => turn,
+        }
+    }
+
+    fn thread(&self) -> Option<&'a BtwThread> {
+        match self {
+            TabSource::Entry(entry) => Some(&entry.thread),
+            TabSource::Draft { .. } => None,
+        }
+    }
+}
+
 /// Unsent text the side composer starts from. A new key makes a new
 /// composer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -172,21 +211,14 @@ impl BtwConversation {
         &self.seed
     }
 
-    /// One tab per side thread, oldest first, then the unsent drafts.
-    pub fn tabs(&self) -> Vec<BtwTab> {
-        let mut next: Vec<BtwTab> = self
-            .entries
-            .iter()
-            .map(|entry| BtwTab {
-                id: entry.thread.id.clone(),
-                turn: entry.turn.clone(),
-                thread: Some(entry.thread.clone()),
-                question: None,
-                status: None,
-            })
-            .collect();
+    /// Where each tab comes from, in tab order, without copying anything.
+    /// `tabs` builds every tab from these; the accessors below read the active
+    /// one in place. Those run several times per frame while the sheet is
+    /// open, and building every tab copied every thread and its turn.
+    fn tab_sources(&self) -> Vec<TabSource<'_>> {
+        let mut sources: Vec<TabSource<'_>> = self.entries.iter().map(TabSource::Entry).collect();
         for draft in &self.drafts {
-            if next.iter().any(|tab| tab.id == draft.id) {
+            if sources.iter().any(|source| source.id() == draft.id) {
                 continue;
             }
             if let Some(turn) = self
@@ -194,76 +226,130 @@ impl BtwConversation {
                 .iter()
                 .find(|turn| turn.first().is_some_and(|block| block.id == draft.turn_id))
             {
-                next.push(BtwTab {
-                    id: draft.id.clone(),
-                    turn: turn.clone(),
-                    thread: None,
-                    question: None,
-                    status: None,
+                sources.push(TabSource::Draft {
+                    id: &draft.id,
+                    turn,
                 });
             }
         }
-        for tab in &mut next {
-            let pending = self
-                .optimistic
-                .as_ref()
-                .filter(|(thread_id, _)| thread_id == &tab.id)
-                .map(|(_, message)| message);
-            tab.question = tab
-                .thread
-                .as_ref()
-                .and_then(|thread| {
-                    thread
-                        .messages
-                        .iter()
-                        .find(|message| message.role == BtwMessageRole::User)
-                })
-                .map(|message| message.text.clone())
-                .or_else(|| pending.map(|message| message.text.clone()));
-            tab.status = tab
-                .thread
-                .as_ref()
-                .map(|thread| thread.status)
-                .or_else(|| pending.map(|_| BtwThreadStatus::Running));
+        sources
+    }
+
+    /// The question and status a tab shows.
+    fn tab_label(&self, source: &TabSource<'_>) -> (Option<String>, Option<BtwThreadStatus>) {
+        let id = source.id();
+        let thread = source.thread();
+        let pending = self
+            .optimistic
+            .as_ref()
+            .filter(|(thread_id, _)| thread_id == id)
+            .map(|(_, message)| message);
+        let question = thread
+            .and_then(|thread| {
+                thread
+                    .messages
+                    .iter()
+                    .find(|message| message.role == BtwMessageRole::User)
+            })
+            .map(|message| message.text.clone())
+            .or_else(|| pending.map(|message| message.text.clone()));
+        let status = thread
+            .map(|thread| thread.status)
+            .or_else(|| pending.map(|_| BtwThreadStatus::Running));
+        (question, status)
+    }
+
+    fn tab_from(&self, source: &TabSource<'_>) -> BtwTab {
+        let (question, status) = self.tab_label(source);
+        BtwTab {
+            id: source.id().to_string(),
+            turn: source.turn().to_vec(),
+            thread: source.thread().cloned(),
+            question,
+            status,
         }
-        next
+    }
+
+    /// One tab per side thread, oldest first, then the unsent drafts.
+    pub fn tabs(&self) -> Vec<BtwTab> {
+        self.tab_sources()
+            .iter()
+            .map(|source| self.tab_from(source))
+            .collect()
+    }
+
+    /// What the tab strip shows of each tab, without the threads and turns.
+    pub fn tab_labels(&self) -> Vec<BtwTabLabel> {
+        self.tab_sources()
+            .iter()
+            .map(|source| {
+                let (question, status) = self.tab_label(source);
+                BtwTabLabel {
+                    id: source.id().to_string(),
+                    question,
+                    status,
+                    saved: source.thread().is_some(),
+                }
+            })
+            .collect()
+    }
+
+    /// The active tab's source: the chosen one, else the newest.
+    fn active_source(&self) -> Option<TabSource<'_>> {
+        let mut sources = self.tab_sources();
+        let chosen = self
+            .active_id
+            .as_ref()
+            .and_then(|id| sources.iter().position(|source| source.id() == id));
+        match chosen {
+            Some(index) => Some(sources.swap_remove(index)),
+            None => sources.pop(),
+        }
     }
 
     /// The active tab: the chosen one, else the newest.
     pub fn active(&self) -> Option<BtwTab> {
-        let tabs = self.tabs();
-        let chosen = self
-            .active_id
-            .as_ref()
-            .and_then(|id| tabs.iter().find(|tab| &tab.id == id).cloned());
-        chosen.or_else(|| tabs.last().cloned())
+        self.active_source().map(|source| self.tab_from(&source))
     }
 
     pub fn active_tab_id(&self) -> Option<String> {
-        self.active().map(|tab| tab.id)
+        self.active_source().map(|source| source.id().to_string())
     }
 
     /// The active tab's saved thread.
     pub fn persisted(&self) -> Option<BtwThread> {
-        self.active().and_then(|tab| tab.thread)
+        self.persisted_ref().cloned()
+    }
+
+    /// The active tab's saved thread, borrowed.
+    pub fn persisted_ref(&self) -> Option<&BtwThread> {
+        self.active_source().and_then(|source| source.thread())
     }
 
     fn tab_harness_for(&self, tab: &BtwTab, host: &dyn BtwHost) -> Option<HarnessId> {
-        if let Some(harness) = tab.thread.as_ref().and_then(|thread| thread.harness) {
+        self.harness_for(tab.thread.as_ref(), &tab.turn, host)
+    }
+
+    fn harness_for(
+        &self,
+        thread: Option<&BtwThread>,
+        turn: &[Block],
+        host: &dyn BtwHost,
+    ) -> Option<HarnessId> {
+        if let Some(harness) = thread.and_then(|thread| thread.harness) {
             return Some(harness);
         }
-        let threads = tab
-            .turn
+        let threads = turn
             .iter()
             .find(|block| block.role == BlockRole::User)
             .and_then(|block| block.btw_threads.as_deref());
-        host.surface_harness(&self.props.blocks, &tab.turn, self.props.harness, threads)
+        host.surface_harness(&self.props.blocks, turn, self.props.harness, threads)
     }
 
     /// The active tab's own harness, when it can take questions.
     pub fn tab_harness(&self, host: &dyn BtwHost) -> Option<HarnessId> {
-        self.active()
-            .and_then(|tab| self.tab_harness_for(&tab, host))
+        self.active_source()
+            .and_then(|source| self.harness_for(source.thread(), source.turn(), host))
     }
 
     /// The side composer's harness.
@@ -277,8 +363,11 @@ impl BtwConversation {
     }
 
     fn base_model_for(&self, tab: &BtwTab) -> String {
-        tab.turn
-            .iter()
+        self.base_model_for_turn(&tab.turn)
+    }
+
+    fn base_model_for_turn(&self, turn: &[Block]) -> String {
+        turn.iter()
             .find(|block| block.role == BlockRole::User)
             .and_then(|block| block.turn_model.as_ref())
             .map(|turn_model| turn_model.id.clone())
@@ -286,18 +375,18 @@ impl BtwConversation {
     }
 
     fn optimistic_for_active(&self) -> Option<&BtwMessage> {
-        let active = self.active_tab_id()?;
+        let active = self.active_source()?;
         self.optimistic
             .as_ref()
-            .filter(|(thread_id, _)| thread_id == &active)
+            .filter(|(thread_id, _)| thread_id == active.id())
             .map(|(_, message)| message)
     }
 
     /// The active tab's messages, with a question still in flight.
     pub fn messages(&self) -> Vec<BtwMessage> {
         let mut messages = self
-            .persisted()
-            .map(|thread| thread.messages)
+            .persisted_ref()
+            .map(|thread| thread.messages.clone())
             .unwrap_or_default();
         if let Some(pending) = self.optimistic_for_active()
             && !messages.iter().any(|message| message.id == pending.id)
@@ -309,14 +398,14 @@ impl BtwConversation {
 
     /// The active tab's live reply blocks.
     pub fn pending_blocks(&self) -> Vec<Block> {
-        self.persisted()
-            .and_then(|thread| thread.pending_blocks)
+        self.persisted_ref()
+            .and_then(|thread| thread.pending_blocks.clone())
             .unwrap_or_default()
     }
 
     /// The active tab is answering.
     pub fn running(&self) -> bool {
-        self.persisted()
+        self.persisted_ref()
             .is_some_and(|thread| thread.status == BtwThreadStatus::Running)
             || self.optimistic_for_active().is_some()
     }
@@ -326,11 +415,11 @@ impl BtwConversation {
         if let Some(model) = &self.draft_model {
             return model.clone();
         }
-        if let Some(model) = self.persisted().and_then(|thread| thread.model) {
+        if let Some(model) = self.persisted_ref().and_then(|thread| thread.model.clone()) {
             return model;
         }
-        match self.active() {
-            Some(tab) => self.base_model_for(&tab),
+        match self.active_source() {
+            Some(source) => self.base_model_for_turn(source.turn()),
             None => self.props.model.clone(),
         }
     }
@@ -340,7 +429,10 @@ impl BtwConversation {
         if let Some(settings) = &self.draft_model_settings {
             return settings.clone();
         }
-        if let Some(settings) = self.persisted().and_then(|thread| thread.model_settings) {
+        if let Some(settings) = self
+            .persisted_ref()
+            .and_then(|thread| thread.model_settings.clone())
+        {
             return settings;
         }
         host.preferred_model_settings(

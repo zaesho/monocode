@@ -30,10 +30,10 @@ use super::mascot::banked_reset_mascot;
 use super::model::{
     AccountStatusTone, CodexRateLimitResetOutcome, ProviderAccount, ProviderAccountIdentity,
     ProviderRateLimits, RateLimitProvider, RateLimitResetCredit, RateLimitStatus, RateLimitWindow,
-    ResetCreditStatus, account_status, best_alternative_account, clamp_used_percent,
+    ResetCreditStatus, account_status_for, best_alternative_account_for, clamp_used_percent,
     format_rate_limit_window_chip_label, format_reset_countdown, format_reset_duration,
     format_usage_percent, format_window_label, identity_key, identity_organization_tag,
-    rate_limit_window_tooltip, supports_provider_accounts,
+    rate_limit_window_tooltip, relevant_rate_limit_windows, supports_provider_accounts,
 };
 use super::popover::{Side, anchored_to_trigger, dismiss_outside};
 use super::sign_in_panel::{SignInState, sign_in_panel};
@@ -63,6 +63,8 @@ pub struct ChipProps {
     pub project: Option<String>,
     pub accounts: Vec<ProviderAccount>,
     pub account_id: Option<String>,
+    /// The session's model, which decides which scoped limits count.
+    pub model: Option<String>,
 }
 
 impl ChipProps {
@@ -74,6 +76,7 @@ impl ChipProps {
             project: None,
             accounts: Vec::new(),
             account_id: None,
+            model: None,
         }
     }
 }
@@ -120,9 +123,12 @@ pub enum WindowKind {
     Session,
     Weekly,
     Monthly,
+    /// A weekly limit for one model, by its index in `scoped_weekly`.
+    ScopedWeekly(usize),
 }
 
-/// `usageWindows`.
+/// `usageWindows`: the plan windows, then Claude's model-scoped weekly
+/// limits.
 pub fn usage_windows(limits: &ProviderRateLimits) -> Vec<(WindowKind, RateLimitWindow)> {
     [
         (WindowKind::Session, limits.session),
@@ -131,7 +137,40 @@ pub fn usage_windows(limits: &ProviderRateLimits) -> Vec<(WindowKind, RateLimitW
     ]
     .into_iter()
     .filter_map(|(kind, window)| window.map(|window| (kind, window)))
+    .chain(
+        limits
+            .scoped_weekly
+            .iter()
+            .enumerate()
+            .map(|(index, scoped)| (WindowKind::ScopedWeekly(index), scoped.window)),
+    )
     .collect()
+}
+
+/// The card title for a window, with a scoped limit's model.
+pub fn window_label(limits: &ProviderRateLimits, kind: WindowKind) -> String {
+    match kind {
+        WindowKind::ScopedWeekly(index) => limits.scoped_weekly.get(index).map_or_else(
+            || "Weekly limit".to_string(),
+            |scoped| format!("Weekly {}", scoped.label),
+        ),
+        kind => window_title(kind).to_string(),
+    }
+}
+
+/// The usage credits line: whether credits are on, and how much is used.
+pub fn extra_usage_line(limits: &ProviderRateLimits) -> Option<String> {
+    let extra = limits.extra_usage.as_ref()?;
+    Some(if !extra.enabled {
+        "Usage credits disabled.".into()
+    } else if let Some(used) = extra.used_percent {
+        format!(
+            "Usage credits enabled, {}% used.",
+            monocode_core::js::round(used) as i64
+        )
+    } else {
+        "Usage credits enabled.".into()
+    })
 }
 
 /// `needsProviderLogin`: a missing or expired sign-in, not an account that
@@ -201,6 +240,7 @@ pub fn window_title(kind: WindowKind) -> &'static str {
         WindowKind::Session => "5-hour limit",
         WindowKind::Weekly => "Weekly limit",
         WindowKind::Monthly => "Monthly limit",
+        WindowKind::ScopedWeekly(_) => "Weekly limit",
     }
 }
 
@@ -697,13 +737,16 @@ impl UsageProviderChip {
                 .text_color(muted)
                 .into_any_element()
         } else {
-            let tightest = windows.iter().map(|(_, window)| window.used_percent).fold(
-                None::<f64>,
-                |best, pct| match best {
-                    Some(best) if pct <= best => Some(best),
-                    _ => Some(pct),
-                },
-            );
+            // The tightest window that limits this session's model.
+            let relevant = relevant_rate_limit_windows(limits, self.props.model.as_deref());
+            let tightest =
+                relevant
+                    .iter()
+                    .map(|window| window.used_percent)
+                    .fold(None::<f64>, |best, pct| match best {
+                        Some(best) if pct <= best => Some(best),
+                        _ => Some(pct),
+                    });
             let account_label = (self.props.accounts.len() > 1)
                 .then(|| self.active_account().map(|account| account.label.clone()))
                 .flatten();
@@ -852,14 +895,33 @@ impl UsageProviderChip {
         body = if windows.is_empty() {
             body.child(empty_usage_state(&limits, self.loading(), cx))
         } else {
-            body.child(div().flex().flex_col().gap(u(6.)).children(
-                windows.iter().map(|(kind, window)| {
-                    usage_window_card(*kind, window, now, show_remaining, cx)
-                }),
-            ))
+            body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(u(6.))
+                    .children(windows.iter().map(|(kind, window)| {
+                        usage_window_card(
+                            &window_label(&limits, *kind),
+                            window,
+                            now,
+                            show_remaining,
+                            cx,
+                        )
+                    })),
+            )
         };
+        if let Some(line) = extra_usage_line(&limits) {
+            body = body.child(
+                text(line)
+                    .mt(u(8.))
+                    .text_px(10.)
+                    .text_color(Theme::of(cx).content(0.6)),
+            );
+        }
         // `SwitchSuggestion`.
-        let active_status = account_status(Some(&limits), now);
+        let model = self.props.model.clone();
+        let active_status = account_status_for(Some(&limits), now, model.as_deref());
         if matches!(
             active_status.tone,
             AccountStatusTone::Exhausted | AccountStatusTone::Low
@@ -876,7 +938,9 @@ impl UsageProviderChip {
                     .find(|(id, _)| *id == account.id)
                     .and_then(|(_, limits)| limits.clone())
             };
-            if let Some(suggestion) = best_alternative_account(&others, lookup, now).cloned() {
+            if let Some(suggestion) =
+                best_alternative_account_for(&others, lookup, now, model.as_deref()).cloned()
+            {
                 let suggestion_limits = lookup(&suggestion);
                 body = body.child(self.render_switch_suggestion(
                     &suggestion,
@@ -1089,7 +1153,11 @@ impl UsageProviderChip {
                             .child(text(account.label.clone()).min_w_0().truncate().medium())
                             .child(account_status_label(
                                 "suggestion-status",
-                                &account_status(limits, self.props.now),
+                                &account_status_for(
+                                    limits,
+                                    self.props.now,
+                                    self.props.model.as_deref(),
+                                ),
                                 10.,
                                 cx,
                             )),
@@ -1522,7 +1590,7 @@ impl UsageProviderChip {
             let org = identity_organization_tag(identity.as_ref());
             let usage = self.usage_for(account, cx);
             let meters = meter_windows(usage.as_ref());
-            let status = account_status(usage.as_ref(), now);
+            let status = account_status_for(usage.as_ref(), now, self.props.model.as_deref());
             let id = account.id.clone();
             let row_id = SharedString::from(format!("account-{}", account.id));
             let button_selector = format!("button:{}", account.label);
@@ -1558,10 +1626,16 @@ impl UsageProviderChip {
                     .min_w_0()
                     .flex_1()
                     .gap(u(10.))
-                    .children(meters.iter().map(|(title, window)| {
+                    .children(meters.iter().map(|(title, window, scoped)| {
+                        // Short "5h" or "wk" titles, as on the footer chip.
+                        let label = if *scoped {
+                            title.clone()
+                        } else {
+                            format_window_label(window.window_minutes)
+                        };
                         usage_meter(
                             SharedString::from(format!("meter-{}-{title}", account.id)),
-                            &format_window_label(window.window_minutes),
+                            &label,
                             window,
                             now,
                             MeterWidth::Flex,
@@ -1909,7 +1983,7 @@ fn mini_bar(used_pct: f64, show_remaining: bool, cx: &App) -> AnyElement {
 /// `UsageWindowCard`: the used percent over a bar of what is used, or the
 /// remaining percent over a bar of what remains with `show_remaining` on.
 fn usage_window_card(
-    kind: WindowKind,
+    title: &str,
     window: &RateLimitWindow,
     now: i64,
     show_remaining: bool,
@@ -1928,7 +2002,6 @@ fn usage_window_card(
     } else {
         ("used", "remaining")
     };
-    let title = window_title(kind);
     let aria = format!("{title} {shown_word}");
     let value_now = monocode_core::js::round(shown) as i64;
     let bar_selector = format!("progressbar:{aria}={value_now}");
@@ -2092,6 +2165,8 @@ mod tests {
                     credit("b", ResetCreditStatus::Redeemed),
                 ]),
             }),
+            scoped_weekly: Vec::new(),
+            extra_usage: None,
             ..idle_rate_limits(RateLimitProvider::Codex)
         };
         let rows = banked_reset_rows(&limits);

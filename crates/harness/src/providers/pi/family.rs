@@ -38,6 +38,7 @@ use crate::core::child::{ChildEvent, Children};
 use crate::core::native_commands::{
     CommandContext, CommandsListener, NativeCommand, NativeCommandProvider, Unsubscribe,
 };
+use crate::core::partial_json::PartialJson;
 use crate::core::registry::{AcceptedHook, EventSink};
 
 use super::client::{DEFAULT_REQUEST_TIMEOUT_MS, PiRpc};
@@ -73,7 +74,7 @@ struct InFlightTool {
     id: String,
     name: String,
     input: Rec,
-    partial_json: String,
+    partial_json: PartialJson,
     title: String,
     /// Set on `tool_execution_end`; later progress updates are stale.
     finished: bool,
@@ -1058,11 +1059,23 @@ impl PiFamily {
             match delta.kind {
                 PiDeltaKind::Text => {
                     state.emitted_assistant.push_str(&delta.text);
-                    fx.emit(state, HarnessEvent::MessageDelta { text: delta.text });
+                    fx.emit(
+                        state,
+                        HarnessEvent::MessageDelta {
+                            text: delta.text,
+                            append: None,
+                        },
+                    );
                 }
                 PiDeltaKind::Thinking => {
                     state.emitted_reasoning.push_str(&delta.text);
-                    fx.emit(state, HarnessEvent::ReasoningDelta { text: delta.text });
+                    fx.emit(
+                        state,
+                        HarnessEvent::ReasoningDelta {
+                            text: delta.text,
+                            append: None,
+                        },
+                    );
                 }
             }
         }
@@ -1082,7 +1095,7 @@ impl PiFamily {
         {
             let parsed = state.tools_by_id.get_mut(&id).and_then(|tool| {
                 tool.partial_json.push_str(&delta.delta);
-                try_parse_json_record(&tool.partial_json)
+                tool.partial_json.complete().and_then(try_parse_json_record)
             });
             if let Some(parsed) = parsed {
                 update_tool(state, fx, &id, parsed);
@@ -1658,16 +1671,22 @@ fn interjection_from_custom_message(message: &Rec) -> Option<HarnessEvent> {
         }
         if !bodies.is_empty() {
             return Some(HarnessEvent::Interjection {
+                id: None,
                 text: bodies.join("\n\n"),
                 custom_type,
                 severity,
+                model: None,
+                status: None,
             });
         }
     }
     Some(HarnessEvent::Interjection {
+        id: None,
         text: custom_message_text(message.get("content")),
         custom_type,
         severity: None,
+        model: None,
+        status: None,
     })
 }
 
@@ -1698,7 +1717,7 @@ fn upsert_tool(
                 id: id.to_string(),
                 name: name.to_string(),
                 input,
-                partial_json: String::new(),
+                partial_json: PartialJson::default(),
                 title,
                 finished: false,
             },

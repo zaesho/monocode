@@ -27,6 +27,8 @@ pub struct GeneralSection {
     notification_permission: NotificationPermission,
     notes_enabled: bool,
     live_agents_enabled: bool,
+    agent_sessions_enabled: bool,
+    agent_sessions_review: bool,
     file_tab_mode: FileTabMode,
     tab_animations_enabled: bool,
     close_to_tray: bool,
@@ -61,6 +63,8 @@ impl GeneralSection {
             notification_permission,
             notes_enabled: ss::load_notes_enabled(kv),
             live_agents_enabled: ss::load_live_agents_enabled(kv),
+            agent_sessions_enabled: ss::load_agent_sessions_enabled(kv),
+            agent_sessions_review: ss::load_agent_sessions_review(kv),
             file_tab_mode: ss::load_file_tab_mode(kv),
             tab_animations_enabled: ss::load_tab_animations_enabled(kv),
             close_to_tray: ss::load_close_to_tray(kv, platform),
@@ -164,6 +168,18 @@ impl GeneralSection {
     pub fn on_live_agents_enabled(&mut self, next: bool, cx: &mut Context<Self>) {
         ss::save_live_agents_enabled(&self.ctx.kv, next);
         self.live_agents_enabled = next;
+        cx.notify();
+    }
+
+    pub fn on_agent_sessions_enabled(&mut self, next: bool, cx: &mut Context<Self>) {
+        ss::save_agent_sessions_enabled(&self.ctx.kv, next);
+        self.agent_sessions_enabled = next;
+        cx.notify();
+    }
+
+    pub fn on_agent_sessions_review(&mut self, next: bool, cx: &mut Context<Self>) {
+        ss::save_agent_sessions_review(&self.ctx.kv, next);
+        self.agent_sessions_review = next;
         cx.notify();
     }
 
@@ -466,12 +482,46 @@ impl Render for GeneralSection {
             );
         }
 
+        let mut agents = group(&reveal, "Agents")
+            .description("What agents may do in MonoCode without the /operator command.")
+            .child(
+                row(&reveal, "Let agents open sessions")
+                    .id("agent-sessions")
+                    .description("Agents in any thread can list this project's sessions and open a new session with a prompt they write. /operator still gives full app access.")
+                    .switch_only()
+                    .child(
+                        toggle("Let agents open sessions", self.agent_sessions_enabled).on_change(
+                            cx.listener(|this, next: &bool, _, cx| {
+                                this.on_agent_sessions_enabled(*next, cx)
+                            }),
+                        ),
+                    ),
+            );
+        if self.agent_sessions_enabled {
+            agents = agents.child(
+                row(&reveal, "Review agent-opened sessions before they run")
+                    .id("agent-sessions-review")
+                    .description("A session an agent opens starts as an unsent draft. Read the prompt, then send it yourself. Off, the new session runs its prompt at once.")
+                    .switch_only()
+                    .child(
+                        toggle(
+                            "Review agent-opened sessions before they run",
+                            self.agent_sessions_review,
+                        )
+                        .on_change(cx.listener(|this, next: &bool, _, cx| {
+                            this.on_agent_sessions_review(*next, cx)
+                        })),
+                    ),
+            );
+        }
+
         let about = group(&reveal, "About").child(self.update_row(cx));
         div()
             .flex()
             .flex_col()
             .child(alerts)
             .child(workspace)
+            .child(agents)
             .child(about)
     }
 }

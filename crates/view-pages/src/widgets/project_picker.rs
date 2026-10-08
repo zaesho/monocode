@@ -136,6 +136,9 @@ impl ProjectPicker {
 
     /// `railCwd`: the project whose rail supplies the choices.
     pub fn set_rail_cwd(&mut self, rail_cwd: Option<&str>, cx: &mut Context<Self>) {
+        if self.rail_cwd.as_deref() == rail_cwd {
+            return;
+        }
         self.rail_cwd = rail_cwd.map(str::to_string);
         cx.notify();
     }

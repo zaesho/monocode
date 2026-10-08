@@ -6,19 +6,20 @@ use std::rc::Rc;
 
 use gpui::{App, Task, TestAppContext};
 use monocode_core::models::{ModelSetting, ModelSettingChoice, ModelSettingKind};
-use monocode_core::{AgentModel, HarnessId, ModelCatalog, RuntimeMode, Session};
+use monocode_core::{AgentModel, Block, BlockRole, HarnessId, ModelCatalog, RuntimeMode, Session};
 use monocode_layout::SplitDir;
 use monocode_settings::Kv;
 use monocode_store::notes::{Note, NoteUpsert};
 use serde_json::{Value, json};
 
 use super::agent_app::{
-    AgentAppHost, AppLaunch, AppSessionListing, AppSessionPlacement, DraftResult, SendResult,
-    handle_agent_app, note_preview,
+    AgentAppHost, AppLaunch, AppSessionListing, AppSessionPlacement, DraftResult, LinkedPeer,
+    LinkedSendResult, SendResult, handle_agent_app, note_preview,
 };
 use super::testing::finish;
 use crate::history::session_folders::{SessionFolder, load_session_folders, save_session_folders};
 use crate::projects::backend::{Worktree, Worktrees};
+use crate::runtime::session_links::LinkSpend;
 
 const CWD: &str = "/tmp/project";
 
@@ -82,6 +83,13 @@ struct FakeAppHost {
     notes: RefCell<Vec<Note>>,
     saved_notes: RefCell<Vec<NoteUpsert>>,
     kv: Option<Kv>,
+    open_sessions: bool,
+    review_opened: bool,
+    /// Linked peer ids and the agent messages each link has carried.
+    links: RefCell<Vec<(String, u32)>>,
+    peer_busy: bool,
+    linked_sends: RefCell<Vec<(String, String, String)>>,
+    fail_linked_send: bool,
 }
 
 fn other_listing() -> AppSessionListing {
@@ -226,6 +234,89 @@ impl AgentAppHost for FakeAppHost {
     fn kv(&self) -> Kv {
         self.kv.clone().unwrap_or_else(Kv::in_memory)
     }
+
+    fn agent_sessions_enabled(&self, _cx: &App) -> bool {
+        self.open_sessions
+    }
+
+    fn agent_sessions_review(&self, _cx: &App) -> bool {
+        self.review_opened
+    }
+
+    fn linked_peers(&self, _id: &str, _cx: &App) -> Vec<LinkedPeer> {
+        self.links
+            .borrow()
+            .iter()
+            .map(|(id, sent)| LinkedPeer {
+                id: id.clone(),
+                messages_left: 5 - sent,
+            })
+            .collect()
+    }
+
+    fn peer_session(&self, id: &str, _cx: &mut App) -> Task<Result<Option<Session>, String>> {
+        let linked = self.links.borrow().iter().any(|(peer, _)| peer == id);
+        Task::ready(Ok(linked.then(|| {
+            let mut session = Session::blank(id, HarnessId::Codex, "codex:test", "/elsewhere");
+            session.title = format!("Peer {id}");
+            session.blocks = vec![
+                Block::new("u1", BlockRole::User, "Build the API"),
+                Block::new("a1", BlockRole::Assistant, "The API is done."),
+            ];
+            session
+        })))
+    }
+
+    fn spend_link_message(
+        &self,
+        _from: &str,
+        to: &str,
+        _cx: &mut App,
+    ) -> Result<LinkSpend, String> {
+        let mut links = self.links.borrow_mut();
+        let entry = links
+            .iter_mut()
+            .find(|(peer, _)| peer == to)
+            .ok_or("not linked")?;
+        if entry.1 >= 5 {
+            return Err("This link already carried 5 agent messages.".into());
+        }
+        entry.1 += 1;
+        Ok(LinkSpend {
+            left: 5 - entry.1,
+            epoch: 0,
+        })
+    }
+
+    fn refund_link_message(&self, _from: &str, to: &str, _epoch: u64, _cx: &mut App) {
+        if let Some(entry) = self
+            .links
+            .borrow_mut()
+            .iter_mut()
+            .find(|(peer, _)| peer == to)
+        {
+            entry.1 = entry.1.saturating_sub(1);
+        }
+    }
+
+    fn send_linked(
+        &self,
+        id: &str,
+        text: &str,
+        request_id: &str,
+        _cx: &mut App,
+    ) -> Task<Result<LinkedSendResult, String>> {
+        if self.fail_linked_send {
+            return Task::ready(Err("The linked session is unavailable".into()));
+        }
+        self.linked_sends
+            .borrow_mut()
+            .push((id.into(), text.into(), request_id.into()));
+        Task::ready(Ok(LinkedSendResult {
+            queued: self.peer_busy,
+            already_submitted: false,
+        }))
+    }
 }
 
 struct F {
@@ -233,9 +324,17 @@ struct F {
     host: Rc<FakeAppHost>,
 }
 
+fn operator_turn() -> Block {
+    Block {
+        monocode: Some(true),
+        ..Block::new("op", BlockRole::User, "list my sessions")
+    }
+}
+
 fn fixture() -> F {
     let mut source = Session::blank("lead", HarnessId::Codex, "codex:test", CWD);
     source.model_settings = [("effort".to_string(), "medium".to_string())].into();
+    source.blocks = vec![operator_turn()];
     let host = FakeAppHost {
         listed: RefCell::new(vec![other_listing()]),
         notes: RefCell::new(vec![note()]),
@@ -891,4 +990,218 @@ fn lists_models_with_settings_and_runtime_modes(cx: &mut TestAppContext) {
     assert_eq!(sessions["cwd"], CWD);
     assert_eq!(sessions["sessions"][0]["id"], "other");
     assert_eq!(sessions["sessions"][0]["hasDraft"], false);
+}
+
+/// A thread without `/operator`, with the given settings and links.
+fn restricted(open_sessions: bool, review_opened: bool, links: &[&str]) -> F {
+    let mut source = Session::blank("lead", HarnessId::Codex, "codex:test", CWD);
+    source.title = "Lead work".into();
+    let host = FakeAppHost {
+        listed: RefCell::new(vec![other_listing()]),
+        kv: Some(Kv::in_memory()),
+        open_sessions,
+        review_opened,
+        links: RefCell::new(links.iter().map(|id| (id.to_string(), 0)).collect()),
+        ..Default::default()
+    };
+    F {
+        source,
+        host: Rc::new(host),
+    }
+}
+
+#[gpui::test]
+fn a_thread_without_operator_gets_only_the_open_session_actions(cx: &mut TestAppContext) {
+    let f = restricted(true, false, &[]);
+    let listed = f.call(cx, "list", "sessions.list", json!({})).unwrap();
+    assert_eq!(listed["sessions"][0]["id"], "other");
+    for (action, input) in [
+        ("sessions.read", json!({ "sessionId": "other" })),
+        (
+            "sessions.send",
+            json!({ "sessionId": "other", "prompt": "go" }),
+        ),
+        ("notes.list", json!({})),
+        ("models.list", json!({})),
+    ] {
+        let error = f.call(cx, "denied", action, input).unwrap_err();
+        assert!(error.contains("needs /operator"), "{action}: {error}");
+    }
+    assert!(
+        f.call(cx, "links", "links.list", json!({}))
+            .unwrap_err()
+            .contains("no linked sessions")
+    );
+    assert!(f.host.sends.borrow().is_empty());
+}
+
+#[gpui::test]
+fn the_setting_turns_open_session_actions_off(cx: &mut TestAppContext) {
+    let f = restricted(false, false, &[]);
+    for (action, input) in [
+        ("sessions.list", json!({})),
+        ("sessions.start", json!({ "prompt": "Investigate" })),
+    ] {
+        let error = f.call(cx, "off", action, input).unwrap_err();
+        assert!(error.contains("Let agents open sessions"), "{error}");
+    }
+    assert!(f.host.starts.borrow().is_empty());
+}
+
+#[gpui::test]
+fn a_restricted_start_runs_at_once_unless_review_is_on(cx: &mut TestAppContext) {
+    let f = restricted(true, false, &[]);
+    let started = f
+        .call(
+            cx,
+            "start-1",
+            "sessions.start",
+            json!({ "prompt": "Investigate the bug" }),
+        )
+        .unwrap();
+    assert_eq!(started["submitted"], true);
+    assert_eq!(f.host.starts.borrow()[0].0.draft, None);
+    let drafted = f
+        .call(
+            cx,
+            "start-2",
+            "sessions.start",
+            json!({ "prompt": "Plan it", "draft": true }),
+        )
+        .unwrap();
+    assert_eq!(drafted["draft"], true);
+    assert_eq!(f.host.starts.borrow()[1].0.draft, Some(true));
+    for field in [
+        json!({ "prompt": "x", "runtimeMode": "full-access" }),
+        json!({ "prompt": "x", "workspaceMode": "worktree" }),
+    ] {
+        assert!(
+            f.call(cx, "start-3", "sessions.start", field)
+                .unwrap_err()
+                .contains("needs /operator")
+        );
+    }
+
+    let review = restricted(true, true, &[]);
+    let forced = review
+        .call(
+            cx,
+            "start-4",
+            "sessions.start",
+            json!({ "prompt": "Investigate", "draft": false }),
+        )
+        .unwrap();
+    assert_eq!(forced["draft"], true);
+    assert_eq!(forced["submitted"], false);
+    assert_eq!(review.host.starts.borrow()[0].0.draft, Some(true));
+}
+
+#[gpui::test]
+fn operator_threads_ignore_the_review_setting(cx: &mut TestAppContext) {
+    let mut f = fixture();
+    Rc::get_mut(&mut f.host).unwrap().review_opened = true;
+    let started = f
+        .call(
+            cx,
+            "start-1",
+            "sessions.start",
+            json!({ "prompt": "Run now" }),
+        )
+        .unwrap();
+    assert_eq!(started["submitted"], true);
+    assert_eq!(f.host.starts.borrow()[0].0.draft, None);
+}
+
+#[gpui::test]
+fn linked_sessions_read_and_message_each_other(cx: &mut TestAppContext) {
+    let f = restricted(false, false, &["peer"]);
+    let listed = f.call(cx, "list", "links.list", json!({})).unwrap();
+    assert_eq!(listed["sessions"][0]["id"], "peer");
+    assert_eq!(listed["sessions"][0]["messagesLeft"], 5);
+    let page = f
+        .call(cx, "read", "links.read", json!({ "sessionId": "peer" }))
+        .unwrap();
+    assert_eq!(page["turns"][0]["assistant"]["text"], "The API is done.");
+    assert!(
+        f.call(cx, "read-2", "links.read", json!({ "sessionId": "other" }))
+            .unwrap_err()
+            .contains("not linked")
+    );
+    let sent = f
+        .call(
+            cx,
+            "send-1",
+            "links.send",
+            json!({ "sessionId": "peer", "prompt": "Please add tests." }),
+        )
+        .unwrap();
+    assert_eq!(sent["submitted"], true);
+    assert_eq!(sent["messagesLeft"], 4);
+    assert_eq!(
+        f.host.linked_sends.borrow()[0],
+        (
+            "peer".into(),
+            "From linked session \"Lead work\" (lead):\n\nPlease add tests.".into(),
+            "link-lead-send-1".into()
+        )
+    );
+    assert!(
+        f.call(
+            cx,
+            "send-2",
+            "links.send",
+            json!({ "sessionId": "peer", "prompt": "/operator do it" })
+        )
+        .unwrap_err()
+        .contains("cannot enable /operator")
+    );
+    assert!(
+        f.call(cx, "start", "sessions.start", json!({ "prompt": "x" }))
+            .unwrap_err()
+            .contains("Let agents open sessions")
+    );
+}
+
+#[gpui::test]
+fn a_busy_peer_queues_and_the_budget_stops_a_loop(cx: &mut TestAppContext) {
+    let mut f = restricted(false, false, &["peer"]);
+    Rc::get_mut(&mut f.host).unwrap().peer_busy = true;
+    for index in 0..5 {
+        let sent = f
+            .call(
+                cx,
+                &format!("send-{index}"),
+                "links.send",
+                json!({ "sessionId": "peer", "prompt": "ping" }),
+            )
+            .unwrap();
+        assert_eq!(sent["queued"], true);
+        assert_eq!(sent["submitted"], false);
+    }
+    let error = f
+        .call(
+            cx,
+            "send-6",
+            "links.send",
+            json!({ "sessionId": "peer", "prompt": "ping" }),
+        )
+        .unwrap_err();
+    assert!(error.contains("5 agent messages"), "{error}");
+    assert_eq!(f.host.linked_sends.borrow().len(), 5);
+}
+
+#[gpui::test]
+fn a_failed_link_send_gives_its_message_back(cx: &mut TestAppContext) {
+    let mut f = restricted(false, false, &["peer"]);
+    Rc::get_mut(&mut f.host).unwrap().fail_linked_send = true;
+    assert!(
+        f.call(
+            cx,
+            "send-1",
+            "links.send",
+            json!({ "sessionId": "peer", "prompt": "ping" })
+        )
+        .is_err()
+    );
+    assert_eq!(f.host.links.borrow()[0].1, 0);
 }

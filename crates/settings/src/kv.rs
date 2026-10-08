@@ -330,6 +330,13 @@ impl Kv {
         self.inner.shared.id
     }
 
+    /// A count of changes to this store. It moves on every `set_item`,
+    /// `remove_item`, or import that changed something, so a cache of values
+    /// parsed from the store stays valid while it holds still.
+    pub fn generation(&self) -> u64 {
+        read(&self.inner.shared.state).generation
+    }
+
     /// Store bookkeeping saved next to the items.
     pub(crate) fn meta(&self, key: &str) -> Option<Value> {
         read(&self.inner.shared.state).meta.get(key).cloned()

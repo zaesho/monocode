@@ -18,6 +18,7 @@ pub mod reducer;
 pub mod session_cache;
 pub mod session_done;
 pub mod session_history;
+pub mod session_links;
 pub mod session_store;
 pub mod sessions;
 #[cfg(any(test, feature = "test-support"))]
@@ -34,10 +35,11 @@ pub use checkpoint::{
 };
 pub use engine::{Engine, EngineConfig};
 pub use hooks::{
-    AttentionHooks, EngineHooks, HarnessHooks, NoopHooks, OrchestrationHooks, RecoveredSession,
-    RemoteHooks, SideThreadHooks, SubmitHooks, WorkspaceHooks,
+    AttentionHooks, CatalogScope, EngineHooks, HarnessHooks, NoopHooks, OrchestrationHooks,
+    RecoveredSession, RemoteHooks, SideThreadHooks, SubmitHooks, WorkspaceHooks,
 };
 pub use in_flight::ResumedWorkspace;
 pub use lifecycle::{BootWorkspace, Lifecycle, LifecycleEvent, QuitMode};
-pub use session_store::{InFlightRef, SessionSummary, SessionWriter};
+pub use session_links::{LINK_MESSAGE_BUDGET, SessionLinks};
+pub use session_store::{InFlightRef, PersistOutcome, SessionSummary, SessionWriter};
 pub use sessions::{Sessions, SessionsEvent};

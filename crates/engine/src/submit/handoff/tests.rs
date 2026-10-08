@@ -722,3 +722,143 @@ fn preserves_saved_ci_context_when_its_evidence_cannot_be_separated_safely() {
     });
     assert!(prompt.contains(&context));
 }
+
+/// `unknownTargetHistory`: a switch from Cursor to Fx whose request may
+/// have run, recovered after a restart.
+fn unknown_target_history(confirm_inspection: bool) -> Session {
+    use monocode_core::provider_context::{
+        DeliveryStart, begin_provider_delivery, confirm_provider_delivery_inspection,
+        mark_provider_request_submitted, recover_submitted_provider_delivery,
+    };
+    let mut source = session_with(vec![
+        user("u1", "Original source instruction"),
+        assistant("a1", "Source response"),
+    ]);
+    source.harness = HarnessId::Fx;
+    source.model = "fx:target-model".into();
+    source.model_settings.insert("effort".into(), "high".into());
+    source.pending_switch = Some(PendingHarnessSwitch {
+        from_provider_session_id: Some("acp-1".into()),
+        ..switch(HarnessId::Cursor, None)
+    });
+    let mut session = append_ready_handoff(
+        &source,
+        HarnessId::Cursor,
+        HarnessId::Fx,
+        "Portable history",
+    );
+    session
+        .blocks
+        .push(user("u2", "Possibly executed target request"));
+    let cwd = session.cwd.clone();
+    begin_provider_delivery(
+        &mut session,
+        DeliveryStart {
+            switch_id: "inspected-switch".into(),
+            from: Some(HarnessId::Cursor),
+            to: Some(HarnessId::Fx),
+            cwd,
+            current_user_block_id: "u2".into(),
+            source_through_block_id: Some("a1".into()),
+            included_block_ids: vec!["u1".into(), "a1".into()],
+            ..Default::default()
+        },
+    );
+    mark_provider_request_submitted(&mut session, "inspected-switch");
+    recover_submitted_provider_delivery(&mut session, "inspected-switch");
+    if confirm_inspection {
+        confirm_provider_delivery_inspection(&mut session);
+    }
+    session
+}
+
+fn fresh_fx_switch() -> ComposerSwitchPlan {
+    let mut settings = ModelSettings::new();
+    settings.insert("effort".into(), "high".into());
+    ComposerSwitchPlan::Arm {
+        pending: PendingHarnessSwitch {
+            from: HarnessId::Fx,
+            from_model: "fx:target-model".into(),
+            from_settings: settings,
+            from_provider_session_id: None,
+            from_provider_account_id: None,
+        },
+    }
+}
+
+#[test]
+fn arms_a_new_transfer_after_inspecting_a_possibly_executed_request() {
+    for next in [HarnessId::Cursor, HarnessId::Claude] {
+        let inspected = unknown_target_history(true);
+        assert_eq!(
+            inspected
+                .pending_switch
+                .as_ref()
+                .map(|pending| pending.from),
+            Some(HarnessId::Cursor)
+        );
+        assert_eq!(plan_composer_switch(&inspected, next), fresh_fx_switch());
+        assert!(
+            inspected
+                .blocks
+                .iter()
+                .find(|block| block.id == "u2")
+                .is_some_and(|block| block.draft.is_none())
+        );
+    }
+}
+
+#[test]
+fn keeps_reconstruction_intent_for_a_model_change_after_inspection() {
+    let inspected = unknown_target_history(true);
+    assert_eq!(
+        plan_composer_switch(&inspected, HarnessId::Fx),
+        ComposerSwitchPlan::Model
+    );
+}
+
+#[test]
+fn arms_a_new_source_transfer_before_inspection_is_confirmed() {
+    let recovered = unknown_target_history(false);
+    assert!(
+        recovered
+            .provider_context
+            .as_ref()
+            .and_then(|state| state.delivery.as_ref())
+            .is_some_and(|delivery| delivery.needs_inspection())
+    );
+    assert_eq!(
+        plan_composer_switch(&recovered, HarnessId::Cursor),
+        fresh_fx_switch()
+    );
+}
+
+#[test]
+fn does_not_deliver_a_failed_target_handoff_to_the_restored_source() {
+    let mut session = session_with(Vec::new());
+    session.harness = HarnessId::Cursor;
+    session.blocks.push(Block {
+        handoff: Some(HandoffMeta {
+            from: HarnessId::Cursor,
+            to: HarnessId::Claude,
+            status: HandoffStatus::Ready,
+            pending: Some(true),
+            transfer: Some(monocode_core::block::HandoffTransfer {
+                switch_id: "failed-target".into(),
+                status: monocode_core::block::TransferStatus::Uncertain,
+                mode: monocode_core::block::TransferMode::Native,
+                included: 1,
+                omitted: 0,
+                historical_attachments: 0,
+                retrieval_path: None,
+                request_submitted: None,
+                failed_before_submission: None,
+                needs_inspection: None,
+                inspection_confirmed: None,
+            }),
+            extra: Extra::new(),
+        }),
+        ..Block::new("handoff", BlockRole::Handoff, "Prepared shared history")
+    });
+    assert!(pending_handoff(&session).is_none());
+}

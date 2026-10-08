@@ -7,10 +7,9 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, AppContext as _, Context, InteractiveElement as _,
-    IntoElement, ParentElement as _, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use monocode_core::block::HandoffStatus;
 use monocode_core::task_list::legacy_task_list_from_text;
 use monocode_core::transcript::BlockRef;
 use monocode_core::{Block, BlockRole};
@@ -21,9 +20,11 @@ use monocode_ui::{Theme, u};
 use crate::cards::generated_image::GeneratedImage;
 use crate::cards::plan_preview::{build_disabled, plan_preview};
 use crate::cards::task_list::task_list_preview;
+use crate::motion::spinner_loop;
 use crate::threads::{
     OrchestrationPreview, SecondOpinionButton, SecondOpinionEvent, SecondOpinionProps,
 };
+use crate::transcript::model::handoff::handoff_chrome;
 use crate::transcript::model::plan::Row;
 use crate::transcript::model::turn::interjection_chrome;
 
@@ -67,7 +68,8 @@ impl TranscriptView {
                 Some(list) => gutter(div().py(u(4.)))
                     .child(
                         task_list_preview(eid(key, "tasks"), list.items.clone())
-                            .explanation(list.explanation.clone()),
+                            .explanation(list.explanation.clone())
+                            .spinning(self.turn_is_live(row)),
                     )
                     .into_any_element(),
                 None => div().into_any_element(),
@@ -78,7 +80,10 @@ impl TranscriptView {
                 }
                 if let Some(items) = legacy_task_list_from_text(&block.text) {
                     return gutter(div().py(u(4.)))
-                        .child(task_list_preview(eid(key, "tasks"), items))
+                        .child(
+                            task_list_preview(eid(key, "tasks"), items)
+                                .spinning(self.turn_is_live(row)),
+                        )
                         .into_any_element();
                 }
                 let card = self.render_plan(key, block, cx);
@@ -119,13 +124,16 @@ impl TranscriptView {
         }
     }
 
-    /// `HandoffDivider`: a rule with the provider the session moved to.
+    /// `HandoffDivider`: a rule with the provider the session moved to, and
+    /// a "Transfer details" disclosure when the switch reported a transfer.
     fn render_handoff(&mut self, key: &str, block: &Block, cx: &mut Context<Self>) -> AnyElement {
         let Some(meta) = &block.handoff else {
             return div().into_any_element();
         };
+        let chrome = handoff_chrome(meta);
         let theme = Theme::of(cx).clone();
-        let preparing = meta.status == HandoffStatus::Preparing;
+        let toggle = format!("handoff-details:{}", block.id);
+        let expanded = self.toggled(&toggle, false);
         let rule = || {
             div()
                 .h(px(1.))
@@ -133,7 +141,7 @@ impl TranscriptView {
                 .flex_1()
                 .bg(theme.content(0.12))
         };
-        let label: AnyElement = if preparing {
+        let label: AnyElement = if chrome.preparing {
             div()
                 .flex()
                 .items_center()
@@ -144,31 +152,26 @@ impl TranscriptView {
                         .flex_none()
                         .text_px(11.)
                         .text_color(theme.content(0.45))
-                        .with_animation(
-                            eid(key, "spinner"),
-                            Animation::new(Duration::from_millis(80 * SPINNER.len() as u64))
-                                .repeat(),
-                            |el, delta| {
-                                let frame = ((delta * SPINNER.len() as f32) as usize)
-                                    .min(SPINNER.len() - 1);
-                                el.child(SPINNER[frame])
-                            },
-                        ),
+                        .child(spinner_loop(
+                            Duration::from_millis(80 * SPINNER.len() as u64),
+                            SPINNER.len() as u32,
+                            |frame| SPINNER[frame as usize % SPINNER.len()],
+                        )),
                 )
                 .child(shimmer(
-                    eid(key, "preparing"),
-                    "Preparing a handoff",
+                    chrome.label.clone(),
                     Duration::from_millis(1400),
                     &theme,
                 ))
                 .into_any_element()
         } else {
-            harness_icon(meta.to)
-        };
-        let aria = if preparing {
-            format!("Preparing a handoff to {}", meta.to.title())
-        } else {
-            format!("Continued with {}", meta.to.title())
+            div()
+                .flex()
+                .items_center()
+                .gap(u(6.))
+                .child(harness_icon(meta.to))
+                .child(chrome.label.clone())
+                .into_any_element()
         };
         div()
             .px(u(16.))
@@ -189,11 +192,62 @@ impl TranscriptView {
                             .font_family(theme.fonts.sans.clone())
                             .text_px(12.)
                             .text_color(theme.content(0.55))
-                            .tooltip(tooltip(aria))
+                            .tooltip(tooltip(chrome.aria.clone()))
                             .child(label),
                     )
                     .child(rule()),
             )
+            .when_some(chrome.details, |el, lines| {
+                let toggle_key = toggle.clone();
+                el.child(
+                    div()
+                        .mt(u(8.))
+                        .mx_auto()
+                        .max_w(u(576.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(u(4.))
+                        .font_family(theme.fonts.sans.clone())
+                        .text_px(12.)
+                        .text_center()
+                        .text_color(theme.content(0.55))
+                        .child(
+                            div()
+                                .id(eid(key, &toggle))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.colors.content))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle(toggle_key.clone(), false, cx)
+                                }))
+                                .child("Transfer details"),
+                        )
+                        .when(expanded, |el| {
+                            el.children(lines.into_iter().map(|line| {
+                                // A path sits after its sentence, wrapping onto
+                                // its own line when the column is narrow.
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .justify_center()
+                                    .gap_x(u(4.))
+                                    .child(line.text)
+                                    .when_some(line.code, |el, code| {
+                                        el.child(
+                                            div()
+                                                .flex()
+                                                .child(
+                                                    div()
+                                                        .font_family(theme.fonts.mono.clone())
+                                                        .child(code),
+                                                )
+                                                .child("."),
+                                        )
+                                    })
+                            }))
+                        }),
+                )
+            })
             .into_any_element()
     }
 

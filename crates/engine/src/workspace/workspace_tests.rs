@@ -208,6 +208,67 @@ fn git_cwd_uses_the_remote_host_checkout_and_preserves_focused_files(cx: &mut Te
 }
 
 #[gpui::test]
+fn terminal_cwd_prefers_the_session_worktree_over_a_focused_main_checkout_file(
+    cx: &mut TestAppContext,
+) {
+    let h = setup(cx);
+    let session_id = sessions(cx)[0].id.clone();
+    let worktree = format!("{PROJECT}/.worktrees/feature");
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update(&session_id, cx, |session| {
+                session.worktree_cwd = Some(worktree.clone());
+            });
+        });
+    });
+    let file = new_file_tab(&format!("{PROJECT}/README.md"), PROJECT, false, None, None);
+    let tab = WorkspaceTab {
+        layout: monocode_layout::split_pane(
+            &monocode_layout::leaf(session_id.clone()),
+            &session_id,
+            SplitDir::Right,
+            "file-pane",
+        ),
+        focused_id: "file-pane".into(),
+        editor_panes: vec![monocode_layout::EditorPane::new(
+            "file-pane",
+            vec![file.clone()],
+            file.id.clone(),
+        )],
+        ..active(&h, cx)
+    };
+    let config = WorkspaceConfig::transferred(
+        vec![tab.clone()],
+        tab.id.clone(),
+        PROJECT.into(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let workspace = cx.new(|cx| Workspace::new(config, cx));
+    // The explorer and git panel still follow the focused file.
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace.git_cwd(cx)),
+        PROJECT,
+    );
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace.terminal_cwd(cx)),
+        worktree,
+    );
+    // A deleted worktree falls back to the focused file.
+    cx.update(|cx| {
+        Engine::sessions(cx).update(cx, |sessions, cx| {
+            sessions.update(&session_id, cx, |session| {
+                session.worktree_removed = Some(true);
+            });
+        });
+    });
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace.terminal_cwd(cx)),
+        PROJECT,
+    );
+}
+
+#[gpui::test]
 fn saves_the_snapshot_after_the_debounce(cx: &mut TestAppContext) {
     let h = setup(cx);
     h.workspace

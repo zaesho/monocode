@@ -109,6 +109,14 @@ struct SettingsWindow {
     history: Entity<History>,
     notification_project_path: Option<String>,
     notification_settings_request: u64,
+    /// The window keeps this page after it closes. Changes to the
+    /// workspace, history, projects, and settings only mark it, and the next
+    /// render applies them, so a closed page does no work.
+    stale: bool,
+    refresh_pending: bool,
+    /// `projectRailOpen` and the [`crate::revisions::revision`] it was read
+    /// at; reading it parses every stored setting.
+    full_rail: Option<(u64, bool)>,
     _subscriptions: Vec<Subscription>,
     _store_task: Task<()>,
 }
@@ -135,6 +143,9 @@ impl SettingsWindow {
             project_notifications: Some(
                 monocode_view_settings::accounts::project_notifications_slot(accounts.clone()),
             ),
+            harness_updates: Some(monocode_view_settings::accounts::harness_updates_slot(
+                accounts.clone(),
+            )),
             accounts: Some(monocode_view_settings::accounts::accounts_slot(accounts)),
             window_controls: None,
         };
@@ -199,16 +210,15 @@ impl SettingsWindow {
             )
         });
         let subscriptions = vec![
-            cx.observe(&workspace, |this, _, cx| this.sync(cx)),
-            cx.observe(&projects, |this, _, cx| this.sync(cx)),
-            cx.observe(&history, |this, _, cx| this.sync(cx)),
+            cx.observe(&workspace, Self::mark_stale),
+            cx.observe(&projects, Self::mark_stale),
+            cx.observe(&history, Self::mark_stale),
             cx.observe(&page, |_, _, cx| cx.notify()),
         ];
         let (send, receive) = async_channel::bounded(1);
         let store = kv.subscribe(move |_| {
             let _ = send.try_send(());
         });
-        let handle = window.window_handle();
         let weak = cx.entity().downgrade();
         let catalog = AppServices::global(cx).catalog.clone();
         let catalog_send = receive.clone();
@@ -226,11 +236,13 @@ impl SettingsWindow {
             loop {
                 use futures::{FutureExt as _, select_biased};
                 select_biased! { value = receive.recv().fuse() => if value.is_err() { break; }, value = catalog_rx.recv().fuse() => if value.is_err() { break; }, value = availability_rx.recv().fuse() => if value.is_err() { break; } }
-                let weak = weak.clone();
-                handle.update(cx, |_, window, cx| { if let Some(view) = weak.upgrade() { view.update(cx, |view, cx| {
-                    let section = monocode_settings::settings_store::load_settings_section(&AppServices::global(cx).kv);
-                    view.page.update(cx, |page, cx| { page.set_section(section, window, cx); page.refresh(cx); }); view.sync(cx);
-                }); } }).ok();
+                let updated = weak.update(cx, |view, cx| {
+                    view.refresh_pending = true;
+                    cx.notify();
+                });
+                if updated.is_err() {
+                    break;
+                }
             }
         });
         let mut subscriptions = subscriptions;
@@ -245,20 +257,56 @@ impl SettingsWindow {
             history,
             notification_project_path: None,
             notification_settings_request: 0,
+            stale: false,
+            refresh_pending: false,
+            full_rail: None,
             _subscriptions: subscriptions,
             _store_task: task,
         }
     }
+    fn mark_stale<T>(&mut self, _: Entity<T>, cx: &mut Context<Self>) {
+        self.stale = true;
+        cx.notify();
+    }
     fn sync(&mut self, cx: &mut Context<Self>) {
+        self.push_props(cx);
+        cx.notify();
+    }
+    fn push_props(&mut self, cx: &mut Context<Self>) {
         let mut props = props(&self.workspace, &self.projects, &self.history, cx);
         props.notification_project_path = self.notification_project_path.clone();
         props.notification_settings_request = self.notification_settings_request;
         self.page.update(cx, |page, cx| page.set_props(props, cx));
-        cx.notify();
     }
 }
 impl Render for SettingsWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.refresh_pending) {
+            let section = monocode_settings::settings_store::load_settings_section(
+                &AppServices::global(cx).kv,
+            );
+            self.page.update(cx, |page, cx| {
+                page.set_section(section, window, cx);
+                page.refresh(cx);
+            });
+            self.stale = true;
+        }
+        if std::mem::take(&mut self.stale) {
+            self.push_props(cx);
+        }
+        let revision = crate::revisions::revision(cx);
+        let full_rail = match self.full_rail {
+            Some((read, full_rail)) if read == revision => full_rail,
+            _ => {
+                let full_rail = AppServices::try_global(cx).is_some_and(|services| {
+                    monocode_settings::load_app_settings(&services.kv, Platform::current())
+                        .appearance
+                        .project_rail_open
+                });
+                self.full_rail = Some((revision, full_rail));
+                full_rail
+            }
+        };
         let theme = monocode_ui::Theme::of(cx);
         let selected = self.page.read(cx).section();
         let mut nav = div()
@@ -301,11 +349,6 @@ impl Render for SettingsWindow {
                     }),
             );
         }
-        let full_rail = AppServices::try_global(cx).is_some_and(|services| {
-            monocode_settings::load_app_settings(&services.kv, Platform::current())
-                .appearance
-                .project_rail_open
-        });
         div()
             .size_full()
             .flex()

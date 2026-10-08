@@ -9,3 +9,4 @@ pub mod bridge;
 pub mod data_dir;
 pub mod provider_hooks;
 pub mod session_factory;
+pub mod skills_runtime;

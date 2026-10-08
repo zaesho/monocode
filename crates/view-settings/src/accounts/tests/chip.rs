@@ -45,6 +45,8 @@ fn codex_limits() -> ProviderRateLimits {
                 },
             ]),
         }),
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: NOW,
         error: None,
         status: RateLimitStatus::Ok,

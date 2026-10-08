@@ -401,7 +401,12 @@ pub fn fit_ns_height(window: &NSWindow, width: f64, height: f64, max_height: f64
     if MainThreadMarker::new().is_none() {
         return;
     }
-    let next = fit_frame(rect(window.frame()), width, height, max_height);
+    let current = rect(window.frame());
+    let next = fit_frame(current, width, height, max_height);
+    // The same frame again would only redraw the shadow and the window.
+    if next == current {
+        return;
+    }
     set_frame(window, next);
 }
 

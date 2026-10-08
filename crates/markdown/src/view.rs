@@ -5,6 +5,7 @@
 //! word fade from `wordFade.tsx`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -94,6 +95,7 @@ pub struct MarkdownView {
     focus_handle: FocusHandle,
     on_link: Option<LinkHandler>,
     images: Option<ImageResolver>,
+    image_sources: HashMap<String, Option<gpui::ImageSource>>,
     reduced_motion: bool,
     loading_syntaxes: bool,
     copied_task: Option<Task<()>>,
@@ -125,6 +127,7 @@ impl MarkdownView {
             focus_handle: cx.focus_handle(),
             on_link: None,
             images: None,
+            image_sources: HashMap::new(),
             reduced_motion: false,
             loading_syntaxes: false,
             copied_task: None,
@@ -179,6 +182,7 @@ impl MarkdownView {
         if !text.starts_with(self.received.as_str()) {
             self.selection.clear();
             self.hovered_link = None;
+            self.image_sources.clear();
         }
         self.received.clear();
         self.received.push_str(text);
@@ -245,6 +249,7 @@ impl MarkdownView {
         cx: &mut Context<Self>,
     ) {
         self.images = Some(Rc::new(resolver));
+        self.image_sources.clear();
         cx.notify();
     }
 
@@ -419,6 +424,7 @@ impl Render for MarkdownView {
                 code: &mut self.code,
                 view: cx.weak_entity(),
                 images: self.images.as_ref(),
+                image_sources: &mut self.image_sources,
                 text_system: window.text_system().clone(),
             };
             render_blocks(&self.prepared, &self.layout, &mut frame)
@@ -467,7 +473,10 @@ impl Render for MarkdownView {
             self.load_syntaxes(cx);
         }
 
-        if self.pacer.needs_frame() || fading {
+        // Ask for another frame only while the reveal moves or a word is
+        // still fading. A stream that waits on its next token draws nothing
+        // new, and the next `set_text` or `push_str` notifies anyway.
+        if self.pacer.needs_frame() || (fading && self.timeline.is_fading(now)) {
             window.request_animation_frame();
         }
 

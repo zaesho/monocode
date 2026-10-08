@@ -8,14 +8,17 @@
 //!   background tasks (claude.ts).
 //! - [`text`], [`title`], [`git`]: the isolated text runner and what is built
 //!   on it (claudeText.ts, claudeTitle.ts, claudeGit.ts).
+//! - [`elicitation`]: MCP forms in the question UI (claudeElicitation.ts).
 //! - [`catalog`]: the bundled model list and live discovery (claudeCatalog.ts).
 //! - [`adapter`]: the `HarnessAdapter` and [`register`] (claudeAdapter.ts).
 
 pub mod adapter;
 pub mod catalog;
+pub mod elicitation;
 pub mod git;
 pub mod io;
 pub mod protocol;
+pub mod schedule;
 pub mod session;
 pub mod shared;
 pub mod text;

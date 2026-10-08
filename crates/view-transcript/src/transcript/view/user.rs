@@ -636,6 +636,10 @@ impl TranscriptView {
                 .size(u(14.))
                 .text_color(theme.content(0.45))
                 .into_any_element(),
+            ChatContextItem::Session { .. } => icon(IconName::Chatting)
+                .size(u(14.))
+                .text_color(theme.content(0.45))
+                .into_any_element(),
         };
         let line_tag = label.line_tag.clone().map(|tag| {
             div()

@@ -38,6 +38,20 @@ struct Calls {
     revoked: Vec<String>,
     paths: Vec<Vec<String>>,
     files: Vec<Vec<ClipboardFile>>,
+    /// `rank_mentions` calls, by query.
+    ranks: Vec<String>,
+}
+
+/// How `TestHost` answers `rank_mentions_task`.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum BackgroundRank {
+    /// No task: the composer ranks inline.
+    #[default]
+    Off,
+    /// A task that lands on the next executor turn.
+    Ready,
+    /// A task that never lands.
+    Stalled,
 }
 
 struct TestHost {
@@ -45,6 +59,7 @@ struct TestHost {
     accept: Rc<Cell<bool>>,
     btw_accept: bool,
     compact_ok: bool,
+    background_rank: Cell<BackgroundRank>,
 }
 
 impl TestHost {
@@ -57,6 +72,7 @@ impl TestHost {
                 accept: accept.clone(),
                 btw_accept: true,
                 compact_ok: true,
+                background_rank: Cell::default(),
             }),
             calls,
             accept,
@@ -184,6 +200,7 @@ impl ComposerHost for TestHost {
     }
 
     fn rank_mentions(&self, cwd: &str, query: &str, cx: &mut App) -> Vec<RankedFile> {
+        self.calls.borrow_mut().ranks.push(query.to_string());
         self.mention_files(cwd, cx)
             .into_iter()
             .filter(|file| file.relative.to_lowercase().contains(&query.to_lowercase()))
@@ -192,6 +209,25 @@ impl ComposerHost for TestHost {
                 ..RankedFile::default()
             })
             .collect()
+    }
+
+    fn rank_mentions_task(
+        &self,
+        cwd: &str,
+        query: &str,
+        cx: &mut App,
+    ) -> Option<Task<Vec<RankedFile>>> {
+        match self.background_rank.get() {
+            BackgroundRank::Off => None,
+            BackgroundRank::Ready => {
+                let rows = self.rank_mentions(cwd, query, cx);
+                Some(cx.background_spawn(async move { rows }))
+            }
+            BackgroundRank::Stalled => Some(cx.background_spawn(async move {
+                std::future::pending::<()>().await;
+                Vec::new()
+            })),
+        }
     }
 
     fn mcp_servers(&self, _: &str, _: HarnessId, _: &mut App) -> McpServers {
@@ -522,8 +558,9 @@ fn offers_operator_in_the_slash_picker_and_submits_it_as_a_local_command(cx: &mu
     f.type_text("/operator");
     let operator = f.read(|c, _| {
         c.ranked_skills()
-            .into_iter()
+            .iter()
             .find(|skill| skill.invocation == "operator")
+            .cloned()
             .unwrap()
     });
     f.update(|composer, window, cx| composer.pick_skill(&operator, window, cx));
@@ -636,6 +673,7 @@ fn keeps_the_draft_when_the_btw_command_is_rejected(cx: &mut TestAppContext) {
         accept: Rc::new(Cell::new(true)),
         btw_accept: false,
         compact_ok: true,
+        background_rank: Cell::default(),
     });
     let mut f = mount(
         cx,
@@ -704,8 +742,9 @@ fn inserts_an_mcp_tag_beside_existing_composer_text(cx: &mut TestAppContext) {
     f.type_text("sad /mcp");
     let mcp = f.read(|c, _| {
         c.ranked_skills()
-            .into_iter()
+            .iter()
             .find(|skill| skill.invocation == "mcp")
+            .cloned()
             .unwrap()
     });
     f.update(|composer, window, cx| composer.pick_skill(&mcp, window, cx));
@@ -1194,6 +1233,67 @@ fn send_waits_for_a_paste_and_a_reset_drops_a_late_one(cx: &mut TestAppContext) 
 // Drop.
 
 #[gpui::test]
+fn a_dropped_session_asks_whether_to_add_it_or_link_it(cx: &mut TestAppContext) {
+    use monocode_ui::drag::PaneDragSource;
+    let (host, _, _) = TestHost::new();
+    let mut f = mount(cx, host, props(), None);
+    let events = f.events();
+    let other = PaneDragSource::Session("s2".into());
+    assert!(f.read(|c, _| c.accepts_session_drag(&other)));
+    // A session dropped on itself, or a workspace tab, goes back to the pane
+    // tree.
+    for source in [
+        PaneDragSource::Session("s1".into()),
+        PaneDragSource::WorkspaceTab("tab".into()),
+    ] {
+        assert!(!f.read(|c, _| c.accepts_session_drag(&source)));
+        f.update(|composer, _, cx| composer.on_pane_drop(&source, cx));
+        assert!(f.read(|c, _| c.pending_session_drop().is_none()));
+        assert_eq!(
+            events.borrow().last(),
+            Some(&ComposerEvent::ForwardDrop(source.clone()))
+        );
+    }
+
+    let shown = f.update(|composer, _, cx| {
+        composer.set_session_drag(true, cx);
+        composer.session_drag
+    });
+    assert!(shown);
+    assert!(events.borrow().contains(&ComposerEvent::SessionDragOver));
+    f.update(|composer, _, cx| composer.on_pane_drop(&other, cx));
+    assert!(!f.read(|c, _| c.session_drag));
+    assert_eq!(
+        f.read(|c, _| c.pending_session_drop().map(str::to_string)),
+        Some("s2".into())
+    );
+    assert_eq!(events.borrow().last(), Some(&ComposerEvent::SessionDropped));
+
+    f.update(|composer, _, cx| composer.choose_add_session_context(cx));
+    assert_eq!(
+        events.borrow().last(),
+        Some(&ComposerEvent::AddSessionContext("s2".into()))
+    );
+    let session = ChatContextItem::Session {
+        id: "s2".into(),
+        title: "Auth".into(),
+    };
+    f.update(|composer, _, cx| {
+        composer.add_context_item(session.clone(), cx);
+        composer.add_context_item(session.clone(), cx);
+    });
+    assert_eq!(f.read(|c, _| c.context_items.clone()), vec![session]);
+
+    f.update(|composer, _, cx| composer.on_pane_drop(&other, cx));
+    f.update(|composer, _, cx| composer.choose_link_session(cx));
+    assert_eq!(
+        events.borrow().last(),
+        Some(&ComposerEvent::LinkSession("s2".into()))
+    );
+    assert!(f.read(|c, _| c.pending_session_drop().is_none()));
+}
+
+#[gpui::test]
 fn dropping_files_attaches_them_and_clears_the_overlay(cx: &mut TestAppContext) {
     let (host, _, _) = TestHost::new();
     let mut f = mount(cx, host, props(), None);
@@ -1251,4 +1351,270 @@ fn the_access_picker_reports_mode_changes(cx: &mut TestAppContext) {
     assert!(events.borrow().contains(&ComposerEvent::RuntimeModeChange(
         monocode_core::RuntimeMode::FullAccess
     )));
+}
+
+// Work that render and every keystroke repeat.
+
+#[gpui::test]
+fn slash_rows_are_built_once_per_catalog(cx: &mut TestAppContext) {
+    let (host, _, _) = TestHost::new();
+    let mut f = mount(cx, host, props(), None);
+    f.type_text("hello there");
+    let (names, again) = f.read(|c, _| (c.skill_names(), c.skill_names()));
+    assert!(Rc::ptr_eq(&names, &again));
+    assert!(names.contains("review-pr"));
+    let (ranked, again) = f.read(|c, _| (c.ranked_skills(), c.ranked_skills()));
+    assert!(Rc::ptr_eq(&ranked, &again));
+
+    // A new catalog rebuilds the rows and their names.
+    f.update(|composer, _, _| {
+        composer.skills.push(Skill::file(
+            "ship-it",
+            "Ship the branch.",
+            "/repo/.agents/skills/ship-it/SKILL.md",
+            "project",
+            "agents",
+        ));
+    });
+    let names = f.read(|c, _| c.skill_names());
+    assert!(names.contains("ship-it"));
+    let ranked = f.read(|c, _| c.ranked_skills());
+    assert!(ranked.iter().any(|skill| skill.invocation == "ship-it"));
+
+    // So does a prop the rows read.
+    f.set_props(ComposerProps {
+        remote_session: true,
+        ..props()
+    });
+    assert!(!f.read(|c, _| c.skill_names().contains("ship-it")));
+}
+
+#[gpui::test]
+fn a_caret_move_that_keeps_the_mention_query_does_not_rank_again(cx: &mut TestAppContext) {
+    let (host, calls, _) = TestHost::new();
+    let mut f = mount(cx, host, props(), None);
+    f.type_text("look at @App");
+    let ranks = calls.borrow().ranks.len();
+    assert_eq!(calls.borrow().ranks.last().map(String::as_str), Some("App"));
+    let prompt = f.read(|c, _| c.prompt.clone());
+    f.cx.update(|_, cx| prompt.update(cx, |prompt, cx| prompt.move_to(12, cx)));
+    f.draw();
+    f.update(|composer, _, cx| composer.sync_tokens(cx));
+    assert_eq!(calls.borrow().ranks.len(), ranks);
+    // A file index refresh still ranks again.
+    f.update(|composer, _, cx| composer.refresh_ranked_files(cx));
+    assert_eq!(calls.borrow().ranks.len(), ranks + 1);
+}
+
+#[gpui::test]
+fn a_background_mention_ranking_fills_the_picker(cx: &mut TestAppContext) {
+    let (host, _, _) = TestHost::new();
+    host.background_rank.set(BackgroundRank::Ready);
+    let mut f = mount(cx, host, props(), None);
+    f.type_text("look at @App");
+    f.read(|c, _| {
+        assert!(c.mention_rank.pending.is_none());
+        assert_eq!(c.ranked_files.len(), 1);
+        assert_eq!(c.ranked_files[0].file.relative, "src/App.tsx");
+    });
+}
+
+#[gpui::test]
+fn enter_ranks_inline_when_a_background_ranking_has_not_landed(cx: &mut TestAppContext) {
+    let (host, calls, _) = TestHost::new();
+    host.background_rank.set(BackgroundRank::Stalled);
+    let mut f = mount(cx, host, props(), None);
+    f.type_text("look at @App");
+    f.read(|c, _| {
+        assert!(c.mention_rank.pending.is_some());
+        assert!(c.ranked_files.is_empty());
+    });
+    f.keys("enter");
+    assert_eq!(f.text(), "look at @App.tsx ");
+    assert!(calls.borrow().submits.is_empty());
+    assert!(f.read(|c, _| c.mention_rank.pending.is_none()));
+}
+
+#[gpui::test]
+fn an_inline_image_decodes_once_across_frames(cx: &mut TestAppContext) {
+    let (host, _, _) = TestHost::new();
+    let mut f = mount(cx, host, props(), None);
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    f.update(|composer, _, cx| {
+        composer.attachments = vec![Attachment {
+            id: "img-1".into(),
+            kind: AttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: "shot.png".into(),
+            data: Some(png.into()),
+            ..Attachment::default()
+        }];
+        cx.notify();
+    });
+    let source = |f: &mut Fixture| {
+        f.read(
+            |c, _| match c.attachment_images.get("img-1").and_then(|i| i.source()) {
+                Some(gpui::ImageSource::Image(image)) => image.clone(),
+                _ => panic!("expected an inline image source"),
+            },
+        )
+    };
+    let first = source(&mut f);
+    f.update(|_, _, cx| cx.notify());
+    let second = source(&mut f);
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+}
+
+#[gpui::test]
+fn the_runner_asks_for_frames_only_while_it_shows(cx: &mut TestAppContext) {
+    let frames = |f: &mut Fixture| f.cx.update(|window, cx| window.simulate_next_frame(cx));
+
+    let (host, _, _) = TestHost::new();
+    let live = ComposerProps {
+        runner_enabled: true,
+        busy: true,
+        ..props()
+    };
+    let mut f = mount(cx, host, live.clone(), None);
+    assert!(f.read(|c, _| c.runner.is_some()));
+    assert!(frames(&mut f) > 0);
+
+    // Hidden: nothing to draw, so no frame requests.
+    f.set_props(ComposerProps {
+        enabled: false,
+        ..live.clone()
+    });
+    frames(&mut f);
+    f.draw();
+    assert_eq!(frames(&mut f), 0);
+}
+
+#[gpui::test]
+fn a_reduced_motion_runner_waits_for_its_next_talk_frame(cx: &mut TestAppContext) {
+    let frames = |f: &mut Fixture| f.cx.update(|window, cx| window.simulate_next_frame(cx));
+    let (host, _, _) = TestHost::new();
+    let mut f = mount(
+        cx,
+        host,
+        ComposerProps {
+            runner_enabled: true,
+            busy: true,
+            reduced_motion: true,
+            ..props()
+        },
+        None,
+    );
+    assert!(f.read(|c, _| c.runner.is_some()));
+    // The first frame had no composer bounds yet and asked for another.
+    frames(&mut f);
+    f.draw();
+    // The sprite stands still, so a timer wakes it for the next talk frame
+    // instead of a redraw on every display refresh.
+    assert_eq!(frames(&mut f), 0);
+}
+
+#[gpui::test]
+fn the_runner_ignores_props_that_change_nothing(cx: &mut TestAppContext) {
+    let (host, _, _) = TestHost::new();
+    let live = ComposerProps {
+        runner_enabled: true,
+        busy: true,
+        ..props()
+    };
+    let mut f = mount(cx, host, live, None);
+    let runner = f.read(|c, _| c.runner.clone().unwrap());
+    let notified = Rc::new(Cell::new(0));
+    let count = notified.clone();
+    let _observer =
+        f.cx.update(|_, cx| cx.observe(&runner, move |_, _| count.set(count.get() + 1)));
+    let composer = f.composer.clone();
+    f.cx.update(|_, cx| {
+        let props = composer.read(cx).props().clone();
+        runner.update(cx, |runner, cx| runner.set_props(&props, cx));
+    });
+    f.cx.run_until_parked();
+    assert_eq!(notified.get(), 0);
+}
+
+#[gpui::test]
+fn the_mention_picker_shows_loading_until_a_background_ranking_lands(cx: &mut TestAppContext) {
+    let (host, _, _) = TestHost::new();
+    host.background_rank.set(BackgroundRank::Stalled);
+    let mut f = mount(cx, host, props(), None);
+    f.type_text("look at @App");
+    assert!(f.read(|c, _| c.ranked_files.is_empty()));
+    assert!(f.update(|composer, _, cx| composer.mention_picker_loading(cx)));
+
+    // Rows from an earlier query stay on screen instead.
+    f.update(|composer, _, cx| composer.flush_ranked_files(cx));
+    f.type_text("x");
+    f.read(|c, _| {
+        assert!(c.mention_rank.pending.is_some());
+        assert!(!c.ranked_files.is_empty());
+    });
+    assert!(!f.update(|composer, _, cx| composer.mention_picker_loading(cx)));
+}
+
+#[gpui::test]
+fn a_runner_without_room_to_draw_stops_asking_for_frames(cx: &mut TestAppContext) {
+    struct RunnerHarness {
+        runner: Entity<super::runner::ComposerRunner>,
+    }
+    impl Render for RunnerHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.runner.clone())
+        }
+    }
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        monocode_ui::init(AppearanceSettings::default(), cx);
+    });
+    let geometry = super::runner::RunnerGeometry::default();
+    let live = ComposerProps {
+        runner_enabled: true,
+        busy: true,
+        ..props()
+    };
+    let runner_geometry = geometry.clone();
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let runner = cx.new(|cx| {
+            super::runner::ComposerRunner::new(
+                gpui::WeakEntity::new_invalid(),
+                runner_geometry,
+                &live,
+                window,
+                cx,
+            )
+        });
+        RunnerHarness { runner }
+    });
+    let draw = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+    };
+    let frames =
+        |cx: &mut VisualTestContext| cx.update(|window, cx| window.simulate_next_frame(cx));
+
+    // No composer box painted yet: one frame to pick up its bounds, then
+    // nothing while it never arrives.
+    draw(cx);
+    assert_eq!(frames(cx), 1);
+    draw(cx);
+    assert_eq!(frames(cx), 0);
+
+    // A box with no width leaves no track to run on.
+    geometry.r#box.set(Some(gpui::Bounds::new(
+        gpui::point(px(0.), px(100.)),
+        gpui::size(px(0.), px(40.)),
+    )));
+    draw(cx);
+    assert_eq!(frames(cx), 0);
+
+    // Room to run: the sprite animates every frame again.
+    geometry.r#box.set(Some(gpui::Bounds::new(
+        gpui::point(px(0.), px(100.)),
+        gpui::size(px(400.), px(40.)),
+    )));
+    draw(cx);
+    assert_eq!(frames(cx), 1);
 }

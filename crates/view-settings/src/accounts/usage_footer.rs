@@ -14,15 +14,15 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{LocalBoxFuture, Shared, join_all};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
-    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
     prelude::FluentBuilder as _,
 };
 use monocode_core::{HarnessId, Platform};
 use monocode_layout::terminal_tab::{RunningTerminal, running_terminal_chip_label};
 use monocode_ui::widgets::{PopoverSide, popover_frame, tooltip};
-use monocode_ui::{IconName, Theme, UiStyled as _, icon, provider_logo, u};
+use monocode_ui::{IconName, Theme, UiStyled as _, icon, looping_step, provider_logo, u};
 
 use super::host::{HostTask, UsageHost};
 use super::model::{
@@ -49,6 +49,8 @@ pub struct UsageFooterSession {
     pub model: Option<String>,
     pub auth_required: bool,
     pub provider_account_id: Option<String>,
+    /// The remote machine the session runs on. `None` is this computer.
+    pub environment_id: Option<String>,
 }
 
 impl UsageFooterSession {
@@ -59,9 +61,13 @@ impl UsageFooterSession {
             model: None,
             auth_required: false,
             provider_account_id: None,
+            environment_id: None,
         }
     }
 }
+
+/// Shown instead of this computer's usage while a remote session is active.
+const REMOTE_USAGE_UNAVAILABLE: &str = "Usage is unavailable for remote sessions";
 
 /// The footer's data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +241,15 @@ impl UsageFooter {
         self.props.providers.contains(&provider)
     }
 
+    /// True while the active session runs on another machine. The usage
+    /// this computer can read belongs to the local accounts, not that one.
+    fn remote_session(&self) -> bool {
+        self.props
+            .session
+            .as_ref()
+            .is_some_and(|session| session.environment_id.is_some())
+    }
+
     /// The account a provider's chip shows: the conversation's own, else the
     /// project's choice.
     fn account_id(&self, provider: RateLimitProvider, cx: &App) -> String {
@@ -264,6 +279,9 @@ impl UsageFooter {
     /// The snapshot a chip shows (`useCachedRateLimits`, or the removed
     /// account state).
     fn limits(&self, provider: RateLimitProvider, cx: &App) -> ProviderRateLimits {
+        if self.remote_session() {
+            return unavailable_rate_limits(provider, REMOTE_USAGE_UNAVAILABLE, self.now);
+        }
         let account_id = self.account_id(provider, cx);
         if matches!(
             provider,
@@ -284,6 +302,9 @@ impl UsageFooter {
     /// The accounts the footer loads and refreshes, as `(provider, account)`.
     fn targets(&self, cx: &App) -> Vec<(RateLimitProvider, String)> {
         let mut targets = Vec::new();
+        if self.remote_session() {
+            return targets;
+        }
         for provider in [RateLimitProvider::Claude, RateLimitProvider::Codex] {
             if !self.wants(provider) {
                 continue;
@@ -610,6 +631,13 @@ impl UsageFooter {
 
     fn chip_props(&self, provider: RateLimitProvider, cx: &App) -> ChipProps {
         let mut props = ChipProps::new(self.limits(provider, cx), self.now);
+        // Claude's model-scoped weekly limits only count for that model.
+        props.model = self
+            .props
+            .session
+            .as_ref()
+            .filter(|session| session.harness == provider.harness())
+            .and_then(|session| session.model.clone());
         if provider != RateLimitProvider::Claude {
             props.project = self.props.project.clone();
         }
@@ -962,7 +990,7 @@ impl UsageFooter {
                 cx.notify();
             }))
             .child(self.terminal_trigger.probe())
-            .child(terminal_live_mark())
+            .child(terminal_live_mark(window, cx))
             .child(
                 text(label)
                     .truncate()
@@ -1101,20 +1129,19 @@ impl UsageFooter {
 }
 
 /// `TerminalLiveMark`: three amber bars that light up in turn.
-fn terminal_live_mark() -> AnyElement {
+///
+/// The bars change four times per 3.2s loop, so the mark redraws on those
+/// steps only. A repeating `with_animation` re-rendered the window on every
+/// display refresh for as long as a terminal process ran.
+fn terminal_live_mark(window: &mut Window, cx: &mut App) -> AnyElement {
+    let step = looping_step(Duration::from_millis(3200), 4, window, cx) as usize;
     let bar = |index: usize| {
+        let lit = step > index;
         div()
             .w(gpui::px(4.))
             .h(gpui::px(8.))
             .bg(palette::terminal_live())
-            .with_animation(
-                SharedString::from(format!("terminal-live-{index}")),
-                Animation::new(Duration::from_millis(3200)).repeat(),
-                move |el, t| {
-                    let lit = t >= 0.25 * (index + 1) as f32;
-                    el.opacity(if lit { 0.85 } else { 0.4 })
-                },
-            )
+            .opacity(if lit { 0.85 } else { 0.4 })
     };
     div()
         .flex()

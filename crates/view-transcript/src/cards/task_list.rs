@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, ElementId, Hsla, IntoElement,
-    ParentElement as _, RenderOnce, SharedString, Styled as _, Transformation, Window, div,
-    percentage, px,
+    AnyElement, App, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
+    RenderOnce, SharedString, Styled as _, Transformation, Window, div, percentage, px,
 };
 use monocode_core::block::{TaskListItem, TaskListItemStatus};
 use monocode_core::task_list::task_list_progress_label;
@@ -15,6 +14,7 @@ use monocode_ui::styled::UiStyled as _;
 use monocode_ui::{IconName, Theme, icon, u};
 
 use super::style;
+use crate::motion::smooth_loop;
 
 /// `<TaskListPreview items explanation />`.
 #[derive(IntoElement)]
@@ -22,6 +22,7 @@ pub struct TaskListPreview {
     id: ElementId,
     items: Vec<TaskListItem>,
     explanation: Option<SharedString>,
+    spinning: bool,
 }
 
 pub fn task_list_preview(id: impl Into<ElementId>, items: Vec<TaskListItem>) -> TaskListPreview {
@@ -29,6 +30,7 @@ pub fn task_list_preview(id: impl Into<ElementId>, items: Vec<TaskListItem>) -> 
         id: id.into(),
         items,
         explanation: None,
+        spinning: true,
     }
 }
 
@@ -37,6 +39,14 @@ impl TaskListPreview {
         self.explanation = explanation
             .map(Into::into)
             .filter(|text: &SharedString| !text.is_empty());
+        self
+    }
+
+    /// Whether an in-progress item's loader turns. A list from a turn that
+    /// is no longer running holds it still: a spinning loader redraws the
+    /// whole window every frame, and a stale one would spin forever.
+    pub fn spinning(mut self, spinning: bool) -> Self {
+        self.spinning = spinning;
         self
     }
 }
@@ -116,12 +126,8 @@ impl RenderOnce for TaskListPreview {
                     }),
             );
         let mut list = div().py(u(4.)).flex().flex_col();
-        for (index, item) in self.items.iter().enumerate() {
+        for item in &self.items {
             let (ink, strike) = item_ink(item.status, &theme);
-            let key = item
-                .id
-                .clone()
-                .unwrap_or_else(|| format!("{index}:{}", item.text));
             list = list.child(
                 div()
                     .flex()
@@ -130,11 +136,7 @@ impl RenderOnce for TaskListPreview {
                     .min_w_0()
                     .px(u(10.))
                     .py(u(6.))
-                    .child(task_state(
-                        ElementId::NamedChild(std::sync::Arc::new(self.id.clone()), key.into()),
-                        item.status,
-                        &theme,
-                    ))
+                    .child(task_state(item.status, self.spinning, &theme))
                     .child(
                         div()
                             .flex_1()
@@ -149,6 +151,7 @@ impl RenderOnce for TaskListPreview {
             );
         }
         div()
+            .id(self.id)
             .mb(u(8.))
             .overflow_hidden()
             .rounded(u(10.))
@@ -171,8 +174,9 @@ pub fn strike_through<E: gpui::Styled>(mut el: E, color: Hsla) -> E {
 
 /// `TaskState`.
 /// The loader spins with `motion-safe:animate-spin`; GPUI holds it still
-/// when `App::reduce_motion` is set.
-fn task_state(id: ElementId, status: TaskListItemStatus, theme: &Theme) -> AnyElement {
+/// when `App::reduce_motion` is set, and so does a list that is not
+/// `spinning`.
+fn task_state(status: TaskListItemStatus, spinning: bool, theme: &Theme) -> AnyElement {
     let frame = div()
         .mt(px(1.))
         .flex()
@@ -194,12 +198,13 @@ fn task_state(id: ElementId, status: TaskListItemStatus, theme: &Theme) -> AnyEl
             let loader = icon(IconName::Loader)
                 .size(u(16.))
                 .text_color(style::sky_300());
+            if !spinning {
+                return frame.child(loader).into_any_element();
+            }
             frame
-                .child(loader.with_animation(
-                    id,
-                    Animation::new(Duration::from_secs(1)).repeat(),
-                    |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
-                ))
+                .child(smooth_loop(Duration::from_secs(1), move |delta| {
+                    loader.with_transformation(Transformation::rotate(percentage(delta)))
+                }))
                 .into_any_element()
         }
         TaskListItemStatus::Cancelled => frame

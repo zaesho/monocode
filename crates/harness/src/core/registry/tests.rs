@@ -29,6 +29,8 @@ struct Hooks {
     stop_session: Option<Calls<String>>,
     bind_session: Option<Calls<BindCall>>,
     restore_task_lists: Option<Calls<(String, Vec<TaskListMeta>)>>,
+    needs_process: Option<Arc<std::sync::atomic::AtomicBool>>,
+    sinks: Option<Calls<EventSink>>,
 }
 
 struct Stub {
@@ -59,10 +61,20 @@ impl HarnessAdapter for Stub {
     fn send_turn(
         &self,
         _input: SendTurnInput,
-        _on_event: EventSink,
+        on_event: EventSink,
         _on_accepted: Option<AcceptedHook>,
     ) -> BoxFuture<'_, Result<()>> {
+        if let Some(sinks) = &self.hooks.sinks {
+            sinks.lock().push(on_event);
+        }
         async { Ok(()) }.boxed()
+    }
+
+    fn needs_process(&self, _session_id: &str) -> bool {
+        self.hooks
+            .needs_process
+            .as_ref()
+            .is_some_and(|needs| needs.load(Ordering::SeqCst))
     }
 
     fn compact_context(
@@ -772,4 +784,110 @@ fn reports_turn_control_around_a_send() {
         ]
     );
     registry.reset_harness_idle_park();
+}
+
+fn send_s1(registry: &HarnessRegistry, harness: HarnessId, on_event: EventSink) {
+    smol::block_on(registry.send_harness_turn(
+        harness,
+        SendTurnInput {
+            session: session_input("s1", "claude:sonnet"),
+            text: "hi".into(),
+            attachments: None,
+        },
+        on_event,
+        None,
+    ))
+    .unwrap();
+}
+
+#[test]
+fn keeps_a_child_that_still_needs_its_process_past_the_idle_park() {
+    let park = Duration::from_millis(60);
+    let registry = HarnessRegistry::new(
+        Arc::new(SmolSpawner),
+        RegistryOptions {
+            idle_park: park,
+            ..Default::default()
+        },
+    );
+    let stops = Arc::new(Mutex::new(Vec::new()));
+    let needs = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    registry.register_harness(stub(
+        HarnessId::Claude,
+        Hooks {
+            stop_session: Some(stops.clone()),
+            needs_process: Some(needs.clone()),
+            ..Default::default()
+        },
+    ));
+    send_s1(&registry, HarnessId::Claude, ignore_events());
+    std::thread::sleep(park * 4);
+    assert!(stops.lock().is_empty());
+    needs.store(false, Ordering::SeqCst);
+    std::thread::sleep(park * 4);
+    assert_eq!(*stops.lock(), vec!["s1".to_string()]);
+}
+
+#[test]
+fn routes_a_native_turn_after_the_send_ended_to_the_ambient_handler() {
+    let ambient: Calls<(String, HarnessEvent)> = Arc::default();
+    let registry = HarnessRegistry::new(
+        Arc::new(SmolSpawner),
+        RegistryOptions {
+            ambient_events: Some({
+                let ambient = ambient.clone();
+                Arc::new(move |session_id: &str, event| {
+                    ambient.lock().push((session_id.to_string(), event));
+                })
+            }),
+            ..Default::default()
+        },
+    );
+    let sinks: Calls<EventSink> = Arc::default();
+    registry.register_harness(stub(
+        HarnessId::Claude,
+        Hooks {
+            sinks: Some(sinks.clone()),
+            ..Default::default()
+        },
+    ));
+    let during: Calls<HarnessEvent> = Arc::default();
+    let record = {
+        let during = during.clone();
+        Arc::new(move |event| during.lock().push(event)) as EventSink
+    };
+    send_s1(&registry, HarnessId::Claude, record);
+    let sink = sinks.lock()[0].clone();
+    let delta = |text: &str| HarnessEvent::MessageDelta {
+        text: text.into(),
+        append: Some(true),
+    };
+    sink(delta("stray"));
+    sink(HarnessEvent::TurnStarted {
+        provider_turn_id: "wake".into(),
+        native: Some(true),
+    });
+    sink(delta("reminder"));
+    sink(HarnessEvent::TurnFinished { native: Some(true) });
+    sink(delta("after"));
+    assert!(during.lock().is_empty());
+    let routed: Vec<HarnessEvent> = ambient
+        .lock()
+        .iter()
+        .map(|(session_id, event)| {
+            assert_eq!(session_id, "s1");
+            event.clone()
+        })
+        .collect();
+    assert_eq!(
+        routed,
+        vec![
+            HarnessEvent::TurnStarted {
+                provider_turn_id: "wake".into(),
+                native: Some(true),
+            },
+            delta("reminder"),
+            HarnessEvent::TurnFinished { native: Some(true) },
+        ]
+    );
 }

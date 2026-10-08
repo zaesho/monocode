@@ -37,7 +37,15 @@ impl SharedCatalog {
 
     /// `setHarnessModels`. Listeners run after the write lock is released.
     pub fn set_harness_models(&self, harness: HarnessId, models: Vec<AgentModel>) {
-        self.catalog.write().set_harness_models(harness, models);
+        self.set_harness_catalog(harness, models, true);
+    }
+
+    /// `setHarnessModels` with its `complete` flag. See
+    /// [`ModelCatalog::set_harness_catalog`].
+    pub fn set_harness_catalog(&self, harness: HarnessId, models: Vec<AgentModel>, complete: bool) {
+        self.catalog
+            .write()
+            .set_harness_catalog(harness, models, complete);
         let listeners: Vec<Listener> = self
             .listeners
             .lock()
@@ -47,6 +55,36 @@ impl SharedCatalog {
         for listener in listeners {
             listener(harness);
         }
+    }
+
+    /// `setProjectHarnessModels`: the catalog read in `cwd`. Listeners run
+    /// after the write lock is released.
+    pub fn set_project_harness_models(
+        &self,
+        harness: HarnessId,
+        cwd: &str,
+        models: Vec<AgentModel>,
+    ) {
+        self.catalog
+            .write()
+            .set_project_harness_models(harness, cwd, models);
+        let listeners: Vec<Listener> = self
+            .listeners
+            .lock()
+            .iter()
+            .map(|(_, listener)| listener.clone())
+            .collect();
+        for listener in listeners {
+            listener(harness);
+        }
+    }
+
+    /// `projectHarnessModels`: whether a catalog for `cwd` has loaded.
+    pub fn has_project_harness_models(&self, harness: HarnessId, cwd: &str) -> bool {
+        self.catalog
+            .read()
+            .project_harness_models(harness, cwd)
+            .is_some()
     }
 
     /// `hasLiveCatalog`.
@@ -80,6 +118,34 @@ impl SharedCatalog {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn project_catalogs_do_not_replace_home_or_other_projects() {
+        let catalog = SharedCatalog::new();
+        let model = |id: &str| AgentModel::new(id, HarnessId::Opencode, id);
+        catalog.set_harness_models(HarnessId::Opencode, vec![model("home")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/a", vec![model("a")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/b", vec![model("b")]);
+        catalog.set_project_harness_models(HarnessId::Opencode, "/empty", vec![]);
+        let read = catalog.read();
+        let ids = |cwd: &str| {
+            read.project_harness_models(HarnessId::Opencode, cwd)
+                .map(|models| {
+                    models
+                        .iter()
+                        .map(|model| model.id.clone())
+                        .collect::<Vec<_>>()
+                })
+        };
+        assert_eq!(read.models_for(HarnessId::Opencode)[0].id, "home");
+        assert_eq!(ids("/a"), Some(vec!["a".to_string()]));
+        assert_eq!(ids("/b"), Some(vec!["b".to_string()]));
+        assert_eq!(ids("/empty"), Some(Vec::new()));
+        assert_eq!(ids("/unknown"), None);
+        drop(read);
+        assert!(catalog.has_project_harness_models(HarnessId::Opencode, "/empty"));
+        assert!(!catalog.has_project_harness_models(HarnessId::Opencode, "/unknown"));
+    }
 
     #[test]
     fn notifies_after_a_live_list_lands() {

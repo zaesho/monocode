@@ -109,6 +109,30 @@ pub fn stream_text_delta(value: Option<&Value>) -> &str {
 /// `mergeStream`, the old name of [`join_stream_text`].
 pub use join_stream_text as merge_stream;
 
+/// `MessageParts`: the authoritative text of each provider part, joined in
+/// the order the parts first appeared. Handoff briefs and control replies
+/// read it so a corrected part replaces its earlier text instead of adding to
+/// it.
+#[derive(Debug, Clone, Default)]
+pub struct MessageParts {
+    parts: Vec<(String, String)>,
+}
+
+impl MessageParts {
+    /// Set one part's text and return every part joined.
+    pub fn update(&mut self, part_id: &str, text: &str) -> String {
+        match self.parts.iter_mut().find(|(id, _)| id == part_id) {
+            Some(part) => part.1 = text.to_string(),
+            None => self.parts.push((part_id.to_string(), text.to_string())),
+        }
+        self.parts.iter().map(|(_, text)| text.as_str()).collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.parts.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +199,16 @@ mod tests {
             assert_eq!(text, join_stream_text(existing, incoming));
             assert_eq!(changed, text != existing);
         }
+    }
+
+    #[test]
+    fn collects_corrected_provider_parts_in_their_original_order() {
+        let mut parts = MessageParts::default();
+        assert_eq!(parts.update("first", "Hello worle"), "Hello worle");
+        assert_eq!(parts.update("second", "!"), "Hello worle!");
+        assert_eq!(parts.update("first", "Hi"), "Hi!");
+        parts.clear();
+        assert_eq!(parts.update("second", "New"), "New");
     }
 
     // snapshotRemainder

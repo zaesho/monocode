@@ -6,10 +6,11 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, Bounds, ElementId, Hsla, IntoElement, ParentElement as _,
-    Styled as _, canvas, div, fill, point, px, size,
+    Bounds, Hsla, IntoElement, ParentElement as _, Styled as _, canvas, div, fill, point, px, size,
 };
 use monocode_ui::u;
+
+use crate::motion::stepped_loop;
 
 const GRID: usize = 8;
 
@@ -182,26 +183,23 @@ fn sprite(rows: &'static Rows, color: Hsla, lift: f32) -> impl IntoElement {
     .size_full()
 }
 
-/// `<ProjectMascot project={name} active={…} />` at 14px.
-pub fn mascot(id: impl Into<ElementId>, name: &str, color: Hsla, active: bool) -> impl IntoElement {
+/// `<ProjectMascot project={name} active={…} />` at 14px. An active mascot
+/// is a two-pose [`stepped_loop`], so it redraws twice a beat.
+pub fn mascot(name: &str, color: Hsla, active: bool) -> impl IntoElement {
     let (_, rest, talk) = mascot_for(name);
     let frame = div().flex_none().size(u(14.));
     if !active {
         return frame.child(sprite(rest, color, 0.)).into_any_element();
     }
     frame
-        .with_animation(
-            id,
-            Animation::new(Duration::from_millis(460)).repeat(),
-            move |el, beat| {
-                // A hard swap plus a one-pixel hop, arcade style.
-                if beat < 0.5 {
-                    el.child(sprite(rest, color, 0.))
-                } else {
-                    el.child(sprite(talk, color, 1.))
-                }
-            },
-        )
+        .child(stepped_loop(Duration::from_millis(460), 2, move |beat| {
+            // A hard swap plus a one-pixel hop, arcade style.
+            if beat == 0 {
+                sprite(rest, color, 0.).into_any_element()
+            } else {
+                sprite(talk, color, 1.).into_any_element()
+            }
+        }))
         .into_any_element()
 }
 

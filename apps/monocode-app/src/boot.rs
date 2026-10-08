@@ -3,13 +3,15 @@
 //! main.tsx wired them. The window and the headless live test both call
 //! [`boot`] and then [`restore_workspace`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, Global, Task};
+use monocode_core::harness_event::HarnessEvent;
 use monocode_core::platform::Platform;
 use monocode_core::settings::AppSettings;
 use monocode_engine::attention::{
@@ -120,6 +122,9 @@ pub struct AppServices {
     pub pty: PtyHost,
     /// Settings as they were at boot.
     pub settings: AppSettings,
+    pub skills: std::result::Result<Arc<monocode_skills::SkillManager>, String>,
+    pub skill_home: PathBuf,
+    pub skill_generation: Arc<AtomicU64>,
     /// `startHarnessBridge`: the child router keeps its routes while held.
     _bridge: Rc<BridgeLease>,
 }
@@ -216,7 +221,37 @@ fn initialize_provider_binary_paths(host: &HarnessHost, kv: &Kv) {
 
 /// Start the engine on `options.data_dir`. Call once, before any window.
 pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
-    let data_dir = options.data_dir.path.clone();
+    boot_with_skill_home(options, None, cx)
+}
+
+/// Override skill discovery and exports for an isolated preview.
+pub fn boot_with_skill_home(
+    mut options: BootOptions,
+    skill_home: Option<PathBuf>,
+    cx: &mut App,
+) -> Result<()> {
+    let isolated = skill_home.is_some();
+    if isolated {
+        options.import_webkit = false;
+        options.reap_orphans = false;
+        options.run_schedules = false;
+    }
+    if skill_home.as_ref().is_some_and(|home| !home.is_absolute()) {
+        return Err(anyhow!("The skill home directory must be absolute"));
+    }
+    std::fs::create_dir_all(&options.data_dir.path)
+        .context("Could not create the app data directory")?;
+    let data_dir = std::fs::canonicalize(&options.data_dir.path)
+        .context("Could not resolve the app data directory")?;
+    options.data_dir.path = data_dir.clone();
+    let (skills, skill_home, initial_generation) = crate::skills_runtime::initialize_optional_home(
+        &data_dir,
+        skill_home.or_else(|| monocode_platform::dirs_home().map(PathBuf::from)),
+    );
+    if let Err(error) = &skills {
+        log::warn!("Shared skill library is unavailable: {error}");
+    }
+    let skill_generation = Arc::new(AtomicU64::new(initial_generation));
     let kv = open_settings(&data_dir, options.import_webkit)?;
     let settings = monocode_settings::load_app_settings(&kv, Platform::current());
     if options.reap_orphans {
@@ -255,8 +290,25 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
         spawner.clone(),
     );
     initialize_provider_binary_paths(&host, &kv);
+    match &skills {
+        Ok(manager) => crate::skills_runtime::install_preparer(
+            &host,
+            manager.clone(),
+            skill_generation.clone(),
+            isolated.then(|| data_dir.clone()),
+        ),
+        Err(error) => {
+            let preparation_error = error.clone();
+            host.set_skill_preparer(Some(Arc::new(move |_| Err(preparation_error.clone()))));
+            let error = error.clone();
+            host.set_skill_account_retirer(Some(Arc::new(move |_| Err(error.clone()))));
+        }
+    }
     let bridge = children.start_harness_bridge();
     let catalog = SharedCatalog::new();
+    // Turns a provider starts on its own after a send ended, such as a
+    // Claude scheduled wakeup. They apply to the session like any turn.
+    let (ambient_events, ambient_received) = async_channel::unbounded::<(String, HarnessEvent)>();
     let registry = HarnessRegistry::new(
         spawner.clone(),
         RegistryOptions {
@@ -266,6 +318,9 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
                     owner: CONTROL_OWNER.into(),
                 }) as _
             }),
+            ambient_events: Some(Arc::new(move |session_id: &str, event| {
+                let _ = ambient_events.try_send((session_id.to_string(), event));
+            })),
             ..RegistryOptions::default()
         },
     );
@@ -282,6 +337,16 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
         cursor_store: Arc::new(CursorSessionStore),
     });
     Engine::init(config, cx);
+    cx.spawn(async move |cx| {
+        while let Ok((session_id, event)) = ambient_received.recv().await {
+            cx.update(|cx| {
+                Engine::sessions(cx).update(cx, |sessions, cx| {
+                    sessions.enqueue_event(&session_id, event, cx)
+                })
+            });
+        }
+    })
+    .detach();
 
     // Attention, the way `Attention::init_native` builds it, with
     // notifications only inside the app bundle.
@@ -329,11 +394,24 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
 
     // Submit.
     let mut submit = SubmitConfig::new(registry.clone(), catalog.clone(), kv.clone(), spawner);
+    let skill_data = data_dir.clone();
+    let catalog_home = skill_home.clone();
+    let catalog_generation = skill_generation.clone();
+    submit.skill_context = Arc::new(move |context| {
+        crate::skills_runtime::resolve_context(
+            context,
+            &skill_data,
+            &catalog_home,
+            catalog_generation.load(Ordering::Acquire),
+            isolated,
+        )
+    });
     submit.mcp_settings = Some(
         monocode_engine::submit::mcp_settings_cache::McpSettingsCache::new(
             Arc::new(
                 monocode_engine::submit::mcp_settings_cache::ProcessMcpSources {
                     host: host.clone(),
+                    data_dir: data_dir.clone(),
                 },
             ),
             registry.spawner().clone(),
@@ -466,6 +544,9 @@ pub fn boot(options: BootOptions, cx: &mut App) -> Result<()> {
         control,
         pty,
         settings,
+        skills,
+        skill_home,
+        skill_generation,
         _bridge: Rc::new(bridge),
     });
 

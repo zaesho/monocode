@@ -426,3 +426,89 @@ fn marked_text_is_underlined() {
         vec![(4, gpui::white(), false), (2, gpui::white(), true)]
     );
 }
+
+#[gpui::test]
+fn a_redraw_without_changes_reuses_the_text_layout(cx: &mut TestAppContext) {
+    let (input, cx) = mount(cx, "one two three four five six seven eight nine ten");
+    let first = cx.update(|_, cx| input.read(cx).last_layout().unwrap());
+    draw(cx);
+    let second = cx.update(|_, cx| input.read(cx).last_layout().unwrap());
+    assert!(Rc::ptr_eq(&first, &second));
+
+    cx.update(|_, cx| input.update(cx, |input, cx| input.insert("!", cx)));
+    draw(cx);
+    let edited = cx.update(|_, cx| input.read(cx).last_layout().unwrap());
+    assert!(!Rc::ptr_eq(&second, &edited));
+    assert_eq!(edited.text_len, second.text_len + 1);
+}
+
+#[gpui::test]
+fn style_setters_with_the_same_value_do_not_notify(cx: &mut TestAppContext) {
+    let (input, cx) = mount(cx, "hello");
+    let notified = Rc::new(std::cell::Cell::new(0));
+    let count = notified.clone();
+    let _observer = cx.update(|_, cx| cx.observe(&input, move |_, _| count.set(count.get() + 1)));
+    cx.update(|_, cx| {
+        input.update(cx, |input, cx| {
+            let colors = input.colors;
+            let max_height = input.max_height;
+            input.set_padding([0., 0., 0., 0.], cx);
+            input.set_max_height(max_height, cx);
+            input.set_colors(colors, cx);
+            input.set_disabled(false, cx);
+            input.set_placeholder(input.placeholder().clone(), cx);
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(notified.get(), 0);
+
+    cx.update(|_, cx| input.update(cx, |input, cx| input.set_padding([4., 0., 4., 0.], cx)));
+    cx.run_until_parked();
+    assert_eq!(notified.get(), 1);
+}
+
+#[gpui::test]
+fn the_caret_stops_blinking_while_the_window_is_inactive(cx: &mut TestAppContext) {
+    let (input, cx) = mount(cx, "hello");
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let handle = input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    cx.update(|_, cx| input.update(cx, |input, cx| input.insert("!", cx)));
+    assert!(cx.update(|_, cx| input.read(cx)._blink.is_some()));
+
+    cx.deactivate_window();
+    cx.update(|_, cx| {
+        let input = input.read(cx);
+        assert!(!input.window_active);
+        assert!(input._blink.is_none());
+        assert!(!input.caret_visible);
+    });
+    // An edit while the window is in the background does not restart it.
+    cx.update(|_, cx| input.update(cx, |input, cx| input.insert("?", cx)));
+    assert!(cx.update(|_, cx| input.read(cx)._blink.is_none()));
+
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let input = input.read(cx);
+        assert!(input.window_active);
+        assert!(input._blink.is_some());
+        assert!(input.caret_visible);
+    });
+}
+
+#[gpui::test]
+fn a_prompt_in_a_window_that_was_never_active_does_not_blink(cx: &mut TestAppContext) {
+    // Test windows start inactive, as a window opened behind another app.
+    let (input, cx) = mount(cx, "hello");
+    cx.update(|_, cx| input.update(cx, |input, cx| input.insert("!", cx)));
+    cx.update(|_, cx| {
+        let input = input.read(cx);
+        assert!(!input.window_active);
+        assert!(input._blink.is_none());
+        assert!(!input.caret_visible);
+    });
+}

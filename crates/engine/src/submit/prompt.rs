@@ -27,7 +27,10 @@ where
     FN: Future<Output = String>,
 {
     skills.warm_native_skills(context);
-    if skills.is_native_command_prompt(text, context.harness) {
+    if skills
+        .is_native_command_prompt_in_context(text, context)
+        .await
+    {
         return native_command_prompt(context.harness, text);
     }
     let with_files = apply_file_mentions(text.to_string()).await;
@@ -137,11 +140,20 @@ mod tests {
             _cwd: String,
             _disabled: Vec<String>,
         ) -> BoxFuture<'static, Result<Vec<DiscoveredSkill>, String>> {
-            async { Ok(Vec::new()) }.boxed()
+            async {
+                Ok(vec![DiscoveredSkill {
+                    name: "shared".into(),
+                    description: "Shared file skill".into(),
+                    path: "/skills/shared/SKILL.md".into(),
+                    scope: "user".into(),
+                    source: "agents".into(),
+                }])
+            }
+            .boxed()
         }
 
         fn read_text_file(&self, _path: String) -> BoxFuture<'static, Result<String, String>> {
-            async { Ok(String::new()) }.boxed()
+            async { Ok("Read references/policy.md".into()) }.boxed()
         }
 
         fn home_dir(&self) -> BoxFuture<'static, Result<String, String>> {
@@ -199,6 +211,29 @@ mod tests {
             assert_eq!(prepared, text.replace("/omp:compact", "/compact"));
             assert_eq!(*calls.borrow(), 0);
         }
+    }
+
+    #[test]
+    fn expands_a_shared_file_skill_for_a_raw_command_provider() {
+        let skills = catalog();
+        let calls = RefCell::new(Vec::new());
+        let prepared = smol::block_on(prepare_prompt(
+            "/shared @README.md",
+            &SkillCatalogContext::new(HarnessId::Omp, "/repo"),
+            &skills,
+            |text| {
+                calls.borrow_mut().push("files");
+                async move { text.replace("@README.md", "README contents") }
+            },
+            |text| {
+                calls.borrow_mut().push("notes");
+                async move { text }
+            },
+        ));
+        assert_eq!(*calls.borrow(), ["files", "notes"]);
+        assert!(prepared.contains("Read references/policy.md"));
+        assert!(prepared.contains("Resource directory: /skills/shared"));
+        assert!(prepared.ends_with("/shared README contents"));
     }
 
     #[test]

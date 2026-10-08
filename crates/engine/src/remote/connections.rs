@@ -160,6 +160,8 @@ fn command_session_id(command: &HostCommand) -> Option<&str> {
     match command {
         HostCommand::Create { .. } => None,
         HostCommand::Configure { session_id, .. }
+        | HostCommand::SwitchProvider { session_id, .. }
+        | HostCommand::ConfirmProviderInspection { session_id, .. }
         | HostCommand::Compact { session_id, .. }
         | HostCommand::Send { session_id, .. }
         | HostCommand::Draft { session_id, .. }
@@ -248,6 +250,8 @@ pub fn command_id(command: &HostCommand) -> &str {
     match command {
         HostCommand::Create { command_id, .. }
         | HostCommand::Configure { command_id, .. }
+        | HostCommand::SwitchProvider { command_id, .. }
+        | HostCommand::ConfirmProviderInspection { command_id, .. }
         | HostCommand::Compact { command_id, .. }
         | HostCommand::Send { command_id, .. }
         | HostCommand::Draft { command_id, .. }

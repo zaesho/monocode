@@ -68,6 +68,15 @@ impl LoadedDiff {
         Self::from_sides(diff.binary, diff.too_large, diff.original, diff.current)
     }
 
+    /// A git read's result as a loaded diff. Callers run this on the
+    /// background executor, because `build_unified_file` is a full line diff.
+    fn from_result(result: Result<GitFileDiff, String>) -> Self {
+        match result {
+            Ok(diff) => Self::from_git(diff),
+            Err(error) => Self::failed(error),
+        }
+    }
+
     fn failed(error: String) -> Self {
         Self {
             binary: false,
@@ -120,7 +129,7 @@ struct ModelInput<'a> {
     path: &'a str,
     label: String,
     status: &'a str,
-    loaded: Option<&'a LoadedDiff>,
+    loaded: Option<&'a Arc<LoadedDiff>>,
     /// The index counts to show while a file loads.
     fallback: (i64, i64),
     unchanged_message: &'a str,
@@ -129,13 +138,54 @@ struct ModelInput<'a> {
     actions: DiffFileActions,
 }
 
+/// What a file's model was built from. A stored diff never changes, so
+/// `loaded` compares by pointer.
+struct ModelKey {
+    path: String,
+    label: String,
+    status: String,
+    loaded: Option<Arc<LoadedDiff>>,
+    fallback: (i64, i64),
+    unchanged_message: String,
+    actions: DiffFileActions,
+}
+
+impl ModelKey {
+    fn of(input: &ModelInput) -> Self {
+        Self {
+            path: input.path.to_string(),
+            label: input.label.clone(),
+            status: input.status.to_string(),
+            loaded: input.loaded.cloned(),
+            fallback: input.fallback,
+            unchanged_message: input.unchanged_message.to_string(),
+            actions: input.actions,
+        }
+    }
+
+    fn matches(&self, input: &ModelInput) -> bool {
+        self.path == input.path
+            && self.label == input.label
+            && self.status == input.status
+            && match (&self.loaded, input.loaded) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.fallback == input.fallback
+            && self.unchanged_message == input.unchanged_message
+            && self.actions == input.actions
+    }
+}
+
 fn file_model(input: ModelInput) -> FileModel {
-    let unified = input.loaded.and_then(|loaded| loaded.unified.clone());
+    let loaded = input.loaded.map(Arc::as_ref);
+    let unified = loaded.and_then(|loaded| loaded.unified.clone());
     let unchanged = unified
         .as_ref()
         .is_some_and(|u| u.additions == 0 && u.deletions == 0)
-        && !input.loaded.is_some_and(|loaded| loaded.binary);
-    let empty_message: Option<SharedString> = match input.loaded {
+        && !loaded.is_some_and(|loaded| loaded.binary);
+    let empty_message: Option<SharedString> = match loaded {
         None => Some("Loading…".into()),
         Some(loaded) => match &loaded.error {
             Some(error) => Some((input.error_message)(error).into()),
@@ -163,8 +213,8 @@ fn file_model(input: ModelInput) -> FileModel {
         label: input.label.into(),
         previous_path: None,
         status: patch_status(input.status),
-        binary: input.loaded.is_some_and(|loaded| loaded.binary),
-        too_large: input.loaded.is_some_and(|loaded| loaded.too_large),
+        binary: loaded.is_some_and(|loaded| loaded.binary),
+        too_large: loaded.is_some_and(|loaded| loaded.too_large),
         empty_message,
         diff,
         hunks,
@@ -176,6 +226,9 @@ fn file_model(input: ModelInput) -> FileModel {
 struct DiffState {
     view: Entity<DiffView>,
     models: Arc<Vec<Arc<FileModel>>>,
+    /// Each file's last model and its inputs, so a publish rebuilds only the
+    /// files whose diff or row changed instead of cloning every diff again.
+    built: HashMap<String, (ModelKey, Arc<FileModel>)>,
     focus: Option<String>,
     focused: bool,
     comment: Option<Entity<DiffCommentComposer>>,
@@ -196,6 +249,7 @@ impl DiffState {
                 view
             }),
             models: Arc::new(Vec::new()),
+            built: HashMap::new(),
             focus: None,
             focused: false,
             comment: None,
@@ -203,9 +257,24 @@ impl DiffState {
         }
     }
 
+    /// The models for `inputs`, reusing each one whose inputs are unchanged.
+    fn models(&mut self, inputs: Vec<ModelInput>) -> Vec<Arc<FileModel>> {
+        let mut previous = std::mem::take(&mut self.built);
+        let mut out = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let id = input.id.to_string();
+            let (key, model) = match previous.remove(&id) {
+                Some((key, model)) if key.matches(&input) => (key, model),
+                _ => (ModelKey::of(&input), Arc::new(file_model(input))),
+            };
+            out.push(model.clone());
+            self.built.insert(id, (key, model));
+        }
+        out
+    }
+
     /// Push models to the view when any of them changed.
-    fn publish(&mut self, models: Vec<FileModel>, cx: &mut App) {
-        let next: Vec<Arc<FileModel>> = models.into_iter().map(Arc::new).collect();
+    fn publish(&mut self, next: Vec<Arc<FileModel>>, cx: &mut App) {
         let merged = reuse_unchanged_by_id(&self.models, next);
         if Arc::ptr_eq(&merged, &self.models) {
             return;
@@ -379,7 +448,7 @@ pub struct WorkingTreeDiff {
     focus_kind: Option<GitFileDiffKind>,
     files: Option<Vec<GitChangedFile>>,
     entries: Vec<WorkingTreeDiffEntry>,
-    diffs: HashMap<String, LoadedDiff>,
+    diffs: HashMap<String, Arc<LoadedDiff>>,
     error: Option<String>,
     busy_id: Option<String>,
     /// The count passed to the view's `fileCount`.
@@ -468,7 +537,7 @@ impl WorkingTreeDiff {
     }
 
     pub fn loaded(&self, id: &str) -> Option<&LoadedDiff> {
-        self.diffs.get(id)
+        self.diffs.get(id).map(Arc::as_ref)
     }
 
     pub fn totals(&self) -> (usize, usize) {
@@ -535,17 +604,16 @@ impl WorkingTreeDiff {
                     move |entry: &WorkingTreeDiffEntry, cx| {
                         let (cwd, relative, kind) =
                             (cwd.clone(), entry.file.relative.clone(), entry.kind);
-                        scm.run(cx, move |git| git.git_file_diff(&cwd, &relative, kind))
+                        // The line diff runs here, off the UI thread, with the read.
+                        scm.run(cx, move |git| {
+                            LoadedDiff::from_result(git.git_file_diff(&cwd, &relative, kind))
+                        })
                     },
-                    move |this: &mut Self, entry, result, cx| {
+                    move |this: &mut Self, entry, loaded, cx| {
                         if this.generation != generation {
                             return;
                         }
-                        let loaded = match result {
-                            Ok(diff) => LoadedDiff::from_git(diff),
-                            Err(error) => LoadedDiff::failed(error),
-                        };
-                        this.diffs.insert(entry.id.clone(), loaded);
+                        this.diffs.insert(entry.id.clone(), Arc::new(loaded));
                         schedule_publish(
                             |this: &mut Self| &mut this.state,
                             Self::publish,
@@ -569,7 +637,7 @@ impl WorkingTreeDiff {
             self.state.focus = focus;
             self.state.focused = false;
         }
-        let models: Vec<FileModel> = self
+        let inputs: Vec<ModelInput> = self
             .entries
             .iter()
             .map(|entry| {
@@ -577,7 +645,7 @@ impl WorkingTreeDiff {
                 let unstaged = entry.kind == GitFileDiffKind::Unstaged;
                 let can_use_index_counts = loaded.is_some_and(|l| l.error.is_none())
                     && !(entry.file.staged && entry.file.unstaged);
-                file_model(ModelInput {
+                ModelInput {
                     id: &entry.id,
                     path: &entry.file.path,
                     label: working_tree_diff_entry_label(entry),
@@ -601,9 +669,10 @@ impl WorkingTreeDiff {
                         comment: self.scm.hooks.add_to_chat.is_some(),
                         ..Default::default()
                     },
-                })
+                }
             })
             .collect();
+        let models = self.state.models(inputs);
         self.state.publish(models, cx);
         // A partially staged file counts once, unless the review shows one side.
         let file_count = match (&self.files, self.focus_kind) {
@@ -737,7 +806,7 @@ pub struct CommitDiff {
     cwd: String,
     sha: String,
     files: Option<Vec<GitChangedFile>>,
-    diffs: HashMap<String, LoadedDiff>,
+    diffs: HashMap<String, Arc<LoadedDiff>>,
     error: Option<String>,
     state: DiffState,
     load: Option<Task<()>>,
@@ -820,15 +889,11 @@ impl CommitDiff {
                         let (cwd, sha, relative) =
                             (cwd.clone(), sha.clone(), file.relative.clone());
                         scm.run(cx, move |git| {
-                            git.git_commit_file_diff(&cwd, &sha, &relative)
+                            LoadedDiff::from_result(git.git_commit_file_diff(&cwd, &sha, &relative))
                         })
                     },
-                    |this: &mut Self, file, result, cx| {
-                        let loaded = match result {
-                            Ok(diff) => LoadedDiff::from_git(diff),
-                            Err(error) => LoadedDiff::failed(error),
-                        };
-                        this.diffs.insert(file.relative.clone(), loaded);
+                    |this: &mut Self, file, loaded, cx| {
+                        this.diffs.insert(file.relative.clone(), Arc::new(loaded));
                         schedule_publish(
                             |this: &mut Self| &mut this.state,
                             Self::publish,
@@ -847,27 +912,26 @@ impl CommitDiff {
 
     fn publish(&mut self, cx: &mut Context<Self>) {
         let comment = self.scm.hooks.add_to_chat.is_some();
-        let models: Vec<FileModel> = self
+        let inputs: Vec<ModelInput> = self
             .files
             .iter()
             .flatten()
-            .map(|file| {
-                file_model(ModelInput {
-                    id: &file.relative,
-                    path: &file.path,
-                    label: file.relative.clone(),
-                    status: &file.status,
-                    loaded: self.diffs.get(&file.relative),
-                    fallback: (file.additions, file.deletions),
-                    unchanged_message: "No textual diff",
-                    error_message: |error| format!("Couldn’t load diff: {error}"),
-                    actions: DiffFileActions {
-                        comment,
-                        ..Default::default()
-                    },
-                })
+            .map(|file| ModelInput {
+                id: &file.relative,
+                path: &file.path,
+                label: file.relative.clone(),
+                status: &file.status,
+                loaded: self.diffs.get(&file.relative),
+                fallback: (file.additions, file.deletions),
+                unchanged_message: "No textual diff",
+                error_message: |error| format!("Couldn’t load diff: {error}"),
+                actions: DiffFileActions {
+                    comment,
+                    ..Default::default()
+                },
             })
             .collect();
+        let models = self.state.models(inputs);
         self.state.publish(models, cx);
         cx.notify();
     }
@@ -910,7 +974,7 @@ pub struct SessionChangesDiff {
     focus_path: Option<String>,
     checkpoints: Checkpoints,
     files: Option<Vec<CheckpointFile>>,
-    diffs: HashMap<String, LoadedDiff>,
+    diffs: HashMap<String, Arc<LoadedDiff>>,
     error: Option<String>,
     state: DiffState,
     generation: u64,
@@ -1000,23 +1064,26 @@ impl SessionChangesDiff {
                 );
                 load_concurrently(
                     order,
-                    move |file: &CheckpointFile, _| {
-                        checkpoints.file_diff(&session, &cwd, &file.relative)
+                    move |file: &CheckpointFile, cx| {
+                        let read = checkpoints.file_diff(&session, &cwd, &file.relative);
+                        // Build the line diff on the background executor too.
+                        cx.background_spawn(async move {
+                            match read.await {
+                                Ok(diff) => LoadedDiff::from_sides(
+                                    diff.binary,
+                                    diff.too_large,
+                                    diff.original,
+                                    diff.current,
+                                ),
+                                Err(error) => LoadedDiff::failed(error),
+                            }
+                        })
                     },
-                    move |this: &mut Self, file, result, cx| {
+                    move |this: &mut Self, file, loaded, cx| {
                         if this.generation != generation {
                             return;
                         }
-                        let loaded = match result {
-                            Ok(diff) => LoadedDiff::from_sides(
-                                diff.binary,
-                                diff.too_large,
-                                diff.original,
-                                diff.current,
-                            ),
-                            Err(error) => LoadedDiff::failed(error),
-                        };
-                        this.diffs.insert(file.relative.clone(), loaded);
+                        this.diffs.insert(file.relative.clone(), Arc::new(loaded));
                         schedule_publish(
                             |this: &mut Self| &mut this.state,
                             Self::publish,
@@ -1042,24 +1109,23 @@ impl SessionChangesDiff {
                 .find(|file| &file.path == focus || &file.relative == focus)
                 .map(|file| file.relative.clone())
         });
-        let models: Vec<FileModel> = self
+        let inputs: Vec<ModelInput> = self
             .files
             .iter()
             .flatten()
-            .map(|file| {
-                file_model(ModelInput {
-                    id: &file.relative,
-                    path: &file.path,
-                    label: file.relative.clone(),
-                    status: &file.status,
-                    loaded: self.diffs.get(&file.relative),
-                    fallback: (file.additions, file.deletions),
-                    unchanged_message: "No textual diff",
-                    error_message: |error| error.to_string(),
-                    actions: DiffFileActions::default(),
-                })
+            .map(|file| ModelInput {
+                id: &file.relative,
+                path: &file.path,
+                label: file.relative.clone(),
+                status: &file.status,
+                loaded: self.diffs.get(&file.relative),
+                fallback: (file.additions, file.deletions),
+                unchanged_message: "No textual diff",
+                error_message: |error| error.to_string(),
+                actions: DiffFileActions::default(),
             })
             .collect();
+        let models = self.state.models(inputs);
         self.state.publish(models, cx);
         cx.notify();
     }
@@ -1122,6 +1188,51 @@ mod tests {
     use monocode_ui::{AppearanceSettings, ThemePreference, set_appearance};
 
     #[gpui::test]
+    fn unchanged_files_keep_their_models_between_publishes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            monocode_ui::init(AppearanceSettings::default(), cx);
+        });
+        fn input(loaded: &Arc<LoadedDiff>) -> ModelInput<'_> {
+            ModelInput {
+                id: "a.txt",
+                path: "/repo/a.txt",
+                label: "a.txt".into(),
+                status: "modified",
+                loaded: Some(loaded),
+                fallback: (0, 0),
+                unchanged_message: "No textual diff",
+                error_message: |error| error.to_string(),
+                actions: DiffFileActions::default(),
+            }
+        }
+        let sides = || LoadedDiff::from_sides(false, false, "a\n".into(), "b\n".into());
+        let loaded = Arc::new(sides());
+        let mut state = cx.update(DiffState::new);
+        let first = state.models(vec![input(&loaded)]);
+        let again = state.models(vec![input(&loaded)]);
+        assert!(
+            Arc::ptr_eq(&first[0], &again[0]),
+            "same inputs reuse the model"
+        );
+
+        let reloaded = Arc::new(sides());
+        let rebuilt = state.models(vec![input(&reloaded)]);
+        assert!(
+            !Arc::ptr_eq(&first[0], &rebuilt[0]),
+            "a new diff rebuilds it"
+        );
+
+        cx.update(|cx| state.publish(first, cx));
+        let published = state.models.clone();
+        cx.update(|cx| state.publish(rebuilt, cx));
+        assert!(
+            Arc::ptr_eq(&published, &state.models),
+            "an equal rebuilt model keeps the published list"
+        );
+    }
+
+    #[gpui::test]
     fn cached_diff_follows_appearance_without_resetting_content_or_expansion(
         cx: &mut TestAppContext,
     ) {
@@ -1142,7 +1253,12 @@ mod tests {
         let first = DiffFile::from_texts("first.txt", &original, &current);
         let second = DiffFile::from_texts("second.txt", "before\n", "after\n");
         let mut state = cx.update(DiffState::new);
-        cx.update(|cx| state.publish(vec![FileModel(first), FileModel(second)], cx));
+        cx.update(|cx| {
+            state.publish(
+                vec![Arc::new(FileModel(first)), Arc::new(FileModel(second))],
+                cx,
+            )
+        });
         let view = state.view.clone();
         view.update(cx, |view, cx| {
             view.toggle_file(1, cx);

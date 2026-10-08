@@ -6,8 +6,9 @@
 //! has the full port). These copies keep `--features submit` building on its
 //! own; the lead can point both at one module once the packages merge.
 
-use monocode_core::Session;
+use monocode_core::block::ModelTarget;
 use monocode_core::session::{MessageQueueStatus, QueuedMessage};
+use monocode_core::{ModelCatalog, Session};
 
 use super::handoff::is_preparing_handoff;
 
@@ -50,9 +51,19 @@ pub fn dequeue_queued_message(session: &mut Session, message_id: &str) {
     }
 }
 
+/// A provider request may have run without acknowledgment, so nothing
+/// else goes out until the user confirms inspection.
+pub fn needs_delivery_inspection(session: &Session) -> bool {
+    session
+        .provider_context
+        .as_ref()
+        .and_then(|state| state.delivery.as_ref())
+        .is_some_and(|delivery| delivery.needs_inspection())
+}
+
 /// `canDispatchQueuedHead`: the idle session can send its queued head.
 pub fn can_dispatch_queued_head(session: &Session) -> bool {
-    if session.is_busy() || session.usage_limit.is_some() {
+    if session.is_busy() || session.usage_limit.is_some() || needs_delivery_inspection(session) {
         return false;
     }
     if matches!(
@@ -74,6 +85,9 @@ pub fn queued_message_for_submit<'a>(
     message_id: &str,
     mode: QueueSubmitMode,
 ) -> Option<&'a QueuedMessage> {
+    if needs_delivery_inspection(session) {
+        return None;
+    }
     let message = session
         .queued_messages
         .as_ref()?
@@ -88,6 +102,40 @@ pub fn queued_message_for_submit<'a>(
     can_dispatch_queued_head(session).then_some(message)
 }
 
+/// `sameSteeringSelection`: the queued row's provider, model, and resolved
+/// settings match the running turn's.
+fn same_steering_selection(
+    saved: &ModelTarget,
+    active: &ModelTarget,
+    catalog: &ModelCatalog,
+) -> bool {
+    if saved.harness != active.harness || saved.model != active.model {
+        return false;
+    }
+    let model = catalog.resolve_model(saved.harness, Some(&saved.model));
+    let resolve = |settings: &monocode_core::ModelSettings| {
+        let mut merged = settings.clone();
+        merged.extend(catalog.merge_model_settings(&model, Some(settings)));
+        merged
+    };
+    resolve(&saved.model_settings) == resolve(&active.model_settings)
+}
+
+/// A queued row may steer the running turn only when it was queued for that
+/// turn's provider and model. Rows queued for another selection wait.
+pub fn can_steer_with_selection(
+    session: &Session,
+    message: &QueuedMessage,
+    active: &ModelTarget,
+    catalog: &ModelCatalog,
+) -> bool {
+    !session.is_busy()
+        || message
+            .selection
+            .as_ref()
+            .is_none_or(|saved| same_steering_selection(saved, active, catalog))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +145,8 @@ mod tests {
 
     fn queued(id: &str) -> QueuedMessage {
         QueuedMessage {
+            selection: None,
+            app_request_id: None,
             id: id.into(),
             text: id.into(),
             attachments: vec![],
@@ -239,5 +289,80 @@ mod tests {
         };
         assert!(queued_message_for_submit(&paused, "a", QueueSubmitMode::Steer).is_some());
         assert!(queued_message_for_submit(&session, "missing", QueueSubmitMode::Steer).is_none());
+    }
+
+    fn target(model: &str, effort: Option<&str>) -> ModelTarget {
+        let mut model_settings = monocode_core::ModelSettings::new();
+        if let Some(effort) = effort {
+            model_settings.insert("effort".into(), effort.into());
+        }
+        ModelTarget {
+            harness: HarnessId::Claude,
+            model: model.into(),
+            model_settings,
+        }
+    }
+
+    #[test]
+    fn pauses_dispatch_and_steering_while_a_request_needs_inspection() {
+        let mut session = chat();
+        session.provider_context = serde_json::from_value(serde_json::json!({
+            "version": 1, "bindings": [],
+            "delivery": {
+                "switchId": "s", "status": "uncertain", "mode": "native", "from": "codex",
+                "to": "claude", "cwd": "/tmp/project", "currentUserBlockId": "u",
+                "includedBlockIds": [], "omittedBlockIds": [], "requestSubmitted": true,
+                "needsInspection": true,
+            },
+        }))
+        .ok();
+        assert!(!can_dispatch_queued_head(&session));
+        assert!(queued_message_for_submit(&session, "b", QueueSubmitMode::Steer).is_none());
+    }
+
+    #[test]
+    fn steers_only_rows_queued_for_the_running_selection() {
+        let catalog = ModelCatalog::new();
+        let mut busy = Session {
+            busy: Some(true),
+            ..chat()
+        };
+        let mut row = queued("a");
+        row.selection = Some(target("claude:opus", Some("high")));
+        busy.queued_messages = Some(vec![row.clone()]);
+        assert!(can_steer_with_selection(
+            &busy,
+            &row,
+            &target("claude:opus", Some("high")),
+            &catalog
+        ));
+        assert!(!can_steer_with_selection(
+            &busy,
+            &row,
+            &target("claude:sonnet", Some("high")),
+            &catalog
+        ));
+        assert!(!can_steer_with_selection(
+            &busy,
+            &row,
+            &target("claude:opus", Some("low")),
+            &catalog
+        ));
+        let idle = Session {
+            busy: None,
+            ..busy.clone()
+        };
+        assert!(can_steer_with_selection(
+            &idle,
+            &row,
+            &target("claude:sonnet", None),
+            &catalog
+        ));
+        assert!(can_steer_with_selection(
+            &busy,
+            &queued("legacy"),
+            &target("claude:sonnet", None),
+            &catalog
+        ));
     }
 }

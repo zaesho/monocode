@@ -142,6 +142,27 @@ pub struct RateLimitResetCredits {
     pub credits: Option<Vec<RateLimitResetCredit>>,
 }
 
+/// A weekly limit that applies to one model: `label` names it for people,
+/// `model` is what a selected model id is matched against.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedRateLimitWindow {
+    #[serde(flatten)]
+    pub window: RateLimitWindow,
+    pub label: String,
+    pub model: String,
+}
+
+/// `extraUsage`: Claude usage credits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraUsage {
+    pub enabled: bool,
+    pub used_credits: Option<f64>,
+    pub monthly_limit: Option<f64>,
+    pub used_percent: Option<f64>,
+}
+
 /// `ProviderRateLimits`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,6 +173,12 @@ pub struct ProviderRateLimits {
     pub monthly: Option<RateLimitWindow>,
     /// Codex-only banked rate-limit reset rewards, when supplied by app-server.
     pub reset_credits: Option<RateLimitResetCredits>,
+    /// Claude's weekly limits for one model family, such as Opus or Fable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_weekly: Vec<ScopedRateLimitWindow>,
+    /// Claude's usage credits, which take over once plan limits run out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_usage: Option<ExtraUsage>,
     pub updated_at: i64,
     pub error: Option<String>,
     pub status: RateLimitStatus,
@@ -194,6 +221,8 @@ pub fn idle_rate_limits(provider: RateLimitProvider) -> ProviderRateLimits {
         weekly: None,
         monthly: None,
         reset_credits: None,
+        scoped_weekly: Vec::new(),
+        extra_usage: None,
         updated_at: 0,
         error: None,
         status: RateLimitStatus::Idle,
@@ -349,14 +378,54 @@ pub fn rate_limit_window_tooltip(
     }
 }
 
-/// `exhaustedWindowResetAt`: when a used-up window resets; the later one
-/// when several are spent.
-pub fn exhausted_window_reset_at(limits: &ProviderRateLimits) -> Option<i64> {
-    let mut latest: Option<i64> = None;
-    for window in [limits.session, limits.weekly, limits.monthly]
+/// The lowercase letter runs of `text`: `/[a-z]+/g` on its lowercase form.
+fn letter_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_ascii_lowercase())
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `relevantRateLimitWindows`: the windows that limit `model`. A scoped
+/// weekly limit counts when it names the model's family, or names no family
+/// at all. Without a model every window counts.
+pub fn relevant_rate_limit_windows(
+    limits: &ProviderRateLimits,
+    model: Option<&str>,
+) -> Vec<RateLimitWindow> {
+    let selected = model.map(letter_words).unwrap_or_default();
+    let scoped = limits.scoped_weekly.iter().filter(|scoped| {
+        if selected.is_empty() {
+            return true;
+        }
+        let words = letter_words(&scoped.model);
+        let family = words
+            .iter()
+            .find(|word| matches!(word.as_str(), "opus" | "sonnet" | "haiku"))
+            .or_else(|| words.iter().find(|word| *word != "claude"));
+        family.is_none_or(|family| selected.contains(family))
+    });
+    [limits.session, limits.weekly, limits.monthly]
         .into_iter()
         .flatten()
-    {
+        .chain(scoped.map(|scoped| scoped.window))
+        .collect()
+}
+
+/// `exhaustedWindowResetAt`: when a used-up window resets; the later one
+/// when several are spent. Every scoped limit counts.
+pub fn exhausted_window_reset_at(limits: &ProviderRateLimits) -> Option<i64> {
+    exhausted_window_reset_at_for(limits, None)
+}
+
+/// [`exhausted_window_reset_at`] over the windows that limit `model`.
+pub fn exhausted_window_reset_at_for(
+    limits: &ProviderRateLimits,
+    model: Option<&str>,
+) -> Option<i64> {
+    let mut latest: Option<i64> = None;
+    for window in relevant_rate_limit_windows(limits, model) {
         let Some(resets_at) = window.resets_at else {
             continue;
         };
@@ -499,10 +568,19 @@ pub struct AccountStatus {
 /// without usage data. A window whose reset time has passed counts as fully
 /// available.
 pub fn account_headroom(limits: Option<&ProviderRateLimits>, now: i64) -> Option<f64> {
+    account_headroom_for(limits, now, None)
+}
+
+/// [`account_headroom`] over the windows that limit `model`, so a used-up
+/// Opus quota does not hold back a Sonnet session.
+pub fn account_headroom_for(
+    limits: Option<&ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<f64> {
     let limits = limits?;
-    [limits.session, limits.weekly, limits.monthly]
+    relevant_rate_limit_windows(limits, model)
         .into_iter()
-        .flatten()
         .map(|window| {
             if window.resets_at.is_some_and(|resets_at| resets_at <= now) {
                 100.0
@@ -515,7 +593,16 @@ pub fn account_headroom(limits: Option<&ProviderRateLimits>, now: i64) -> Option
 
 /// `accountStatus`: Ready, Running low, or Exhausted, shared by every view.
 pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountStatus {
-    let headroom = account_headroom(limits, now);
+    account_status_for(limits, now, None)
+}
+
+/// [`account_status`] for a session running `model`.
+pub fn account_status_for(
+    limits: Option<&ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> AccountStatus {
+    let headroom = account_headroom_for(limits, now, model);
     let (Some(limits), Some(headroom)) = (limits, headroom) else {
         let Some(limits) = limits.filter(|limits| {
             !matches!(
@@ -544,7 +631,7 @@ pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountS
         return AccountStatus {
             tone: AccountStatusTone::Exhausted,
             label: "Exhausted".into(),
-            detail: back_in(limits, now),
+            detail: back_in(limits, now, model),
         };
     }
     if headroom <= LOW_HEADROOM_PERCENT {
@@ -562,8 +649,8 @@ pub fn account_status(limits: Option<&ProviderRateLimits>, now: i64) -> AccountS
 }
 
 /// "back in 31m" for the used-up window that stays blocked longest.
-fn back_in(limits: &ProviderRateLimits, now: i64) -> Option<String> {
-    let reset_at = exhausted_window_reset_at(limits)?;
+fn back_in(limits: &ProviderRateLimits, now: i64, model: Option<&str>) -> Option<String> {
+    let reset_at = exhausted_window_reset_at_for(limits, model)?;
     if reset_at <= now {
         return None;
     }
@@ -577,9 +664,19 @@ pub fn best_alternative_account(
     usage_for: impl Fn(&ProviderAccount) -> Option<ProviderRateLimits>,
     now: i64,
 ) -> Option<&ProviderAccount> {
+    best_alternative_account_for(accounts, usage_for, now, None)
+}
+
+/// [`best_alternative_account`] for a session running `model`.
+pub fn best_alternative_account_for<'a>(
+    accounts: &'a [ProviderAccount],
+    usage_for: impl Fn(&ProviderAccount) -> Option<ProviderRateLimits>,
+    now: i64,
+    model: Option<&str>,
+) -> Option<&'a ProviderAccount> {
     let mut best: Option<(&ProviderAccount, f64)> = None;
     for account in accounts {
-        let Some(headroom) = account_headroom(usage_for(account).as_ref(), now) else {
+        let Some(headroom) = account_headroom_for(usage_for(account).as_ref(), now, model) else {
             continue;
         };
         if headroom <= LOW_HEADROOM_PERCENT {
@@ -710,9 +807,145 @@ pub fn compare_semver(left: &str, right: &str) -> i64 {
     0
 }
 
+/// `HarnessVersionCheck`: one harness compared with its newest release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum HarnessVersionCheck {
+    Current {
+        harness: HarnessId,
+        installed: String,
+        latest: String,
+    },
+    Behind {
+        harness: HarnessId,
+        installed: String,
+        latest: String,
+    },
+    /// The CLI or its feed gave no version, or a lookup failed.
+    Unknown { harness: HarnessId, error: String },
+}
+
+impl HarnessVersionCheck {
+    pub fn harness(&self) -> HarnessId {
+        match self {
+            Self::Current { harness, .. }
+            | Self::Behind { harness, .. }
+            | Self::Unknown { harness, .. } => *harness,
+        }
+    }
+
+    /// The installed and newest versions, unless the check failed.
+    pub fn versions(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Current {
+                installed, latest, ..
+            }
+            | Self::Behind {
+                installed, latest, ..
+            } => Some((installed, latest)),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+/// `pendingHarnessUpdates`: only the harnesses behind their newest release.
+pub fn pending_harness_updates(checks: &[HarnessVersionCheck]) -> Vec<HarnessUpdate> {
+    checks
+        .iter()
+        .filter_map(|check| match check {
+            HarnessVersionCheck::Behind {
+                harness,
+                installed,
+                latest,
+            } => Some(HarnessUpdate {
+                harness: *harness,
+                installed: installed.clone(),
+                latest: latest.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first Cursor build in `output`, a date and commit such as
+/// `2026.09.28-64d2043` (`/\d{4}\.\d{2}\.\d{2}-[0-9a-f]+/`).
+fn cursor_build(output: &str) -> Option<&str> {
+    let bytes = output.as_bytes();
+    let digits = |at: usize, count: usize| {
+        bytes.len() >= at + count && bytes[at..at + count].iter().all(u8::is_ascii_digit)
+    };
+    (0..bytes.len()).find_map(|start| {
+        let date = digits(start, 4)
+            && bytes.get(start + 4) == Some(&b'.')
+            && digits(start + 5, 2)
+            && bytes.get(start + 7) == Some(&b'.')
+            && digits(start + 8, 2)
+            && bytes.get(start + 10) == Some(&b'-');
+        if !date {
+            return None;
+        }
+        let hash = bytes[start + 11..]
+            .iter()
+            .take_while(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+            .count();
+        (hash > 0).then(|| &output[start..start + 11 + hash])
+    })
+}
+
+/// `parseHarnessVersion`: the version to compare and display. Cursor keeps
+/// its full build, because two builds can share a date.
+pub fn parse_harness_version(harness: HarnessId, output: &str) -> Option<String> {
+    if harness == HarnessId::Cursor
+        && let Some(build) = cursor_build(output)
+    {
+        return Some(build.to_string());
+    }
+    parse_version(output)
+}
+
+/// `isHarnessVersionBehind`: true when `installed` is older than `latest`. A
+/// Cursor build from the same day as the feed but with another commit is
+/// behind, since the feed names the newest build.
+pub fn is_harness_version_behind(harness: HarnessId, installed: &str, latest: &str) -> bool {
+    let order = compare_semver(latest, installed);
+    if order != 0 {
+        return order > 0;
+    }
+    harness == HarnessId::Cursor && installed != latest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_and_compares_cursor_builds() {
+        let cursor = HarnessId::Cursor;
+        assert_eq!(
+            parse_harness_version(cursor, "2026.09.28-64d2043").as_deref(),
+            Some("2026.09.28-64d2043")
+        );
+        assert_eq!(
+            parse_harness_version(HarnessId::Grok, "grok 1.0.46 (4220f3b224a6) [stable]")
+                .as_deref(),
+            Some("1.0.46")
+        );
+        assert!(is_harness_version_behind(
+            cursor,
+            "2026.09.28-9a7762b",
+            "2026.09.28-64d2043"
+        ));
+        assert!(!is_harness_version_behind(
+            cursor,
+            "2026.10.01-1111111",
+            "2026.09.28-64d2043"
+        ));
+        assert!(!is_harness_version_behind(
+            HarnessId::Grok,
+            "1.0.46",
+            "1.0.46"
+        ));
+    }
 
     const NOW: i64 = 1_790_000_000_000;
     const HOUR: i64 = 3_600_000;
@@ -887,6 +1120,8 @@ mod tests {
                 available_count: 1,
                 credits: None,
             }),
+            scoped_weekly: Vec::new(),
+            extra_usage: None,
             ..limits(Some(window(42.0, None)))
         };
         let json = serde_json::to_value(&value).unwrap();

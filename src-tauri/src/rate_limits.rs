@@ -19,7 +19,7 @@ pub async fn fetch_opencode_go_usage() -> Result<OpencodeGoUsageFetch, String> {
 /// Droid CLI stores in `~/.factory`. The token never leaves the host process.
 #[tauri::command]
 pub async fn fetch_droid_usage() -> Result<DroidUsageFetch, String> {
-    tauri::async_runtime::spawn_blocking(rate_limits::fetch_droid_usage)
+    tauri::async_runtime::spawn_blocking(|| rate_limits::fetch_droid_usage(None))
         .await
         .map_err(|e| e.to_string())?
 }

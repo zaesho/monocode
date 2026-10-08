@@ -327,8 +327,7 @@ impl Notifier {
     /// `syncDockBadge(sessionsRef.current)`.
     pub fn sync_dock_badge_now(&mut self, cx: &mut Context<Self>) {
         let sessions = Engine::sessions(cx);
-        let sessions = sessions.read(cx).all().to_vec();
-        self.sync_dock_badge(&sessions);
+        self.sync_dock_badge(sessions.read(cx).all());
     }
 
     // Banners.

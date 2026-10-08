@@ -1,13 +1,18 @@
 //! `TerminalSpinner`: a braille dot spinner that steps every 80ms.
+//!
+//! It redraws only when the frame changes, through
+//! [`crate::ticker::loading_step`]. A repeating `with_animation` would
+//! re-render the whole window on every display refresh while a session runs.
+//! Like the React spinner, it keeps turning with reduced motion.
 
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, ElementId, Hsla, IntoElement, ParentElement as _,
-    RenderOnce, Styled as _, Window, div,
+    App, ElementId, Hsla, IntoElement, ParentElement as _, RenderOnce, Styled as _, Window, div,
 };
 
 use crate::styled::UiStyled as _;
+use crate::ticker::loading_step;
 use crate::{Theme, u};
 
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -15,6 +20,9 @@ const FRAME: Duration = Duration::from_millis(80);
 
 #[derive(IntoElement)]
 pub struct Spinner {
+    /// Kept so callers keep naming their spinners. The step clock is shared,
+    /// so every spinner shows the same frame.
+    #[allow(dead_code)]
     id: ElementId,
     color: Option<Hsla>,
     size: f32,
@@ -42,7 +50,8 @@ impl Spinner {
 }
 
 impl RenderOnce for Spinner {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let index = loading_step(FRAME * FRAMES.len() as u32, FRAMES.len() as u32, window, cx);
         let theme = Theme::of(cx);
         div()
             .flex()
@@ -52,13 +61,6 @@ impl RenderOnce for Spinner {
             .text_px(self.size)
             .leading(theme.leading.none)
             .text_color(self.color.unwrap_or(theme.colors.accent))
-            .with_animation(
-                self.id,
-                Animation::new(FRAME * FRAMES.len() as u32).repeat(),
-                |el, t| {
-                    let index = ((t * FRAMES.len() as f32) as usize).min(FRAMES.len() - 1);
-                    el.child(FRAMES[index])
-                },
-            )
+            .child(FRAMES[index as usize])
     }
 }

@@ -140,7 +140,10 @@ fn maps_agent_message_and_tool_updates_to_harness_events() {
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": "Hi" },
         })),
-        vec![HarnessEvent::MessageDelta { text: "Hi".into() }]
+        vec![HarnessEvent::MessageDelta {
+            text: "Hi".into(),
+            append: None
+        }]
     );
     let tools = events_from_acp_update(&json!({
         "sessionUpdate": "tool_call",
@@ -407,4 +410,103 @@ fn reports_a_directory_listing_as_a_plain_list_call() {
     }));
     assert_match(&event, &json!({ "title": "List .", "kind": "other" }));
     assert!(event.get("preview").is_none());
+}
+
+// fx 0.0.8+ announces each call as a pending tool_call with the tool name and
+// its arguments. Session checkpoints prepare a pre-edit snapshot only from a
+// start event that is an edit and carries the target path.
+fn is_edit_event(event: &Value) -> bool {
+    let preview: Option<monocode_core::block::ToolPreview> = event
+        .get("preview")
+        .map(|preview| serde_json::from_value(preview.clone()).unwrap());
+    monocode_core::reducer::preview::is_edit_tool(
+        event.get("kind").and_then(Value::as_str),
+        event.get("title").and_then(Value::as_str),
+        preview.as_ref(),
+    )
+}
+
+#[test]
+fn puts_the_write_target_on_fxs_pending_tool_call() {
+    let event = first_event(json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "approved_call_1",
+        "name": "write_file",
+        "title": "Writing",
+        "kind": "edit",
+        "status": "pending",
+        "rawInput": { "path": "/repo/out.txt", "content": "first\n" },
+    }));
+    assert_match(
+        &event,
+        &json!({
+            "type": "tool.updated",
+            "title": "Write",
+            "kind": "edit",
+            "status": "pending",
+            "preview": { "kind": "write", "path": "/repo/out.txt", "fileName": "out.txt" },
+        }),
+    );
+    assert!(is_edit_event(&event));
+}
+
+#[test]
+fn puts_the_edit_target_on_fxs_pending_tool_call() {
+    let event = first_event(json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_edit",
+        "name": "edit_file",
+        "title": "Editing",
+        "kind": "edit",
+        "status": "pending",
+        "rawInput": { "path": "src/app.ts", "old_string": "a", "new_string": "b" },
+    }));
+    assert_match(
+        &event,
+        &json!({
+            "title": "Edit",
+            "kind": "edit",
+            "status": "pending",
+            "preview": { "kind": "write", "path": "src/app.ts", "fileName": "app.ts" },
+        }),
+    );
+    assert!(is_edit_event(&event));
+}
+
+#[test]
+fn does_not_treat_a_pending_fx_read_as_an_edit() {
+    let event = first_event(json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "call_read",
+        "name": "read_file",
+        "title": "Reading",
+        "kind": "read",
+        "status": "pending",
+        "rawInput": { "path": "README.md" },
+    }));
+    assert_match(
+        &event,
+        &json!({ "kind": "read", "preview": { "kind": "read", "path": "README.md" } }),
+    );
+    assert!(!is_edit_event(&event));
+}
+
+#[test]
+fn puts_the_write_target_on_an_fx_permission_prompt() {
+    let request = permission_request_from_acp(&json!({
+        "sessionId": "S1",
+        "toolCall": {
+            "toolCallId": "approved_call_1",
+            "name": "write_file",
+            "title": "Writing",
+            "kind": "edit",
+            "status": "pending",
+            "rawInput": { "path": "/repo/out.txt", "content": "first\n" },
+        },
+        "options": [{ "optionId": "allow_once" }],
+    }));
+    assert_match(
+        &value(&request.preview),
+        &json!({ "kind": "write", "path": "/repo/out.txt" }),
+    );
 }

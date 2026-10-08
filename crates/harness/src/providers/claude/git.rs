@@ -63,9 +63,16 @@ fn throw_if_aborted(signal: Option<&AbortSignal>) -> Result<()> {
     signal.map_or(Ok(()), AbortSignal::throw_if_aborted)
 }
 
-fn prompt(cwd: &str, prompt: String, signal: Option<AbortSignal>) -> TextPromptInput {
+/// A Git helper prompt, run under the account the caller selected.
+fn prompt(
+    cwd: &str,
+    provider_account_id: Option<&str>,
+    prompt: String,
+    signal: Option<AbortSignal>,
+) -> TextPromptInput {
     TextPromptInput {
         cwd: cwd.to_string(),
+        provider_account_id: provider_account_id.map(str::to_string),
         prompt,
         timeout_ms: Some(GIT_TIMEOUT_MS),
         signal,
@@ -78,6 +85,7 @@ pub async fn generate_claude_commit_message(
     text: &ClaudeText,
     git: Option<&SharedGitSource>,
     cwd: &str,
+    provider_account_id: Option<&str>,
     signal: Option<AbortSignal>,
 ) -> Result<String> {
     throw_if_aborted(signal.as_ref())?;
@@ -86,6 +94,7 @@ pub async fn generate_claude_commit_message(
     let output = text
         .run(prompt(
             cwd,
+            provider_account_id,
             build_commit_message_prompt(&CommitMessagePromptInput {
                 branch: context.branch,
                 staged_summary: context.summary,
@@ -129,11 +138,13 @@ pub async fn generate_claude_pr_content(
     text: &ClaudeText,
     git: Option<&SharedGitSource>,
     cwd: &str,
+    provider_account_id: Option<&str>,
 ) -> Result<Option<GeneratedPrContent>> {
     let range = git_source(git)?.range_context(cwd).await?;
     let output = text
         .run(prompt(
             cwd,
+            provider_account_id,
             build_pr_content_prompt(&PrContentPromptInput {
                 base_branch: range.base.clone(),
                 head_branch: range.head.clone(),
@@ -180,9 +191,15 @@ pub async fn generate_claude_branch_name(
     text: &ClaudeText,
     cwd: &str,
     message: &str,
+    provider_account_id: Option<&str>,
 ) -> Option<String> {
     match text
-        .run(prompt(cwd, build_branch_name_prompt(message), None))
+        .run(prompt(
+            cwd,
+            provider_account_id,
+            build_branch_name_prompt(message),
+            None,
+        ))
         .await
     {
         Ok(output) => parse_branch_name(&output),

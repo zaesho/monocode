@@ -6,5 +6,6 @@
 //! - [`threads`]: side threads, second opinions, and orchestration views.
 
 pub mod cards;
+pub mod motion;
 pub mod threads;
 pub mod transcript;

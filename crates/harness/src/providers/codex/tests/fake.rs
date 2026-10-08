@@ -134,7 +134,7 @@ impl ChildBackend for FakeChild {
         _command: String,
         _provider: HarnessId,
         _path: Option<String>,
-    ) -> ChildFuture<()> {
+    ) -> ChildFuture<String> {
         async { Err("unsupported".into()) }.boxed()
     }
 

@@ -247,7 +247,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::MessageDelta { text }]
+            vec![HarnessEvent::MessageDelta { text, append: None }]
         };
     }
 
@@ -259,7 +259,7 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         return if text.is_empty() {
             Vec::new()
         } else {
-            vec![HarnessEvent::ReasoningDelta { text }]
+            vec![HarnessEvent::ReasoningDelta { text, append: None }]
         };
     }
 
@@ -279,10 +279,10 @@ pub fn events_from_acp_update(params: &Value) -> Vec<HarnessEvent> {
         let status = string_field(update, "status")
             .or_else(|| string_field(tool, "status"))
             .map(str::to_string);
-        // fx sends no rawInput, locations, or diff, so the generic ACP
-        // extraction has nothing to work with. Mine the result instead, and
-        // fall back to the shared path only if fx starts sending structured
-        // fields.
+        // fx sends no locations or diff, so mine the result first. A pending
+        // call has no result yet. fx 0.0.8+ puts the tool arguments in
+        // rawInput there, and the shared path reads the edit target from it
+        // before the edit runs.
         let fx = fx_tool_info(update, tool);
         let tool_kind = fx
             .kind

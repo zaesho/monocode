@@ -113,7 +113,7 @@ fn runs_one_short_turn_against_the_real_cli() {
         let reply: String = events
             .iter()
             .filter_map(|event| match event {
-                HarnessEvent::MessageDelta { text } => Some(text.as_str()),
+                HarnessEvent::MessageDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

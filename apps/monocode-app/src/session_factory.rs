@@ -72,3 +72,54 @@ impl SessionFactory for AppSessionFactory {
         self.snapshot().new_session_like(seed, cwd)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monocode_core::models::AgentModel;
+
+    #[test]
+    fn creates_sessions_with_the_project_model_and_settings() {
+        let catalog = SharedCatalog::new();
+        catalog.set_harness_models(
+            HarnessId::Opencode,
+            vec![AgentModel::new(
+                "opencode:home/model",
+                HarnessId::Opencode,
+                "Home",
+            )],
+        );
+        let model: AgentModel = serde_json::from_value(serde_json::json!({
+            "id": "opencode:fixture/model", "harness": "opencode", "name": "Project",
+            "settings": [{ "id": "agent", "label": "Agent", "kind": "select", "value": "project_agent",
+                "options": [{ "value": "project_agent", "label": "Project agent" }] }],
+        })).unwrap();
+        catalog.set_project_harness_models(HarnessId::Opencode, "/project", vec![model]);
+        let factory =
+            AppSessionFactory::new(Kv::in_memory(), catalog, HarnessAvailabilityStore::new());
+        let session = factory.new_session(
+            HarnessId::Opencode,
+            "/project",
+            Some("opencode:fixture/model"),
+            None,
+            None,
+        );
+        assert_eq!(session.model, "opencode:fixture/model");
+        assert_eq!(
+            session.model_settings.get("agent").map(String::as_str),
+            Some("project_agent")
+        );
+        assert_eq!(
+            factory
+                .new_session(
+                    HarnessId::Opencode,
+                    "/other",
+                    Some("opencode:fixture/model"),
+                    None,
+                    None
+                )
+                .model,
+            "opencode:home/model"
+        );
+    }
+}

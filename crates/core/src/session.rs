@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::attachment::Attachment;
-use crate::block::{Block, BlockRole, Extra, ModelSettings, TurnIntent};
+use crate::block::{Block, BlockRole, Extra, ModelSettings, ModelTarget, TurnIntent};
 use crate::context_usage::{ContextUsage, drop_context_window};
 use crate::handoff::HandoffComposerCard;
 use crate::harness::{DEFAULT_RUNTIME_MODE, HarnessId, RuntimeMode};
@@ -17,6 +17,7 @@ use crate::inbox::{InboxAskContext, InboxComposerCard, LinkedWorkItemUpdateCard,
 use crate::js;
 use crate::models::ModelEnv;
 use crate::notes::NoteComposerCard;
+use crate::provider_context::ProviderContextState;
 use crate::task_list::split_lines;
 use crate::user_question::UserQuestionPrompt;
 
@@ -24,6 +25,9 @@ use crate::user_question::UserQuestionPrompt;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedMessage {
+    /// The provider choice captured when this request entered the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelTarget>,
     pub id: String,
     pub text: String,
     pub attachments: Vec<Attachment>,
@@ -33,6 +37,10 @@ pub struct QueuedMessage {
     pub handoff_card: Option<HandoffComposerCard>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub intent: Option<TurnIntent>,
+    /// The app CLI request that queued a linked session's message, so a
+    /// retried request is not queued twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,6 +177,9 @@ pub struct Session {
     pub context: Option<ContextUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_switch: Option<PendingHarnessSwitch>,
+    /// Native provider bindings and receipts for shared conversation history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_context: Option<ProviderContextState>,
     /// Last known branch in the session's working copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
@@ -245,6 +256,7 @@ impl Session {
             provider_account_id: None,
             context: None,
             pending_switch: None,
+            provider_context: None,
             branch: None,
             worktree_cwd: None,
             workspace_mode: None,
@@ -288,7 +300,9 @@ pub fn new_session(
             preferred.as_str()
         }
     };
-    let resolved = env.catalog.resolve_model(harness, Some(model));
+    let resolved = env
+        .catalog
+        .resolve_model_in(harness, Some(model), Some(cwd));
     let mut session = Session::blank(id, harness, resolved.id.clone(), cwd);
     session.model_settings = env.preferred_model_settings(&resolved, model_settings);
     session.runtime_mode = runtime_mode.unwrap_or(DEFAULT_RUNTIME_MODE);
@@ -385,7 +399,9 @@ pub fn retarget_session_to_project(env: &ModelEnv<'_>, session: &Session, cwd: &
     let carries_seed =
         model.as_deref() == Some(session.model.as_str()) && harness == session.harness;
     let model = model.unwrap_or_else(|| env.preferred_model_id(harness));
-    let resolved = env.catalog.resolve_model(harness, Some(&model));
+    let resolved = env
+        .catalog
+        .resolve_model_in(harness, Some(&model), Some(cwd));
     let mut next = session.clone();
     next.cwd = cwd.to_string();
     next.harness = harness;

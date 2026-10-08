@@ -212,22 +212,25 @@ impl NotificationsHost for GalleryHost {
     }
 }
 impl HarnessUpdateHost for GalleryHost {
-    fn check_for_updates(&self, _: &mut App) -> Task<Vec<HarnessUpdate>> {
+    fn claim_launch_check(&self, _: &mut App) -> bool {
+        true
+    }
+    fn check_versions(&self, _: bool, _: &mut App) -> Task<Vec<HarnessVersionCheck>> {
         Task::ready(vec![
-            HarnessUpdate {
+            HarnessVersionCheck::Behind {
                 harness: HarnessId::Claude,
                 installed: "2.1.4".into(),
                 latest: "2.2.0".into(),
             },
-            HarnessUpdate {
+            HarnessVersionCheck::Behind {
                 harness: HarnessId::Codex,
                 installed: "0.156.1".into(),
                 latest: "0.157.0".into(),
             },
         ])
     }
-    fn update_cli(&self, _: HarnessId, _: &mut App) -> host::HostTask<()> {
-        Task::ready(Ok(()))
+    fn update_cli(&self, _: HarnessId, _: &mut App) -> host::HostTask<String> {
+        Task::ready(Ok(String::new()))
     }
     fn installed_version(&self, _: HarnessId, _: &mut App) -> host::HostTask<Option<String>> {
         Task::ready(Ok(Some("2.2.0".into())))

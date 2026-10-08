@@ -1171,14 +1171,14 @@ fn handle_session_update(live: &Arc<Live>, params: &Value) {
         // Whole-message arrays contain distinct content blocks; chunks are exact deltas.
         let text = update_text(update, if kind == "agent_message" { "\n" } else { "" });
         if !text.is_empty() {
-            route(live, HarnessEvent::MessageDelta { text });
+            route(live, HarnessEvent::MessageDelta { text, append: None });
         }
         return;
     }
     if kind == "agent_thought_chunk" || kind == "agent_thought" {
         let text = update_text(update, if kind == "agent_thought" { "\n" } else { "" });
         if !text.is_empty() {
-            route(live, HarnessEvent::ReasoningDelta { text });
+            route(live, HarnessEvent::ReasoningDelta { text, append: None });
         }
         return;
     }
